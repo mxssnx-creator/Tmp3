@@ -1,10 +1,8 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import { Button } from "@/components/ui/button"
+import { useEffect } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { RefreshCw } from "lucide-react"
 import { useExchange } from "@/lib/exchange-context"
 
 interface Connection {
@@ -27,7 +25,11 @@ const STANDARD_OPTION: Connection = {
   isLiveTradeEnabled: false,
 }
 
-export function ExchangeSelectorTop() {
+interface ExchangeSelectorTopProps {
+  variant?: "header" | "sidebar"
+}
+
+export function ExchangeSelectorTop({ variant = "header" }: ExchangeSelectorTopProps) {
   const { selectedConnectionId, setSelectedConnectionId, activeConnections, isLoading, loadActiveConnections } = useExchange()
 
   const currentConnection = activeConnections.find((c) => c.id === selectedConnectionId) || STANDARD_OPTION
@@ -36,11 +38,8 @@ export function ExchangeSelectorTop() {
     setSelectedConnectionId(id)
   }
 
-  const handleRefresh = async () => {
-    await loadActiveConnections()
-  }
-
   const defaultValue = selectedConnectionId || "standard"
+  const isSidebar = variant === "sidebar"
 
   const renderStatusBadges = () => {
     return (
@@ -55,12 +54,17 @@ export function ExchangeSelectorTop() {
     )
   }
 
+  useEffect(() => {
+    loadActiveConnections({ force: true }).catch((error) => {
+      console.warn("[v0] [ExchangeSelectorTop] Failed to load active connections:", error)
+    })
+  }, [loadActiveConnections])
+
   return (
-    <div className="w-full">
-      <div className="text-sm font-medium text-foreground">Exchange:</div>
-      <div className="mt-1 flex items-start gap-2 min-w-0">
+    <div className="w-full min-w-0">
+      <div className="flex items-center gap-2 min-w-0 flex-wrap">
         <Select value={defaultValue} onValueChange={handleSelectConnection}>
-          <SelectTrigger className="w-[180px] h-8 text-sm border-input bg-background hover:bg-muted">
+          <SelectTrigger className={isSidebar ? "w-full h-8 text-sm border-input bg-background hover:bg-muted" : "w-[220px] h-8 text-sm border-input bg-background hover:bg-muted"}>
             <SelectValue placeholder="Select connection" />
           </SelectTrigger>
           <SelectContent>
@@ -87,12 +91,9 @@ export function ExchangeSelectorTop() {
             )}
           </SelectContent>
         </Select>
-        <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0" onClick={handleRefresh} aria-label="Refresh connections">
-          <RefreshCw className="h-3.5 w-3.5" />
-        </Button>
-      </div>
-      <div className="mt-1 min-h-5 flex flex-wrap gap-1">
-        {renderStatusBadges()}
+        <div className="min-h-5 flex flex-wrap gap-1">
+          {renderStatusBadges()}
+        </div>
       </div>
     </div>
   )
