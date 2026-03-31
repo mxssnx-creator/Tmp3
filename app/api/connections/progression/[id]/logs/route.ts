@@ -12,6 +12,15 @@ function toNumber(value: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
+async function countKeys(client: any, patterns: string[]): Promise<number> {
+  let total = 0
+  for (const pattern of patterns) {
+    const keys = await client.keys(pattern).catch(() => [])
+    total += Array.isArray(keys) ? keys.length : 0
+  }
+  return total
+}
+
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
@@ -56,6 +65,38 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
           connectionId,
         }))
 
+    const [
+      prehistoricSymbolsSet,
+      prehistoricDataKeys,
+      baseSetCount,
+      mainSetCount,
+      realSetCount,
+      indicationDirectionCount,
+      indicationMoveCount,
+      indicationActiveCount,
+      indicationOptimalCount,
+      redisDbSize,
+      redisMemoryInfo,
+    ] = await Promise.all([
+      client.scard(`prehistoric:${connectionId}:symbols`).catch(() => 0),
+      countKeys(client, [`prehistoric:${connectionId}:*`, `market_data:${connectionId}:*`]),
+      countKeys(client, [`sets:${connectionId}:base:*`, `pseudo_positions:${connectionId}:base:*`]),
+      countKeys(client, [`sets:${connectionId}:main:*`, `pseudo_positions:${connectionId}:main:*`]),
+      countKeys(client, [`sets:${connectionId}:real:*`, `pseudo_positions:${connectionId}:real:*`]),
+      toNumber(await client.get(`indications:${connectionId}:direction:evaluated`).catch(() => 0)),
+      toNumber(await client.get(`indications:${connectionId}:move:evaluated`).catch(() => 0)),
+      toNumber(await client.get(`indications:${connectionId}:active:evaluated`).catch(() => 0)),
+      toNumber(await client.get(`indications:${connectionId}:optimal:evaluated`).catch(() => 0)),
+      client.dbsize().catch(() => 0),
+      client.info("memory").catch(() => ""),
+    ])
+
+    const usedMemoryLine = String(redisMemoryInfo)
+      .split("\n")
+      .find((line) => line.startsWith("used_memory:"))
+    const usedMemoryBytes = toNumber(usedMemoryLine?.split(":")[1])
+    const dbSizeMb = usedMemoryBytes > 0 ? usedMemoryBytes / (1024 * 1024) : 0
+
     return NextResponse.json({
       success: true,
       connectionId,
@@ -83,8 +124,20 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         strategyEvaluatedBase: toNumber(await client.get(`strategies:${connectionId}:base:evaluated`).catch(() => 0)),
         strategyEvaluatedMain: toNumber(await client.get(`strategies:${connectionId}:main:evaluated`).catch(() => 0)),
         strategyEvaluatedReal: toNumber(await client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0)),
+        indicationEvaluatedDirection: indicationDirectionCount,
+        indicationEvaluatedMove: indicationMoveCount,
+        indicationEvaluatedActive: indicationActiveCount,
+        indicationEvaluatedOptimal: indicationOptimalCount,
         prehistoricSymbolsProcessed: toNumber(engineState?.config_set_symbols_processed),
         prehistoricCandlesProcessed: toNumber(engineState?.config_set_candles_processed),
+        prehistoricSymbolsProcessedCount: toNumber(prehistoricSymbolsSet || engineState?.config_set_symbols_processed),
+        prehistoricDataSize: toNumber(prehistoricDataKeys),
+        setsBaseCount: toNumber(baseSetCount),
+        setsMainCount: toNumber(mainSetCount),
+        setsRealCount: toNumber(realSetCount),
+        setsTotalCount: toNumber(baseSetCount + mainSetCount + realSetCount),
+        redisDbEntries: toNumber(redisDbSize),
+        redisDbSizeMb: Number(dbSizeMb.toFixed(2)),
       },
       enginePhase: engineProgression ? {
         phase: engineProgression.phase,

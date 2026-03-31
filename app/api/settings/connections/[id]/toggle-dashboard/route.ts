@@ -67,19 +67,6 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     // Determine new state based on request
     const enableMain = hasDashboardEnabled ? isDashboardEnabled : (hasActiveInserted ? isActiveInserted : state.main_enabled)
 
-    // Guard: enabling dashboard processing must not implicitly insert into Main panel.
-    // Users must explicitly add connection to Main first (add-to-active flow).
-    // Auto-add to Main panel if enabling but not yet added
-    if (hasDashboardEnabled && isDashboardEnabled && !hasActiveInserted && !state.main_assigned) {
-      console.log(`[v0] [Toggle] Auto-adding connection to Main Connections before enabling...`)
-      // Auto-add to Main panel first
-      const addedConnection = buildMainConnectionEnableUpdate(connection)
-      await updateConnection(resolvedId, addedConnection)
-      console.log(`[v0] [Toggle] Auto-added ${connection.name} to Main Connections`)
-      // Update local state to reflect the change
-      state.main_assigned = true
-    }
-    
     // Check if state actually changes
     const currentMainEnabled = state.main_enabled
     const needsUpdate = currentMainEnabled !== enableMain
@@ -103,8 +90,13 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       // No state change but still need to ensure engine is running if already enabled
       updatedConnection = connection
       if (enableMain) {
-        engineAction = "start" // Ensure engine is started if already enabled
-        console.log(`[v0] [Toggle] Already enabled - ensuring engine is running`)
+        const coordinator = getGlobalTradeEngineCoordinator()
+        if (!coordinator.isEngineRunning(resolvedId)) {
+          engineAction = "start" // Ensure engine is started if it is unexpectedly down
+          console.log(`[v0] [Toggle] Already enabled - engine not running, starting...`)
+        } else {
+          console.log(`[v0] [Toggle] Already enabled - engine already running, no restart`)
+        }
       } else {
         console.log(`[v0] [Toggle] Already disabled`)
       }
