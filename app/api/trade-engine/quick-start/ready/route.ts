@@ -8,6 +8,12 @@ function isTruthy(value: unknown): boolean {
   return value === true || value === "1" || value === "true"
 }
 
+function isMainAssigned(connection: any): boolean {
+  return isTruthy(connection?.is_assigned) ||
+    isTruthy(connection?.is_active_inserted) ||
+    isTruthy(connection?.is_dashboard_inserted)
+}
+
 /**
  * GET /api/trade-engine/quick-start/ready
  * Returns whether the system is ready for quickstart
@@ -29,15 +35,15 @@ export async function GET() {
       return isBase && hasCredentials
     })
 
-    // Check for base connections that are inserted (even without credentials)
-    const baseConnections = allConnections.filter((c: any) => {
+    // Check for main-assigned connections (even without credentials)
+    const mainConnections = allConnections.filter((c: any) => {
       const exch = (c.exchange || "").toLowerCase()
-      const isBaseInserted = isTruthy(c.is_active_inserted) || isTruthy(c.is_dashboard_inserted)
+      const isAssignedToMain = isMainAssigned(c)
       const isBase = BASE_EXCHANGES.includes(exch)
-      return isBase && isBaseInserted
+      return isBase && isAssignedToMain
     })
 
-    const isReady = connectionsWithCredentials.length > 0 || baseConnections.length > 0
+    const isReady = connectionsWithCredentials.length > 0 || mainConnections.length > 0
     
     return NextResponse.json({
       ready: isReady,
@@ -47,7 +53,14 @@ export async function GET() {
         name: c.name,
         exchange: c.exchange,
       })),
-      baseConnections: baseConnections.map((c: any) => ({
+      // Keep both keys for compatibility while the UI transitions to Main naming.
+      mainConnections: mainConnections.map((c: any) => ({
+        id: c.id,
+        name: c.name,
+        exchange: c.exchange,
+        hasCredentials: (c.api_key || c.apiKey || "").length >= 10 && (c.api_secret || c.apiSecret || "").length >= 10,
+      })),
+      baseConnections: mainConnections.map((c: any) => ({
         id: c.id,
         name: c.name,
         exchange: c.exchange,
@@ -56,7 +69,7 @@ export async function GET() {
       totalConnections: allConnections.length,
       message: isReady
         ? "System is ready for quickstart"
-        : "No suitable connections found. Add BingX/Bybit to Active panel in Dashboard first.",
+        : "No suitable connections found. Add BingX/Bybit to Main Connections in Dashboard first.",
     })
   } catch (error) {
     console.error("[v0] [QuickStartReady] Error:", error)

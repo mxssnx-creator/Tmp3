@@ -12,7 +12,9 @@
 
 // The 4 primary/base exchanges that are inserted in Settings by default.
 // Dashboard activation remains OFF until explicitly enabled.
-export const BASE_EXCHANGES = ["bybit", "bingx", "pionex", "orangex"]
+// Main/default exchange set for dashboard assignment handling.
+// Keep this limited to bybit + bingx to avoid auto-reassignment drift.
+export const BASE_EXCHANGES = ["bybit", "bingx"]
 
 // All known exchanges (base + templates)
 export const ALL_EXCHANGES = ["bybit", "bingx", "binance", "okx", "pionex", "orangex", "gateio", "kucoin", "mexc", "bitget", "huobi"]

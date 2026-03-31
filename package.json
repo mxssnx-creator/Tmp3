@@ -6,6 +6,7 @@
     "build": "next build",
     "dev": "next dev -p 3001",
     "lint": "eslint .",
+    "test": "node scripts/system-smoke-test.mjs",
     "typecheck": "tsc --noEmit",
     "start": "next start -p 3001",
     "vercel-build": "next build"

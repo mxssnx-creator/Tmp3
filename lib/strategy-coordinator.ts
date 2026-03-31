@@ -132,6 +132,7 @@ export class StrategyCoordinator {
   private async createBaseStrategies(symbol: string, indications: any[]): Promise<StrategyEvaluation> {
     const metrics = this.METRICS.base
     let totalCreated = 0
+    let totalCandidates = 0
     const baseStrategies: any[] = []
 
     for (const indication of indications) {
@@ -201,6 +202,7 @@ export class StrategyCoordinator {
   private async createMainStrategies(symbol: string, baseSurvivors: any[]): Promise<StrategyEvaluation> {
     const metrics = this.METRICS.main
     let totalCreated = 0
+    let totalCandidates = 0
     const mainStrategies: any[] = []
     const perConfigStrategies = new Map<string, any[]>()
 
@@ -254,6 +256,8 @@ export class StrategyCoordinator {
             const minPF = Math.max(0.5, metrics.minProfitFactor * 0.5) // Relaxed: 1.2 * 0.5 = 0.6
             const minConf = Math.max(0.3, metrics.confidence * 0.6) // Relaxed: 0.5 * 0.6 = 0.3
             
+            totalCandidates++
+
             if (mainStrategy.profitFactor >= minPF &&
                 mainStrategy.drawdownTime <= metrics.maxDrawdownTime &&
                 (mainStrategy.confidence || 0.5) >= minConf) {
@@ -298,7 +302,7 @@ export class StrategyCoordinator {
       timestamp: new Date(),
       totalCreated,
       passedEvaluation: totalCreated,
-      failedEvaluation: baseSurvivors.length - totalCreated,
+      failedEvaluation: Math.max(0, totalCandidates - totalCreated),
       avgProfitFactor: mainStrategies.reduce((sum: number, s: any) => sum + s.profitFactor, 0) / (mainStrategies.length || 1),
       avgDrawdownTime: mainStrategies.reduce((sum: number, s: any) => sum + (s.drawdownTime || 0), 0) / (mainStrategies.length || 1)
     }

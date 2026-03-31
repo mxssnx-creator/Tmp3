@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge"
 import { Zap, Loader2, CheckCircle2, AlertCircle, RefreshCw } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
 import { DetailedLoggingDialog } from "./detailed-logging-dialog"
+import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
 import { useExchange } from "@/lib/exchange-context"
 
 interface QuickStartButtonProps {
@@ -320,6 +321,9 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
             <RefreshCw className="w-4 h-4" />
           </Button>
           
+          {/* Main / Log compact overview button */}
+          <QuickstartOverviewDialog connectionId="bingx-x01" />
+
           {/* Detailed Logs Button */}
           <DetailedLoggingDialog />
         </div>
