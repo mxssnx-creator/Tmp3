@@ -1922,23 +1922,25 @@ export default function SettingsPage() {
 
   return (
     <AuthGuard>
-      <div className="flex flex-col h-screen">
+      <div className="flex min-h-0 flex-col">
         <PageHeader title="Settings" description="Configure system parameters and trading strategies">
           <Button onClick={saveAllSettings} disabled={saving} size="sm">
             <Save className="h-4 w-4 mr-2" />
             {reorganizing ? "Reorganizing..." : saving ? "Saving..." : "Save Changes"}
           </Button>
         </PageHeader>
-        <div className="flex-1 overflow-auto p-6">
-          <div className="max-w-7xl mx-auto space-y-6">
+        <div className="flex-1 min-h-0 overflow-auto">
+          <div className="mx-auto max-w-7xl space-y-6">
         <Tabs value={activeTab} onValueChange={setActiveTab}>
-          <TabsList className="grid w-full grid-cols-5">
-            <TabsTrigger value="overall">Overall</TabsTrigger>
-            <TabsTrigger value="exchange">Exchange</TabsTrigger>
-            <TabsTrigger value="indication">Indication</TabsTrigger>
-            <TabsTrigger value="strategy">Strategy</TabsTrigger>
-            <TabsTrigger value="system">System</TabsTrigger>
-          </TabsList>
+          <div className="overflow-x-auto pb-1">
+            <TabsList className="grid w-full min-w-[640px] grid-cols-5">
+              <TabsTrigger value="overall">Overall</TabsTrigger>
+              <TabsTrigger value="exchange">Exchange</TabsTrigger>
+              <TabsTrigger value="indication">Indication</TabsTrigger>
+              <TabsTrigger value="strategy">Strategy</TabsTrigger>
+              <TabsTrigger value="system">System</TabsTrigger>
+            </TabsList>
+          </div>
 
           <TabsContent value="overall" className="space-y-4">
             <OverallTab
