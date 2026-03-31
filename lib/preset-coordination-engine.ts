@@ -10,6 +10,8 @@ import type { PresetType, PresetConfigurationSet, PresetCoordinationResult } fro
 import { calculateIndicators, type IndicatorConfig } from "./indicators"
 import * as crypto from "crypto"
 import { PresetPseudoPositionManager } from "./preset-pseudo-position-manager"
+import { DataSyncManager } from "./data-sync-manager"
+import { logProgressionEvent } from "./engine-progression-logs"
 
 export interface PresetCoordinationConfig {
   connectionId: string
@@ -130,34 +132,60 @@ export class PresetCoordinationEngine {
    */
   private async loadHistoricalDataIfNeeded(): Promise<void> {
     console.log("[v0] Checking historical data...")
+    const symbolDayRequirements = new Map<string, number>()
 
     for (const configSet of this.configurationSets) {
       const symbols = await this.getSymbolsForConfigSet(configSet)
-
       for (const symbol of symbols) {
-        try {
-          // Check if historical data exists
-          const [existingData] = await sql`
-            SELECT MIN(timestamp) as oldest, MAX(timestamp) as newest, COUNT(*) as count
-            FROM preset_historical_data
-            WHERE connection_id = ${this.connectionId}
-              AND symbol = ${symbol}
-          `
-
-          const requiredDays = configSet.range_days
-          const requiredDataPoints = requiredDays * 24 * 60 // 1-minute candles
-
-          if (!existingData || existingData.count < requiredDataPoints) {
-            // Load missing historical data
-            console.log(`[v0] Loading historical data for ${symbol} (${requiredDays} days)`)
-            await this.loadHistoricalDataForSymbol(symbol, requiredDays, existingData?.newest)
-          } else {
-            console.log(`[v0] Historical data for ${symbol} already exists`)
-          }
-        } catch (error) {
-          console.error(`[v0] Failed to check/load historical data for ${symbol}:`, error)
-        }
+        const existingDays = symbolDayRequirements.get(symbol) || 0
+        symbolDayRequirements.set(symbol, Math.max(existingDays, configSet.range_days))
       }
+    }
+
+    const symbolEntries = Array.from(symbolDayRequirements.entries())
+    const batches = this.createBatches(symbolEntries, this.MAX_CONCURRENT_SYMBOLS)
+    let completed = 0
+
+    for (const batch of batches) {
+      await Promise.all(
+        batch.map(async ([symbol, requiredDays]) => {
+          try {
+            const endTime = new Date()
+            const startTime = new Date(endTime.getTime() - requiredDays * 24 * 60 * 60 * 1000)
+            const syncStatus = await DataSyncManager.checkSyncStatus(
+              this.connectionId,
+              symbol,
+              "market_data",
+              startTime,
+              endTime,
+            )
+
+            if (!syncStatus.needsSync) {
+              console.log(`[v0] Historical data for ${symbol} already fully synced`)
+              completed++
+              return
+            }
+
+            for (const missingRange of syncStatus.missingRanges) {
+              await this.loadHistoricalDataRangeForSymbol(symbol, missingRange.start, missingRange.end)
+            }
+
+            completed++
+            await logProgressionEvent(this.connectionId, "preset_historical_progress", "info", "Historical sync progress", {
+              completed,
+              total: symbolEntries.length,
+              symbol,
+              requiredDays,
+              missingRanges: syncStatus.missingRanges.length,
+            })
+          } catch (error) {
+            console.error(`[v0] Failed to check/load historical data for ${symbol}:`, error)
+            completed++
+          }
+        }),
+      )
+
+      await new Promise((resolve) => setTimeout(resolve, this.RATE_LIMIT_DELAY))
     }
 
     console.log("[v0] Historical data check complete")
@@ -166,11 +194,7 @@ export class PresetCoordinationEngine {
   /**
    * Load historical data for a symbol (only missing timerange)
    */
-  private async loadHistoricalDataForSymbol(symbol: string, days: number, newestTimestamp?: string): Promise<void> {
-    // Calculate timerange to fetch
-    const endTime = newestTimestamp ? new Date(newestTimestamp) : new Date()
-    const startTime = new Date(endTime.getTime() - days * 24 * 60 * 60 * 1000)
-
+  private async loadHistoricalDataRangeForSymbol(symbol: string, startTime: Date, endTime: Date): Promise<void> {
     // Fetch historical OHLCV data from exchange
     // This is a placeholder - actual implementation depends on exchange API
     const historicalData = await this.fetchHistoricalOHLCV(symbol, startTime, endTime)
@@ -178,7 +202,20 @@ export class PresetCoordinationEngine {
     // Store in database
     if (historicalData.length > 0) {
       await this.storeHistoricalData(symbol, historicalData)
-      console.log(`[v0] Loaded ${historicalData.length} candles for ${symbol}`)
+      await DataSyncManager.logSync(
+        this.connectionId,
+        symbol,
+        "market_data",
+        startTime,
+        endTime,
+        historicalData.length,
+        "success",
+      )
+      console.log(
+        `[v0] Loaded ${historicalData.length} candles for ${symbol} [${startTime.toISOString()} → ${endTime.toISOString()}]`,
+      )
+    } else {
+      await DataSyncManager.logSync(this.connectionId, symbol, "market_data", startTime, endTime, 0, "partial")
     }
   }
 

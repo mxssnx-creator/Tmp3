@@ -11,6 +11,17 @@ interface SyncRange {
   end: Date
 }
 
+interface StoredSyncRange {
+  start: string
+  end: string
+}
+
+interface StoredSyncStatus {
+  lastSyncEnd?: string | null
+  updatedAt?: string
+  ranges?: StoredSyncRange[]
+}
+
 interface SyncStatus {
   needsSync: boolean
   missingRanges: SyncRange[]
@@ -18,6 +29,68 @@ interface SyncStatus {
 }
 
 export class DataSyncManager {
+  private static normalizeRange(start: Date, end: Date): SyncRange {
+    if (start <= end) return { start, end }
+    return { start: end, end: start }
+  }
+
+  private static mergeRanges(ranges: SyncRange[]): SyncRange[] {
+    if (!ranges.length) return []
+    const sorted = ranges
+      .map((r) => DataSyncManager.normalizeRange(new Date(r.start), new Date(r.end)))
+      .sort((a, b) => a.start.getTime() - b.start.getTime())
+
+    const merged: SyncRange[] = [sorted[0]]
+    for (let i = 1; i < sorted.length; i++) {
+      const current = sorted[i]
+      const last = merged[merged.length - 1]
+      const overlapOrAdjacent = current.start.getTime() <= last.end.getTime() + 1000
+      if (overlapOrAdjacent) {
+        if (current.end > last.end) last.end = current.end
+      } else {
+        merged.push({ start: current.start, end: current.end })
+      }
+    }
+    return merged
+  }
+
+  private static getMissingRanges(requested: SyncRange, coveredRanges: SyncRange[]): SyncRange[] {
+    let gaps: SyncRange[] = [{ start: requested.start, end: requested.end }]
+
+    for (const covered of coveredRanges) {
+      const next: SyncRange[] = []
+      for (const gap of gaps) {
+        if (covered.end <= gap.start || covered.start >= gap.end) {
+          next.push(gap)
+          continue
+        }
+
+        if (covered.start > gap.start) {
+          next.push({ start: gap.start, end: covered.start })
+        }
+
+        if (covered.end < gap.end) {
+          next.push({ start: covered.end, end: gap.end })
+        }
+      }
+      gaps = next
+      if (!gaps.length) break
+    }
+
+    return gaps.filter((g) => g.end.getTime() - g.start.getTime() > 1000)
+  }
+
+  private static toStoredRanges(ranges: SyncRange[]): StoredSyncRange[] {
+    return ranges.map((r) => ({ start: r.start.toISOString(), end: r.end.toISOString() }))
+  }
+
+  private static toRuntimeRanges(ranges: StoredSyncRange[] | undefined): SyncRange[] {
+    if (!ranges?.length) return []
+    return ranges
+      .map((r) => ({ start: new Date(r.start), end: new Date(r.end) }))
+      .filter((r) => !Number.isNaN(r.start.getTime()) && !Number.isNaN(r.end.getTime()))
+  }
+
   /**
    * Check if data needs to be synced for a connection and symbol
    */
@@ -31,31 +104,31 @@ export class DataSyncManager {
     try {
       // Get sync status from Redis
       const syncKey = `sync_status:${connectionId}:${symbol}:${dataType}`
-      const syncData = (await getSettings(syncKey)) || { lastSyncEnd: null }
+      const syncData = ((await getSettings(syncKey)) as StoredSyncStatus | null) || { lastSyncEnd: null, ranges: [] }
+      const requested = DataSyncManager.normalizeRange(requestedStart, requestedEnd)
+      const coveredRanges = DataSyncManager.mergeRanges(DataSyncManager.toRuntimeRanges(syncData.ranges))
 
-      // If no previous sync, all data is missing
-      if (!syncData.lastSyncEnd) {
-        return {
-          needsSync: true,
-          missingRanges: [{ start: requestedStart, end: requestedEnd }],
+      // Backward compatibility with old shape that only tracked lastSyncEnd
+      if (!coveredRanges.length && syncData.lastSyncEnd) {
+        const last = new Date(syncData.lastSyncEnd)
+        if (!Number.isNaN(last.getTime())) {
+          coveredRanges.push({ start: new Date(0), end: last })
         }
       }
 
-      const lastSyncDate = new Date(syncData.lastSyncEnd)
-
-      // If requested data is after last sync, need to sync new range
-      if (requestedEnd > lastSyncDate) {
+      if (!coveredRanges.length) {
         return {
           needsSync: true,
-          missingRanges: [{ start: lastSyncDate, end: requestedEnd }],
-          lastSyncEnd: lastSyncDate,
+          missingRanges: [{ start: requested.start, end: requested.end }],
         }
       }
 
-      // All requested data already synced
+      const missingRanges = DataSyncManager.getMissingRanges(requested, coveredRanges)
+      const lastSyncDate = coveredRanges[coveredRanges.length - 1]?.end
+
       return {
-        needsSync: false,
-        missingRanges: [],
+        needsSync: missingRanges.length > 0,
+        missingRanges,
         lastSyncEnd: lastSyncDate,
       }
     } catch (error) {
@@ -76,14 +149,23 @@ export class DataSyncManager {
     symbol: string,
     dataType: "market_data" | "indication" | "position",
     syncEnd: Date,
+    syncStart?: Date,
   ): Promise<void> {
     try {
       const syncKey = `sync_status:${connectionId}:${symbol}:${dataType}`
+      const existing = ((await getSettings(syncKey)) as StoredSyncStatus | null) || { ranges: [] }
+      const existingRanges = DataSyncManager.toRuntimeRanges(existing.ranges)
+      const newRange = DataSyncManager.normalizeRange(syncStart || new Date(0), syncEnd)
+      const mergedRanges = DataSyncManager.mergeRanges([...existingRanges, newRange])
+
       await setSettings(syncKey, {
+        ranges: DataSyncManager.toStoredRanges(mergedRanges),
         lastSyncEnd: syncEnd.toISOString(),
         updatedAt: new Date().toISOString(),
       })
-      console.log(`[v0] Marked ${dataType} as synced for ${symbol} until ${syncEnd.toISOString()}`)
+      console.log(
+        `[v0] Marked ${dataType} as synced for ${symbol} [${newRange.start.toISOString()} → ${newRange.end.toISOString()}], ranges=${mergedRanges.length}`,
+      )
     } catch (error) {
       console.error("[v0] Error marking data as synced:", error)
     }
@@ -122,7 +204,7 @@ export class DataSyncManager {
       await setSettings(logKey, trimmed)
 
       if (status === "success") {
-        await DataSyncManager.markSynced(connectionId, symbol, dataType, syncEnd)
+        await DataSyncManager.markSynced(connectionId, symbol, dataType, syncEnd, syncStart)
       }
     } catch (error) {
       console.error("[v0] Failed to log sync:", error)

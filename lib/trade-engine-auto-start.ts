@@ -2,8 +2,9 @@
  * Trade Engine Auto-Start Service
  * Automatically starts trade engines for enabled connections via their toggles
  * 
- * MODIFIED: Prevents automatic restarting to address user requirement.
- * Engines will only start when explicitly enabled by user via dashboard toggle.
+ * Keeps engine lifecycle synchronized with current main-enabled connections.
+ * Engines are still user-controlled via dashboard toggles; monitor only ensures
+ * enabled connections are actually running when global coordinator is running.
  */
 
 import { getGlobalTradeEngineCoordinator } from "./trade-engine"
@@ -19,8 +20,7 @@ export function isAutoStartInitialized(): boolean {
 }
 
 /**
- * Initialize trade engine auto-start service WITHOUT automatic engine starting.
- * Engines will only start when explicitly toggled on by user.
+ * Initialize trade engine monitor for auto-recovery/synchronization.
  */
 export async function initializeTradeEngineAutoStart(): Promise<void> {
   if (autoStartInitialized) {
@@ -33,7 +33,7 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
   }
 
   try {
-    console.log("[v0] [Auto-Start] Starting trade engine auto-initialization (manual start mode)...")
+    console.log("[v0] [Auto-Start] Starting trade engine auto-initialization (sync mode)...")
     const coordinator = getGlobalTradeEngineCoordinator()
     
     // Check if Global Trade Engine Coordinator is running
@@ -43,15 +43,13 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
     const globalRunning = globalState?.status === "running"
     
     if (!globalRunning) {
-      console.log("[v0] [Auto-Start] Global Trade Engine is not running - skipping auto-start. Engines will start when global is started and user enables them.")
+      console.log("[v0] [Auto-Start] Global Trade Engine is not running - monitor initialized, waiting for global start.")
       autoStartInitialized = true
       startConnectionMonitoring()
       return
     }
     
-    // Just initialize monitoring - DO NOT auto-start engines
-    // Engines will only start when user explicitly enables them via dashboard toggle
-    console.log("[v0] [Auto-Start] Auto-start monitoring initialized (engines will NOT start automatically)")
+    console.log("[v0] [Auto-Start] Monitoring initialized - enabled connections will be synchronized")
     autoStartInitialized = true
     startConnectionMonitoring()
   } catch (error) {
@@ -62,8 +60,7 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
 }
 
 /**
- * Monitor for connection changes - DO NOT auto-start engines
- * Only monitors for changes, engines must be started manually by user
+ * Monitor for connection changes and synchronize coordinator engine state.
  */
 function startConnectionMonitoring(): void {
   if (autoStartTimer) {
@@ -128,8 +125,14 @@ function startConnectionMonitoring(): void {
         settingsCacheTime = Date.now()
       }
 
-      // NOTE: Not auto-starting engines - waiting for explicit user action
-      // Engines must be started via dashboard toggle or manual start
+      // Ensure coordinator engine map matches currently enabled+assigned connections.
+      // This recovers from missed toggle events, service restarts, or stale state.
+      try {
+        const coordinator = getGlobalTradeEngineCoordinator()
+        await coordinator.refreshEngines()
+      } catch (syncError) {
+        console.warn("[v0] [Monitor] Failed to refresh coordinator engines:", syncError)
+      }
       
     } catch (error) {
       // Log but don't crash - gracefully handle Redis errors

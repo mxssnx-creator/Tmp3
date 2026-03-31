@@ -15,7 +15,6 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { RefreshCw, Activity, Pause, Square, AlertCircle } from "lucide-react"
-import { ExchangeSelectorTop } from "@/components/exchange-selector-top"
 import { PageHeader } from "@/components/page-header"
 import { toast } from "sonner"
 import type { ExchangeConnection } from "@/lib/types"
@@ -256,17 +255,12 @@ export function Dashboard() {
   }, [loadStats, selectedExchange])
 
   return (
-    <div className="flex-1 space-y-6 p-6">
+    <div className="flex-1 space-y-6 px-3 md:px-4 pb-6">
       <PageHeader 
         title="CTS v3.2 Dashboard" 
         description="Monitor and control your Main Connections (Active Connections)"
         showExchangeSelector
       />
-
-      {/* Global Coordinator Status - Shows at top of page */}
-      <ErrorBoundary name="Global Coordinator Status">
-        <GlobalCoordinatorStatus />
-      </ErrorBoundary>
 
       {/* Smart Overview - Comprehensive system status */}
       <ErrorBoundary name="System Overview">

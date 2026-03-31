@@ -1,8 +1,8 @@
 "use client"
 
+import { ExchangeSelectorTop } from "@/components/exchange-selector-top"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 import { Separator } from "@/components/ui/separator"
-import { ExchangeSelectorTop } from "@/components/exchange-selector-top"
 
 interface PageHeaderProps {
   title?: string
@@ -14,7 +14,7 @@ interface PageHeaderProps {
 export function PageHeader({ title, description, children, showExchangeSelector = false }: PageHeaderProps) {
   return (
     <div className="sticky top-0 z-10 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 border-b">
-      <div className="flex h-auto min-h-[4rem] items-start gap-4 px-4 py-3">
+      <div className="flex h-auto min-h-[4rem] items-start gap-3 px-3 md:px-4 py-3">
         <SidebarTrigger className="h-8 w-8 shrink-0 mt-1" />
         <Separator orientation="vertical" className="h-8 shrink-0 mt-1" />
         <div className="flex-1 min-w-0">
@@ -24,7 +24,7 @@ export function PageHeader({ title, description, children, showExchangeSelector 
           )}
           {showExchangeSelector && (
             <div className="mt-2">
-              <ExchangeSelectorTop />
+              <ExchangeSelectorTop variant="header" />
             </div>
           )}
         </div>

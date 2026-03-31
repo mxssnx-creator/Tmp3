@@ -1,6 +1,6 @@
 "use client"
 
-import { createContext, useContext, useState, useEffect, useRef, type ReactNode } from "react"
+import { createContext, useContext, useState, useEffect, useRef, useCallback, type ReactNode } from "react"
 
 interface ExchangeContextType {
   selectedExchange: string | null
@@ -9,7 +9,7 @@ interface ExchangeContextType {
   setSelectedConnectionId: (connectionId: string | null) => void
   selectedConnection: any | null
   activeConnections: any[]
-  loadActiveConnections: () => Promise<void>
+  loadActiveConnections: (options?: { force?: boolean }) => Promise<void>
   isLoading: boolean
 }
 
@@ -24,9 +24,10 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
   const lastLoadRef = useRef(0)
   const LOAD_COOLDOWN = 60000 // 60 seconds between refreshes
 
-  const loadActiveConnections = async () => {
+  const loadActiveConnections = useCallback(async (options?: { force?: boolean }) => {
+    const force = options?.force === true
     if (loadingRef.current) return
-    if (Date.now() - lastLoadRef.current < LOAD_COOLDOWN) return
+    if (!force && Date.now() - lastLoadRef.current < LOAD_COOLDOWN) return
 
     loadingRef.current = true
     setIsLoading(true)
@@ -47,9 +48,10 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
         setActiveConnections(mainConnections)
         console.log("[v0] [Exchange Context] Loaded", mainConnections.length, "Main Connections")
         
-        if (mainConnections.length > 0 && !selectedConnectionId) {
-          setSelectedConnectionId(mainConnections[0].id)
-          setSelectedExchange(mainConnections[0].exchange || null)
+        if (mainConnections.length > 0) {
+          const firstConnection = mainConnections[0]
+          setSelectedConnectionId((prev) => prev || firstConnection.id)
+          setSelectedExchange((prev) => prev || firstConnection.exchange || null)
         }
       }
     } catch (error) {
@@ -59,7 +61,7 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
       setIsLoading(false)
       lastLoadRef.current = Date.now()
     }
-  }
+  }, [])
 
   // Only load on mount, remove interval to prevent loops
   useEffect(() => {

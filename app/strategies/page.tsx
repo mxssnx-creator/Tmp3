@@ -114,11 +114,10 @@ export default function StrategiesPage() {
   }, [])
 
   // Subscribe to strategy updates via SSE
-  useEffect(() => {
-    if (!selectedConnectionId || selectedConnectionId === 'demo-mode') return
-    
-    useStrategyUpdates(selectedConnectionId, handleStrategyUpdate)
-  }, [selectedConnectionId, handleStrategyUpdate])
+  useStrategyUpdates(
+    selectedConnectionId && selectedConnectionId !== "demo-mode" ? selectedConnectionId : "",
+    handleStrategyUpdate
+  )
 
   // Apply advanced filters with memoization for performance
   const filteredAndSortedStrategies = useMemo(() => {

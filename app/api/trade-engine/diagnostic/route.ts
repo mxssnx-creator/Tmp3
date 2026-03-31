@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server"
-import { getAllConnections, initRedis } from "@/lib/redis-db"
+import { getAllConnections, getAssignedAndEnabledConnections, getRedisClient, initRedis } from "@/lib/redis-db"
+import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -13,7 +14,10 @@ export async function GET() {
     console.log("[v0] [Diagnostic] Analyzing trade engine startup state...")
     
     await initRedis()
+    const client = getRedisClient()
     const allConnections = await getAllConnections()
+    const assignedAndEnabled = await getAssignedAndEnabledConnections()
+    const coordinator = getGlobalTradeEngineCoordinator()
     
     // Check if ANY connections have is_enabled_dashboard = true/"1"
     const activeConnections = allConnections.filter((c: any) => {
@@ -31,6 +35,13 @@ export async function GET() {
       return isBase
     })
     
+    const [globalState, marketDataKeys, prehistoricKeys, engineStateKeys] = await Promise.all([
+      client.hgetall("trade_engine:global").catch(() => ({})),
+      client.keys("market_data:*:1m").catch(() => []),
+      client.keys("prehistoric:*").catch(() => []),
+      client.keys("settings:trade_engine_state:*").catch(() => []),
+    ])
+
     const diagnostic = {
       timestamp: new Date().toISOString(),
       summary: {
@@ -38,7 +49,17 @@ export async function GET() {
         baseConnections: baseConnections.length,
         dashboardInserted: dashboardInsertedConnections.length,
         dashboardActive: activeConnections.length,
-        tradeEngineCanStart: activeConnections.length > 0,
+        assignedAndEnabled: assignedAndEnabled.length,
+        tradeEngineCanStart: assignedAndEnabled.length > 0,
+        coordinatorActiveEngines: coordinator?.getActiveEngineCount?.() ?? 0,
+      },
+      runtime: {
+        globalState,
+        dataCoverage: {
+          marketDataKeys: marketDataKeys.length,
+          prehistoricKeys: prehistoricKeys.length,
+          tradeEngineStateKeys: engineStateKeys.length,
+        },
       },
       details: {
         allConnections: allConnections.map((c: any) => ({
@@ -48,23 +69,29 @@ export async function GET() {
           is_enabled: c.is_enabled,
           is_dashboard_inserted: c.is_dashboard_inserted,
           is_enabled_dashboard: c.is_enabled_dashboard,
+          is_assigned: c.is_assigned,
           is_live_trade: c.is_live_trade,
+          hasCredentials: !!(c.api_key && c.api_secret && String(c.api_key).length > 8 && String(c.api_secret).length > 8),
         })),
       },
       diagnosis: {
-        noActiveConnections: activeConnections.length === 0,
-        reason: activeConnections.length === 0 
-          ? "No connections have is_enabled_dashboard=true. Trade engine needs at least one active connection."
-          : "Trade engine should be able to start.",
-        nextSteps: activeConnections.length === 0
+        noActiveConnections: assignedAndEnabled.length === 0,
+        reason: assignedAndEnabled.length === 0 
+          ? "No connections are both assigned-to-main and dashboard-enabled."
+          : "Engine should process. If not, inspect runtime/dataCoverage and progression keys.",
+        nextSteps: assignedAndEnabled.length === 0
           ? [
               "1. Ensure Global Trade Engine is running: POST /api/trade-engine/start",
-              "2. Enable at least one connection on the dashboard (bybit or bingx)",
-              "3. Toggle the connection's Enable switch in the UI",
-              "4. This will set is_enabled_dashboard='1' for the connection",
-              "5. Trade engine will automatically pick it up and start processing"
+              "2. Add connection to Main panel (assigned)",
+              "3. Toggle dashboard Enable to ON",
+              "4. Verify credentials are present",
+              "5. Re-check /api/trade-engine/status and this diagnostic endpoint"
             ]
-          : ["Trade engine should start. Check logs for detailed progression."],
+          : [
+              "1. Check globalState.status is running",
+              "2. Verify marketDataKeys and tradeEngineStateKeys are increasing",
+              "3. Inspect /api/trade-engine/detailed-logs for cycle progress"
+            ],
       },
     }
     

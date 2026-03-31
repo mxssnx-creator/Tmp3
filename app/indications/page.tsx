@@ -133,11 +133,10 @@ export default function IndicationsPage() {
   }, [isDemo])
 
   // Subscribe to indication updates via SSE
-  useEffect(() => {
-    if (!selectedConnectionId || selectedConnectionId === 'demo-mode') return
-    
-    useIndicationUpdates(selectedConnectionId, handleIndicationUpdate)
-  }, [selectedConnectionId, handleIndicationUpdate])
+  useIndicationUpdates(
+    selectedConnectionId && selectedConnectionId !== "demo-mode" ? selectedConnectionId : "",
+    handleIndicationUpdate
+  )
 
   // Apply filters and sorting with memoization
   const filteredAndSortedIndications = useMemo(() => {

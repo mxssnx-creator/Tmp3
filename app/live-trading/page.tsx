@@ -113,11 +113,10 @@ export default function LiveTradingPage() {
   }, [isDemo])
 
   // Subscribe to position updates via SSE
-  useEffect(() => {
-    if (!selectedConnectionId || selectedConnectionId === 'demo-mode') return
-    
-    usePositionUpdates(selectedConnectionId, handlePositionUpdate)
-  }, [selectedConnectionId, handlePositionUpdate])
+  usePositionUpdates(
+    selectedConnectionId && selectedConnectionId !== "demo-mode" ? selectedConnectionId : "",
+    handlePositionUpdate
+  )
 
   // Simulate real-time price updates (fallback for demo mode)
   useEffect(() => {
