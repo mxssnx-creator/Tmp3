@@ -1,0 +1,439 @@
+import { NextResponse } from "next/server"
+import { initRedis, getAllConnections, getConnectionPositions, getConnectionTrades, getRedisClient, getSettings } from "@/lib/redis-db"
+import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { getProgressionLogs } from "@/lib/engine-progression-logs"
+
+function mapPhaseToType(phase: string) {
+  if (phase.includes("indication")) return "indication"
+  if (phase.includes("strategy")) return "strategy"
+  if (phase.includes("position")) return "position"
+  if (phase.includes("error")) return "error"
+  return "engine"
+}
+
+function isTruthy(value: unknown): boolean {
+  return value === true || value === 1 || value === "1" || value === "true"
+}
+
+const INDICATION_TYPES = ["direction", "move", "active", "optimal", "auto"] as const
+
+function toNumber(value: unknown): number {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : 0
+}
+
+async function countArrayEntries(client: ReturnType<typeof getRedisClient>, key: string): Promise<number> {
+  try {
+    const raw = await client.get(key)
+    if (!raw) return 0
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw
+    return Array.isArray(parsed) ? parsed.length : 0
+  } catch {
+    return 0
+  }
+}
+
+async function countIndicationsByType(client: ReturnType<typeof getRedisClient>, connectionId: string) {
+  const counters = await Promise.all(
+    INDICATION_TYPES.map(async (type) => ({
+      type,
+      count: toNumber(await client.get(`indications:${connectionId}:${type}:count`).catch(() => 0)),
+    })),
+  )
+
+  const result = counters.reduce(
+    (acc, item) => {
+      acc[item.type] = item.count
+      acc.total += item.count
+      return acc
+    },
+    { direction: 0, move: 0, active: 0, optimal: 0, auto: 0, total: 0 } as Record<string, number>,
+  )
+
+  if (result.total > 0) {
+    return result
+  }
+
+  // Fallback for older/newer set keys where counters are unavailable.
+  for (const type of INDICATION_TYPES) {
+    const keys = await client.keys(`indication_set:${connectionId}:*:${type}*`).catch(() => [])
+    let sum = 0
+    for (const key of keys) {
+      sum += await countArrayEntries(client, key)
+    }
+    result[type] = sum
+    result.total += sum
+  }
+
+  return result
+}
+
+async function countStrategiesByType(client: ReturnType<typeof getRedisClient>, connectionId: string, symbols: string[]) {
+  const uniqueSymbols = Array.from(new Set(symbols.filter(Boolean)))
+  if (uniqueSymbols.length === 0) {
+    uniqueSymbols.push("BTCUSDT", "ETHUSDT")
+  }
+
+  const totals = { base: 0, main: 0, real: 0 }
+
+  for (const symbol of uniqueSymbols) {
+    const [baseCount, mainCount, realCount] = await Promise.all([
+      countArrayEntries(client, `strategies:${connectionId}:${symbol}:base`),
+      countArrayEntries(client, `strategies:${connectionId}:${symbol}:main`),
+      countArrayEntries(client, `strategies:${connectionId}:${symbol}:real`),
+    ])
+    totals.base += baseCount
+    totals.main += mainCount
+    totals.real += realCount
+  }
+
+  return totals
+}
+
+async function getStrategyEvaluationCounters(client: ReturnType<typeof getRedisClient>, connectionId: string) {
+  const [baseEvaluated, mainEvaluated, realEvaluated, basePassed, mainPassed, realPassed] = await Promise.all([
+    client.get(`strategies:${connectionId}:base:evaluated`).catch(() => 0),
+    client.get(`strategies:${connectionId}:main:evaluated`).catch(() => 0),
+    client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0),
+    client.get(`strategies:${connectionId}:base:passed`).catch(() => 0),
+    client.get(`strategies:${connectionId}:main:passed`).catch(() => 0),
+    client.get(`strategies:${connectionId}:real:passed`).catch(() => 0),
+  ])
+
+  return {
+    base: toNumber(baseEvaluated),
+    main: toNumber(mainEvaluated),
+    real: toNumber(realEvaluated),
+    passed: {
+      base: toNumber(basePassed),
+      main: toNumber(mainPassed),
+      real: toNumber(realPassed),
+    },
+  }
+}
+
+export const dynamic = "force-dynamic"
+
+export async function GET(request: Request) {
+  try {
+    await initRedis()
+    const { searchParams } = new URL(request.url)
+    const selectedConnectionId = searchParams.get("connectionId")
+    const selectedExchange = (searchParams.get("exchange") || "").toLowerCase()
+
+    const allConnections = await getAllConnections()
+    let activeConnections = allConnections.filter((c: any) => {
+      const exch = (c.exchange || "").toLowerCase()
+      const isBase = ["bingx", "bybit", "pionex", "orangex"].includes(exch)
+      return isBase || isTruthy(c.is_dashboard_inserted) || isTruthy(c.is_active_inserted) || isTruthy(c.is_enabled_dashboard)
+    })
+
+    if (selectedConnectionId) {
+      activeConnections = activeConnections.filter((c: any) => c.id === selectedConnectionId)
+    } else if (selectedExchange) {
+      activeConnections = activeConnections.filter((c: any) => (c.exchange || "").toLowerCase() === selectedExchange)
+    }
+
+    const progressionStates = await Promise.all(activeConnections.map((c: any) => ProgressionStateManager.getProgressionState(c.id)))
+
+    const logsByConnection = await Promise.all(
+      activeConnections.map((c: any) => getProgressionLogs(c.id))
+    )
+
+    const globalLogs = await getProgressionLogs("global")
+
+    const positionsByConnection = await Promise.all(
+      activeConnections.map((c: any) => getConnectionPositions(c.id))
+    )
+
+    const tradesByConnection = await Promise.all(
+      activeConnections.map((c: any) => getConnectionTrades(c.id))
+    )
+
+    const combinedLogsRaw = [...logsByConnection.flat(), ...globalLogs]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, 300)
+
+    const logs = combinedLogsRaw.map((log, index) => ({
+      id: `${log.connectionId}-${index}-${log.timestamp}`,
+      timestamp: log.timestamp,
+      type: mapPhaseToType(log.phase),
+      symbol: log.details?.symbol,
+      phase: log.phase,
+      message: log.message,
+      connectionId: log.connectionId,
+      details: {
+        timeframe: log.details?.timeframe,
+        timeRange: log.details?.timeRange,
+        calculatedIndicators: log.details?.calculatedIndicators,
+        evaluatedStrategies: log.details?.evaluatedStrategies,
+        pseudoPositions: log.details?.pseudoPositions,
+        configs: log.details?.configs,
+        evals: log.details?.evals,
+        ratios: log.details?.ratios,
+        cycleDuration: log.details?.cycleDuration,
+      },
+    }))
+
+    const client = getRedisClient()
+    const perConnection = await Promise.all(
+      activeConnections.map(async (conn: any, index: number) => {
+        const state = (await getSettings(`trade_engine_state:${conn.id}`)) || {}
+        const progression = progressionStates[index] || {}
+        const symbols = Array.isArray((state as any).symbols)
+          ? (state as any).symbols
+          : Array.isArray((state as any).active_symbols)
+            ? (state as any).active_symbols
+            : []
+
+        const [indicationsByType, strategyCounts, strategyEvaluations, basePseudoCount, mainPseudoCount, realPseudoCount, baseDirection, baseMove, baseActive, baseOptimal, livePositionsCount, prehistoricSymbols, prehistoricDataKeys] =
+          await Promise.all([
+            countIndicationsByType(client, conn.id),
+            countStrategiesByType(client, conn.id, symbols),
+            getStrategyEvaluationCounters(client, conn.id),
+            client.scard(`base_pseudo:${conn.id}`).catch(() => 0),
+            client.scard(`main_pseudo:${conn.id}`).catch(() => 0),
+            client.scard(`real_pseudo:${conn.id}`).catch(() => 0),
+            client.scard(`base_pseudo:${conn.id}:direction`).catch(() => 0),
+            client.scard(`base_pseudo:${conn.id}:move`).catch(() => 0),
+            client.scard(`base_pseudo:${conn.id}:active`).catch(() => 0),
+            client.scard(`base_pseudo:${conn.id}:optimal`).catch(() => 0),
+            client.scard(`positions:${conn.id}:live`).catch(() => 0),
+            client.scard(`prehistoric:${conn.id}:symbols`).catch(() => 0),
+            client.keys(`prehistoric:${conn.id}:*`).then((keys) => keys.length).catch(() => 0),
+          ])
+
+        const processedIntervals = toNumber(
+          await client.get(`intervals:${conn.id}:processed_count`).catch(() => 0),
+        )
+
+        return {
+          id: conn.id,
+          symbols,
+          indicationCycles: toNumber((state as any).indication_cycle_count) || toNumber((progression as any).cyclesCompleted),
+          strategyCycles: toNumber((state as any).strategy_cycle_count) || toNumber((progression as any).successfulCycles),
+          realtimeCycles: toNumber((state as any).realtime_cycle_count),
+          strategiesEvaluated: toNumber((state as any).total_strategies_evaluated),
+          durations: {
+            indication: toNumber((state as any).indication_avg_duration_ms),
+            strategy: toNumber((state as any).strategy_avg_duration_ms),
+            realtime: toNumber((state as any).realtime_avg_duration_ms),
+          },
+          indicationsByType,
+          strategyCounts,
+          strategyEvaluations,
+          pseudoCounts: {
+            base: basePseudoCount,
+            main: mainPseudoCount,
+            real: realPseudoCount,
+          },
+          basePseudoByIndication: {
+            direction: baseDirection,
+            move: baseMove,
+            active: baseActive,
+            optimal: baseOptimal,
+          },
+          livePositions: livePositionsCount,
+          prehistoric: {
+            loaded: isTruthy((state as any).prehistoric_data_loaded),
+            symbols: prehistoricSymbols || toNumber((state as any).config_set_symbols_processed),
+            dataKeys: prehistoricDataKeys,
+            indicationResults: toNumber((state as any).config_set_indication_results),
+            strategyPositions: toNumber((state as any).config_set_strategy_positions),
+            candlesProcessed: toNumber((state as any).config_set_candles_processed),
+            symbolsProcessed: toNumber((state as any).config_set_symbols_processed),
+            symbolsTotal: toNumber((state as any).config_set_symbols_total),
+            symbolsWithoutData: toNumber((state as any).config_set_symbols_without_data),
+            errors: toNumber((state as any).config_set_errors),
+            durationMs: toNumber((state as any).config_set_duration_ms),
+            lastProcessedAt: (state as any).prehistoric_last_processed_at || null,
+          },
+          intervalsProcessed: processedIntervals,
+        }
+      }),
+    )
+
+    const indicationCycles = perConnection.reduce((sum, item) => sum + item.indicationCycles, 0)
+    const strategyCycles = perConnection.reduce((sum, item) => sum + item.strategyCycles, 0)
+    const realtimeCycles = perConnection.reduce((sum, item) => sum + item.realtimeCycles, 0)
+    const totalPositions = positionsByConnection.reduce((sum, arr) => sum + arr.length, 0)
+    const totalTrades = tradesByConnection.reduce((sum, arr) => sum + arr.length, 0)
+
+    const aggregatedIndications = perConnection.reduce(
+      (acc, item) => {
+        acc.direction += item.indicationsByType.direction || 0
+        acc.move += item.indicationsByType.move || 0
+        acc.active += item.indicationsByType.active || 0
+        acc.optimal += item.indicationsByType.optimal || 0
+        acc.auto += item.indicationsByType.auto || 0
+        acc.total += item.indicationsByType.total || 0
+        return acc
+      },
+      { direction: 0, move: 0, active: 0, optimal: 0, auto: 0, total: 0 },
+    )
+
+    const aggregatedStrategyCounts = perConnection.reduce(
+      (acc, item) => {
+        acc.base += item.strategyCounts.base
+        acc.main += item.strategyCounts.main
+        acc.real += item.strategyCounts.real
+        return acc
+      },
+      { base: 0, main: 0, real: 0 },
+    )
+
+    const aggregatedStrategyEvaluations = perConnection.reduce(
+      (acc, item) => {
+        acc.base += item.strategyEvaluations.base
+        acc.main += item.strategyEvaluations.main
+        acc.real += item.strategyEvaluations.real
+        acc.passed.base += item.strategyEvaluations.passed.base
+        acc.passed.main += item.strategyEvaluations.passed.main
+        acc.passed.real += item.strategyEvaluations.passed.real
+        return acc
+      },
+      { base: 0, main: 0, real: 0, passed: { base: 0, main: 0, real: 0 } },
+    )
+
+    const aggregatedPseudo = perConnection.reduce(
+      (acc, item) => {
+        acc.base += item.pseudoCounts.base
+        acc.main += item.pseudoCounts.main
+        acc.real += item.pseudoCounts.real
+        return acc
+      },
+      { base: 0, main: 0, real: 0 },
+    )
+
+    const aggregatedPrehistoric = perConnection.reduce(
+      (acc, item) => {
+        acc.symbols += item.prehistoric.symbols
+        acc.dataKeys += item.prehistoric.dataKeys
+        acc.indicationResults += item.prehistoric.indicationResults
+        acc.strategyPositions += item.prehistoric.strategyPositions
+        acc.candlesProcessed += item.prehistoric.candlesProcessed
+        acc.symbolsProcessed += item.prehistoric.symbolsProcessed
+        acc.symbolsTotal += item.prehistoric.symbolsTotal
+        acc.symbolsWithoutData += item.prehistoric.symbolsWithoutData
+        acc.errors += item.prehistoric.errors
+        acc.durationMs += item.prehistoric.durationMs
+        return acc
+      },
+      {
+        symbols: 0,
+        dataKeys: 0,
+        indicationResults: 0,
+        strategyPositions: 0,
+        candlesProcessed: 0,
+        symbolsProcessed: 0,
+        symbolsTotal: 0,
+        symbolsWithoutData: 0,
+        errors: 0,
+        durationMs: 0,
+      },
+    )
+
+    const intervalsProcessed = perConnection.reduce((sum, item) => sum + item.intervalsProcessed, 0)
+    const livePositions = perConnection.reduce((sum, item) => sum + item.livePositions, 0)
+    const cycleDurationMs = perConnection.length
+      ? Math.round(
+          perConnection.reduce(
+            (sum, item) => sum + Math.max(item.durations.indication, item.durations.strategy, item.durations.realtime),
+            0,
+          ) / perConnection.length,
+        )
+      : 0
+    const avgCycleDuration = perConnection.length
+      ? Math.round(
+          perConnection.reduce(
+            (sum, item) => sum + item.durations.indication + item.durations.strategy + item.durations.realtime,
+            0,
+          ) / Math.max(1, perConnection.length * 3),
+        )
+      : 0
+
+    const basePseudoByIndication = perConnection.reduce(
+      (acc, item) => {
+        acc.direction += item.basePseudoByIndication.direction
+        acc.move += item.basePseudoByIndication.move
+        acc.active += item.basePseudoByIndication.active
+        acc.optimal += item.basePseudoByIndication.optimal
+        return acc
+      },
+      { direction: 0, move: 0, active: 0, optimal: 0 },
+    )
+
+    const summary = {
+      symbolsActive: Math.max(1, activeConnections.length),
+      indicationCycles,
+      strategyCycles,
+      totalIndicationsCalculated: aggregatedIndications.total || indicationCycles,
+      totalStrategiesEvaluated:
+        perConnection.reduce((sum, item) => sum + item.strategiesEvaluated, 0) ||
+        aggregatedStrategyCounts.main ||
+        strategyCycles,
+      pseudoPositions: {
+        base: aggregatedPseudo.base || totalPositions,
+        main: aggregatedPseudo.main || strategyCycles,
+        real: aggregatedPseudo.real || totalTrades,
+        total: (aggregatedPseudo.base || totalPositions) + (aggregatedPseudo.main || strategyCycles) + (aggregatedPseudo.real || totalTrades),
+      },
+      // Extended stats
+      prehistoricSymbols: aggregatedPrehistoric.symbols,
+      prehistoricDataSize: aggregatedPrehistoric.dataKeys,
+      intervalsProcessed,
+      indicationsByType: aggregatedIndications,
+      strategyCountsByType: aggregatedStrategyCounts,
+      strategyEvaluatedByType: {
+        base: aggregatedStrategyEvaluations.base || aggregatedStrategyCounts.base,
+        main: aggregatedStrategyEvaluations.main || aggregatedStrategyCounts.main,
+        real: aggregatedStrategyEvaluations.real || aggregatedStrategyCounts.real,
+      },
+      strategyPassedByType: aggregatedStrategyEvaluations.passed,
+      pseudoPositionsByType: {
+        baseByIndication: basePseudoByIndication,
+      },
+      livePositions,
+      cycleDurationMs,
+      realtimeCycles,
+      realtimeRunningConnections: perConnection.filter((item) => item.realtimeCycles > 0).length,
+      prehistoricProcessing: {
+        symbolsProcessed: aggregatedPrehistoric.symbolsProcessed,
+        symbolsTotal: aggregatedPrehistoric.symbolsTotal,
+        symbolsWithoutData: aggregatedPrehistoric.symbolsWithoutData,
+        candlesProcessed: aggregatedPrehistoric.candlesProcessed,
+        indicationResults: aggregatedPrehistoric.indicationResults,
+        strategyPositions: aggregatedPrehistoric.strategyPositions,
+        errors: aggregatedPrehistoric.errors,
+        durationMs: aggregatedPrehistoric.durationMs,
+      },
+      configsProcessed: perConnection.reduce((sum, item) => sum + item.prehistoric.indicationResults + item.prehistoric.strategyPositions, 0),
+      evalsCompleted: aggregatedStrategyCounts.base + aggregatedStrategyCounts.main + aggregatedStrategyCounts.real,
+      avgCycleDuration,
+      lastUpdate: new Date().toISOString(),
+      errors: logs.filter((log: any) => log.type === "error").length,
+      warnings: logs.filter((log: any) => String(log.message || "").toLowerCase().includes("warn")).length,
+    }
+
+    return NextResponse.json({
+      success: true,
+      logs,
+      summary,
+      timestamp: new Date().toISOString(),
+      activeConnections: activeConnections.map((c: any) => ({
+        id: c.id,
+        name: c.name,
+        exchange: c.exchange,
+        dashboardEnabled: isTruthy(c.is_enabled_dashboard),
+      })),
+    })
+  } catch (error) {
+    console.error("[v0] Error fetching detailed logs:", error)
+    return NextResponse.json({
+      success: false,
+      logs: [],
+      summary: null,
+      error: error instanceof Error ? error.message : "Unknown error",
+    })
+  }
+}

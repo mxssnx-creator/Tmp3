@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  cts-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cts-v3-app
+    ports:
+      - "3001:3001"
+    environment:
+      - NEXT_PUBLIC_APP_URL=http://localhost:3001
+      - KV_REST_API_URL=redis://redis:6379
+      - KV_REST_API_TOKEN=${REDIS_PASSWORD:-default_password}
+      - JWT_SECRET=${JWT_SECRET:-your-jwt-secret-change-in-production}
+      - NODE_ENV=production
+    depends_on:
+      - redis
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    container_name: cts-v3-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-default_password}
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  default:
+    name: cts-network

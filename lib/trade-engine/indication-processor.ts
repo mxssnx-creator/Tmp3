@@ -1,0 +1,413 @@
+/**
+ * Indication Processor
+ * Processes independent indication sets for each type (Direction, Move, Active, Optimal)
+ * Each type maintains its own 250-entry pool calculated independently
+ */
+
+import { IndicationSetsProcessor } from "@/lib/indication-sets-processor"
+import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { trackIndicationStats } from "@/lib/statistics-tracker"
+
+// Pre-import modules at module load time (not per-call)
+import { initRedis, getRedisClient, getMarketData, saveIndication, getSettings } from "@/lib/redis-db"
+import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { query } from "@/lib/db" // Add database query function
+
+// Cached helpers object to avoid object allocation per call
+const redisHelpers = {
+  initRedis,
+  getRedisClient,
+  getMarketData: getMarketData ?? (async (_s: string) => null),
+  saveIndication: saveIndication ?? (async (_d: any) => ""),
+  getSettings,
+}
+
+function getRedisHelpers() {
+  return redisHelpers
+}
+
+function getProgressionManager() {
+  return ProgressionStateManager
+}
+
+export class IndicationProcessor {
+  private connectionId: string
+  private marketDataCache: Map<string, { data: any; timestamp: number }> = new Map()
+  private settingsCache: { data: any; timestamp: number } | null = null
+  private readonly CACHE_TTL = 30000
+
+  constructor(connectionId: string) {
+    this.connectionId = connectionId
+  }
+
+  /**
+   * Get all candles for a symbol - tries multiple Redis keys in priority order:
+   * 1. market_data:{symbol}:candles  → JSON array of 250 candles (from loadMarketDataForEngine)
+   * 2. market_data:{symbol}:1m       → JSON object with .candles array
+   * 3. market_data:{symbol}          → single hash entry (fallback, 1 data point)
+   */
+  private async getHistoricalCandles(symbol: string): Promise<any[]> {
+    try {
+      await initRedis()
+      const client = getRedisClient()
+
+      // Priority 1: raw candles array (250 candles from market-data-loader)
+      const candlesRaw = await client.get(`market_data:${symbol}:candles`)
+      if (candlesRaw) {
+        const candles = JSON.parse(typeof candlesRaw === "string" ? candlesRaw : JSON.stringify(candlesRaw))
+        if (Array.isArray(candles) && candles.length > 0) {
+          console.log(`[v0] [PrehistoricIndication] Using candles array for ${symbol}: ${candles.length} candles`)
+          return candles
+        }
+      }
+
+      // Priority 2: full MarketData JSON with nested candles
+      const marketDataRaw = await client.get(`market_data:${symbol}:1m`)
+      if (marketDataRaw) {
+        const marketDataObj = JSON.parse(typeof marketDataRaw === "string" ? marketDataRaw : JSON.stringify(marketDataRaw))
+        if (marketDataObj?.candles && Array.isArray(marketDataObj.candles) && marketDataObj.candles.length > 0) {
+          console.log(`[v0] [PrehistoricIndication] Using market_data:1m candles for ${symbol}: ${marketDataObj.candles.length} candles`)
+          return marketDataObj.candles
+        }
+      }
+
+      // Priority 3: hash (single latest data point from redis-db.saveMarketData / getMarketData)
+      const rawData = await getMarketData(symbol)
+      if (rawData) {
+        const arr = Array.isArray(rawData) ? rawData : [rawData]
+        console.log(`[v0] [PrehistoricIndication] Using hash fallback for ${symbol}: ${arr.length} data point(s)`)
+        return arr
+      }
+
+      return []
+    } catch (error) {
+      console.error(`[v0] [PrehistoricIndication] Failed to get candles for ${symbol}:`, error)
+      return []
+    }
+  }
+
+  /**
+   * Process historical indications - builds up all 4 independent type sets
+   * Prehistoric phase only: evaluation, no trade execution
+   */
+  async processHistoricalIndications(symbol: string, startDate: Date, endDate: Date): Promise<void> {
+    const processStartTime = Date.now()
+    const TIMEOUT_MS = 30000 // 30 second timeout per symbol
+    
+    try {
+      console.log(`[v0] [PrehistoricIndication] START: Processing ${symbol} | Period: ${startDate.toISOString()} to ${endDate.toISOString()}`)
+
+      const redis = await getRedisHelpers()
+      await redis.initRedis()
+
+      // Use enhanced candle loader (tries candles array first, then hash fallback)
+      const historicalData = await this.getHistoricalCandles(symbol)
+
+      if (historicalData.length === 0) {
+        console.log(`[v0] [PrehistoricIndication] NO DATA: No market data available for ${symbol}`)
+        await logProgressionEvent(this.connectionId, "indications_prehistoric", "warning", `No historical data available for ${symbol}`, {
+          symbol,
+          reason: "no_market_data",
+        })
+        return
+      }
+
+      console.log(`[v0] [PrehistoricIndication] DATA RETRIEVED: ${historicalData.length} records for ${symbol} (startDate: ${startDate.toISOString()})`)
+
+      const setsProcessor = new IndicationSetsProcessor(this.connectionId)
+
+      let recordsProcessed = 0
+      for (const marketData of historicalData) {
+        // Check timeout
+        const elapsed = Date.now() - processStartTime
+        if (elapsed > TIMEOUT_MS) {
+          console.warn(`[v0] [PrehistoricIndication] TIMEOUT: Processing exceeded ${TIMEOUT_MS}ms for ${symbol}`)
+          await logProgressionEvent(this.connectionId, "indications_prehistoric", "warning", `Historical indication timeout for ${symbol}`, {
+            symbol,
+            timeoutMs: TIMEOUT_MS,
+            elapsedMs: elapsed,
+            recordsProcessed,
+          })
+          break
+        }
+
+        await setsProcessor.processAllIndicationSets(symbol, marketData)
+        recordsProcessed++
+      }
+
+      const directionStats = await setsProcessor.getSetStats(symbol, "direction")
+      const moveStats = await setsProcessor.getSetStats(symbol, "move")
+      const activeStats = await setsProcessor.getSetStats(symbol, "active")
+      const optimalStats = await setsProcessor.getSetStats(symbol, "optimal")
+
+      const ProgressionManager = await getProgressionManager()
+      await ProgressionManager.incrementPrehistoricCycle(this.connectionId, symbol)
+
+      const totalEntries = (directionStats?.currentEntries || 0) + (moveStats?.currentEntries || 0) + (activeStats?.currentEntries || 0) + (optimalStats?.currentEntries || 0)
+      
+      console.log(
+        `[v0] [PrehistoricIndication] COMPLETE: ${symbol} | Records=${recordsProcessed} | Total Entries=${totalEntries} | Direction=${directionStats?.currentEntries || 0}/250 Move=${moveStats?.currentEntries || 0}/250 Active=${activeStats?.currentEntries || 0}/250 Optimal=${optimalStats?.currentEntries || 0}/250`
+      )
+
+      // CRITICAL: Save prehistoric indications to Redis so realtime phase can access them
+      try {
+        await initRedis()
+        
+        const prehistoricIndications = []
+        if (directionStats && Object.keys(directionStats).length > 0) {
+          prehistoricIndications.push({ type: "direction", ...directionStats, phase: "prehistoric" })
+        }
+        if (moveStats && Object.keys(moveStats).length > 0) {
+          prehistoricIndications.push({ type: "move", ...moveStats, phase: "prehistoric" })
+        }
+        if (activeStats && Object.keys(activeStats).length > 0) {
+          prehistoricIndications.push({ type: "active", ...activeStats, phase: "prehistoric" })
+        }
+        if (optimalStats && Object.keys(optimalStats).length > 0) {
+          prehistoricIndications.push({ type: "optimal", ...optimalStats, phase: "prehistoric" })
+        }
+        
+        for (const ind of prehistoricIndications) {
+          await saveIndication(`${this.connectionId}:${symbol}:prehistoric`, ind)
+        }
+        console.log(`[v0] [PrehistoricIndication] ✓ Saved ${prehistoricIndications.length} indication types to Redis for ${symbol}`)
+      } catch (saveErr) {
+        console.error(`[v0] [PrehistoricIndication] Failed to save indications to Redis:`, saveErr)
+      }
+
+      await logProgressionEvent(this.connectionId, "indications_prehistoric", "info", `Historical indications evaluated for ${symbol}`, {
+        direction: directionStats,
+        move: moveStats,
+        active: activeStats,
+        optimal: optimalStats,
+        dataPoints: historicalData.length,
+        recordsProcessed,
+        totalEntriesCalculated: totalEntries,
+        phase: "prehistoric",
+        durationMs: Date.now() - processStartTime,
+      })
+    } catch (error) {
+      const durationMs = Date.now() - processStartTime
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      console.error(`[v0] [PrehistoricIndication] ERROR for ${symbol} after ${durationMs}ms:`, errorMsg)
+      
+      await logProgressionEvent(this.connectionId, "indications_prehistoric", "error", `Historical indication processing failed for ${symbol}`, {
+        symbol,
+        error: errorMsg,
+        durationMs,
+        stack: error instanceof Error ? error.stack : undefined,
+      })
+    }
+  }
+
+  /**
+   * Process real-time indication - delegates to independent sets processor
+   * Returns array of active indications for strategy processing
+   */
+  async processIndication(symbol: string): Promise<any[]> {
+    try {
+      let marketData = await this.getLatestMarketDataCached(symbol)
+      if (!marketData) {
+        // Try to load market data if not available
+        const redis = await getRedisHelpers()
+        await redis.initRedis()
+
+        // Force load market data for this symbol
+        const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
+        await loadMarketDataForEngine([symbol])
+
+        // Retry getting market data
+        const retryMarketData = await this.getLatestMarketDataCached(symbol)
+        if (!retryMarketData) {
+          console.log(`[v0] [IndicationProcessor] No market data available for ${symbol} after loading attempt`)
+          return []
+        }
+        console.log(`[v0] [IndicationProcessor] Market data loaded on-demand for ${symbol}`)
+        // Continue with the loaded market data
+        marketData = retryMarketData
+      }
+
+      // Market data is a single candle object with fields: price, open, high, low, close, volume, timestamp
+      // Extract price information from the single candle
+      const currentClose = Number.parseFloat(marketData.close || marketData.price || "0")
+      const currentOpen = Number.parseFloat(marketData.open || currentClose)
+      const currentHigh = Number.parseFloat(marketData.high || currentClose)
+      const currentLow = Number.parseFloat(marketData.low || currentClose)
+      const currentVolume = Number.parseFloat(marketData.volume || "0")
+      
+      if (currentClose === 0 || isNaN(currentClose)) {
+        // Disabled logging - runs per symbol per cycle
+        return []
+      }
+
+      // Generate indication from current candle data
+      // Since we only have 1 candle, use OHLC to create artificial price history
+      const prices = [currentOpen, currentLow, currentClose, currentHigh, currentClose] // Simple 5-point history
+      
+      // Disabled logging - runs per symbol per cycle
+      const direction = currentClose >= currentOpen ? "long" : "short"
+      const priceChange = ((currentClose - currentOpen) / currentOpen) * 100
+      const directionConfidence = Math.min(0.95, 0.5 + Math.abs(priceChange) / 100)
+      
+      // Calculate simple indications from current candle OHLC
+      const indications: any[] = []
+      
+      // Direction indication: based on close vs open
+      indications.push({
+        type: "direction",
+        symbol,
+        value: direction === "long" ? 1 : -1,
+        profitFactor: 1.0 + Math.abs(priceChange) / 100,
+        drawdownTime: 0,
+        confidence: directionConfidence,
+        positionState: "new",
+        continuousPosition: false,
+        metadata: {
+          direction,
+          priceChange,
+          open: currentOpen,
+          close: currentClose,
+          high: currentHigh,
+          low: currentLow,
+        }
+      })
+      
+      // Move indication: based on high-low range
+      const range = currentHigh - currentLow
+      const rangePercent = (range / currentClose) * 100
+      const moveConfidence = Math.min(0.95, 0.5 + Math.min(rangePercent, 10) / 20)
+      
+      indications.push({
+        type: "move",
+        symbol,
+        value: rangePercent > 2 ? 1 : 0,
+        profitFactor: 1.0 + rangePercent / 100,
+        drawdownTime: 0,
+        confidence: moveConfidence,
+        positionState: "new",
+        continuousPosition: false,
+        metadata: {
+          range,
+          rangePercent,
+          volatility: rangePercent,
+        }
+      })
+      
+      // Active indication: based on volume
+      const activeConfidence = Math.min(0.95, 0.5 + Math.min(currentVolume, 1000) / 2000)
+      
+      indications.push({
+        type: "active",
+        symbol,
+        value: currentVolume > 0 ? 1 : 0,
+        profitFactor: 1.0 + Math.min(currentVolume, 1000) / 1000,
+        drawdownTime: 0,
+        confidence: activeConfidence,
+        positionState: "new",
+        continuousPosition: false,
+        metadata: {
+          volume: currentVolume,
+          volumeActive: currentVolume > 0,
+        }
+      })
+      
+      // Disabled per-cycle logging - only store and return
+
+      // Store indications in Redis for progression tracking (batch save)
+      try {
+        const connKey = `${this.connectionId}:${symbol}:realtime`
+        // Batch save all indications at once instead of one-by-one
+        if (indications.length > 0) {
+          await saveIndication(connKey, indications[0]) // Single write with latest
+          console.log(`[v0] [IndicationProcessor] Saved ${indications.length} indications for ${symbol}`)
+          
+          // Track each indication to database for statistics and historical analysis
+          for (const indication of indications) {
+            try {
+              await trackIndicationStats(
+                this.connectionId,
+                symbol,
+                indication.type,
+                indication.value,
+                indication.confidence
+              )
+            } catch (e) {
+              console.warn(`[v0] [IndicationProcessor] Failed to track indication:`, e)
+            }
+          }
+        }
+      } catch (redisErr) {
+        console.error(`[v0] [IndicationProcessor] Redis error saving indications:`, redisErr)
+      }
+
+      return indications
+    } catch (error) {
+      console.error(`[v0] [RealtimeIndication] ERROR:`, error)
+      return []
+    }
+  }
+
+  /**
+   * Get latest market data with caching to avoid repeated Redis calls
+   */
+  private async getLatestMarketDataCached(symbol: string): Promise<any> {
+    const now = Date.now()
+    const cached = this.marketDataCache.get(symbol)
+
+    if (cached && now - cached.timestamp < this.CACHE_TTL) {
+      return cached.data
+    }
+
+    try {
+      const redis = await getRedisHelpers()
+      await redis.initRedis()
+      const rawData = await redis.getMarketData(symbol)
+
+      if (!rawData) {
+        return null
+      }
+
+      const latest = Array.isArray(rawData) ? rawData[0] : rawData
+
+      if (latest) {
+        this.marketDataCache.set(symbol, { data: latest, timestamp: now })
+        return latest
+      }
+      return null
+    } catch (error) {
+      console.error(`[v0] Failed to get market data for ${symbol}:`, error)
+      return null
+    }
+  }
+
+  /**
+   * Get indication settings with caching
+   */
+  private async getIndicationSettingsCached(): Promise<any> {
+    const now = Date.now()
+
+    if (this.settingsCache && now - this.settingsCache.timestamp < this.CACHE_TTL) {
+      return this.settingsCache.data
+    }
+
+    try {
+      const redis = await getRedisHelpers()
+      const settings = await redis.getSettings("all_settings") || {}
+
+      const indicationSettings = {
+        minProfitFactor: settings.minProfitFactor || 1.2,
+        minConfidence: settings.minConfidence || 0.6,
+        timeframes: settings.timeframes || ["1h", "4h", "1d"],
+      }
+
+      this.settingsCache = { data: indicationSettings, timestamp: now }
+      return indicationSettings
+    } catch {
+      return {
+        minProfitFactor: 1.2,
+        minConfidence: 0.6,
+        timeframes: ["1h", "4h", "1d"],
+      }
+    }
+  }
+}

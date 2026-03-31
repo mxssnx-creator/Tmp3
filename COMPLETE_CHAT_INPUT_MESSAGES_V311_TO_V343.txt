@@ -1,0 +1,286 @@
+CTS v3.1 Trading System - Complete Input Chat Messages History
+Session Period: Version 311 → Version 343
+Generated: 2025-12-11
+Total Messages: 50+
+========================================================================
+
+MESSAGE 1:
+---
+Continue to next phase
+
+MESSAGE 2:
+---
+Update Preset Trade Engine:max Positions per configuration possibility and direction: 2 (add to Settings/Strategy/Preset as additional Setting).
+
+MESSAGE 3:
+---
+An error occurred during deployment. Please fix:
+Running build in Washington, D.C., USA (East) – iad1 (Turbo Build Machine)
+Build machine configuration: 30 cores, 60 GB
+...
+  322 |   // Overall / Main
+  323 |   base_volume_factor: 1.0,
+  324 |   positions_average: 50,
+Next.js build worker exited with code: 1 and signal: null
+Error: Command "npm run build" exited with 1
+
+MESSAGE 4:
+---
+An error occurred during deployment. Please fix:
+Running build in Washington, D.C., USA (East) – iad1 (Turbo Build Machine)
+...
+  579 |     (acc, key) => {
+  580 |       acc[key] = EXCHANGE_MAX_POSITIONS[key]
+  581 |       return acc
+Next.js build worker exited with code: 1 and signal: null
+
+MESSAGE 5:
+---
+An error occurred during deployment. Please fix:
+Please add source code to this block
+
+MESSAGE 6:
+---
+An error occurred during deployment. Please fix:
+Running build in Washington, D.C., USA (East) – iad1 (Turbo Build Machine)
+...
+  474 |     })
+  475 |   }
+  476 |
+Next.js build worker exited with code: 1 and signal: null
+
+MESSAGE 7:
+---
+Settings/Exchange: Remove "Preset Trade Configuration" because presets Configuration relies onto presets types with Sets Holding multiple configurations, ITS getting defined in presets Site..
+
+MESSAGE 8:
+---
+Settings: Save Settings Button: i am Not receiving any Toast Messages. Please fix
+
+MESSAGE 9:
+---
+Continue queue
+
+MESSAGE 10:
+---
+Settings to Settings/Strategy/Preset described in the Messages before, we're Not added! Please add!
+
+MESSAGE 11:
+---
+Remove First 3 Settings, Update System to use the ms Settings with Sliders.Synchronize Settings Values with engine, make everything functional, make Settings loading the Settings that are in Engine defined!
+[Screenshot provided showing settings page]
+
+MESSAGE 12:
+---
+An error occurred during deployment. Please fix:
+Running build in Washington, D.C., USA (East) – iad1 (Turbo Build Machine)
+...
+Next.js build worker exited with code: 1 and signal: null
+Error: Command "npm run build" exited with 1
+
+MESSAGE 13:
+---
+An error occurred during deployment. Please fix:
+Running build in Washington, D.C., USA (East) – iad1 (Turbo Build Machine)
+...
+  116 |     }
+  117 |
+  118 |     let shouldDisableSet = false
+
+MESSAGE 14:
+---
+Complete indication configuration system with dynamic UI ..... Under which menupoint can i find IT?
+
+MESSAGE 15:
+---
+Is parabolicSAR added?
+
+MESSAGE 16:
+---
+Add to Common with Settings like the other
+
+MESSAGE 17:
+---
+Describe detailed how Base,Main,Real,Exchange in Main trade engine works as progression and Counts logics etc. Create also a Independent Website with the informations.
+
+MESSAGE 18:
+---
+IS the 50 Position Limit in Main strategy the DB size or list of Positions related to indication Configuration?
+I want all Independent without Overall Positions Limit only for Specific configurations which are indeed and market direction a Limit, else "Limit" IS meant the Database sizes (with additional thresholds) for the specific Independent configurations.
+
+MESSAGE 19:
+---
+Yes, Change system to the correct explanation and asynchronous progressing.
+
+MESSAGE 20:
+---
+The continuous main and Real strategies also without Limits (ITS Just filtering from the Base ones .. )
+
+MESSAGE 21:
+---
+The Main trade engine IS without Common Indicators use, IT uses step Counts Based on Positioncost, could IT BE the old code, logics do got replaced, please Check and do explaination about Processing and approx variations (with ev. Percentage validation Ratio) for Indications and Base pseudo positions
+
+MESSAGE 22:
+---
+Update the progression Information Page, still showing for Main 50pos Limit. Explanation to the "Exchange" .. IT do Not falls into Strategies Section, Remove IT! ITS for Logging for the indeed live active Positions from Exchange for statistics and calculations use. (For Differences to "Real" and without need to Re retrieve Positions History from Exchange)
+
+MESSAGE 23:
+---
+Update progression Information Site, Exchange Level Git removed, ITS Just Logging for the live Positions executed, max 50 for Main pseudo positions got also removed. Site /trade-engine-docs Shows IT still
+
+MESSAGE 24:
+---
+Per Exchange Position Limits: fix to Maximum, If possible Up to 500
+
+MESSAGE 25:
+---
+The Base,Main,Real Pseudo Positions are to be counted without Volume Configuration (calculations through factors , Ratio in Relation to Positioncost, Volume Not belonging) Volume applies only for live Exchange Positions. adjust Strategies Like Block, DCA works also with Ratio, factors calculations, without need of "Volume" value, please Update do and fix errors.
+
+MESSAGE 26:
+---
+Recreate the Settings Information Text File.
+
+MESSAGE 27:
+---
+Upgrade Next.js from 15.5.6 to 15.5.7
+
+MESSAGE 28:
+---
+Update the Information Text Files and give me details
+
+MESSAGE 29:
+---
+Create a complex fully detailed Text Files with Infos about the whole project / System, also UI Informations and Progression Logics. Make IT fully effective so that If i start a new Project with Just the File IT should before fully working and functional!
+
+MESSAGE 30:
+---
+Vercel Deployment gives 404 error
+
+MESSAGE 31:
+---
+Update to Show Project Site, Dashboard ..
+
+MESSAGE 32:
+---
+Link the additional Pages to new Site menupoint "Additional", create top menus on Site for the different Pages. Always keep Main Project with Dashboard on deployment and initialization!
+
+MESSAGE 33:
+---
+I mean to Show / load the Real Project: CTS 3.1 Trading System. Dashboard ..
+
+MESSAGE 34:
+---
+No do Not create any new.. Just Restore the old system and Pages
+
+MESSAGE 35:
+---
+Yes and Always load indeed Project, do Not replace by individual Pages / sites.
+
+MESSAGE 36:
+---
+Synchronize the Real working Project / Site by looking into the older versions! And Always create Archive Files for the Last 8 versions internally !! So Restore or recover from Backup is possible!
+
+MESSAGE 37:
+---
+Create a Text File with With input and Output Chat History and 2 Independent files with only Input and Output. Load the Output File within Preview dir listing
+
+MESSAGE 38:
+---
+Showing 0 Messages. Update to include All Messages!
+
+MESSAGE 39:
+---
+Start Time: 2025-12-11T14:00:36.349Z.
+Change to load for Last month 30days
+
+MESSAGE 40:
+---
+Showing again 0 Messages!
+
+MESSAGE 41:
+---
+Make IT start 1 month ago
+
+MESSAGE 42:
+---
+There are Errors with Messages and Time, please fix everything intensively!
+
+MESSAGE 43:
+---
+Still Problems showing less Messages should be over 100
+
+MESSAGE 44:
+---
+[User reverted to version 320, creating v335]
+
+MESSAGE 45:
+---
+An error occurred during deployment. Please fix:
+Running build in Washington, D.C., USA (East) – iad1 (Turbo Build Machine)
+...
+Next.js build worker exited with code: 1 and signal: null
+Error: Command "npm run build" exited with 1
+
+MESSAGE 46:
+---
+Deployment Shows 404, Update to Show the usual Project Dashboard, configured to Show the old Project, Site! Look for the Files and configuration!
+
+MESSAGE 47:
+---
+No do Not create any new.. Just Restore the old system and Pages
+
+MESSAGE 48:
+---
+[User reverted to version 319, creating v341]
+
+MESSAGE 49:
+---
+Upgrade Next.js from 15.5.6 to 15.5.7
+
+MESSAGE 50:
+---
+[User reverted to version 311, creating v343]
+
+MESSAGE 51:
+---
+Upgrade Next.js from 16.0.1 to 16.0.7
+
+MESSAGE 52:
+---
+An error occurred during deployment. Please fix:
+Running build in Washington, D.C., USA (East) – iad1 (Turbo Build Machine)
+...
+Error: Command "npm run build" exited with 1
+[Module not found: Can't resolve 'react-is']
+
+MESSAGE 53:
+---
+Secure this Version now, Always whole project to ReMain in deployment / initialization. No replacing Pages without explicit command. Create new Pages additionally without replacing active ones. Create new and additional individual sites without to affection Main Project and system, the best Western s to implement the individual sites under new menupoint "Additional".
+
+MESSAGE 54:
+---
+create a Textfile with all Input Chat Messages since Version 311
+
+MESSAGE 55:
+---
+I mean from Version 311 All Messages, Messages before 343
+
+========================================================================
+End of Input Messages History
+========================================================================
+
+SUMMARY:
+- Total Input Messages: 55
+- Version Journey: v311 → v320 → v335 → v319 → v341 → v311 → v343
+- Main Topics: 
+  * Settings synchronization and removal
+  * Trade engine architecture corrections
+  * Documentation creation and updates
+  * Next.js upgrades (15.5.6→15.5.7, 16.0.1→16.0.7)
+  * Deployment error fixes
+  * Configuration independence implementation
+  * Project protection and versioning
+  * Chat history system implementation
+  
+Current Status: v343 (Secured and Protected)
+========================================================================

@@ -1,0 +1,50 @@
+$ next dev -p 3001
+   ▲ Next.js 15.5.7
+   - Local:        http://localhost:3001
+   - Network:      http://10.0.0.1:3001
+
+ ✓ Starting...
+ ✓ Compiled /instrumentation in 216ms (32 modules)
+[ERROR_HANDLER] Initializing production error handlers...
+[ERROR_HANDLER] Production error handlers initialized
+[METRICS] Registered metric: http_requests_total
+[METRICS] Registered metric: http_request_duration_seconds
+[METRICS] Registered metric: http_response_size_bytes
+[METRICS] Registered metric: errors_total
+[METRICS] Registered metric: unhandled_rejections_total
+[METRICS] Registered metric: uncaught_exceptions_total
+[METRICS] Registered metric: process_uptime_seconds
+[METRICS] Registered metric: process_memory_heap_used_bytes
+[METRICS] Registered metric: process_memory_heap_total_bytes
+[METRICS] Registered metric: circuit_breaker_state
+[METRICS] Registered metric: circuit_breaker_failures_total
+[METRICS] Registered metric: rate_limit_exceeded_total
+[METRICS] Registered metric: redis_commands_total
+[METRICS] Registered metric: redis_command_duration_seconds
+[METRICS] Registered metric: trade_engine_cycles_total
+[METRICS] Registered metric: trade_engine_cycle_duration_seconds
+[METRICS] Registered metric: active_trades_total
+[METRICS] Registered metric: active_positions_total
+[METRICS] Default metrics initialized
+[ALERTING] Alert manager initialized
+[CB] Initialized exchange-api (threshold: 5, reset: 60000ms)
+[CB] Initialized database (threshold: 10, reset: 30000ms)
+[CB] Initialized cache (threshold: 20, reset: 20000ms)
+[CB] Initialized indication-processor (threshold: 10, reset: 45000ms)
+[CB] Initialized strategy-processor (threshold: 10, reset: 45000ms)
+[CB] Initialized realtime-processor (threshold: 10, reset: 45000ms)
+[ERROR_INTEGRATION] Error handling initialized with circuit breakers
+[METRICS] Registered metric: cache_errors_total
+[METRICS] Registered metric: indication_processor_errors_total
+[METRICS] Registered metric: strategy_processor_errors_total
+[METRICS] Registered metric: realtime_processor_errors_total
+[METRICS] Registered metric: batch_operation_errors_total
+[METRICS] Registered metric: batch_item_errors_total
+[METRICS] Registered metric: retry_exhausted_total
+ ✓ Ready in 1851ms
+ ○ Compiling / ...
+ ✓ Compiled / in 9.3s (1114 modules)
+ ✓ Compiled in 1167ms (485 modules)
+ GET / 200 in 267ms
+ GET / 200 in 279ms
+ GET / 200 in 231ms

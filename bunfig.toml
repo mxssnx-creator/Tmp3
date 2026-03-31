@@ -1,0 +1,8 @@
+# Bun configuration for local development
+[install]
+# Skip optional dependencies to prevent libpq from building
+optional = false
+peer = true
+
+[install.cache]
+disable = false

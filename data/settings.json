@@ -1,0 +1,5 @@
+{
+  "mainEngineIntervalMs": 1000,
+  "strategyUpdateIntervalMs": 300,
+  "minimumConnectInterval": 200
+}
