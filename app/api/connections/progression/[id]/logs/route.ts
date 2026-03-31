@@ -56,6 +56,11 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
           connectionId,
         }))
 
+    const dbSizeBytes = toNumber(await client.get(`db:${connectionId}:size_bytes`).catch(() => 0))
+    const dbEntries = toNumber(await client.get(`db:${connectionId}:entries`).catch(() => 0))
+    const dbWindowSeconds = Math.max(1, toNumber(await client.get(`db:${connectionId}:window_seconds`).catch(() => 60)))
+    const dbEntriesPerSecond = dbEntries / dbWindowSeconds
+
     return NextResponse.json({
       success: true,
       connectionId,
@@ -85,6 +90,16 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         strategyEvaluatedReal: toNumber(await client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0)),
         prehistoricSymbolsProcessed: toNumber(engineState?.config_set_symbols_processed),
         prehistoricCandlesProcessed: toNumber(engineState?.config_set_candles_processed),
+        indicationsDirectionCount: toNumber(progressionState.indicationsDirectionCount),
+        indicationsMoveCount: toNumber(progressionState.indicationsMoveCount),
+        indicationsActiveCount: toNumber(progressionState.indicationsActiveCount),
+        indicationsOptimalCount: toNumber(progressionState.indicationsOptimalCount),
+        indicationsAutoCount: toNumber(progressionState.indicationsAutoCount),
+        strategiesBaseTotal: toNumber(progressionState.strategiesBaseTotal),
+        strategiesMainTotal: toNumber(progressionState.strategiesMainTotal),
+        strategiesRealTotal: toNumber(progressionState.strategiesRealTotal),
+        databaseSizeMB: dbSizeBytes / (1024 * 1024),
+        dbEntriesPerSecond,
       },
       enginePhase: engineProgression ? {
         phase: engineProgression.phase,
