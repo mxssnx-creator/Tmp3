@@ -11,7 +11,7 @@ interface PageHeaderProps {
   showExchangeSelector?: boolean
 }
 
-export function PageHeader({ title, description, children, showExchangeSelector = true }: PageHeaderProps) {
+export function PageHeader({ title, description, children, showExchangeSelector = false }: PageHeaderProps) {
   return (
     <div className="sticky top-0 z-10 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 border-b">
       <div className="flex h-auto min-h-[4rem] items-start gap-4 px-4 py-3">

@@ -100,13 +100,20 @@ export class GlobalTradeEngineCoordinator {
       return
     }
 
-    // Step 2: Check if already running (check Redis state)
+    // Step 2: Check if already running (check in-memory manager first, then Redis hint)
     try {
       const { getSettings } = await import("@/lib/redis-db")
       const runningFlag = await getSettings(`engine_is_running:${connectionId}`)
+      const manager = this.engineManagers.get(connectionId)
+      const managerRunning = !!manager?.isEngineRunning
+
       if (runningFlag === "true" || runningFlag === true || runningFlag === "1") {
-        console.log(`[v0] [STARTUP LOCK] Engine already running for ${connectionId}, skipping...`)
-        return
+        if (managerRunning) {
+          console.log(`[v0] [STARTUP LOCK] Engine already running for ${connectionId}, skipping...`)
+          return
+        }
+        // Redis flag can become stale across crashes/restarts; clear stale state and continue startup.
+        console.warn(`[v0] [STARTUP LOCK] Stale running flag detected for ${connectionId}; continuing with startup`)
       }
     } catch (e) {
       console.log(`[v0] [STARTUP LOCK] Could not check running status: ${e}`)

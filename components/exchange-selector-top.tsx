@@ -4,7 +4,7 @@ import { useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { RefreshCw, Zap } from "lucide-react"
+import { RefreshCw } from "lucide-react"
 import { useExchange } from "@/lib/exchange-context"
 
 interface Connection {
@@ -43,10 +43,6 @@ export function ExchangeSelectorTop() {
   const defaultValue = selectedConnectionId || "standard"
 
   const renderStatusBadges = () => {
-    if (!currentConnection.isReal) {
-      return <Badge className="bg-muted text-muted-foreground text-xs">Mock Data</Badge>
-    }
-    
     return (
       <>
         {currentConnection.isDashboardEnabled && (
@@ -55,28 +51,21 @@ export function ExchangeSelectorTop() {
         {currentConnection.isLiveTradeEnabled && (
           <Badge className="bg-blue-500/20 text-blue-600 border border-blue-500/30 text-xs">Live</Badge>
         )}
-        {!currentConnection.isDashboardEnabled && currentConnection.status === "connected" && (
-          <Badge className="bg-amber-500/20 text-amber-600 border border-amber-500/30 text-xs">Enabled</Badge>
-        )}
       </>
     )
   }
 
   return (
-    <div className="flex items-center gap-3 w-full">
-      <span className="text-sm font-medium text-foreground shrink-0">Exchange:</span>
-      <div className="flex items-center gap-2 min-w-0 flex-1">
+    <div className="w-full">
+      <div className="text-sm font-medium text-foreground">Exchange:</div>
+      <div className="mt-1 flex items-start gap-2 min-w-0">
         <Select value={defaultValue} onValueChange={handleSelectConnection}>
           <SelectTrigger className="w-[180px] h-8 text-sm border-input bg-background hover:bg-muted">
-            <div className="flex items-center gap-2">
-              <Zap className="h-3 w-3 text-yellow-500" />
-              <SelectValue placeholder="Select connection" />
-            </div>
+            <SelectValue placeholder="Select connection" />
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="standard" className="cursor-pointer">
               <div className="flex items-center gap-2">
-                <Zap className="h-3 w-3 text-yellow-500" />
                 <span>Standard</span>
                 <span className="text-muted-foreground text-xs">(Mock)</span>
               </div>
@@ -90,7 +79,6 @@ export function ExchangeSelectorTop() {
               activeConnections.map((conn) => (
                 <SelectItem key={conn.id} value={conn.id} className="cursor-pointer">
                   <div className="flex items-center gap-2">
-                    <Zap className="h-3 w-3 text-yellow-500" />
                     <span>{conn.name || conn.exchange}</span>
                     <Badge variant="outline" className="text-[10px]">{conn.exchange}</Badge>
                   </div>
@@ -99,11 +87,13 @@ export function ExchangeSelectorTop() {
             )}
           </SelectContent>
         </Select>
+        <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0" onClick={handleRefresh} aria-label="Refresh connections">
+          <RefreshCw className="h-3.5 w-3.5" />
+        </Button>
+      </div>
+      <div className="mt-1 min-h-5 flex flex-wrap gap-1">
         {renderStatusBadges()}
       </div>
-      <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0" onClick={handleRefresh} aria-label="Refresh connections">
-        <RefreshCw className="h-3.5 w-3.5" />
-      </Button>
     </div>
   )
 }
