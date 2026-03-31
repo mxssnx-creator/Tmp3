@@ -118,7 +118,7 @@ export function StatisticsOverviewV2({ connections }: StatisticsOverviewV2Props)
       }
 
       // FETCH 2: Strategies metrics (base/main/real/live types)
-      const stratResponse = await fetch("/api/dashboard/strategies-evaluation")
+      const stratResponse = await fetch("/api/main/strategies-evaluation")
       if (stratResponse.ok) {
         const stratData = await stratResponse.json()
         const strategiesData: StrategyMetrics[] = [
@@ -163,7 +163,7 @@ export function StatisticsOverviewV2({ connections }: StatisticsOverviewV2Props)
       }
 
       // FETCH 3: Indications metrics (direction/move/active/optimal types - INDEPENDENT)
-      const indicResponse = await fetch("/api/dashboard/indications-stats")
+      const indicResponse = await fetch("/api/main/indications-stats")
       if (indicResponse.ok) {
         const indicData = await indicResponse.json()
         const indicationsData: IndicationMetrics[] = [

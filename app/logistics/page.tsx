@@ -631,7 +631,7 @@ export default function LogisticsPage() {
       console.log("[v0] [Logistics] Fetching system status...")
       const [statusRes, statsRes, queueRes] = await Promise.all([
         fetch("/api/trade-engine/status", { cache: "no-store" }),
-        fetch("/api/dashboard/system-stats-v3", { cache: "no-store" }),
+        fetch("/api/main/system-stats-v3", { cache: "no-store" }),
         fetch("/api/logistics/queue", { cache: "no-store" }),
       ])
 

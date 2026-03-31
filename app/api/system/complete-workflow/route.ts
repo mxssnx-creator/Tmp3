@@ -190,7 +190,7 @@ export async function GET() {
           stats: {
             system: {
               method: "GET",
-              path: "/api/dashboard/system-stats-v3",
+              path: "/api/main/system-stats-v3",
               description: "Comprehensive system statistics",
               includes: "Connections, engine status, database metrics, credential count"
             },
