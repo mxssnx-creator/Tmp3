@@ -15,6 +15,11 @@ function normalizeLogLevel(level: unknown): LogLevel {
   return "info"
 }
 
+function toNumber(value: unknown): number {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : 0
+}
+
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
@@ -31,6 +36,7 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
       ProgressionStateManager.getProgressionState(connectionId),
       getSettings(`trade_engine_state:${connectionId}`)
     ])
+    const client = getRedisClient()
 
     const mappedProgressionLogs = progressionLogs.map((log) => ({
       source: "progression",
@@ -74,7 +80,94 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
       return acc
     }, {})
 
-     // Enhanced summary with prehistoric data, indications, strategies, and cycle info
+    const [
+      directionCount,
+      moveCount,
+      activeCount,
+      optimalCount,
+      autoCount,
+      baseCount,
+      mainCount,
+      realCount,
+      baseEvaluated,
+      mainEvaluated,
+      realEvaluated,
+      intervalsProcessed,
+      totalIndications,
+      totalStrategies,
+      dbOpsPerSecond,
+      dbSizeMb,
+    ] = await Promise.all([
+      client.get(`indications:${connectionId}:direction:count`).catch(() => 0),
+      client.get(`indications:${connectionId}:move:count`).catch(() => 0),
+      client.get(`indications:${connectionId}:active:count`).catch(() => 0),
+      client.get(`indications:${connectionId}:optimal:count`).catch(() => 0),
+      client.get(`indications:${connectionId}:auto:count`).catch(() => 0),
+      client.get(`strategies:${connectionId}:base:count`).catch(() => 0),
+      client.get(`strategies:${connectionId}:main:count`).catch(() => 0),
+      client.get(`strategies:${connectionId}:real:count`).catch(() => 0),
+      client.get(`strategies:${connectionId}:base:evaluated`).catch(() => 0),
+      client.get(`strategies:${connectionId}:main:evaluated`).catch(() => 0),
+      client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0),
+      client.get(`intervals:${connectionId}:processed_count`).catch(() => 0),
+      client.get(`indications:${connectionId}:count`).catch(() => 0),
+      client.get(`strategies:${connectionId}:count`).catch(() => 0),
+      client.get(`db:${connectionId}:entries_per_second`).catch(() => 0),
+      client.get(`db:${connectionId}:size_mb`).catch(() => 0),
+    ])
+
+    const strategySetKeys = await client.keys(`strategy_set:${connectionId}:*:*`).catch(() => [] as string[])
+    let strategySetTotal = 0
+    let strategySetBase = 0
+    let strategySetMain = 0
+    let strategySetReal = 0
+    let evaluatedPfSumBase = 0
+    let evaluatedPfSumMain = 0
+    let evaluatedPfSumReal = 0
+    let evaluatedDdSumReal = 0
+    let evaluatedPfCountBase = 0
+    let evaluatedPfCountMain = 0
+    let evaluatedPfCountReal = 0
+
+    for (const key of strategySetKeys) {
+      if (key.endsWith(":stats")) continue
+      const entriesRaw = await client.get(key).catch(() => null)
+      if (!entriesRaw) continue
+      try {
+        const entries = JSON.parse(entriesRaw)
+        const list = Array.isArray(entries) ? entries : []
+        strategySetTotal += list.length
+        if (key.endsWith(":base")) strategySetBase += list.length
+        if (key.endsWith(":main")) strategySetMain += list.length
+        if (key.endsWith(":real")) strategySetReal += list.length
+        for (const item of list) {
+          const pf = toNumber(item?.profitFactor ?? item?.avg_profit_factor)
+          const dd = toNumber(item?.drawdownTime ?? item?.drawdown_hours)
+          if (key.endsWith(":base") && pf > 0) {
+            evaluatedPfSumBase += pf
+            evaluatedPfCountBase += 1
+          }
+          if (key.endsWith(":main") && pf > 0) {
+            evaluatedPfSumMain += pf
+            evaluatedPfCountMain += 1
+          }
+          if (key.endsWith(":real") && pf > 0) {
+            evaluatedPfSumReal += pf
+            evaluatedPfCountReal += 1
+            evaluatedDdSumReal += dd
+          }
+        }
+      } catch {
+        // ignore malformed entries
+      }
+    }
+
+    const avgPfBase = evaluatedPfCountBase > 0 ? evaluatedPfSumBase / evaluatedPfCountBase : 0
+    const avgPfMain = evaluatedPfCountMain > 0 ? evaluatedPfSumMain / evaluatedPfCountMain : 0
+    const avgPfReal = evaluatedPfCountReal > 0 ? evaluatedPfSumReal / evaluatedPfCountReal : 0
+    const avgDdReal = evaluatedPfCountReal > 0 ? evaluatedDdSumReal / evaluatedPfCountReal : 0
+
+    // Enhanced summary with prehistoric data, indications, strategies, and cycle info
      const enhancedSummary = {
        total: logs.length,
        ...levelSummary,
@@ -84,44 +177,77 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
        
        // Prehistoric data processing info
        prehistoricData: {
-         cyclesCompleted: progressionState.prehistoricCyclesCompleted || 0,
-         symbolsProcessed: Array.isArray(progressionState.prehistoricSymbolsProcessed) ? progressionState.prehistoricSymbolsProcessed.length : 0,
-         candlesProcessed: progressionState.prehistoricCandlesProcessed || 0,
+         cyclesCompleted: progressionState.prehistoricCyclesCompleted || toNumber(engineState?.config_set_symbols_processed),
+         symbolsProcessed: Array.isArray(progressionState.prehistoricSymbolsProcessed)
+           ? progressionState.prehistoricSymbolsProcessed.length
+           : toNumber(engineState?.config_set_symbols_processed),
+         candlesProcessed: progressionState.prehistoricCandlesProcessed || toNumber(engineState?.config_set_candles_processed),
          phaseActive: progressionState.prehistoricPhaseActive || false,
          lastUpdate: progressionState.lastUpdate?.toISOString() || null
        },
        
        // Indications by type (direction, move, active, optimal, auto)
        indicationsCounts: {
-         direction: progressionState.indicationsDirectionCount || 0,
-         move: progressionState.indicationsMoveCount || 0,
-         active: progressionState.indicationsActiveCount || 0,
-         optimal: progressionState.indicationsOptimalCount || 0,
-         auto: progressionState.indicationsAutoCount || 0
+         direction: progressionState.indicationsDirectionCount || toNumber(directionCount),
+         move: progressionState.indicationsMoveCount || toNumber(moveCount),
+         active: progressionState.indicationsActiveCount || toNumber(activeCount),
+         optimal: progressionState.indicationsOptimalCount || toNumber(optimalCount),
+         auto: progressionState.indicationsAutoCount || toNumber(autoCount)
        },
        
        // Strategy count sets and evaluated counts
        strategyCounts: {
          base: {
-           total: progressionState.strategiesBaseTotal || 0,
-           evaluated: progressionState.strategyEvaluatedBase || 0,
-           pending: Math.max(0, (progressionState.strategiesBaseTotal || 0) - (progressionState.strategyEvaluatedBase || 0))
+           total: progressionState.strategiesBaseTotal || toNumber(baseCount),
+           evaluated: progressionState.strategyEvaluatedBase || toNumber(baseEvaluated),
+           pending: Math.max(
+             0,
+             (progressionState.strategiesBaseTotal || toNumber(baseCount)) -
+               (progressionState.strategyEvaluatedBase || toNumber(baseEvaluated)),
+           ),
+           evaluatedRatePercent: (() => {
+             const total = progressionState.strategiesBaseTotal || toNumber(baseCount)
+             const evald = progressionState.strategyEvaluatedBase || toNumber(baseEvaluated)
+             return total > 0 ? (evald / total) * 100 : 0
+           })(),
+           avgProfitFactor: avgPfBase,
          },
          main: {
-           total: progressionState.strategiesMainTotal || 0,
-           evaluated: progressionState.strategyEvaluatedMain || 0,
-           pending: Math.max(0, (progressionState.strategiesMainTotal || 0) - (progressionState.strategyEvaluatedMain || 0))
+           total: progressionState.strategiesMainTotal || toNumber(mainCount),
+           evaluated: progressionState.strategyEvaluatedMain || toNumber(mainEvaluated),
+           pending: Math.max(
+             0,
+             (progressionState.strategiesMainTotal || toNumber(mainCount)) -
+               (progressionState.strategyEvaluatedMain || toNumber(mainEvaluated)),
+           ),
+           evaluatedRatePercent: (() => {
+             const total = progressionState.strategiesMainTotal || toNumber(mainCount)
+             const evald = progressionState.strategyEvaluatedMain || toNumber(mainEvaluated)
+             return total > 0 ? (evald / total) * 100 : 0
+           })(),
+           avgProfitFactor: avgPfMain,
          },
          real: {
-           total: progressionState.strategiesRealTotal || 0,
-           evaluated: progressionState.strategyEvaluatedReal || 0,
-           pending: Math.max(0, (progressionState.strategiesRealTotal || 0) - (progressionState.strategyEvaluatedReal || 0))
+           total: progressionState.strategiesRealTotal || toNumber(realCount),
+           evaluated: progressionState.strategyEvaluatedReal || toNumber(realEvaluated),
+           pending: Math.max(
+             0,
+             (progressionState.strategiesRealTotal || toNumber(realCount)) -
+               (progressionState.strategyEvaluatedReal || toNumber(realEvaluated)),
+           ),
+           evaluatedRatePercent: (() => {
+             const total = progressionState.strategiesRealTotal || toNumber(realCount)
+             const evald = progressionState.strategyEvaluatedReal || toNumber(realEvaluated)
+             return total > 0 ? (evald / total) * 100 : 0
+           })(),
+           avgProfitFactor: avgPfReal,
+           avgDrawdownTime: avgDdReal,
          }
        },
        
        // Engine performance info
        enginePerformance: {
-         cycleTimeMs: progressionState.cycleTimeMs || 0,
+         cycleTimeMs: progressionState.cycleTimeMs || toNumber(engineState?.last_cycle_duration),
          cyclesCompleted: progressionState.cyclesCompleted || 0,
          successfulCycles: progressionState.successfulCycles || 0,
          failedCycles: progressionState.failedCycles || 0,
@@ -131,9 +257,19 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
          tradeSuccessRate: progressionState.tradeSuccessRate || 0,
          totalProfit: progressionState.totalProfit || 0,
          lastCycleTime: progressionState.lastCycleTime?.toISOString() || null,
-         intervalsProcessed: progressionState.intervalsProcessed || 0,
-         indicationsCount: progressionState.indicationsCount || 0,
-         strategiesCount: progressionState.strategiesCount || 0
+         intervalsProcessed: progressionState.intervalsProcessed || toNumber(intervalsProcessed),
+         indicationsCount: progressionState.indicationsCount || toNumber(totalIndications),
+         strategiesCount: progressionState.strategiesCount || toNumber(totalStrategies)
+       },
+       processingOverview: {
+         prehistoricSymbolsTotal: toNumber(engineState?.config_set_symbols_total),
+         prehistoricSymbolsWithoutData: toNumber(engineState?.config_set_symbols_without_data),
+         strategySetsTotal: strategySetTotal,
+         strategySetsBase: strategySetBase,
+         strategySetsMain: strategySetMain,
+         strategySetsReal: strategySetReal,
+         dbEntriesPerSecond: toNumber(dbOpsPerSecond),
+         dbSizeMb: toNumber(dbSizeMb),
        }
      }
 

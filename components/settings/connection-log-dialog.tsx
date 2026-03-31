@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { Loader2, RefreshCw } from "lucide-react"
+import { ChevronDown, ChevronRight, Loader2, RefreshCw } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
 
 interface ConnectionLogDialogProps {
@@ -48,16 +48,23 @@ type LogSummary = {
       total: number
       evaluated: number
       pending: number
+      evaluatedRatePercent?: number
+      avgProfitFactor?: number
     }
     main: {
       total: number
       evaluated: number
       pending: number
+      evaluatedRatePercent?: number
+      avgProfitFactor?: number
     }
     real: {
       total: number
       evaluated: number
       pending: number
+      evaluatedRatePercent?: number
+      avgProfitFactor?: number
+      avgDrawdownTime?: number
     }
   }
   
@@ -76,12 +83,23 @@ type LogSummary = {
     indicationsCount: number
     strategiesCount: number
   }
+  processingOverview?: {
+    prehistoricSymbolsTotal?: number
+    prehistoricSymbolsWithoutData?: number
+    strategySetsTotal?: number
+    strategySetsBase?: number
+    strategySetsMain?: number
+    strategySetsReal?: number
+    dbEntriesPerSecond?: number
+    dbSizeMb?: number
+  }
 }
 
 export function ConnectionLogDialog({ open, onOpenChange, connectionId, connectionName }: ConnectionLogDialogProps) {
   const [loading, setLoading] = useState(true)
   const [logs, setLogs] = useState<any[]>([])
   const [summary, setSummary] = useState<LogSummary | null>(null)
+  const [expandedLogs, setExpandedLogs] = useState<Record<string, boolean>>({})
 
   useEffect(() => {
     if (open) {
@@ -233,18 +251,42 @@ export function ConnectionLogDialog({ open, onOpenChange, connectionId, connecti
                        <div>
                          <div className="font-semibold">{summary.strategyCounts.base.evaluated}</div>
                          <div className="text-xs text-muted-foreground">Base Evaluated</div>
-                         <div className="text-xs">/{summary.strategyCounts.base.total}</div>
+                          <div className="text-xs">/{summary.strategyCounts.base.total}</div>
+                          <div className="text-[11px] text-muted-foreground">
+                            {Number(summary.strategyCounts.base.evaluatedRatePercent || 0).toFixed(1)}% • PF {Number(summary.strategyCounts.base.avgProfitFactor || 0).toFixed(2)}
+                          </div>
                        </div>
                        <div>
                          <div className="font-semibold">{summary.strategyCounts.main.evaluated}</div>
                          <div className="text-xs text-muted-foreground">Main Evaluated</div>
-                         <div className="text-xs">/{summary.strategyCounts.main.total}</div>
+                          <div className="text-xs">/{summary.strategyCounts.main.total}</div>
+                          <div className="text-[11px] text-muted-foreground">
+                            {Number(summary.strategyCounts.main.evaluatedRatePercent || 0).toFixed(1)}% • PF {Number(summary.strategyCounts.main.avgProfitFactor || 0).toFixed(2)}
+                          </div>
                        </div>
                        <div>
                          <div className="font-semibold">{summary.strategyCounts.real.evaluated}</div>
                          <div className="text-xs text-muted-foreground">Real Evaluated</div>
-                         <div className="text-xs">/{summary.strategyCounts.real.total}</div>
-                       </div>
+                          <div className="text-xs">/{summary.strategyCounts.real.total}</div>
+                          <div className="text-[11px] text-muted-foreground">
+                            {Number(summary.strategyCounts.real.evaluatedRatePercent || 0).toFixed(1)}% • PF {Number(summary.strategyCounts.real.avgProfitFactor || 0).toFixed(2)}
+                          </div>
+                        </div>
+                     </div>
+                   </div>
+                 )}
+                 {summary.processingOverview && (
+                   <div className="bg-amber-50 rounded-lg p-4 mb-4">
+                     <div className="font-medium mb-2">Processing + Database Activity</div>
+                     <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                       <div><div className="font-semibold">{summary.processingOverview.prehistoricSymbolsTotal || 0}</div><div className="text-xs text-muted-foreground">Prehistoric Symbols</div></div>
+                       <div><div className="font-semibold">{summary.processingOverview.prehistoricSymbolsWithoutData || 0}</div><div className="text-xs text-muted-foreground">Symbols w/o Data</div></div>
+                       <div><div className="font-semibold">{summary.processingOverview.strategySetsTotal || 0}</div><div className="text-xs text-muted-foreground">Total Sets</div></div>
+                       <div><div className="font-semibold">{summary.processingOverview.dbSizeMb || 0} MB</div><div className="text-xs text-muted-foreground">DB Size</div></div>
+                       <div><div className="font-semibold">{summary.processingOverview.strategySetsBase || 0}</div><div className="text-xs text-muted-foreground">Base Sets</div></div>
+                       <div><div className="font-semibold">{summary.processingOverview.strategySetsMain || 0}</div><div className="text-xs text-muted-foreground">Main Sets</div></div>
+                       <div><div className="font-semibold">{summary.processingOverview.strategySetsReal || 0}</div><div className="text-xs text-muted-foreground">Real Sets</div></div>
+                       <div><div className="font-semibold">{summary.processingOverview.dbEntriesPerSecond || 0}</div><div className="text-xs text-muted-foreground">DB entries/sec</div></div>
                      </div>
                    </div>
                  )}
@@ -300,23 +342,38 @@ export function ConnectionLogDialog({ open, onOpenChange, connectionId, connecti
                 <p className="text-center text-muted-foreground py-8">No logs available</p>
               ) : (
                 <div className="space-y-2">
-                  {logs.map((log, index) => (
-                    <div key={index} className="p-3 border rounded-lg space-y-1 bg-white/90">
-                      <div className="flex items-center gap-2 justify-between">
-                        {getLevelBadge(log.level)}
-                        <span className="text-xs text-muted-foreground">
-                          {new Date(log.timestamp).toLocaleString()}
-                        </span>
+                  {logs.map((log, index) => {
+                    const logId = `${log.timestamp}-${index}`
+                    const isExpanded = !!expandedLogs[logId]
+                    return (
+                      <div key={logId} className="border rounded-lg bg-white/90">
+                        <button
+                          className="w-full p-2 text-left hover:bg-muted/30"
+                          onClick={() => setExpandedLogs((prev) => ({ ...prev, [logId]: !isExpanded }))}
+                        >
+                          <div className="flex items-center gap-2 justify-between">
+                            <div className="flex items-center gap-2 min-w-0">
+                              {isExpanded ? <ChevronDown className="h-3 w-3 text-muted-foreground" /> : <ChevronRight className="h-3 w-3 text-muted-foreground" />}
+                              {getLevelBadge(log.level)}
+                              <span className="text-xs text-muted-foreground truncate">{log.phase || "unknown"} • {log.source || "runtime"}</span>
+                            </div>
+                            <span className="text-[11px] text-muted-foreground">{new Date(log.timestamp).toLocaleString()}</span>
+                          </div>
+                          <p className="mt-1 text-xs font-medium leading-relaxed truncate">{log.message}</p>
+                        </button>
+                        {isExpanded && (
+                          <div className="px-3 pb-3">
+                            <p className="text-sm mb-2">{log.message}</p>
+                            {log.details && (
+                              <pre className="text-xs text-muted-foreground bg-muted p-2 rounded overflow-auto max-h-56">
+                                {JSON.stringify(log.details, null, 2)}
+                              </pre>
+                            )}
+                          </div>
+                        )}
                       </div>
-                      <p className="text-sm font-medium leading-relaxed">{log.message}</p>
-                      <div className="text-xs text-muted-foreground">Phase: {log.phase || "unknown"} • Source: {log.source || "runtime"}</div>
-                      {log.details && (
-                        <pre className="text-xs text-muted-foreground bg-muted p-2 rounded overflow-x-auto">
-                          {JSON.stringify(log.details, null, 2)}
-                        </pre>
-                      )}
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </ScrollArea>
