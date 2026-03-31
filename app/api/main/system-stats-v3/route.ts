@@ -15,7 +15,8 @@ export const dynamic = "force-dynamic"
 export const revalidate = 0
 export const fetchCache = "force-no-store"
 
-const BASE_EXCHANGES = ["bybit", "bingx", "pionex", "orangex"]
+// Main/base connection scope for dashboard metrics.
+const BASE_EXCHANGES = ["bybit", "bingx"]
 
 function isBaseExchange(c: any): boolean {
   return BASE_EXCHANGES.includes((c?.exchange || "").toLowerCase().trim())
@@ -72,8 +73,8 @@ export async function GET() {
     }
     const globalStatus = globalEngineState.status || "stopped"
 
-    // Main Connections: all connections assigned to the active/main panel
-    const mainConnections = connections.filter((c: any) => isConnectionInActivePanel(c))
+    // Main Connections: only bybit/bingx connections assigned to active/main panel
+    const mainConnections = connections.filter((c: any) => isBaseExchange(c) && isConnectionInActivePanel(c))
     const mainEnabled = mainConnections.length > 0
     
     // Live Trade: runs independently when is_live_trade=true (for real exchange position mirroring)

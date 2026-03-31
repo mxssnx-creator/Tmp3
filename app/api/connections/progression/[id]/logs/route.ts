@@ -12,6 +12,19 @@ function toNumber(value: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
+function sanitizeNonNegative(value: unknown): number {
+  return Math.max(0, toNumber(value))
+}
+
+async function countKeys(client: any, patterns: string[]): Promise<number> {
+  let total = 0
+  for (const pattern of patterns) {
+    const keys = await client.keys(pattern).catch(() => [])
+    total += Array.isArray(keys) ? keys.length : 0
+  }
+  return total
+}
+
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
@@ -56,6 +69,38 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
           connectionId,
         }))
 
+    const [
+      prehistoricSymbolsSet,
+      prehistoricDataKeys,
+      baseSetCount,
+      mainSetCount,
+      realSetCount,
+      indicationDirectionCount,
+      indicationMoveCount,
+      indicationActiveCount,
+      indicationOptimalCount,
+      redisDbSize,
+      redisMemoryInfo,
+    ] = await Promise.all([
+      client.scard(`prehistoric:${connectionId}:symbols`).catch(() => 0),
+      countKeys(client, [`prehistoric:${connectionId}:*`, `market_data:${connectionId}:*`]),
+      countKeys(client, [`sets:${connectionId}:base:*`, `pseudo_positions:${connectionId}:base:*`]),
+      countKeys(client, [`sets:${connectionId}:main:*`, `pseudo_positions:${connectionId}:main:*`]),
+      countKeys(client, [`sets:${connectionId}:real:*`, `pseudo_positions:${connectionId}:real:*`]),
+      toNumber(await client.get(`indications:${connectionId}:direction:evaluated`).catch(() => 0)),
+      toNumber(await client.get(`indications:${connectionId}:move:evaluated`).catch(() => 0)),
+      toNumber(await client.get(`indications:${connectionId}:active:evaluated`).catch(() => 0)),
+      toNumber(await client.get(`indications:${connectionId}:optimal:evaluated`).catch(() => 0)),
+      client.dbSize().catch(() => 0),
+      client.info().catch(() => ""),
+    ])
+
+    const usedMemoryLine = String(redisMemoryInfo)
+      .split("\n")
+      .find((line) => line.startsWith("used_memory:"))
+    const usedMemoryBytes = toNumber(usedMemoryLine?.split(":")[1])
+    const dbSizeMb = usedMemoryBytes > 0 ? usedMemoryBytes / (1024 * 1024) : 0
+
     return NextResponse.json({
       success: true,
       connectionId,
@@ -64,27 +109,46 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       structuredLogs,
       structuredLogsCount: structuredLogs.length,
       progressionState: {
-        cyclesCompleted: Math.max(progressionState.cyclesCompleted, Number(engineState?.indication_cycle_count || 0)),
-        successfulCycles: Math.max(progressionState.successfulCycles, Number(engineState?.strategy_cycle_count || 0)),
-        failedCycles: progressionState.failedCycles,
-        totalTrades: progressionState.totalTrades,
-        successfulTrades: progressionState.successfulTrades,
-        totalProfit: progressionState.totalProfit,
-        cycleSuccessRate: progressionState.cycleSuccessRate,
-        tradeSuccessRate: progressionState.tradeSuccessRate,
+        cyclesCompleted: sanitizeNonNegative(Math.max(progressionState.cyclesCompleted, Number(engineState?.indication_cycle_count || 0))),
+        successfulCycles: sanitizeNonNegative(Math.max(progressionState.successfulCycles, Number(engineState?.strategy_cycle_count || 0))),
+        failedCycles: sanitizeNonNegative(progressionState.failedCycles),
+        totalTrades: sanitizeNonNegative(progressionState.totalTrades),
+        successfulTrades: sanitizeNonNegative(progressionState.successfulTrades),
+        totalProfit: toNumber(progressionState.totalProfit),
+        cycleSuccessRate: sanitizeNonNegative(progressionState.cycleSuccessRate),
+        tradeSuccessRate: sanitizeNonNegative(progressionState.tradeSuccessRate),
         lastCycleTime: progressionState.lastCycleTime,
-        prehistoricCyclesCompleted: progressionState.prehistoricCyclesCompleted,
+        prehistoricCyclesCompleted: sanitizeNonNegative(progressionState.prehistoricCyclesCompleted),
         prehistoricPhaseActive: progressionState.prehistoricPhaseActive,
-        realtimeCycleCount: toNumber(engineState?.realtime_cycle_count),
-        cycleTimeMs: toNumber(engineState?.last_cycle_duration),
-        intervalsProcessed: toNumber(await client.get(`intervals:${connectionId}:processed_count`).catch(() => 0)),
-        indicationsCount: toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0)),
-        strategiesCount: toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0)),
-        strategyEvaluatedBase: toNumber(await client.get(`strategies:${connectionId}:base:evaluated`).catch(() => 0)),
-        strategyEvaluatedMain: toNumber(await client.get(`strategies:${connectionId}:main:evaluated`).catch(() => 0)),
-        strategyEvaluatedReal: toNumber(await client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0)),
-        prehistoricSymbolsProcessed: toNumber(engineState?.config_set_symbols_processed),
-        prehistoricCandlesProcessed: toNumber(engineState?.config_set_candles_processed),
+        realtimeCycleCount: sanitizeNonNegative(engineState?.realtime_cycle_count),
+        cycleTimeMs: sanitizeNonNegative(engineState?.last_cycle_duration),
+        intervalsProcessed: sanitizeNonNegative(await client.get(`intervals:${connectionId}:processed_count`).catch(() => 0)),
+        indicationsCount: sanitizeNonNegative(await client.get(`indications:${connectionId}:count`).catch(() => 0)),
+        strategiesCount: sanitizeNonNegative(await client.get(`strategies:${connectionId}:count`).catch(() => 0)),
+        strategyEvaluatedBase: sanitizeNonNegative(await client.get(`strategies:${connectionId}:base:evaluated`).catch(() => 0)),
+        strategyEvaluatedMain: sanitizeNonNegative(await client.get(`strategies:${connectionId}:main:evaluated`).catch(() => 0)),
+        strategyEvaluatedReal: sanitizeNonNegative(await client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0)),
+        indicationEvaluatedDirection: sanitizeNonNegative(indicationDirectionCount),
+        indicationEvaluatedMove: sanitizeNonNegative(indicationMoveCount),
+        indicationEvaluatedActive: sanitizeNonNegative(indicationActiveCount),
+        indicationEvaluatedOptimal: sanitizeNonNegative(indicationOptimalCount),
+        prehistoricSymbolsProcessed: sanitizeNonNegative(engineState?.config_set_symbols_processed),
+        prehistoricCandlesProcessed: sanitizeNonNegative(engineState?.config_set_candles_processed),
+        prehistoricSymbolsProcessedCount: sanitizeNonNegative(prehistoricSymbolsSet || engineState?.config_set_symbols_processed),
+        prehistoricDataSize: sanitizeNonNegative(prehistoricDataKeys),
+        setsBaseCount: sanitizeNonNegative(baseSetCount),
+        setsMainCount: sanitizeNonNegative(mainSetCount),
+        setsRealCount: sanitizeNonNegative(realSetCount),
+        setsTotalCount: sanitizeNonNegative(baseSetCount + mainSetCount + realSetCount),
+        redisDbEntries: sanitizeNonNegative(redisDbSize),
+        redisDbSizeMb: Number(dbSizeMb.toFixed(2)),
+        processingCompleteness: {
+          prehistoricLoaded: !!(engineState?.prehistoric_data_loaded === true || engineState?.prehistoric_data_loaded === "1"),
+          indicationsRunning: sanitizeNonNegative(engineState?.indication_cycle_count) > 0,
+          strategiesRunning: sanitizeNonNegative(engineState?.strategy_cycle_count) > 0,
+          realtimeRunning: sanitizeNonNegative(engineState?.realtime_cycle_count) > 0,
+          hasErrors: sanitizeNonNegative(engineState?.config_set_errors) > 0,
+        },
       },
       enginePhase: engineProgression ? {
         phase: engineProgression.phase,

@@ -119,7 +119,7 @@ export function ConnectionStateProvider({ children }: { children: ReactNode }) {
   }
 
   // Load ALL BASE connections for Active Connections list
-  // Shows the 4 primary exchanges (bybit, bingx, pionex, orangex) as connection cards
+  // Shows primary dashboard exchanges (bybit, bingx) plus any explicitly assigned connections
   // The toggle controls is_enabled_dashboard (independent from Settings is_enabled)
   const loadExchangeConnectionsActive = async () => {
     // Prevent concurrent requests
@@ -138,7 +138,7 @@ export function ConnectionStateProvider({ children }: { children: ReactNode }) {
         
         // Show ALL inserted connections (not just 4 hardcoded exchanges)
         // Matches the same logic as DashboardActiveConnectionsManager
-        const BASE_EXCHANGES = ["bybit", "bingx", "pionex", "orangex"]
+        const BASE_EXCHANGES = ["bybit", "bingx"]
         const activeConns = allConnections.filter((c: any) => {
           const exchange = (c.exchange || "").toLowerCase().trim()
           const isBase = BASE_EXCHANGES.includes(exchange)
