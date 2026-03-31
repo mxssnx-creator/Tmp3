@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server"
 import { initRedis, getRedisClient } from "@/lib/redis-db"
-import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 
 export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
@@ -9,25 +8,34 @@ export async function GET() {
   try {
     await initRedis()
     const client = getRedisClient()
-    const coordinator = getGlobalTradeEngineCoordinator()
 
     const cpuUsage = process.cpuUsage()
     const memUsage = process.memoryUsage()
     const cpuPercent = Math.min(100, Math.round((cpuUsage.user / 1000000) * 0.1))
-    const memPercent = Math.round((memUsage.heapUsed / memUsage.heapTotal) * 100)
+    const memPercent = memUsage.heapTotal > 0
+      ? Math.round((memUsage.heapUsed / memUsage.heapTotal) * 100)
+      : 0
 
     let allKeys: string[] = []
+    let redisAvailable = false
     try {
-      const keysResult = await client.keys("*").catch(() => [])
+      const keysResult = await client.keys("*")
       allKeys = Array.isArray(keysResult) ? keysResult : []
+      redisAvailable = true
     } catch {
       allKeys = []
+      redisAvailable = false
     }
     
     const keys = allKeys.length
     const sets = allKeys.filter((k: string) => k.includes(":set") || k.includes("_set")).length
-    const positions1h = allKeys.filter((k: string) => k.includes("position")).length
-    const entries1h = allKeys.filter((k: string) => k.includes("entry") || k.includes("indication")).length
+    const positionKeys = allKeys.filter((k: string) => k.includes("position")).length
+    const indicationKeys = allKeys.filter((k: string) => 
+      k.includes("indication") || k.includes("indications:") || k.includes(":rsi") || k.includes(":macd")
+    ).length
+    const strategyKeys = allKeys.filter((k: string) => 
+      k.includes("strategy") || k.includes("strategies:") || k.includes("entry:") || k.includes("signal:")
+    ).length
 
     let estimatedDbBytes = 0
     try {
@@ -56,18 +64,12 @@ export async function GET() {
 
     let coordinatorEngineCount = 0
     try {
+      const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+      const coordinator = getGlobalTradeEngineCoordinator()
       coordinatorEngineCount = coordinator?.getActiveEngineCount?.() ?? 0
     } catch {
       coordinatorEngineCount = 0
     }
-    
-    const indicationKeys = allKeys.filter((k: string) => 
-      k.includes("indication") || k.includes("indications:") || k.includes(":rsi") || k.includes(":macd") || k.includes(":ema")
-    ).length
-    const strategyKeys = allKeys.filter((k: string) => 
-      k.includes("strategy") || k.includes("strategies:") || k.includes("entry:") || k.includes("signal:")
-    ).length
-    const entryKeys = allKeys.filter((k: string) => k.includes("entry:") || k.includes("entries:")).length
     
     let totalIndicationCycles = 0
     let totalStrategyCycles = 0
@@ -82,8 +84,8 @@ export async function GET() {
           const stateStr = await client.get(stateKey)
           if (stateStr) {
             const state = JSON.parse(stateStr)
-            totalIndicationCycles += state.indication_cycle_count ?? 0
-            totalStrategyCycles += state.strategy_cycle_count ?? 0
+            totalIndicationCycles += Number(state.indication_cycle_count) || 0
+            totalStrategyCycles += Number(state.strategy_cycle_count) || 0
             if (state.status === "running") {
               indicationsRunning = true
               strategiesRunning = true
@@ -124,38 +126,38 @@ export async function GET() {
         size: estimatedDbBytes,
         keys,
         sets,
-        positions1h,
-        entries1h,
-        requestsPerSecond: Math.max(1, requestsPerSecond),
+        positions1h: positionKeys,
+        entries1h: indicationKeys + strategyKeys,
+        requestsPerSecond: Math.max(0, requestsPerSecond),
       },
       services: {
         tradeEngine: engineRunning,
         indicationsEngine: indicationsEngineRunning,
         strategiesEngine: strategiesEngineRunning,
-        websocket: true,
+        websocket: redisAvailable,
       },
       modules: {
-        redis: true,
+        redis: redisAvailable,
         persistence: keys > 0,
-        coordinator: engineRunning,
+        coordinator: engineRunning || coordinatorEngineCount > 0,
         logger: true,
       },
       engines: {
         indications: {
           running: indicationsEngineRunning,
           cycleCount: totalIndicationCycles,
-          resultsCount: indicationKeys || entries1h,
+          resultsCount: indicationKeys,
         },
         strategies: {
           running: strategiesEngineRunning,
           cycleCount: totalStrategyCycles,
-          resultsCount: strategyKeys || entryKeys,
+          resultsCount: strategyKeys,
         },
       },
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
-    console.error("[v0] [Monitoring] Error:", error)
+    console.error("[Monitoring] Error:", error)
     return NextResponse.json(
       { 
         cpu: 0, 
@@ -164,7 +166,11 @@ export async function GET() {
         memoryTotal: 1,
         database: { size: 0, keys: 0, sets: 0, positions1h: 0, entries1h: 0, requestsPerSecond: 0 },
         services: { tradeEngine: false, indicationsEngine: false, strategiesEngine: false, websocket: false },
-        modules: { redis: false, persistence: false, coordinator: false, logger: false },
+        modules: { redis: false, persistence: false, coordinator: false, logger: true },
+        engines: {
+          indications: { running: false, cycleCount: 0, resultsCount: 0 },
+          strategies: { running: false, cycleCount: 0, resultsCount: 0 },
+        },
         error: "Failed to fetch metrics", 
         details: error instanceof Error ? error.message : "Unknown" 
       },

@@ -88,138 +88,92 @@ export function StatisticsOverviewV2({ connections }: StatisticsOverviewV2Props)
       setLoading(true)
       setError(null)
 
-      // FETCH 1: Performance metrics (overall positions)
-      const perfResponse = await fetch("/api/trading/stats")
-      if (perfResponse.ok) {
-        const perfData = await perfResponse.json()
-        setPerformance({
-          last250Positions: {
-            total: perfData.last250?.total || 0,
-            winning: perfData.last250?.wins || 0,
-            losing: perfData.last250?.losses || 0,
-            winRate: perfData.last250?.winRate || 0,
-            profitFactor: perfData.last250?.profitFactor || 0,
-            totalProfit: perfData.last250?.totalProfit || 0,
-          },
-          last50Positions: {
-            total: perfData.last50?.total || 0,
-            winning: perfData.last50?.wins || 0,
-            losing: perfData.last50?.losses || 0,
-            winRate: perfData.last50?.winRate || 0,
-            profitFactor: perfData.last50?.profitFactor || 0,
-            totalProfit: perfData.last50?.totalProfit || 0,
-          },
-          last32Hours: {
-            totalPositions: perfData.last32h?.total || 0,
-            totalProfit: perfData.last32h?.totalProfit || 0,
-            profitFactor: perfData.last32h?.profitFactor || 0,
-          },
-        })
+      const results = await Promise.allSettled([
+        fetch("/api/trading/stats"),
+        fetch("/api/main/strategies-evaluation"),
+        fetch("/api/main/indications-stats"),
+        fetch("/api/exchange-positions/symbols-stats"),
+      ])
+
+      // FETCH 1: Performance metrics
+      if (results[0].status === "fulfilled" && results[0].value.ok) {
+        try {
+          const perfData = await results[0].value.json()
+          setPerformance({
+            last250Positions: {
+              total: perfData.last250?.total || 0,
+              winning: perfData.last250?.wins || 0,
+              losing: perfData.last250?.losses || 0,
+              winRate: perfData.last250?.winRate || 0,
+              profitFactor: perfData.last250?.profitFactor || 0,
+              totalProfit: perfData.last250?.totalProfit || 0,
+            },
+            last50Positions: {
+              total: perfData.last50?.total || 0,
+              winning: perfData.last50?.wins || 0,
+              losing: perfData.last50?.losses || 0,
+              winRate: perfData.last50?.winRate || 0,
+              profitFactor: perfData.last50?.profitFactor || 0,
+              totalProfit: perfData.last50?.totalProfit || 0,
+            },
+            last32Hours: {
+              totalPositions: perfData.last32h?.total || 0,
+              totalProfit: perfData.last32h?.totalProfit || 0,
+              profitFactor: perfData.last32h?.profitFactor || 0,
+            },
+          })
+        } catch (e) { console.warn("[Statistics] Failed to parse performance data") }
       }
 
-      // FETCH 2: Strategies metrics (base/main/real/live types)
-      const stratResponse = await fetch("/api/main/strategies-evaluation")
-      if (stratResponse.ok) {
-        const stratData = await stratResponse.json()
-        const strategiesData: StrategyMetrics[] = [
-          { 
-            type: "base", 
-            count: stratData.strategies?.base?.count || 0, 
-            winRate: stratData.strategies?.base?.winRate || 0,
-            drawdown: stratData.strategies?.base?.drawdown || 0,
-            drawdownHours: stratData.strategies?.base?.drawdownHours || 0,
-            profitFactor250: stratData.strategies?.base?.profitFactor250 || 0,
-            profitFactor50: stratData.strategies?.base?.profitFactor50 || 0,
-          },
-          { 
-            type: "main", 
-            count: stratData.strategies?.main?.count || 0,
-            winRate: stratData.strategies?.main?.winRate || 0,
-            drawdown: stratData.strategies?.main?.drawdown || 0,
-            drawdownHours: stratData.strategies?.main?.drawdownHours || 0,
-            profitFactor250: stratData.strategies?.main?.profitFactor250 || 0,
-            profitFactor50: stratData.strategies?.main?.profitFactor50 || 0,
-          },
-          { 
-            type: "real", 
-            count: stratData.strategies?.real?.count || 0,
-            winRate: stratData.strategies?.real?.winRate || 0,
-            drawdown: stratData.strategies?.real?.drawdown || 0,
-            drawdownHours: stratData.strategies?.real?.drawdownHours || 0,
-            profitFactor250: stratData.strategies?.real?.profitFactor250 || 0,
-            profitFactor50: stratData.strategies?.real?.profitFactor50 || 0,
-          },
-          { 
-            type: "live", 
-            count: stratData.strategies?.live?.count || 0,
-            winRate: stratData.strategies?.live?.winRate || 0,
-            drawdown: stratData.strategies?.live?.drawdown || 0,
-            drawdownHours: stratData.strategies?.live?.drawdownHours || 0,
-            profitFactor250: stratData.strategies?.live?.profitFactor250 || 0,
-            profitFactor50: stratData.strategies?.live?.profitFactor50 || 0,
-          },
-        ]
-        setStrategies(strategiesData)
+      // FETCH 2: Strategies metrics
+      if (results[1].status === "fulfilled" && results[1].value.ok) {
+        try {
+          const stratData = await results[1].value.json()
+          const strategiesData: StrategyMetrics[] = ["base", "main", "real", "live"].map((type) => ({
+            type: type as StrategyMetrics["type"],
+            count: stratData.strategies?.[type]?.count || 0,
+            winRate: stratData.strategies?.[type]?.winRate || 0,
+            drawdown: stratData.strategies?.[type]?.drawdown || 0,
+            drawdownHours: stratData.strategies?.[type]?.drawdownHours || 0,
+            profitFactor250: stratData.strategies?.[type]?.profitFactor250 || 0,
+            profitFactor50: stratData.strategies?.[type]?.profitFactor50 || 0,
+          }))
+          setStrategies(strategiesData)
+        } catch (e) { console.warn("[Statistics] Failed to parse strategies data") }
       }
 
-      // FETCH 3: Indications metrics (direction/move/active/optimal types - INDEPENDENT)
-      const indicResponse = await fetch("/api/main/indications-stats")
-      if (indicResponse.ok) {
-        const indicData = await indicResponse.json()
-        const indicationsData: IndicationMetrics[] = [
-          {
-            type: "direction",
-            totalCount: indicData.indications?.direction?.count || 0,
-            avgSignalStrength: indicData.indications?.direction?.avgSignalStrength || 0,
-            lastTrigger: indicData.indications?.direction?.lastTrigger ? new Date(indicData.indications.direction.lastTrigger) : null,
-            profitFactor: indicData.indications?.direction?.profitFactor || 0,
-          },
-          {
-            type: "move",
-            totalCount: indicData.indications?.move?.count || 0,
-            avgSignalStrength: indicData.indications?.move?.avgSignalStrength || 0,
-            lastTrigger: indicData.indications?.move?.lastTrigger ? new Date(indicData.indications.move.lastTrigger) : null,
-            profitFactor: indicData.indications?.move?.profitFactor || 0,
-          },
-          {
-            type: "active",
-            totalCount: indicData.indications?.active?.count || 0,
-            avgSignalStrength: indicData.indications?.active?.avgSignalStrength || 0,
-            lastTrigger: indicData.indications?.active?.lastTrigger ? new Date(indicData.indications.active.lastTrigger) : null,
-            profitFactor: indicData.indications?.active?.profitFactor || 0,
-          },
-          {
-            type: "optimal",
-            totalCount: indicData.indications?.optimal?.count || 0,
-            avgSignalStrength: indicData.indications?.optimal?.avgSignalStrength || 0,
-            lastTrigger: indicData.indications?.optimal?.lastTrigger ? new Date(indicData.indications.optimal.lastTrigger) : null,
-            profitFactor: indicData.indications?.optimal?.profitFactor || 0,
-          },
-        ]
-        setIndications(indicationsData)
+      // FETCH 3: Indications metrics
+      if (results[2].status === "fulfilled" && results[2].value.ok) {
+        try {
+          const indicData = await results[2].value.json()
+          const indicationsData: IndicationMetrics[] = ["direction", "move", "active", "optimal"].map((type) => ({
+            type: type as IndicationMetrics["type"],
+            totalCount: indicData.indications?.[type]?.count || 0,
+            avgSignalStrength: indicData.indications?.[type]?.avgSignalStrength || 0,
+            lastTrigger: indicData.indications?.[type]?.lastTrigger ? new Date(indicData.indications[type].lastTrigger) : null,
+            profitFactor: indicData.indications?.[type]?.profitFactor || 0,
+          }))
+          setIndications(indicationsData)
+        } catch (e) { console.warn("[Statistics] Failed to parse indications data") }
       }
 
       // FETCH 4: Symbols stats
-      const symbolResponse = await fetch("/api/exchange-positions/symbols-stats")
-      if (symbolResponse.ok) {
-        const symbolData = await symbolResponse.json()
-        const normalizedSymbols: SymbolStats[] = (symbolData.symbols || []).slice(0, 22).map((s: any) => ({
-          symbol: String(s?.symbol || "UNKNOWN"),
-          livePositions: toNumber(s?.livePositions ?? s?.openPositions, 0),
-          profitFactor250: toNumber(s?.profitFactor250, 0),
-          profitFactor50: toNumber(s?.profitFactor50, 0),
-        }))
-
-        if ((symbolData.symbols || []).length > 0 && normalizedSymbols.some((s) => Number.isNaN(s.livePositions))) {
-          console.warn("[v0] [Statistics] Malformed symbols payload detected", symbolData)
-        }
-
-        setSymbols(normalizedSymbols)
+      if (results[3].status === "fulfilled" && results[3].value.ok) {
+        try {
+          const symbolData = await results[3].value.json()
+          const normalizedSymbols: SymbolStats[] = (symbolData.symbols || []).slice(0, 22).map((s: any) => ({
+            symbol: String(s?.symbol || "UNKNOWN"),
+            livePositions: toNumber(s?.livePositions ?? s?.openPositions, 0),
+            profitFactor250: toNumber(s?.profitFactor250, 0),
+            profitFactor50: toNumber(s?.profitFactor50, 0),
+          }))
+          setSymbols(normalizedSymbols)
+        } catch (e) { console.warn("[Statistics] Failed to parse symbols data") }
       }
 
       setLoading(false)
     } catch (err) {
-      console.error("[v0] [Statistics] Error loading data:", err)
+      console.error("[Statistics] Error loading data:", err)
       setError("Failed to load statistics")
       setLoading(false)
     }
