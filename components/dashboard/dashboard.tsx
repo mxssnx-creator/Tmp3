@@ -256,6 +256,7 @@ export function Dashboard() {
 
   return (
     <div className="flex-1 space-y-6 px-3 md:px-4 pb-6">
+    <div className="flex-1 space-y-6 px-0 pb-6">
       <PageHeader 
         title="CTS v3.2 Dashboard" 
         description="Monitor and control your Main Connections (Active Connections)"

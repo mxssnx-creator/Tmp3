@@ -62,6 +62,7 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
       lastLoadRef.current = Date.now()
     }
   }, [])
+  }, [selectedConnectionId])
 
   // Only load on mount, remove interval to prevent loops
   useEffect(() => {
