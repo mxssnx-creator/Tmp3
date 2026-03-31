@@ -27,7 +27,10 @@ function GlobalCoordinatorStatus() {
   useEffect(() => {
     const loadStatus = async () => {
       try {
-        const res = await fetch("/api/trade-engine/status", { cache: "no-store" })
+        const res = await fetch("/api/trade-engine/status", { 
+          cache: "no-store",
+          signal: AbortSignal.timeout(8000) 
+        })
         if (res.ok) {
           const data = await res.json()
           setStatus({
@@ -38,18 +41,18 @@ function GlobalCoordinatorStatus() {
         }
       } catch (e) {
         console.warn("[v0] Failed to load coordinator status:", e)
+        setStatus({ running: false, paused: false, status: "unavailable" })
       }
     }
     loadStatus()
-    // Increased polling: 2000ms → 5000ms to reduce API load
     const interval = setInterval(loadStatus, 5000)
     return () => clearInterval(interval)
   }, [])
 
-  if (!status) return null
+  const isLoading = status === null
 
   const getStatusDisplay = () => {
-    if (!status.running) {
+    if (!status || !status.running) {
       return { 
         label: "Stopped", 
         color: "bg-red-500/10 text-red-600 border-red-200", 
@@ -75,6 +78,16 @@ function GlobalCoordinatorStatus() {
 
   const display = getStatusDisplay()
   const Icon = display.icon
+
+  if (isLoading) {
+    return (
+      <Card className="border mb-4">
+        <CardContent className="py-3">
+          <p className="text-sm text-muted-foreground">Loading status...</p>
+        </CardContent>
+      </Card>
+    )
+  }
 
   return (
     <Card className={`border ${display.color} mb-4`}>
@@ -171,7 +184,6 @@ export function Dashboard() {
 
   const loadStats = React.useCallback(async () => {
     try {
-      // Cancel previous request if still in flight
       if (abortControllerRef.current) {
         abortControllerRef.current.abort()
       }
@@ -179,14 +191,13 @@ export function Dashboard() {
       abortControllerRef.current = new AbortController()
       const signal = abortControllerRef.current.signal
       
-      // Fetch both monitoring stats and system monitoring data
       const url = selectedExchange 
         ? `/api/monitoring/stats?exchange=${selectedExchange}`
         : "/api/monitoring/stats"
       
       const [statsRes, sysMonRes] = await Promise.all([
-        fetch(url, { signal }),
-        fetch("/api/system/monitoring", { signal }),
+        fetch(url, { signal: AbortSignal.timeout(8000) }),
+        fetch("/api/system/monitoring", { signal: AbortSignal.timeout(8000) }),
       ])
       
       let data = { activeConnections: 0, totalPositions: 0, dailyPnL: 0, totalBalance: 0 }
@@ -211,7 +222,7 @@ export function Dashboard() {
       })
     } catch (error) {
       if ((error as Error).name !== 'AbortError') {
-        console.error("Failed to load stats:", error)
+        console.warn("Failed to load stats:", error)
       }
     }
   }, [selectedExchange])
