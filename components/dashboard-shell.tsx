@@ -4,7 +4,7 @@ import type React from "react"
 import { AuthProvider } from "@/lib/auth-context"
 import { ExchangeProvider } from "@/lib/exchange-context"
 import { ConnectionStateProvider } from "@/lib/connection-state"
-import { SidebarProvider } from "@/components/ui/sidebar"
+import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar"
 import { AppSidebar } from "@/components/app-sidebar"
 import { Toaster } from "sonner"
 
@@ -16,7 +16,6 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
           <SidebarProvider>
             <div className="flex min-h-screen overflow-hidden bg-muted/20">
               <AppSidebar />
-              <main className="flex-1 min-w-0 overflow-auto overflow-x-hidden">
               <main className="relative flex-1 min-w-0 overflow-auto">
                 <div className="fixed top-3 left-3 z-40 md:hidden">
                   <SidebarTrigger className="h-8 w-8 bg-background/90 border shadow-sm" />

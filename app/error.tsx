@@ -2,8 +2,6 @@
 
 import { useEffect } from "react"
 import { AlertCircle, RefreshCw, Home } from "lucide-react"
-import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 
 export default function Error({
   error,
@@ -14,25 +12,8 @@ export default function Error({
 }) {
   useEffect(() => {
     console.error("[v0] Page error:", error)
-
-    // Log to monitoring API
-    fetch("/api/monitoring/site", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        level: "error",
-        category: "nextjs",
-        message: error.message,
-        stack: error.stack,
-        metadata: {
-          digest: error.digest,
-          page: window.location.pathname,
-        },
-      }),
-    }).catch((err) => console.error("[v0] Failed to log page error:", err))
   }, [error])
 
-  // Minimal fallback for faster debugging
   return (
     <div style={{ 
       minHeight: "100vh", 
@@ -43,8 +24,8 @@ export default function Error({
       fontFamily: "system-ui, sans-serif"
     }}>
       <div style={{ maxWidth: "600px", width: "100%" }}>
-        <h1 style={{ color: "#dc2626", marginBottom: "10px" }}>
-          <AlertCircle style={{ display: "inline", marginRight: "8px" }} />
+        <h1 style={{ color: "#dc2626", marginBottom: "10px", display: "flex", alignItems: "center", gap: "8px" }}>
+          <AlertCircle style={{ width: "24px", height: "24px" }} />
           Page Error
         </h1>
         <p style={{ color: "#6b7280", marginBottom: "20px" }}>
@@ -56,14 +37,40 @@ export default function Error({
           </p>
         )}
         <div style={{ display: "flex", gap: "10px" }}>
-          <Button onClick={reset}>
-            <RefreshCw style={{ marginRight: "8px", height: "16px" }} />
+          <button 
+            onClick={reset}
+            style={{
+              padding: "8px 16px",
+              borderRadius: "6px",
+              background: "#000",
+              color: "#fff",
+              border: "none",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: "8px"
+            }}
+          >
+            <RefreshCw style={{ height: "16px" }} />
             Try Again
-          </Button>
-          <Button onClick={() => (window.location.href = "/")} variant="outline">
-            <Home style={{ marginRight: "8px", height: "16px" }} />
+          </button>
+          <button 
+            onClick={() => (window.location.href = "/")}
+            style={{
+              padding: "8px 16px",
+              borderRadius: "6px",
+              background: "#fff",
+              color: "#000",
+              border: "1px solid #d1d5db",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: "8px"
+            }}
+          >
+            <Home style={{ height: "16px" }} />
             Go Home
-          </Button>
+          </button>
         </div>
         {process.env.NODE_ENV === "development" && error.stack && (
           <details style={{ marginTop: "20px" }}>

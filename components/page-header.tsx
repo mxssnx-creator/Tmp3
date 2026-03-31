@@ -17,7 +17,6 @@ export function PageHeader({ title, description, children, showExchangeSelector 
       <div className="flex h-auto min-h-[4rem] items-start gap-3 px-3 md:px-4 py-3">
         <SidebarTrigger className="h-8 w-8 shrink-0 mt-1" />
         <Separator orientation="vertical" className="h-8 shrink-0 mt-1" />
-      <div className="flex h-auto min-h-[4rem] items-start gap-4 px-4 py-3 pl-14 md:pl-4">
         <div className="flex-1 min-w-0">
           <h1 className="text-lg font-semibold">{title}</h1>
           {description && (
