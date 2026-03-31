@@ -106,18 +106,18 @@ export function ProgressionLogsDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-5xl max-h-[90vh] flex flex-col overflow-hidden">
+      <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="flex max-h-[90vh] max-w-5xl flex-col overflow-hidden p-0">
         <DialogHeader>
-          <DialogTitle>Progression Logs - {connectionName}</DialogTitle>
-          <DialogDescription>
+          <DialogTitle className="px-6 pt-6">Progression Logs - {connectionName}</DialogTitle>
+          <DialogDescription className="px-6">
             Detailed logs of all engine operations and phase transitions. Use this to debug progression issues.
           </DialogDescription>
         </DialogHeader>
 
         {/* Progression State Summary */}
         {progressionState && (
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 p-3 bg-muted rounded-lg text-xs">
+          <div className="mx-6 mb-4 grid grid-cols-2 gap-3 rounded-lg bg-muted p-3 text-xs md:grid-cols-4">
             <div className="text-center">
               <div className="text-lg font-semibold">{progressionState.cyclesCompleted || 0}</div>
               <div className="text-xs text-muted-foreground">Cycles</div>
@@ -137,7 +137,7 @@ export function ProgressionLogsDialog({
           </div>
         )}
 
-        <div className="flex items-center justify-between mb-4">
+        <div className="mb-4 flex items-center justify-between px-6">
           <div className="text-sm text-muted-foreground">
             {logs.length} log entries {isLoading && "(refreshing...)"}
           </div>
@@ -164,7 +164,7 @@ export function ProgressionLogsDialog({
           </div>
         </div>
 
-        <ScrollArea className="w-full h-[50vh] border rounded-md bg-slate-50 p-3 font-mono text-xs">
+        <ScrollArea className="mx-6 h-[52vh] w-auto rounded-md border bg-muted/20 px-3 py-2 font-mono text-xs">
           {isLoading ? (
             <div className="text-muted-foreground">Loading logs...</div>
           ) : logs.length === 0 ? (
@@ -174,7 +174,7 @@ export function ProgressionLogsDialog({
               {logs.map((log, idx) => {
                 const time = new Date(log.timestamp).toLocaleTimeString()
                 return (
-                  <div key={idx} className="flex gap-2 text-xs items-start">
+                  <div key={idx} className="grid grid-cols-[auto_auto_auto_1fr] items-start gap-2 text-xs">
                     <span className="text-gray-500 min-w-fit">[{time}]</span>
                     <Badge className={`min-w-fit ${getLevelBadgeColor(log.level)}`}>
                       {log.level.toUpperCase()}
@@ -182,12 +182,14 @@ export function ProgressionLogsDialog({
                     <Badge variant="outline" className="min-w-fit">
                       {log.phase}
                     </Badge>
-                    <span className="flex-1 min-w-0 break-words text-gray-700 leading-relaxed">{log.message}</span>
+                    <div className="min-w-0 space-y-1">
+                      <p className="break-words leading-relaxed text-foreground">{log.message}</p>
                     {log.details && (
-                      <span className="text-gray-500 max-w-xs break-words whitespace-pre-wrap">
+                      <pre className="max-h-32 overflow-auto rounded bg-background p-2 text-[11px] text-muted-foreground">
                         {JSON.stringify(log.details, null, 2)}
-                      </span>
+                      </pre>
                     )}
+                    </div>
                   </div>
                 )
               })}
@@ -195,7 +197,7 @@ export function ProgressionLogsDialog({
           )}
         </ScrollArea>
 
-        <div className="mt-4 text-xs text-muted-foreground border-t pt-3">
+        <div className="mt-4 border-t px-6 pb-6 pt-3 text-xs text-muted-foreground">
           <p>Logs are retained for 24 hours and show all engine operations including errors, phase transitions, and performance metrics.</p>
         </div>
       </DialogContent>

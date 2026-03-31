@@ -12,6 +12,14 @@ function toNumber(value: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
+async function readCount(client: any, key: string): Promise<number> {
+  try {
+    return toNumber(await client.get(key))
+  } catch {
+    return 0
+  }
+}
+
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
@@ -56,6 +64,47 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
           connectionId,
         }))
 
+    const indicationByType = {
+      direction: await readCount(client, `indications:${connectionId}:direction:count`),
+      move: await readCount(client, `indications:${connectionId}:move:count`),
+      active: await readCount(client, `indications:${connectionId}:active:count`),
+      optimal: await readCount(client, `indications:${connectionId}:optimal:count`),
+      auto: await readCount(client, `indications:${connectionId}:auto:count`),
+    }
+
+    const strategyStats = {
+      base: {
+        total: await readCount(client, `strategies:${connectionId}:base:total`),
+        evaluated: await readCount(client, `strategies:${connectionId}:base:evaluated`),
+        avgProfitFactor: await readCount(client, `strategies:${connectionId}:base:avg_profit_factor`),
+        avgDrawdownTime: await readCount(client, `strategies:${connectionId}:base:avg_drawdown_time`),
+      },
+      main: {
+        total: await readCount(client, `strategies:${connectionId}:main:total`),
+        evaluated: await readCount(client, `strategies:${connectionId}:main:evaluated`),
+        avgProfitFactor: await readCount(client, `strategies:${connectionId}:main:avg_profit_factor`),
+        avgDrawdownTime: await readCount(client, `strategies:${connectionId}:main:avg_drawdown_time`),
+      },
+      real: {
+        total: await readCount(client, `strategies:${connectionId}:real:total`),
+        evaluated: await readCount(client, `strategies:${connectionId}:real:evaluated`),
+        avgProfitFactor: await readCount(client, `strategies:${connectionId}:real:avg_profit_factor`),
+        avgDrawdownTime: await readCount(client, `strategies:${connectionId}:real:avg_drawdown_time`),
+      },
+    }
+
+    const calculateRate = (evaluated: number, total: number) => (total > 0 ? (evaluated / total) * 100 : 0)
+
+    const prehistoricDbEntries = await readCount(client, `prehistoric:${connectionId}:db_entries`)
+    const dbWritesPerSec = await readCount(client, `db:${connectionId}:writes_per_sec`)
+    const dbSizeMb = await readCount(client, `db:${connectionId}:size_mb`)
+    const setCounts = {
+      base: await readCount(client, `sets:${connectionId}:base:count`),
+      main: await readCount(client, `sets:${connectionId}:main:count`),
+      real: await readCount(client, `sets:${connectionId}:real:count`),
+      total: await readCount(client, `sets:${connectionId}:total`),
+    }
+
     return NextResponse.json({
       success: true,
       connectionId,
@@ -80,11 +129,34 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         intervalsProcessed: toNumber(await client.get(`intervals:${connectionId}:processed_count`).catch(() => 0)),
         indicationsCount: toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0)),
         strategiesCount: toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0)),
-        strategyEvaluatedBase: toNumber(await client.get(`strategies:${connectionId}:base:evaluated`).catch(() => 0)),
-        strategyEvaluatedMain: toNumber(await client.get(`strategies:${connectionId}:main:evaluated`).catch(() => 0)),
-        strategyEvaluatedReal: toNumber(await client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0)),
+        strategyEvaluatedBase: strategyStats.base.evaluated,
+        strategyEvaluatedMain: strategyStats.main.evaluated,
+        strategyEvaluatedReal: strategyStats.real.evaluated,
         prehistoricSymbolsProcessed: toNumber(engineState?.config_set_symbols_processed),
+        prehistoricSymbolsTotal: toNumber(engineState?.config_set_symbols_total),
         prehistoricCandlesProcessed: toNumber(engineState?.config_set_candles_processed),
+        prehistoricDbEntries,
+        dbWritesPerSec,
+        dbSizeMb,
+        indicationByType: {
+          ...indicationByType,
+          total: Object.values(indicationByType).reduce((sum, current) => sum + current, 0),
+        },
+        strategyStats: {
+          base: {
+            ...strategyStats.base,
+            evaluationRatePercent: calculateRate(strategyStats.base.evaluated, strategyStats.base.total),
+          },
+          main: {
+            ...strategyStats.main,
+            evaluationRatePercent: calculateRate(strategyStats.main.evaluated, strategyStats.main.total),
+          },
+          real: {
+            ...strategyStats.real,
+            evaluationRatePercent: calculateRate(strategyStats.real.evaluated, strategyStats.real.total),
+          },
+        },
+        setCounts,
       },
       enginePhase: engineProgression ? {
         phase: engineProgression.phase,

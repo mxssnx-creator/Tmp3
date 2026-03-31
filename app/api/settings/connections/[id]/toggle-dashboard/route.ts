@@ -67,17 +67,18 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     // Determine new state based on request
     const enableMain = hasDashboardEnabled ? isDashboardEnabled : (hasActiveInserted ? isActiveInserted : state.main_enabled)
 
-    // Guard: enabling dashboard processing must not implicitly insert into Main panel.
-    // Users must explicitly add connection to Main first (add-to-active flow).
-    // Auto-add to Main panel if enabling but not yet added
-    if (hasDashboardEnabled && isDashboardEnabled && !hasActiveInserted && !state.main_assigned) {
-      console.log(`[v0] [Toggle] Auto-adding connection to Main Connections before enabling...`)
-      // Auto-add to Main panel first
-      const addedConnection = buildMainConnectionEnableUpdate(connection)
-      await updateConnection(resolvedId, addedConnection)
-      console.log(`[v0] [Toggle] Auto-added ${connection.name} to Main Connections`)
-      // Update local state to reflect the change
-      state.main_assigned = true
+    // Guard: do NOT auto-assign/reassign to main when toggle is enabled.
+    // Main panel assignment must be explicit by user action.
+    if (hasDashboardEnabled && isDashboardEnabled && !state.main_assigned) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Connection is not assigned to Main Connections",
+          details: "Add the connection to Main Connections first, then enable dashboard processing.",
+          connectionId: resolvedId,
+        },
+        { status: 400 },
+      )
     }
     
     // Check if state actually changes
@@ -100,14 +101,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         console.log(`[v0] [Toggle] DISABLING: main_enabled=false (engine will stop)`)
       }
     } else {
-      // No state change but still need to ensure engine is running if already enabled
+      // No state change
       updatedConnection = connection
-      if (enableMain) {
-        engineAction = "start" // Ensure engine is started if already enabled
-        console.log(`[v0] [Toggle] Already enabled - ensuring engine is running`)
-      } else {
-        console.log(`[v0] [Toggle] Already disabled`)
-      }
+      console.log(`[v0] [Toggle] No main toggle state change`)
     }
 
     // Save connection state only if state changed
@@ -167,9 +163,13 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           active_connections: String(activeDashboardCount),
         })
         
-        // DIRECTLY START THE ENGINE - don't rely on coordinator polling
+        // DIRECTLY START THE ENGINE only on OFF->ON transitions.
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
+          if (coordinator.isEngineRunning(resolvedId)) {
+            engineStatus = "already-running"
+            console.log(`[v0] [Toggle] Engine already running for ${connection.name}; skip restart`)
+          } else {
           const settings = await loadSettingsAsync()
             
             // Start the engine directly
@@ -189,6 +189,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
               connectionName: connection.name,
               exchange: connection.exchange,
             })
+          }
           } catch (engineStartError) {
             console.error(`[v0] [Toggle] Failed to start engine directly:`, engineStartError)
             // Still set the flag as fallback - coordinator may pick it up
