@@ -5,6 +5,7 @@
   "scripts": {
     "build": "next build",
     "dev": "next dev -p 3001",
+    "test": "sh -c 'fuser -k 3001/tcp >/dev/null 2>&1 || true; timeout -s TERM 90s bash -lc \"npm run dev >/tmp/tmp3-test-dev.log 2>&1 & DEV_PID=$!; trap \\\"kill $DEV_PID >/dev/null 2>&1 || true\\\" EXIT; for i in {1..45}; do curl -sf http://localhost:3001 >/dev/null && break; sleep 1; done; curl -sf http://localhost:3001/main >/dev/null && curl -sf http://localhost:3001/strategies >/dev/null && curl -sf http://localhost:3001/settings >/dev/null && curl -sf http://localhost:3001/monitoring >/dev/null\"'",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "start": "next start -p 3001",

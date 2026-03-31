@@ -16,9 +16,9 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
           <SidebarProvider>
             <div className="flex min-h-screen overflow-hidden bg-muted/20">
               <AppSidebar />
-              <main className="flex-1 min-w-0 overflow-auto">
-                <div className="sticky top-2 z-30 px-2 md:px-3 pointer-events-none">
-                  <SidebarTrigger className="pointer-events-auto h-8 w-8 bg-background/90 border shadow-sm" />
+              <main className="relative flex-1 min-w-0 overflow-auto">
+                <div className="fixed top-3 left-3 z-40 md:hidden">
+                  <SidebarTrigger className="h-8 w-8 bg-background/90 border shadow-sm" />
                 </div>
                 {children}
               </main>

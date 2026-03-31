@@ -28,7 +28,6 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
-  SidebarTrigger,
   SidebarRail,
   SidebarFooter,
 } from "@/components/ui/sidebar"
@@ -226,7 +225,7 @@ export function AppSidebar() {
       <SidebarFooter className="space-y-2 border-t border-sidebar-border p-1.5">
         <div className="px-1 pb-1 group-data-[collapsible=icon]:hidden">
           <p className="mb-1 text-[10px] text-muted-foreground">Active exchange</p>
-          <ExchangeSelectorTop />
+          <ExchangeSelectorTop variant="sidebar" />
         </div>
         {user && (
           <div className="px-2 py-1 group-data-[collapsible=icon]:hidden">

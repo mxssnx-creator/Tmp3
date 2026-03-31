@@ -8,3 +8,7 @@
 - Updated quickstart runtime variable naming to use "main" wording for main-connection enablement checks.
 - Removed "quickstart_engine_not_started" passive branch so quickstart attempts engine startup directly when credentials/testing pass.
 - Updated `nextSteps` messaging to reflect automatic assignment/enabling behavior.
+- Fixed dashboard shell/header layout to remove duplicate sidebar trigger and normalize mobile trigger layering.
+- Refactored exchange selector UX: removed refresh button, switched to automatic forced load on access, no "Exchange:" label line break, and added dedicated sidebar variant styling.
+- Reduced outer wrapper padding on dashboard root to prevent double-wrapping/outer-spacing issues.
+- Updated `npm test` to kill previous process on port `3001` and enforce a 90-second timeout.
