@@ -72,16 +72,16 @@ export async function POST(request: Request) {
       return exch === "bybit" && hasCredentials
     }) || allConnections.find((c: any) => {
       const exch = (c.exchange || "").toLowerCase()
-      const isBaseInserted = c.is_active_inserted === "1" || c.is_active_inserted === true || 
-                            c.is_dashboard_inserted === "1" || c.is_dashboard_inserted === true
+      // QuickStart startup relies on Main Connections assignment state.
+      const isAssigned = c.is_assigned === "1" || c.is_assigned === true
       const isBase = exch === "bingx" || exch === "bybit" || exch === "pionex" || exch === "orangex"
-      return isBase && isBaseInserted
+      return isBase && isAssigned
     })
     
     if (!connection) {
-      console.log(`${LOG_PREFIX}: No BingX/Bybit connections found in Active panel`)
+      console.log(`${LOG_PREFIX}: No BingX/Bybit connections found in Main Connections`)
       
-      await logProgressionEvent("global", "quickstart_no_connection", "warning", "No BingX/Bybit connections in Active panel", {
+      await logProgressionEvent("global", "quickstart_no_connection", "warning", "No BingX/Bybit connections in Main Connections", {
         totalConnections: allConnections.length,
         availableExchanges: [...new Set(allConnections.map((c: any) => c.exchange))],
       })
@@ -89,14 +89,14 @@ export async function POST(request: Request) {
       return NextResponse.json(
         { 
           success: false,
-          error: "No BingX/Bybit connections found in Active panel",
-          message: "Add a BingX or Bybit connection to the Active panel first, then add API credentials in Settings",
+          error: "No BingX/Bybit connections found in Main Connections",
+          message: "Add a BingX or Bybit connection to Main Connections first, then add API credentials in Settings",
           availableConnections: allConnections.map((c: any) => ({ 
             name: c.name,
             id: c.id,
             exchange: c.exchange,
             hasCredentials: !!(c.api_key && c.api_secret && c.api_key.length >= 10),
-            isActiveInserted: c.is_active_inserted === "1" || c.is_active_inserted === true,
+            isMainAssigned: c.is_assigned === "1" || c.is_assigned === true,
           })),
           logs: await getProgressionLogs("global"),
         },
@@ -118,6 +118,7 @@ export async function POST(request: Request) {
         ...connection,
         is_dashboard_inserted: "0",
         is_enabled_dashboard: "0",
+        is_assigned: "0",
         is_enabled: "0",
         updated_at: new Date().toISOString(),
       }
@@ -233,14 +234,17 @@ export async function POST(request: Request) {
       count: symbols.length,
     })
     
-     // Step 3: Update connection state - PRESERVE user settings
-     // PHASE 2 FIX: Do NOT auto-enable - only update symbols and test status
-     // User must explicitly assign to main and enable dashboard toggle
+     // Step 3: QuickStart must assign + enable connection flow
      console.log(`${LOG_PREFIX}: [3/4] Updating connection state...`)
      
-     // Only update test results and symbols, preserve enable/disable state
      const updated = {
        ...connection,
+       // Explicit quickstart assignment/enabling for engine processing
+       is_active_inserted: "1",
+       is_dashboard_inserted: "1",
+       is_enabled_dashboard: "1",
+       is_assigned: "1",
+       is_active: "1",
        active_symbols: JSON.stringify(symbols),
        last_test_status: testPassed ? "success" : "failed",
        last_test_balance: testBalance,
@@ -249,7 +253,7 @@ export async function POST(request: Request) {
      }
      
      await updateConnection(connectionId, updated)
-     console.log(`${LOG_PREFIX}: [3/4] Connection state updated (symbols, test results). Engine will start only if explicitly enabled.`)
+     console.log(`${LOG_PREFIX}: [3/4] Connection state updated (assigned+enabled for quickstart).`)
     
     // ALSO store in trade_engine_state for engine to find
     await setSettings(`trade_engine_state:${connectionId}`, {
@@ -261,21 +265,20 @@ export async function POST(request: Request) {
     })
     console.log(`${LOG_PREFIX}: [3/4] Stored symbols in trade_engine_state: ${symbols.join(", ")}`)
     
-     // PHASE 2 FIX: Respect user's explicit enable/disable choice
-     const isAssignedToMain = updated.is_assigned === "1" || updated.is_assigned === true
-     const isDashboardEnabled = updated.is_enabled_dashboard === "1" || updated.is_enabled_dashboard === true
+     const isAssigned = updated.is_assigned === "1" || updated.is_assigned === true
+     const isMainEnabled = updated.is_enabled_dashboard === "1" || updated.is_enabled_dashboard === true
      
      await logProgressionEvent(connectionId, "quickstart_updated", "info", "Connection state updated", {
        symbols,
-       isAssignedToMain,
-       isDashboardEnabled,
+       isAssigned,
+       isMainEnabled,
        testPassed,
      })
      
-     // Step 4: Start engine ONLY if user explicitly enabled it
+     // Step 4: Start engine
      console.log(`${LOG_PREFIX}: [4/4] Checking if engine should start...`)
      
-     if (isAssignedToMain && isDashboardEnabled) {
+     if (isAssigned && isMainEnabled) {
        console.log(`${LOG_PREFIX}: [4/4] Connection is explicitly enabled - initializing engine...`)
        await setSettings(`engine_progression:${connectionId}`, {
          phase: "initializing",
@@ -318,13 +321,6 @@ export async function POST(request: Request) {
            error: engineError instanceof Error ? engineError.message : String(engineError),
          })
        }
-     } else {
-       console.log(`${LOG_PREFIX} [4/4] Connection not explicitly enabled - engine will not start`)
-       await logProgressionEvent(connectionId, "quickstart_engine_not_started", "info", "Engine not started - connection not explicitly enabled", {
-         isAssignedToMain,
-         isDashboardEnabled,
-         message: "Add connection to Main Connections and enable dashboard toggle to start engine",
-       })
      }
     
     // Store in global quickstart state
@@ -496,8 +492,8 @@ export async function POST(request: Request) {
       },
       status: hasCredentials ? "ready_with_credentials" : "ready_without_credentials",
       nextSteps: hasCredentials 
-        ? "Connection is ready. Go to Dashboard > Main Connections > Add this connection and enable it to start trading."
-        : "Add API credentials in Settings > Connections > Edit, then go to Dashboard > Main Connections to add and enable.",
+        ? "Connection assigned and enabled in Main Connections. Engine startup initiated."
+        : "Connection assigned and enabled for quickstart, but credentials are missing/invalid for live exchange operations.",
       duration: totalDuration,
       logs: allLogs.slice(0, 50),
       logsCount: allLogs.length,

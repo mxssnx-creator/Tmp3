@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -17,22 +17,46 @@ export function QuickstartOverviewDialog({ connectionId = "bingx-x01" }: Props) 
   const [loading, setLoading] = useState(false)
   const [stats, setStats] = useState<any>(null)
   const [logs, setLogs] = useState<any[]>([])
+  const [resolvedConnectionId, setResolvedConnectionId] = useState(connectionId)
 
   const load = async () => {
     setLoading(true)
     try {
-      const [statsRes, logsRes] = await Promise.all([
-        fetch(`/api/connections/progression/${connectionId}/logs`),
-        fetch(`/api/trade-engine/structured-logs?connectionId=${connectionId}&limit=150`),
-      ])
-      const s = await statsRes.json().catch(() => ({}))
-      const l = await logsRes.json().catch(() => ({}))
-      setStats(s?.progressionState || null)
-      setLogs(Array.isArray(l?.logs) ? l.logs : [])
+      const candidates = [connectionId, connectionId.startsWith("conn-") ? connectionId.replace(/^conn-/, "") : `conn-${connectionId}`]
+      let chosenId = connectionId
+      let statsPayload: any = {}
+      let logsPayload: any = {}
+
+      for (const candidate of candidates) {
+        const [statsRes, logsRes] = await Promise.all([
+          fetch(`/api/connections/progression/${candidate}/logs`),
+          fetch(`/api/trade-engine/structured-logs?connectionId=${candidate}&limit=150`),
+        ])
+        const s = await statsRes.json().catch(() => ({}))
+        const l = await logsRes.json().catch(() => ({}))
+        if (statsRes.ok || (Array.isArray(l?.logs) && l.logs.length > 0)) {
+          chosenId = candidate
+          statsPayload = s
+          logsPayload = l
+          break
+        }
+      }
+
+      setResolvedConnectionId(chosenId)
+      setStats(statsPayload?.progressionState || null)
+      setLogs(Array.isArray(logsPayload?.logs) ? logsPayload.logs : [])
     } finally {
       setLoading(false)
     }
   }
+
+  useEffect(() => {
+    if (!open) return
+    const timer = setInterval(() => {
+      void load()
+    }, 15000)
+    return () => clearInterval(timer)
+  }, [open, connectionId])
 
   const grouped = useMemo(() => {
     const overall = logs.filter((l) => ["system", "coordinator"].includes(String(l.engine || "").toLowerCase()))
@@ -57,6 +81,7 @@ export function QuickstartOverviewDialog({ connectionId = "bingx-x01" }: Props) 
               <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
             </Button>
           </DialogTitle>
+          <div className="text-xs text-muted-foreground">Connection: {resolvedConnectionId}</div>
         </DialogHeader>
 
         <Tabs defaultValue="main" className="space-y-3">

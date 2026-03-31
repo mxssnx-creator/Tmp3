@@ -5,7 +5,6 @@ import { AuthProvider } from "@/lib/auth-context"
 import { ExchangeProvider } from "@/lib/exchange-context"
 import { ConnectionStateProvider } from "@/lib/connection-state"
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar"
-import { SidebarProvider } from "@/components/ui/sidebar"
 import { AppSidebar } from "@/components/app-sidebar"
 import { Toaster } from "sonner"
 

@@ -243,6 +243,16 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           })
         } catch (engineStopError) {
           console.warn(`[v0] [Toggle] Failed to stop engine directly:`, engineStopError)
+          // Fallback refresh request so coordinator picks up desired stop state
+          await setSettings("engine_coordinator:refresh_requested", {
+            timestamp: new Date().toISOString(),
+            connectionId: resolvedId,
+            action: "stop",
+          })
+          await logProgressionEvent(resolvedId, "engine_stop_fallback_requested", "warning", "Direct stop failed; coordinator refresh requested", {
+            connectionId: resolvedId,
+            error: engineStopError instanceof Error ? engineStopError.message : String(engineStopError),
+          })
         }
         
         engineStatus = "stopped"

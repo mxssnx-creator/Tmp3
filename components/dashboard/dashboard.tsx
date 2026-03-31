@@ -260,6 +260,7 @@ export function Dashboard() {
       <PageHeader 
         title="CTS v3.2 Dashboard" 
         description="Monitor and control your Main Connections (Active Connections)"
+        showExchangeSelector
       />
 
       {/* Global Coordinator Status - Shows at top of page */}

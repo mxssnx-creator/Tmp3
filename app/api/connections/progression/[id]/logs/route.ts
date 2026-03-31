@@ -12,6 +12,10 @@ function toNumber(value: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
+function sanitizeNonNegative(value: unknown): number {
+  return Math.max(0, toNumber(value))
+}
+
 async function countKeys(client: any, patterns: string[]): Promise<number> {
   let total = 0
   for (const pattern of patterns) {
@@ -87,8 +91,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       toNumber(await client.get(`indications:${connectionId}:move:evaluated`).catch(() => 0)),
       toNumber(await client.get(`indications:${connectionId}:active:evaluated`).catch(() => 0)),
       toNumber(await client.get(`indications:${connectionId}:optimal:evaluated`).catch(() => 0)),
-      client.dbsize().catch(() => 0),
-      client.info("memory").catch(() => ""),
+      client.dbSize().catch(() => 0),
+      client.info().catch(() => ""),
     ])
 
     const usedMemoryLine = String(redisMemoryInfo)
@@ -105,39 +109,46 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       structuredLogs,
       structuredLogsCount: structuredLogs.length,
       progressionState: {
-        cyclesCompleted: Math.max(progressionState.cyclesCompleted, Number(engineState?.indication_cycle_count || 0)),
-        successfulCycles: Math.max(progressionState.successfulCycles, Number(engineState?.strategy_cycle_count || 0)),
-        failedCycles: progressionState.failedCycles,
-        totalTrades: progressionState.totalTrades,
-        successfulTrades: progressionState.successfulTrades,
-        totalProfit: progressionState.totalProfit,
-        cycleSuccessRate: progressionState.cycleSuccessRate,
-        tradeSuccessRate: progressionState.tradeSuccessRate,
+        cyclesCompleted: sanitizeNonNegative(Math.max(progressionState.cyclesCompleted, Number(engineState?.indication_cycle_count || 0))),
+        successfulCycles: sanitizeNonNegative(Math.max(progressionState.successfulCycles, Number(engineState?.strategy_cycle_count || 0))),
+        failedCycles: sanitizeNonNegative(progressionState.failedCycles),
+        totalTrades: sanitizeNonNegative(progressionState.totalTrades),
+        successfulTrades: sanitizeNonNegative(progressionState.successfulTrades),
+        totalProfit: toNumber(progressionState.totalProfit),
+        cycleSuccessRate: sanitizeNonNegative(progressionState.cycleSuccessRate),
+        tradeSuccessRate: sanitizeNonNegative(progressionState.tradeSuccessRate),
         lastCycleTime: progressionState.lastCycleTime,
-        prehistoricCyclesCompleted: progressionState.prehistoricCyclesCompleted,
+        prehistoricCyclesCompleted: sanitizeNonNegative(progressionState.prehistoricCyclesCompleted),
         prehistoricPhaseActive: progressionState.prehistoricPhaseActive,
-        realtimeCycleCount: toNumber(engineState?.realtime_cycle_count),
-        cycleTimeMs: toNumber(engineState?.last_cycle_duration),
-        intervalsProcessed: toNumber(await client.get(`intervals:${connectionId}:processed_count`).catch(() => 0)),
-        indicationsCount: toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0)),
-        strategiesCount: toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0)),
-        strategyEvaluatedBase: toNumber(await client.get(`strategies:${connectionId}:base:evaluated`).catch(() => 0)),
-        strategyEvaluatedMain: toNumber(await client.get(`strategies:${connectionId}:main:evaluated`).catch(() => 0)),
-        strategyEvaluatedReal: toNumber(await client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0)),
-        indicationEvaluatedDirection: indicationDirectionCount,
-        indicationEvaluatedMove: indicationMoveCount,
-        indicationEvaluatedActive: indicationActiveCount,
-        indicationEvaluatedOptimal: indicationOptimalCount,
-        prehistoricSymbolsProcessed: toNumber(engineState?.config_set_symbols_processed),
-        prehistoricCandlesProcessed: toNumber(engineState?.config_set_candles_processed),
-        prehistoricSymbolsProcessedCount: toNumber(prehistoricSymbolsSet || engineState?.config_set_symbols_processed),
-        prehistoricDataSize: toNumber(prehistoricDataKeys),
-        setsBaseCount: toNumber(baseSetCount),
-        setsMainCount: toNumber(mainSetCount),
-        setsRealCount: toNumber(realSetCount),
-        setsTotalCount: toNumber(baseSetCount + mainSetCount + realSetCount),
-        redisDbEntries: toNumber(redisDbSize),
+        realtimeCycleCount: sanitizeNonNegative(engineState?.realtime_cycle_count),
+        cycleTimeMs: sanitizeNonNegative(engineState?.last_cycle_duration),
+        intervalsProcessed: sanitizeNonNegative(await client.get(`intervals:${connectionId}:processed_count`).catch(() => 0)),
+        indicationsCount: sanitizeNonNegative(await client.get(`indications:${connectionId}:count`).catch(() => 0)),
+        strategiesCount: sanitizeNonNegative(await client.get(`strategies:${connectionId}:count`).catch(() => 0)),
+        strategyEvaluatedBase: sanitizeNonNegative(await client.get(`strategies:${connectionId}:base:evaluated`).catch(() => 0)),
+        strategyEvaluatedMain: sanitizeNonNegative(await client.get(`strategies:${connectionId}:main:evaluated`).catch(() => 0)),
+        strategyEvaluatedReal: sanitizeNonNegative(await client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0)),
+        indicationEvaluatedDirection: sanitizeNonNegative(indicationDirectionCount),
+        indicationEvaluatedMove: sanitizeNonNegative(indicationMoveCount),
+        indicationEvaluatedActive: sanitizeNonNegative(indicationActiveCount),
+        indicationEvaluatedOptimal: sanitizeNonNegative(indicationOptimalCount),
+        prehistoricSymbolsProcessed: sanitizeNonNegative(engineState?.config_set_symbols_processed),
+        prehistoricCandlesProcessed: sanitizeNonNegative(engineState?.config_set_candles_processed),
+        prehistoricSymbolsProcessedCount: sanitizeNonNegative(prehistoricSymbolsSet || engineState?.config_set_symbols_processed),
+        prehistoricDataSize: sanitizeNonNegative(prehistoricDataKeys),
+        setsBaseCount: sanitizeNonNegative(baseSetCount),
+        setsMainCount: sanitizeNonNegative(mainSetCount),
+        setsRealCount: sanitizeNonNegative(realSetCount),
+        setsTotalCount: sanitizeNonNegative(baseSetCount + mainSetCount + realSetCount),
+        redisDbEntries: sanitizeNonNegative(redisDbSize),
         redisDbSizeMb: Number(dbSizeMb.toFixed(2)),
+        processingCompleteness: {
+          prehistoricLoaded: !!(engineState?.prehistoric_data_loaded === true || engineState?.prehistoric_data_loaded === "1"),
+          indicationsRunning: sanitizeNonNegative(engineState?.indication_cycle_count) > 0,
+          strategiesRunning: sanitizeNonNegative(engineState?.strategy_cycle_count) > 0,
+          realtimeRunning: sanitizeNonNegative(engineState?.realtime_cycle_count) > 0,
+          hasErrors: sanitizeNonNegative(engineState?.config_set_errors) > 0,
+        },
       },
       enginePhase: engineProgression ? {
         phase: engineProgression.phase,
