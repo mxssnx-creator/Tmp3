@@ -32,7 +32,6 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
     loadingRef.current = true
     setIsLoading(true)
     try {
-      console.log("[v0] [Exchange Context] Loading Main Connections...")
       const response = await fetch("/api/settings/connections", {
         cache: "no-store",
         headers: { "Cache-Control": "no-cache" },
@@ -41,21 +40,27 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
         const data = await response.json()
         const connections = data.connections || []
         
+        const BASE_EXCHANGES = ["bybit", "bingx"]
+        const toBoolean = (v: unknown) => v === true || v === 1 || v === "1" || v === "true"
+        
         const mainConnections = connections.filter((c: any) => {
-          return c.is_active_inserted === "1" || c.is_active_inserted === true || c.is_dashboard_inserted === "1" || c.is_dashboard_inserted === true
+          const exchange = (c.exchange || "").toLowerCase().trim()
+          const isBase = BASE_EXCHANGES.includes(exchange)
+          const isInserted = toBoolean(c.is_active_inserted) || toBoolean(c.is_dashboard_inserted)
+          const isDashboardActive = toBoolean(c.is_enabled_dashboard)
+          return isBase || isInserted || isDashboardActive
         })
         
         setActiveConnections(mainConnections)
-        console.log("[v0] [Exchange Context] Loaded", mainConnections.length, "Main Connections")
         
-        if (mainConnections.length > 0) {
+        if (mainConnections.length > 0 && !selectedConnectionId) {
           const firstConnection = mainConnections[0]
-          setSelectedConnectionId((prev) => prev || firstConnection.id)
-          setSelectedExchange((prev) => prev || firstConnection.exchange || null)
+          setSelectedConnectionId(firstConnection.id)
+          setSelectedExchange(firstConnection.exchange || null)
         }
       }
     } catch (error) {
-      console.error("[v0] [Exchange Context] Failed to load connections:", error)
+      console.error("[ExchangeContext] Failed to load connections:", error)
     } finally {
       loadingRef.current = false
       setIsLoading(false)

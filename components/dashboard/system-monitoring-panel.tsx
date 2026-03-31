@@ -5,7 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
-import { AlertCircle, Activity, Database, RotateCw, Cpu, HardDrive, Server, Gauge } from "lucide-react"
+import { AlertCircle, Activity, Database, RotateCw, Cpu, HardDrive, Server, Gauge, Zap } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
 
 interface SystemMonitor {
@@ -31,6 +31,18 @@ interface SystemMonitor {
     sets: number
     positions1h: number
     entries1h: number
+  }
+  engines?: {
+    indications: {
+      running: boolean
+      cycleCount: number
+      resultsCount: number
+    }
+    strategies: {
+      running: boolean
+      cycleCount: number
+      resultsCount: number
+    }
   }
 }
 
@@ -83,6 +95,18 @@ export function SystemMonitoringPanel() {
       positions1h: toNumber(raw?.database?.positions1h, 0),
       entries1h: toNumber(raw?.database?.entries1h, 0),
     },
+    engines: raw?.engines ? {
+      indications: {
+        running: toBoolean(raw.engines?.indications?.running),
+        cycleCount: toNumber(raw.engines?.indications?.cycleCount, 0),
+        resultsCount: toNumber(raw.engines?.indications?.resultsCount, 0),
+      },
+      strategies: {
+        running: toBoolean(raw.engines?.strategies?.running),
+        cycleCount: toNumber(raw.engines?.strategies?.cycleCount, 0),
+        resultsCount: toNumber(raw.engines?.strategies?.resultsCount, 0),
+      },
+    } : undefined,
   })
 
   const loadMonitoring = async () => {
@@ -321,6 +345,67 @@ export function SystemMonitoringPanel() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Engines Status */}
+      {monitor.engines && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm font-medium flex items-center gap-2">
+                <Zap className="h-4 w-4" />
+                Indications Engine
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              <div className="flex items-center justify-between p-2 bg-secondary/50 rounded">
+                <div className="flex items-center gap-2">
+                  <div className={`h-2 w-2 rounded-full ${monitor.engines.indications.running ? "bg-green-500" : "bg-red-500"}`}></div>
+                  <span className="text-sm font-medium">Status</span>
+                </div>
+                <Badge variant={monitor.engines.indications.running ? "outline" : "destructive"} className="text-xs">
+                  {monitor.engines.indications.running ? "Running" : "Stopped"}
+                </Badge>
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">Cycles</span>
+                <span className="font-medium">{monitor.engines.indications.cycleCount}</span>
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">Results</span>
+                <span className="font-medium">{monitor.engines.indications.resultsCount}</span>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm font-medium flex items-center gap-2">
+                <Activity className="h-4 w-4" />
+                Strategies Engine
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              <div className="flex items-center justify-between p-2 bg-secondary/50 rounded">
+                <div className="flex items-center gap-2">
+                  <div className={`h-2 w-2 rounded-full ${monitor.engines.strategies.running ? "bg-green-500" : "bg-red-500"}`}></div>
+                  <span className="text-sm font-medium">Status</span>
+                </div>
+                <Badge variant={monitor.engines.strategies.running ? "outline" : "destructive"} className="text-xs">
+                  {monitor.engines.strategies.running ? "Running" : "Stopped"}
+                </Badge>
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">Cycles</span>
+                <span className="font-medium">{monitor.engines.strategies.cycleCount}</span>
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">Results</span>
+                <span className="font-medium">{monitor.engines.strategies.resultsCount}</span>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
 
       {/* Alert if critical */}
       {(monitor.cpu > 90 || monitor.memory > 90) && (

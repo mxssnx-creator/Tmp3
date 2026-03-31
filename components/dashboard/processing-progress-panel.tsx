@@ -62,9 +62,24 @@ export function ProcessingProgressPanel({ connectionId }: ProcessingProgressPane
     return (
       <Card className="bg-gradient-to-br from-slate-900 to-slate-800 border-slate-700">
         <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium text-slate-300">Processing Progress</CardTitle>
+          <CardTitle className="text-sm font-medium text-slate-300 flex items-center gap-2">
+            <Activity className="w-4 h-4" />
+            Processing Progress
+          </CardTitle>
         </CardHeader>
-        <CardContent className="text-xs text-red-400">{error || 'No metrics available'}</CardContent>
+        <CardContent className="space-y-2">
+          <div className="text-xs text-slate-400">
+            {error ? `Error: ${error}` : 'No processing data yet. Start the engine and enable a connection to see progress.'}
+          </div>
+          {['Prehistoric', 'Realtime', 'Indication', 'Strategy'].map((phase) => (
+            <div key={phase} className="flex items-center justify-between p-2 rounded bg-slate-800/50">
+              <span className="text-xs text-slate-400">{phase}</span>
+              <Badge variant="outline" className="text-[10px] py-0 bg-slate-700 text-slate-400 border-slate-600">
+                idle
+              </Badge>
+            </div>
+          ))}
+        </CardContent>
       </Card>
     )
   }
