@@ -48,22 +48,33 @@ export function SystemMonitoringPanel() {
     return fallback
   }
 
+  const toBoolean = (value: unknown): boolean => {
+    if (typeof value === "boolean") return value
+    if (typeof value === "number") return value === 1
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase()
+      if (["true", "1", "yes", "on", "online", "running", "active", "healthy"].includes(normalized)) return true
+      if (["false", "0", "no", "off", "offline", "stopped", "inactive", "down", "error"].includes(normalized)) return false
+    }
+    return false
+  }
+
   const normalizeMonitorPayload = (raw: any): SystemMonitor => ({
     cpu: toNumber(raw?.cpu, 0),
     memory: toNumber(raw?.memory, 0),
     memoryUsed: toNumber(raw?.memoryUsed, 0),
     memoryTotal: Math.max(toNumber(raw?.memoryTotal, 1), 1),
     services: {
-      tradeEngine: !!raw?.services?.tradeEngine,
-      indicationsEngine: !!raw?.services?.indicationsEngine,
-      strategiesEngine: !!raw?.services?.strategiesEngine,
-      websocket: !!raw?.services?.websocket,
+      tradeEngine: toBoolean(raw?.services?.tradeEngine),
+      indicationsEngine: toBoolean(raw?.services?.indicationsEngine),
+      strategiesEngine: toBoolean(raw?.services?.strategiesEngine),
+      websocket: toBoolean(raw?.services?.websocket),
     },
     modules: {
-      redis: !!raw?.modules?.redis,
-      persistence: !!raw?.modules?.persistence,
-      coordinator: !!raw?.modules?.coordinator,
-      logger: !!raw?.modules?.logger,
+      redis: toBoolean(raw?.modules?.redis),
+      persistence: toBoolean(raw?.modules?.persistence),
+      coordinator: toBoolean(raw?.modules?.coordinator),
+      logger: toBoolean(raw?.modules?.logger),
     },
     database: {
       size: toNumber(raw?.database?.size, 0),

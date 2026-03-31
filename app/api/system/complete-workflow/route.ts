@@ -108,7 +108,7 @@ export async function GET() {
               "Monitor logs in the progression panel"
             ],
             expected: "✓ Engine processes market data, indications, strategies",
-            endpoint: "PUT /api/settings/connections/{id}/toggle-dashboard",
+            endpoint: "POST /api/settings/connections/{id}/toggle-dashboard",
             processing: {
               phase1: "Market Data Collection (1-2 seconds)",
               phase2: "Historical Data Analysis (3-5 seconds)",
@@ -143,7 +143,7 @@ export async function GET() {
               retry: "3 attempts, 1 second interval, 30 second timeout"
             },
             toggleDashboard: {
-              method: "PUT",
+              method: "POST",
               path: "/api/settings/connections/{id}/toggle-dashboard",
               description: "Enable/disable connection on dashboard (starts engine processing)",
               effect: "Sets is_enabled_dashboard, triggers engine lifecycle"

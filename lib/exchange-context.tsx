@@ -48,9 +48,10 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
         setActiveConnections(mainConnections)
         console.log("[v0] [Exchange Context] Loaded", mainConnections.length, "Main Connections")
         
-        if (mainConnections.length > 0 && !selectedConnectionId) {
-          setSelectedConnectionId(mainConnections[0].id)
-          setSelectedExchange(mainConnections[0].exchange || null)
+        if (mainConnections.length > 0) {
+          const firstConnection = mainConnections[0]
+          setSelectedConnectionId((prev) => prev || firstConnection.id)
+          setSelectedExchange((prev) => prev || firstConnection.exchange || null)
         }
       }
     } catch (error) {
@@ -60,6 +61,7 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
       setIsLoading(false)
       lastLoadRef.current = Date.now()
     }
+  }, [])
   }, [selectedConnectionId])
 
   // Only load on mount, remove interval to prevent loops

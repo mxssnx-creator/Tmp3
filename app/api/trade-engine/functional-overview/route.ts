@@ -1,5 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { initRedis, getRedisClient, getAllConnections, getSettings } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getAllConnections, getSettings, getAssignedAndEnabledConnections } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
@@ -20,10 +20,7 @@ export async function GET() {
 
     // Get active symbols count
     const allConnections = await getAllConnections()
-    const enabledConnections = allConnections.filter(c => 
-      (c.is_enabled === "1" || c.is_enabled === true) &&
-      (c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true)
-    )
+    const enabledConnections = await getAssignedAndEnabledConnections()
     
     // Get main engine config to find how many symbols are configured
     const mainConfigKey = await client.hgetall("trade_engine:main_config")
@@ -63,35 +60,45 @@ export async function GET() {
           totalStrategiesEvaluated += progression.successfulCycles || 0
         }
         
-        // Check for strategy sets per connection (check for common symbols)
+        const parseSetCount = (raw: string | null): number => {
+          if (!raw) return 0
+          try {
+            const data = JSON.parse(raw)
+            if (Array.isArray(data)) return data.length
+            if (typeof data?.count === "number") return data.count
+            if (Array.isArray(data?.strategies)) return data.strategies.length
+            if (Array.isArray(data?.entries)) return data.entries.length
+            return 0
+          } catch {
+            return 0
+          }
+        }
+
+        // Check for strategy sets per connection (common symbols + both key families)
         const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         for (const symbol of symbols) {
-          const baseKey = `strategies:${conn.id}:${symbol}:base`
-          const mainKey = `strategies:${conn.id}:${symbol}:main`
-          const realKey = `strategies:${conn.id}:${symbol}:real`
-          const liveKey = `strategies:${conn.id}:${symbol}:live`
-          
-          const baseJson = await client.get(baseKey)
-          const mainJson = await client.get(mainKey)
-          const realJson = await client.get(realKey)
-          const liveJson = await client.get(liveKey)
-          
-          if (baseJson) {
-            const data = JSON.parse(baseJson)
-            baseSetsCount += data.count || data.strategies?.length || 0
+          const keys = {
+            base: [`strategies:${conn.id}:${symbol}:base`, `strategy_set:${conn.id}:${symbol}:base`],
+            main: [`strategies:${conn.id}:${symbol}:main`, `strategy_set:${conn.id}:${symbol}:main`],
+            real: [`strategies:${conn.id}:${symbol}:real`, `strategy_set:${conn.id}:${symbol}:real`],
+            live: [`strategies:${conn.id}:${symbol}:live`, `strategy_set:${conn.id}:${symbol}:live`],
           }
-          if (mainJson) {
-            const data = JSON.parse(mainJson)
-            mainSetsCount += data.count || data.strategies?.length || 0
-          }
-          if (realJson) {
-            const data = JSON.parse(realJson)
-            realSetsCount += data.count || data.strategies?.length || 0
-          }
-          if (liveJson) {
-            const data = JSON.parse(liveJson)
-            liveSetsCount += data.count || data.strategies?.length || 0
-          }
+
+          const [baseJsonA, baseJsonB, mainJsonA, mainJsonB, realJsonA, realJsonB, liveJsonA, liveJsonB] = await Promise.all([
+            client.get(keys.base[0]),
+            client.get(keys.base[1]),
+            client.get(keys.main[0]),
+            client.get(keys.main[1]),
+            client.get(keys.real[0]),
+            client.get(keys.real[1]),
+            client.get(keys.live[0]),
+            client.get(keys.live[1]),
+          ])
+
+          baseSetsCount += parseSetCount(baseJsonA) || parseSetCount(baseJsonB)
+          mainSetsCount += parseSetCount(mainJsonA) || parseSetCount(mainJsonB)
+          realSetsCount += parseSetCount(realJsonA) || parseSetCount(realJsonB)
+          liveSetsCount += parseSetCount(liveJsonA) || parseSetCount(liveJsonB)
         }
       } catch (e) {
         // Ignore per-connection errors
@@ -116,6 +123,7 @@ export async function GET() {
       liveSetsCreated: liveSetsCount > 0,
       positionsEntriesCreated: positionsCount,
       enabledConnections: enabledConnections.length,
+      totalConnections: allConnections.length,
       persistenceKeys: persistenceKeys.length,
       // Detailed counts
       counts: {

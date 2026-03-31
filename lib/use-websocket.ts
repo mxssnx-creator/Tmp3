@@ -41,13 +41,19 @@ export interface IndicationUpdate {
 }
 
 export function useRealTime(connectionId: string) {
-  const sseClientRef = useRef(getSSEClient(connectionId))
+  const sseClientRef = useRef<ReturnType<typeof getSSEClient> | null>(null)
   const [isConnected, setIsConnected] = useState(false)
   const [connectionError, setConnectionError] = useState<string | null>(null)
 
   // Initialize SSE connection
   useEffect(() => {
-    const sseClient = sseClientRef.current
+    if (!connectionId) {
+      setIsConnected(false)
+      return
+    }
+
+    const sseClient = getSSEClient(connectionId)
+    sseClientRef.current = sseClient
 
     const handleError = (error: any) => {
       setConnectionError(error.message || 'Connection error occurred')
@@ -75,12 +81,16 @@ export function useRealTime(connectionId: string) {
     return () => {
       // Clean up on unmount
       sseClient.disconnect()
+      sseClientRef.current = null
     }
   }, [connectionId])
 
   const subscribe = useCallback(
     (eventType: RealTimeEventType, callback: (data: any) => void) => {
       const sseClient = sseClientRef.current
+      if (!sseClient) {
+        return () => {}
+      }
       return sseClient.subscribe(eventType, callback)
     },
     []

@@ -261,40 +261,68 @@ async function loadSingleSymbolTimeframe(
 
     const client = getRedisClient()
     const dataKey = `market_data:${connectionId}:${symbol}:${timeframe}`
+    let totalRecordCount = 0
+    const loadedRanges: Array<{ startDate: string; endDate: string; recordCount: number }> = []
 
-    // Simulate/fetch market data
-    // In production, this would call the exchange connector
-    const recordCount = Math.floor(Math.random() * 1000) + 100 // Placeholder
+    // Load only missing ranges for high-performance incremental sync.
+    for (const range of syncStatus.missingRanges) {
+      const rangeMs = Math.max(0, range.end.getTime() - range.start.getTime())
+      const minutes = Math.max(1, Math.floor(rangeMs / (60 * 1000)))
 
-    // Store data in Redis
-    await client.set(dataKey, JSON.stringify({
-      symbol,
-      timeframe,
-      startDate: startDate.toISOString(),
-      endDate: endDate.toISOString(),
-      recordCount,
-      loadedAt: new Date().toISOString(),
-    }))
+      // Simulate/fetch market data for this specific range
+      // In production, this would call the exchange connector with explicit start/end.
+      const rangeRecordCount = Math.max(10, Math.floor(minutes * 0.7))
+      totalRecordCount += rangeRecordCount
+      loadedRanges.push({
+        startDate: range.start.toISOString(),
+        endDate: range.end.toISOString(),
+        recordCount: rangeRecordCount,
+      })
 
-    // Mark as synced
-    await DataSyncManager.logSync(
-      connectionId,
-      symbol,
-      "market_data",
-      startDate,
-      endDate,
-      recordCount,
-      "success",
+      await DataSyncManager.logSync(
+        connectionId,
+        symbol,
+        "market_data",
+        range.start,
+        range.end,
+        rangeRecordCount,
+        "success",
+      )
+    }
+
+    const existingPayloadRaw = await client.get(dataKey)
+    let existingPayload: any = null
+    if (existingPayloadRaw) {
+      try {
+        existingPayload = JSON.parse(existingPayloadRaw)
+      } catch {
+        existingPayload = null
+      }
+    }
+
+    // Store merged metadata so consumers can reason about partial backfills.
+    await client.set(
+      dataKey,
+      JSON.stringify({
+        symbol,
+        timeframe,
+        requestedStartDate: startDate.toISOString(),
+        requestedEndDate: endDate.toISOString(),
+        loadedRanges: [...(existingPayload?.loadedRanges || []), ...loadedRanges],
+        recordCount: (existingPayload?.recordCount || 0) + totalRecordCount,
+        loadedAt: new Date().toISOString(),
+      }),
     )
 
-    logForVercel("INFO", "SymbolDataLoader", `Loaded ${recordCount} records for ${symbol} at ${timeframe}`, {
+    logForVercel("INFO", "SymbolDataLoader", `Loaded ${totalRecordCount} records for ${symbol} at ${timeframe}`, {
       symbol,
       timeframe,
-      recordCount,
+      recordCount: totalRecordCount,
+      missingRangesCount: syncStatus.missingRanges.length,
       range: `${startDate.toISOString()} to ${endDate.toISOString()}`,
     })
 
-    return { success: true, recordCount }
+    return { success: true, recordCount: totalRecordCount }
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error)
 

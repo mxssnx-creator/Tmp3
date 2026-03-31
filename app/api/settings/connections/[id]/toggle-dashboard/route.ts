@@ -288,3 +288,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     )
   }
 }
+
+
+// Backward compatibility: accept PUT as alias for POST
+export async function PUT(request: NextRequest, context: { params: Promise<{ id: string }> }) {
+  return POST(request, context)
+}

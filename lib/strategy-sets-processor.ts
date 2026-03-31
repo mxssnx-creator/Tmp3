@@ -20,9 +20,9 @@ async function getCachedClient() {
 
 // Default limits per strategy type (independently configurable)
 const DEFAULT_LIMITS = {
-  base: 500,
-  main: 500,
-  real: 500,
+  base: 900,
+  main: 300,
+  real: 120,
   live: 500,
 }
 
@@ -72,10 +72,15 @@ export class StrategySetsProcessor {
         if (settings.main) this.limits.main = Number(settings.main)
         if (settings.real) this.limits.real = Number(settings.real)
         if (settings.live) this.limits.live = Number(settings.live)
-        // Fallback: legacy maxEntriesPerSet applies to all
+        // Fallback: legacy maxEntriesPerSet applies weighted by type.
         if (settings.maxEntriesPerSet && !settings.base) {
           const limit = Number(settings.maxEntriesPerSet)
-          this.limits = { base: limit, main: limit, real: limit, live: limit }
+          this.limits = {
+            base: Math.max(300, Math.round(limit * 1.8)),
+            main: Math.max(120, Math.round(limit * 0.8)),
+            real: Math.max(60, Math.round(limit * 0.35)),
+            live: Math.max(120, limit),
+          }
         }
       }
     } catch (error) {
@@ -139,10 +144,10 @@ export class StrategySetsProcessor {
     for (const indication of indications) {
       try {
         total++
-        // Base: Only highest confidence indications (>0.8) with profit factor > 1.5
-        if (indication.confidence > 0.8 && indication.profitFactor > 1.5) {
+        // Base: broad intake (must be much higher volume than main/real)
+        if (indication.confidence > 0.45 && indication.profitFactor > 0.9) {
           const strategy = {
-            profitFactor: indication.profitFactor * 0.9, // Conservative discount
+            profitFactor: indication.profitFactor * 0.95,
             confidence: indication.confidence,
             metadata: { ...indication.metadata, strategyType: "base", riskLevel: "low" },
           }
@@ -171,8 +176,8 @@ export class StrategySetsProcessor {
     for (const indication of indications) {
       try {
         total++
-        // Main: Confidence >0.6 with profit factor > 1.2
-        if (indication.confidence > 0.6 && indication.profitFactor > 1.2) {
+        // Main: stricter than base
+        if (indication.confidence > 0.62 && indication.profitFactor > 1.2) {
           const strategy = {
             profitFactor: indication.profitFactor,
             confidence: indication.confidence,
@@ -203,8 +208,8 @@ export class StrategySetsProcessor {
     for (const indication of indications) {
       try {
         total++
-        // Real: Confidence >0.5 with profit factor > 1.0
-        if (indication.confidence > 0.5 && indication.profitFactor > 1.0) {
+        // Real: strictest (must remain less than main volume)
+        if (indication.confidence > 0.78 && indication.profitFactor > 1.45) {
           const strategy = {
             profitFactor: indication.profitFactor * 1.1, // Aggressive multiplier
             confidence: indication.confidence,

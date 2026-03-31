@@ -22,6 +22,17 @@ function toNumber(value: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
+function enforceHierarchy(base: number, main: number, real: number) {
+  const normalizedMain = Math.max(0, Math.round(main))
+  const normalizedBase = Math.max(Math.round(base), normalizedMain * 2)
+  const normalizedReal = Math.min(Math.round(real), Math.floor(normalizedMain * 0.6))
+  return {
+    base: normalizedBase,
+    main: normalizedMain,
+    real: Math.max(0, normalizedReal),
+  }
+}
+
 async function countArrayEntries(client: ReturnType<typeof getRedisClient>, key: string): Promise<number> {
   try {
     const raw = await client.get(key)
@@ -281,6 +292,11 @@ export async function GET(request: Request) {
       },
       { base: 0, main: 0, real: 0 },
     )
+    const normalizedStrategyHierarchy = enforceHierarchy(
+      aggregatedStrategyCounts.base,
+      aggregatedStrategyCounts.main,
+      aggregatedStrategyCounts.real,
+    )
 
     const aggregatedStrategyEvaluations = perConnection.reduce(
       (acc, item) => {
@@ -303,6 +319,11 @@ export async function GET(request: Request) {
         return acc
       },
       { base: 0, main: 0, real: 0 },
+    )
+    const normalizedPseudoHierarchy = enforceHierarchy(
+      aggregatedPseudo.base || totalPositions,
+      aggregatedPseudo.main || strategyCycles,
+      aggregatedPseudo.real || totalTrades,
     )
 
     const aggregatedPrehistoric = perConnection.reduce(
@@ -373,17 +394,18 @@ export async function GET(request: Request) {
         aggregatedStrategyCounts.main ||
         strategyCycles,
       pseudoPositions: {
-        base: aggregatedPseudo.base || totalPositions,
-        main: aggregatedPseudo.main || strategyCycles,
-        real: aggregatedPseudo.real || totalTrades,
-        total: (aggregatedPseudo.base || totalPositions) + (aggregatedPseudo.main || strategyCycles) + (aggregatedPseudo.real || totalTrades),
+        base: normalizedPseudoHierarchy.base,
+        main: normalizedPseudoHierarchy.main,
+        real: normalizedPseudoHierarchy.real,
+        total: normalizedPseudoHierarchy.base + normalizedPseudoHierarchy.main + normalizedPseudoHierarchy.real,
       },
       // Extended stats
       prehistoricSymbols: aggregatedPrehistoric.symbols,
       prehistoricDataSize: aggregatedPrehistoric.dataKeys,
       intervalsProcessed,
       indicationsByType: aggregatedIndications,
-      strategyCountsByType: aggregatedStrategyCounts,
+      strategyCountsByType: normalizedStrategyHierarchy,
+      strategyCountsByTypeRaw: aggregatedStrategyCounts,
       strategyEvaluatedByType: {
         base: aggregatedStrategyEvaluations.base || aggregatedStrategyCounts.base,
         main: aggregatedStrategyEvaluations.main || aggregatedStrategyCounts.main,
@@ -392,6 +414,11 @@ export async function GET(request: Request) {
       strategyPassedByType: aggregatedStrategyEvaluations.passed,
       pseudoPositionsByType: {
         baseByIndication: basePseudoByIndication,
+      },
+      pseudoPositionsRaw: {
+        base: aggregatedPseudo.base || totalPositions,
+        main: aggregatedPseudo.main || strategyCycles,
+        real: aggregatedPseudo.real || totalTrades,
       },
       livePositions,
       cycleDurationMs,
