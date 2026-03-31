@@ -20,49 +20,39 @@ interface Props {
 export default function ChatMessageComponent({ message }: Props) {
   const [expanded, setExpanded] = useState(false);
 
-  const typeColors = {
-    info: "border-blue-400/20 bg-blue-400/10 text-blue-200",
-    warning: "border-yellow-400/20 bg-yellow-400/10 text-yellow-200",
-    error: "border-red-400/20 bg-red-400/10 text-red-200",
-    success: "border-green-400/20 bg-green-400/10 text-green-200",
+  const typeDots = {
+    info: "bg-blue-400",
+    warning: "bg-yellow-400",
+    error: "bg-red-400",
+    success: "bg-green-400",
   };
 
   return (
-    <div className={`rounded-2xl border ${typeColors[message.type]} p-4 transition-all duration-200`}>
-      <div className="flex items-start justify-between">
-        <div className="flex-1">
-          <div className="flex items-center gap-2 mb-2">
-            <span className="text-sm font-medium text-slate-300">{message.sender}</span>
-            <span className="text-xs text-slate-400">{message.timestamp.toLocaleTimeString()}</span>
-            <span className={`text-xs px-2 py-1 rounded-full ${typeColors[message.type]} uppercase`}>
-              {message.type}
-            </span>
-          </div>
-          <p className="text-sm text-white mb-2">{message.summary}</p>
-          {expanded && (
-            <div className="mt-3 pt-3 border-t border-white/10">
-              <p className="text-sm text-slate-300 leading-relaxed">{message.content}</p>
-              {message.related && message.related.length > 0 && (
-                <div className="mt-3">
-                  <p className="text-xs text-slate-400 mb-2">Related items:</p>
-                  <div className="flex flex-wrap gap-2">
-                    {message.related.map((item, index) => (
-                      <span key={index} className="text-xs px-2 py-1 bg-white/5 rounded text-slate-300">
-                        {item}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
+    <div className="flex items-start gap-2 px-2 py-1.5 rounded hover:bg-white/5 transition-colors cursor-pointer" onClick={() => setExpanded(!expanded)}>
+      <span className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 ${typeDots[message.type]}`} />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-1.5">
+          <span className="text-[11px] font-medium text-slate-300 truncate">{message.sender}</span>
+          <span className="text-[10px] text-slate-500">{message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+          <span className="ml-auto shrink-0">
+            {expanded ? <ChevronDown className="w-3 h-3 text-slate-500" /> : <ChevronRight className="w-3 h-3 text-slate-500" />}
+          </span>
         </div>
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className="ml-3 p-1 rounded-lg hover:bg-white/10 transition-colors"
-        >
-          {expanded ? <ChevronDown className="w-4 h-4 text-slate-400" /> : <ChevronRight className="w-4 h-4 text-slate-400" />}
-        </button>
+        <p className="text-[11px] text-slate-300 truncate">{message.summary}</p>
+        {expanded && (
+          <div className="mt-1.5 pt-1.5 border-t border-white/5">
+            <p className="text-xs text-slate-400 leading-relaxed">{message.content}</p>
+            {message.related && message.related.length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-1.5">
+                {message.related.map((item, index) => (
+                  <span key={index} className="text-[10px] px-1.5 py-0.5 bg-white/5 rounded text-slate-400">
+                    {item}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
