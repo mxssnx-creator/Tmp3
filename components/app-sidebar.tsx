@@ -34,6 +34,7 @@ import {
 } from "@/components/ui/sidebar"
 import { ThemeSwitcher } from "@/components/theme-switcher"
 import { StyleSwitcher } from "@/components/style-switcher"
+import { ExchangeSelectorTop } from "@/components/exchange-selector-top"
 import { useAuth } from "@/lib/auth-context"
 import { Button } from "@/components/ui/button"
 import type React from "react"
@@ -158,7 +159,7 @@ export function AppSidebar() {
 
         </div>
       </SidebarHeader>
-      <SidebarContent>
+      <SidebarContent className="overflow-x-hidden">
         <SidebarGroup>
           <SidebarGroupLabel className="text-xs">Navigation</SidebarGroupLabel>
           <SidebarGroupContent>
@@ -222,7 +223,11 @@ export function AppSidebar() {
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
-      <SidebarFooter className="border-t border-sidebar-border p-1.5 space-y-2">
+      <SidebarFooter className="space-y-2 border-t border-sidebar-border p-1.5">
+        <div className="px-1 pb-1 group-data-[collapsible=icon]:hidden">
+          <p className="mb-1 text-[10px] text-muted-foreground">Active exchange</p>
+          <ExchangeSelectorTop />
+        </div>
         {user && (
           <div className="px-2 py-1 group-data-[collapsible=icon]:hidden">
             <p className="text-xs font-medium truncate">{user.username}</p>
