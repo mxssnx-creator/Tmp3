@@ -3,10 +3,8 @@ export const dynamic = "force-dynamic"
 
 
 import { useEffect, useState } from "react"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Download, MessageSquare, User, Bot, Calendar, FileText } from "lucide-react"
+import { Download } from "lucide-react"
 import type { ChatHistoryStats } from "@/lib/additional/chat-history"
 
 export default function ChatHistoryPage() {
@@ -51,131 +49,50 @@ export default function ChatHistoryPage() {
   }
 
   return (
-    <div className="flex-1 space-y-4 p-4 md:p-8 pt-6">
-      <div className="flex items-center justify-between space-y-2">
-        <h2 className="text-3xl font-bold tracking-tight">Chat History</h2>
+    <div className="flex-1 space-y-3 p-4 pt-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-bold tracking-tight">Chat History</h2>
+        <div className="flex gap-1 text-xs text-muted-foreground">
+          <Download className="h-3 w-3" />
+          <span>{loading ? "..." : stats?.totalMessages || 0} msgs</span>
+        </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Total Messages</CardTitle>
-            <MessageSquare className="h-4 w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{loading ? "..." : stats?.totalMessages || 0}</div>
-            <p className="text-xs text-muted-foreground">Last 30 days</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">User Inputs</CardTitle>
-            <User className="h-4 w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{loading ? "..." : stats?.userMessages || 0}</div>
-            <p className="text-xs text-muted-foreground">Your messages</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Assistant Outputs</CardTitle>
-            <Bot className="h-4 w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{loading ? "..." : stats?.assistantMessages || 0}</div>
-            <p className="text-xs text-muted-foreground">AI responses</p>
-          </CardContent>
-        </Card>
+      <div className="grid gap-2 grid-cols-3">
+        <div className="rounded-md border px-3 py-2">
+          <div className="text-xs text-muted-foreground">Total</div>
+          <div className="text-lg font-bold">{loading ? "..." : stats?.totalMessages || 0}</div>
+        </div>
+        <div className="rounded-md border px-3 py-2">
+          <div className="text-xs text-muted-foreground">Inputs</div>
+          <div className="text-lg font-bold">{loading ? "..." : stats?.userMessages || 0}</div>
+        </div>
+        <div className="rounded-md border px-3 py-2">
+          <div className="text-xs text-muted-foreground">Outputs</div>
+          <div className="text-lg font-bold">{loading ? "..." : stats?.assistantMessages || 0}</div>
+        </div>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Export Conversation History</CardTitle>
-          <CardDescription>Download chat messages in different formats</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Tabs defaultValue="combined" className="w-full">
-            <TabsList className="grid w-full grid-cols-3">
-              <TabsTrigger value="combined">Combined</TabsTrigger>
-              <TabsTrigger value="input">Inputs Only</TabsTrigger>
-              <TabsTrigger value="output">Outputs Only</TabsTrigger>
-            </TabsList>
-
-            <TabsContent value="combined" className="space-y-4">
-              <div className="rounded-lg border p-4 space-y-2">
-                <div className="flex items-center gap-2">
-                  <FileText className="h-5 w-5 text-muted-foreground" />
-                  <h3 className="font-semibold">Complete Conversation</h3>
-                </div>
-                <p className="text-sm text-muted-foreground">
-                  Download the complete conversation with both user inputs and assistant outputs in chronological order.
-                </p>
-                <Button onClick={() => handleDownload("combined")} className="w-full mt-2">
-                  <Download className="h-4 w-4 mr-2" />
-                  Download Combined History
-                </Button>
-              </div>
-            </TabsContent>
-
-            <TabsContent value="input" className="space-y-4">
-              <div className="rounded-lg border p-4 space-y-2">
-                <div className="flex items-center gap-2">
-                  <User className="h-5 w-5 text-muted-foreground" />
-                  <h3 className="font-semibold">User Input Messages</h3>
-                </div>
-                <p className="text-sm text-muted-foreground">
-                  Download only the messages you sent - useful for reviewing your requests and commands.
-                </p>
-                <Button onClick={() => handleDownload("input")} className="w-full mt-2">
-                  <Download className="h-4 w-4 mr-2" />
-                  Download Input Messages
-                </Button>
-              </div>
-            </TabsContent>
-
-            <TabsContent value="output" className="space-y-4">
-              <div className="rounded-lg border p-4 space-y-2">
-                <div className="flex items-center gap-2">
-                  <Bot className="h-5 w-5 text-muted-foreground" />
-                  <h3 className="font-semibold">Assistant Output Messages</h3>
-                </div>
-                <p className="text-sm text-muted-foreground">
-                  Download only the assistant&apos;s responses - useful for reviewing solutions and documentation.
-                </p>
-                <Button onClick={() => handleDownload("output")} className="w-full mt-2">
-                  <Download className="h-4 w-4 mr-2" />
-                  Download Output Messages
-                </Button>
-              </div>
-            </TabsContent>
-          </Tabs>
-        </CardContent>
-      </Card>
+      <div className="rounded-md border p-3">
+        <div className="text-sm font-medium mb-2">Export</div>
+        <div className="flex gap-2">
+          <Button size="sm" variant="outline" onClick={() => handleDownload("combined")} className="flex-1 text-xs h-8">
+            <Download className="h-3 w-3 mr-1" /> Combined
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => handleDownload("input")} className="flex-1 text-xs h-8">
+            <Download className="h-3 w-3 mr-1" /> Inputs
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => handleDownload("output")} className="flex-1 text-xs h-8">
+            <Download className="h-3 w-3 mr-1" /> Outputs
+          </Button>
+        </div>
+      </div>
 
       {stats && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Calendar className="h-5 w-5" />
-              Date Range
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid gap-2 text-sm">
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">First Message:</span>
-                <span className="font-mono">{new Date(stats.dateRange.start).toLocaleString()}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-muted-foreground">Latest Message:</span>
-                <span className="font-mono">{new Date(stats.dateRange.end).toLocaleString()}</span>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+        <div className="rounded-md border px-3 py-2 flex justify-between text-xs">
+          <span className="text-muted-foreground">Range:</span>
+          <span className="font-mono">{new Date(stats.dateRange.start).toLocaleDateString()} - {new Date(stats.dateRange.end).toLocaleDateString()}</span>
+        </div>
       )}
     </div>
   )
