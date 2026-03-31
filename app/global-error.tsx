@@ -3,7 +3,6 @@
 import { useEffect } from "react"
 import { AlertCircle, RefreshCw, Home } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 
 export default function GlobalError({
   error,
@@ -34,49 +33,54 @@ export default function GlobalError({
 
   return (
     <html lang="en">
-      <body>
-        <div className="flex items-center justify-center min-h-screen p-6 bg-background">
-          <Card className="max-w-2xl w-full border-destructive">
-            <CardHeader>
-              <div className="flex items-center gap-3">
-                <AlertCircle className="h-8 w-8 text-destructive" />
-                <div>
-                  <CardTitle className="text-2xl">Application Error</CardTitle>
-                  <CardDescription>A critical error occurred in the application</CardDescription>
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="bg-muted p-4 rounded-lg">
-                <p className="font-mono text-sm text-destructive">{error.message}</p>
-                {error.digest && (
-                  <p className="font-mono text-xs text-muted-foreground mt-2">Error ID: {error.digest}</p>
-                )}
-              </div>
-
-              {process.env.NODE_ENV === "development" && error.stack && (
-                <details className="text-sm">
-                  <summary className="cursor-pointer font-medium mb-2">Stack Trace</summary>
-                  <pre className="bg-muted p-4 rounded-lg overflow-x-auto text-xs">{error.stack}</pre>
-                </details>
-              )}
-
-              <div className="flex gap-2">
-                <Button onClick={reset} variant="default">
-                  <RefreshCw className="h-4 w-4 mr-2" />
-                  Try Again
-                </Button>
-                <Button onClick={() => (window.location.href = "/")} variant="outline">
-                  <Home className="h-4 w-4 mr-2" />
-                  Go Home
-                </Button>
-              </div>
-
-              <p className="text-sm text-muted-foreground">
-                This error has been logged and will be reviewed by the development team.
+      <body style={{ margin: 0, fontFamily: "system-ui, sans-serif" }}>
+        <div style={{ 
+          minHeight: "100vh", 
+          display: "flex", 
+          alignItems: "center", 
+          justifyContent: "center",
+          padding: "20px",
+          background: "#fff"
+        }}>
+          <div style={{ maxWidth: "600px", width: "100%" }}>
+            <h1 style={{ color: "#dc2626", marginBottom: "10px", display: "flex", alignItems: "center", gap: "8px" }}>
+              <AlertCircle style={{ width: "24px", height: "24px" }} />
+              Application Error
+            </h1>
+            <p style={{ color: "#6b7280", marginBottom: "20px" }}>
+              {error.message}
+            </p>
+            {error.digest && (
+              <p style={{ fontSize: "12px", color: "#9ca3af", marginBottom: "20px" }}>
+                Error ID: {error.digest}
               </p>
-            </CardContent>
-          </Card>
+            )}
+            <div style={{ display: "flex", gap: "10px" }}>
+              <Button onClick={reset}>
+                <RefreshCw style={{ marginRight: "8px", height: "16px" }} />
+                Try Again
+              </Button>
+              <Button onClick={() => (window.location.href = "/")} variant="outline">
+                <Home style={{ marginRight: "8px", height: "16px" }} />
+                Go Home
+              </Button>
+            </div>
+            {process.env.NODE_ENV === "development" && error.stack && (
+              <details style={{ marginTop: "20px" }}>
+                <summary style={{ cursor: "pointer", marginBottom: "10px" }}>Stack Trace</summary>
+                <pre style={{ 
+                  background: "#1f2937", 
+                  color: "#e5e7eb", 
+                  padding: "12px", 
+                  borderRadius: "6px",
+                  overflow: "auto",
+                  fontSize: "12px"
+                }}>
+                  {error.stack}
+                </pre>
+              </details>
+            )}
+          </div>
         </div>
       </body>
     </html>
