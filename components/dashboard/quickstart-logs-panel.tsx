@@ -46,6 +46,17 @@ interface ProgressionState {
   strategyEvaluatedReal?: number
   prehistoricSymbolsProcessedCount?: number
   prehistoricCandlesProcessed?: number
+  prehistoricDataSize?: number
+  indicationEvaluatedDirection?: number
+  indicationEvaluatedMove?: number
+  indicationEvaluatedActive?: number
+  indicationEvaluatedOptimal?: number
+  setsBaseCount?: number
+  setsMainCount?: number
+  setsRealCount?: number
+  setsTotalCount?: number
+  redisDbEntries?: number
+  redisDbSizeMb?: number
 }
 
 export function QuickstartLogsPanel({ connectionId, className = "" }: QuickstartLogsPanelProps) {
@@ -274,6 +285,10 @@ export function QuickstartLogsPanel({ connectionId, className = "" }: Quickstart
                      <div className="text-xs text-muted-foreground">Candles</div>
                    </div>
                    <div>
+                     <div className="font-semibold">{progressionState.prehistoricDataSize || 0}</div>
+                     <div className="text-xs text-muted-foreground">Data Keys</div>
+                   </div>
+                   <div>
                      <div className="font-semibold">{progressionState.strategyEvaluatedBase || 0}</div>
                      <div className="text-xs text-muted-foreground">Base Eval</div>
                    </div>
@@ -288,6 +303,30 @@ export function QuickstartLogsPanel({ connectionId, className = "" }: Quickstart
                  </div>
                </div>
              )}
+
+             {/* Cascading indication/strategy/db overview */}
+             <div className="rounded-lg border bg-background p-3 mb-3">
+               <div className="mb-2 text-xs font-medium text-muted-foreground">Cascading overview (under indications)</div>
+               <div className="flex flex-wrap gap-1 mb-2">
+                 <Badge variant="secondary">Indications</Badge>
+                 <Badge variant="outline">Dir: {progressionState.indicationEvaluatedDirection || 0}</Badge>
+                 <Badge variant="outline">Move: {progressionState.indicationEvaluatedMove || 0}</Badge>
+                 <Badge variant="outline">Active: {progressionState.indicationEvaluatedActive || 0}</Badge>
+                 <Badge variant="outline">Optimal: {progressionState.indicationEvaluatedOptimal || 0}</Badge>
+               </div>
+               <div className="flex flex-wrap gap-1 mb-2">
+                 <Badge variant="secondary">Strategies</Badge>
+                 <Badge variant="outline">Base sets: {progressionState.setsBaseCount || 0}</Badge>
+                 <Badge variant="outline">Main sets: {progressionState.setsMainCount || 0}</Badge>
+                 <Badge variant="outline">Real sets: {progressionState.setsRealCount || 0}</Badge>
+                 <Badge variant="outline">Total sets: {progressionState.setsTotalCount || 0}</Badge>
+               </div>
+               <div className="flex flex-wrap gap-1">
+                 <Badge variant="secondary">Database</Badge>
+                 <Badge variant="outline">Entries: {progressionState.redisDbEntries || 0}</Badge>
+                 <Badge variant="outline">Size: {(progressionState.redisDbSizeMb || 0).toFixed(2)} MB</Badge>
+               </div>
+             </div>
              
              {/* Detailed Logs Section */}
               {loading && logs.length === 0 ? (

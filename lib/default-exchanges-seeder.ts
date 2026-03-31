@@ -100,10 +100,10 @@ export async function ensureDefaultExchangesExist() {
         is_testnet: existing?.is_testnet ?? false,
         is_predefined: existing?.is_predefined ?? true,
         is_inserted: existing?.is_inserted ?? "1",
-        // Startup defaults: all pre-assigned to Main panel and enabled for dashboard
-        is_active_inserted: existing?.is_active_inserted ?? "1",
+        // Keep dashboard assignment stable; do not auto-assign/re-enable on seed.
+        is_active_inserted: existing?.is_active_inserted ?? "0",
         is_enabled: existing?.is_enabled ?? "1",
-        is_enabled_dashboard: existing?.is_enabled_dashboard ?? "1",
+        is_enabled_dashboard: existing?.is_enabled_dashboard ?? "0",
         is_active: existing?.is_active ?? "0",
         created_at: existing?.created_at || now,
         updated_at: now,
