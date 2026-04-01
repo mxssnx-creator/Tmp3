@@ -223,10 +223,6 @@ export function AppSidebar() {
         </SidebarGroup>
       </SidebarContent>
       <SidebarFooter className="space-y-2 border-t border-sidebar-border p-1.5">
-        <div className="px-1 pb-1 group-data-[collapsible=icon]:hidden">
-          <p className="mb-1 text-[10px] text-muted-foreground">Active exchange</p>
-          <ExchangeSelectorTop variant="sidebar" />
-        </div>
         {user && (
           <div className="px-2 py-1 group-data-[collapsible=icon]:hidden">
             <p className="text-xs font-medium truncate">{user.username}</p>
@@ -237,6 +233,9 @@ export function AppSidebar() {
             </Button>
           </div>
         )}
+        <div className="px-1 pb-1 group-data-[collapsible=icon]:hidden">
+          <ExchangeSelectorTop variant="sidebar" />
+        </div>
         <div className="flex items-center justify-between gap-1 group-data-[collapsible=icon]:justify-center">
           <span className="text-[10px] text-muted-foreground group-data-[collapsible=icon]:hidden">Appearance</span>
           <div className="flex items-center gap-1 group-data-[collapsible=icon]:flex-col">

@@ -57,7 +57,7 @@ export class StrategyCoordinator {
       description: "Position-state specific strategies"
     },
     real: {
-      maxDrawdownTime: 240, // 4 hours
+      maxDrawdownTime: 960, // 16 hours
       minProfitFactor: 1.5,
       confidence: 0.65,
       description: "Exchange-mirrored high-confidence strategies"
