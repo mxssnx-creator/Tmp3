@@ -305,12 +305,89 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
-   * Refresh engines - detect and start/stop engines based on current enabled connections
+   * Start engines for connections that should be running but don't have engines
+   * Does NOT stop engines - leaves that to explicit user actions via dashboard toggles
+   */
+  async startMissingEngines(connections: any[]): Promise<number> {
+    try {
+      console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
+      
+      const { initRedis, getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
+      const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
+      
+      await initRedis()
+      const enabledIds = new Set(connections.map(c => c.id))
+      const runningIds = new Set(this.engineManagers.keys())
+      
+      console.log(`[v0] [Coordinator] Missing engines check: shouldBeRunning=${enabledIds.size}, currentlyRunning=${runningIds.size}`)
+      
+      // Start engines for connections that should be running but aren't
+      let started = 0
+      for (const connection of connections) {
+        if (!runningIds.has(connection.id)) {
+          try {
+            const hasCredentials = (connection.api_key || connection.apiKey) && (connection.api_secret || connection.apiSecret)
+            if (!hasCredentials) {
+              console.log(`[v0] [Coordinator] SKIP: ${connection.name} - no credentials`)
+              await logProgressionEvent(connection.id, "engine_skip", "warning", "Engine start skipped - missing credentials", {
+                connectionId: connection.id,
+                connectionName: connection.name,
+              })
+              continue
+            }
+            
+            console.log(`[v0] [Coordinator] START: ${connection.name} (${connection.exchange})`)
+            await logProgressionEvent(connection.id, "engine_starting", "info", "Coordinator starting engine", {
+              connectionId: connection.id,
+              connectionName: connection.name,
+              exchange: connection.exchange,
+            })
+            
+            const { loadSettingsAsync } = await import("@/lib/settings-storage")
+            const settings = await loadSettingsAsync()
+            
+            const config: EngineConfig = {
+              connectionId: connection.id,
+              engine_type: "main", // Main Trade Engine for indications, strategies, pseudo positions
+              indicationInterval: settings.mainEngineIntervalMs ? Math.max(1, settings.mainEngineIntervalMs / 1000) : 5,
+              strategyInterval: settings.strategyUpdateIntervalMs ? Math.max(1, settings.strategyUpdateIntervalMs / 1000) : 10,
+              realtimeInterval: settings.realtimeIntervalMs ? Math.max(1, settings.realtimeIntervalMs / 1000) : 3,
+            }
+            
+            await this.startEngine(connection.id, config)
+            started++
+            
+            await logProgressionEvent(connection.id, "engine_started", "info", "Main Trade Engine started for progression", {
+              connectionId: connection.id,
+              engineType: "main",
+              config,
+            })
+          } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error)
+            console.error(`[v0] [Coordinator] ERROR starting ${connection.name}:`, errorMsg)
+            await logProgressionEvent(connection.id, "engine_start_error", "error", "Coordinator failed to start engine", {
+              error: errorMsg,
+            })
+          }
+        }
+      }
+      
+      console.log(`[v0] [Coordinator] === START MISSING ENGINES COMPLETE: started=${started} ===`)
+      return started
+    } catch (error) {
+      console.error("[v0] [Coordinator] Error starting missing engines:", error)
+      return 0
+    }
+  }
+
+  /**
+   * Refresh engines - only start engines for newly enabled connections
+   * Does NOT stop engines - leaves that to explicit user actions via dashboard toggles
    * Called periodically or when connections toggle
    */
   async refreshEngines(): Promise<void> {
     try {
-      console.log("[v0] [Coordinator] === REFRESH ENGINES START ===")
+      console.log("[v0] [Coordinator] === REFRESH ENGINES START (START ONLY) ===")
       
       const { initRedis, getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
@@ -377,33 +454,12 @@ export class GlobalTradeEngineCoordinator {
         }
       }
       
-      // Stop engines for disabled connections
-      let stopped = 0
-      for (const connectionId of runningIds) {
-        if (!enabledIds.has(connectionId)) {
-          try {
-            const conn = allConnections.find(c => c.id === connectionId)
-            console.log(`[v0] [Coordinator] STOP: ${conn?.name || connectionId}`)
-            
-            await logProgressionEvent(connectionId, "engine_stopping", "info", "Coordinator stopping engine", {
-              connectionId,
-              connectionName: conn?.name,
-            })
-            
-            await this.stopEngine(connectionId)
-            stopped++
-            
-            await logProgressionEvent(connectionId, "engine_stopped", "info", "Engine stopped by coordinator", {
-              connectionId,
-            })
-          } catch (error) {
-            const errorMsg = error instanceof Error ? error.message : String(error)
-            console.error(`[v0] [Coordinator] ERROR stopping ${connectionId}:`, errorMsg)
-          }
-        }
-      }
+      // NOTE: Intentionally NOT stopping engines for disabled connections
+      // Engine stopping should only happen via explicit user actions (dashboard toggles)
+      // This prevents automatic reassignment and maintains user control
+      const stopped = 0
       
-      console.log(`[v0] [Coordinator] === REFRESH COMPLETE: started=${started}, stopped=${stopped}, skipped=${skipped} ===`)
+      console.log(`[v0] [Coordinator] === REFRESH COMPLETE: started=${started}, stopped=${stopped} (engines not stopped per user control policy), skipped=${skipped} ===`)
     } catch (error) {
       console.error("[v0] [Coordinator] Error refreshing engines:", error)
     }

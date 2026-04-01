@@ -59,98 +59,89 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
   }
 }
 
-/**
- * Monitor for connection changes and synchronize coordinator engine state.
- */
-function startConnectionMonitoring(): void {
-  if (autoStartTimer) {
-    return
-  }
-
-  let lastEnabledCount = 0
-  let lastEnabledSignature = ""
-  let cachedSettings: any = null
-  let settingsCacheTime = 0
-  let monitorCycleInFlight = false
-  const SETTINGS_CACHE_TTL = 60000 // 60 seconds
-
-  autoStartTimer = setInterval(async () => {
-    if (monitorCycleInFlight) {
+  /**
+   * Monitor for connection changes and synchronize coordinator engine state.
+   * Only starts missing engines - does not stop engines to avoid interfering with explicit user actions.
+   */
+  function startConnectionMonitoring(): void {
+    if (autoStartTimer) {
       return
     }
 
-    monitorCycleInFlight = true
-    try {
-      // Always check global engine status first
-      await initRedis()
-      const monClient = getRedisClient()
-      const monGlobalState = await monClient.hgetall("trade_engine:global")
-      if (monGlobalState?.status !== "running") {
-        // Global engine not running - don't auto-start any connections
-        return
-      }
-      
-      const connections = await getAllConnections()
+    let lastStartAttemptCount = 0
+    let cachedSettings: any = null
+    let settingsCacheTime = 0
+    let monitorCycleInFlight = false
+    const SETTINGS_CACHE_TTL = 60000 // 60 seconds
 
-      // Ensure connections is an array before filtering
-      if (!Array.isArray(connections)) {
-        console.warn("[v0] [Monitor] Connections not array")
+    autoStartTimer = setInterval(async () => {
+      if (monitorCycleInFlight) {
         return
       }
 
-      // Filter for main-assigned + dashboard-enabled connections with valid API keys only.
-      const enabledConnections = connections.filter((c) => {
-        const isMainProcessing = isConnectionMainProcessing(c)
-        const hasValidCredentials = hasConnectionCredentials(c, 20, false)
-        return isMainProcessing && hasValidCredentials
-      })
-
-      const enabledSignature = enabledConnections
-        .map((connection) => connection.id)
-        .sort()
-        .join(",")
-
-      // If enabled connection set changed, log it (but don't auto-start)
-      if (enabledSignature !== lastEnabledSignature) {
-        console.log(`[v0] [Monitor] Enabled connections changed: ${lastEnabledCount} -> ${enabledConnections.length} (manual start required)`)
-        lastEnabledCount = enabledConnections.length
-        lastEnabledSignature = enabledSignature
-      }
-
-      // Load settings ONCE per interval, not per connection
-      let settings = cachedSettings
-      if (!settings || Date.now() - settingsCacheTime > SETTINGS_CACHE_TTL) {
-        settings = await loadSettingsAsync()
-        cachedSettings = settings
-        settingsCacheTime = Date.now()
-      }
-
-      // Ensure coordinator engine map matches currently enabled+assigned connections.
-      // This recovers from missed toggle events, service restarts, or stale state.
+      monitorCycleInFlight = true
       try {
-        const coordinator = getGlobalTradeEngineCoordinator()
-        await coordinator.refreshEngines()
-      } catch (syncError) {
-        console.warn("[v0] [Monitor] Failed to refresh coordinator engines:", syncError)
-      }
-      
-    } catch (error) {
-      // Log but don't crash - gracefully handle Redis errors
-      if (error instanceof Error && error.message.includes("Redis credentials")) {
-        // Only log once per interval to avoid spam
-        if (Math.random() < 0.1) {
-          console.warn("[v0] [Monitor] Redis not configured - skipping auto-start check")
+        // Always check global engine status first
+        await initRedis()
+        const monClient = getRedisClient()
+        const monGlobalState = await monClient.hgetall("trade_engine:global")
+        if (monGlobalState?.status !== "running") {
+          // Global engine not running - don't auto-start any connections
+          return
         }
-      } else {
-        console.warn("[v0] [Monitor] Error during connection monitoring:", error instanceof Error ? error.message : String(error))
-      }
-    } finally {
-      monitorCycleInFlight = false
-    }
-  }, 10000) // Check every 10 seconds for new enabled connections
 
-  autoStartTimer.unref?.()
-}
+        const connections = await getAllConnections()
+
+        // Ensure connections is an array before filtering
+        if (!Array.isArray(connections)) {
+          console.warn("[v0] [Monitor] Connections not array")
+          return
+        }
+
+        // Filter for main-assigned + dashboard-enabled connections with valid API keys only.
+        const connectionsThatShouldBeRunning = connections.filter((c) => {
+          const isMainProcessing = isConnectionMainProcessing(c)
+          const hasValidCredentials = hasConnectionCredentials(c, 20, false)
+          return isMainProcessing && hasValidCredentials
+        })
+
+        // Load settings ONCE per interval, not per connection
+        let settings = cachedSettings
+        if (!settings || Date.now() - settingsCacheTime > SETTINGS_CACHE_TTL) {
+          settings = await loadSettingsAsync()
+          cachedSettings = settings
+          settingsCacheTime = Date.now()
+        }
+
+        // Start engines for connections that should be running but don't have engines
+        // Do NOT stop engines - leave that to explicit user actions via dashboard toggles
+        try {
+          const coordinator = getGlobalTradeEngineCoordinator()
+          const startedCount = await coordinator.startMissingEngines(connectionsThatShouldBeRunning)
+          if (startedCount > 0) {
+            console.log(`[v0] [Monitor] Started ${startedCount} missing engines`)
+          }
+        } catch (startError) {
+          console.warn("[v0] [Monitor] Failed to start missing engines:", startError)
+        }
+        
+      } catch (error) {
+        // Log but don't crash - gracefully handle Redis errors
+        if (error instanceof Error && error.message.includes("Redis credentials")) {
+          // Only log once per interval to avoid spam
+          if (Math.random() < 0.1) {
+            console.warn("[v0] [Monitor] Redis not configured - skipping auto-start check")
+          }
+        } else {
+          console.warn("[v0] [Monitor] Error during connection monitoring:", error instanceof Error ? error.message : String(error))
+        }
+      } finally {
+        monitorCycleInFlight = false
+      }
+    }, 10000) // Check every 10 seconds for new enabled connections
+
+    autoStartTimer.unref?.()
+  }
 
 /**
  * Stop the connection monitoring timer

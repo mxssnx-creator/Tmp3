@@ -618,34 +618,37 @@ export class TradeEngineManager {
           await this.updateProgressionPhase("indications", Math.min(70, 60 + (cycleCount % 15)), `Processing indications continuously (${cycleCount} cycles)`)
         }
 
-        // Persist cycle count every cycle (not just every 10)
-        // Update Redis state with latest metrics on EVERY cycle for dashboard real-time visibility
-        try {
-          await setSettings(`trade_engine_state:${this.connectionId}`, {
-            connection_id: this.connectionId,
-            status: "running",
-            started_at: this.startTime?.toISOString() || new Date().toISOString(),
-            last_indication_run: new Date().toISOString(),
-            indication_cycle_count: cycleCount,
-            indication_avg_duration_ms: totalDuration > 0 ? Math.round(totalDuration / cycleCount) : 0,
-            engine_cycles_total: cycleCount,
-          })
-        } catch (err) {
-          // Silently fail - non-critical for engine operation
+        // Persist cycle count every 10 cycles to reduce Redis writes
+        if (cycleCount % 10 === 0) {
+          try {
+            await setSettings(`trade_engine_state:${this.connectionId}`, {
+              connection_id: this.connectionId,
+              status: "running",
+              started_at: this.startTime?.toISOString() || new Date().toISOString(),
+              last_indication_run: new Date().toISOString(),
+              indication_cycle_count: cycleCount,
+              indication_avg_duration_ms: totalDuration > 0 ? Math.round(totalDuration / cycleCount) : 0,
+              engine_cycles_total: cycleCount,
+            })
+          } catch (err) {
+            // Silently fail - non-critical for engine operation
+          }
         }
 
-        // Track intervals processed in Redis for dashboard display (counter, not unbounded set)
-        try {
-          const client = getRedisClient()
-          await client.incr(`intervals:${this.connectionId}:processed_count`)
-          await client.expire(`intervals:${this.connectionId}:processed_count`, 86400) // 24h TTL
-          await setSettings(`trade_engine_state:${this.connectionId}`, {
-            last_cycle_duration: duration,
-            last_cycle_type: "indications",
-            total_indications_evaluated: totalStrategiesEvaluated,
-            updated_at: new Date().toISOString(),
-          })
-        } catch { /* ignore Redis errors */ }
+        // Track intervals processed in Redis for dashboard display (every 10 cycles)
+        if (cycleCount % 10 === 0) {
+          try {
+            const client = getRedisClient()
+            await client.incr(`intervals:${this.connectionId}:processed_count`)
+            await client.expire(`intervals:${this.connectionId}:processed_count`, 86400) // 24h TTL
+            await setSettings(`trade_engine_state:${this.connectionId}`, {
+              last_cycle_duration: duration,
+              last_cycle_type: "indications",
+              total_indications_evaluated: totalStrategiesEvaluated,
+              updated_at: new Date().toISOString(),
+            })
+          } catch { /* ignore Redis errors */ }
+        }
 
         // Track detailed performance metrics
         await engineMonitor.trackCycle(this.connectionId, "indications", {

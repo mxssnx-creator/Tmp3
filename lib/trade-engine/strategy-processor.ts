@@ -15,6 +15,9 @@ export class StrategyProcessor {
   private connectionId: string
   private strategyCache: Map<string, { signal: any; timestamp: number }> = new Map()
   private readonly CACHE_TTL = 60000 // 60 seconds
+  
+  // Cycle tracking for performance optimization
+  private cycleCount = 0
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -43,10 +46,11 @@ export class StrategyProcessor {
       const coordinator = new StrategyCoordinator(this.connectionId)
       const results = await coordinator.executeStrategyFlow(symbol, indications, false)
 
-      // Calculate totals across all stages
-      let totalEvaluated = 0
-      let totalLiveReady = 0
-      const stageSummary: Record<string, any> = {}
+        // Calculate totals across all stages
+        let totalEvaluated = 0
+        let totalLiveReady = 0
+        const stageSummary: Record<string, any> = {}
+        this.cycleCount++
 
       for (const result of results) {
         totalEvaluated += result.totalCreated
@@ -65,9 +69,9 @@ export class StrategyProcessor {
           `PF=${result.avgProfitFactor.toFixed(2)} | DDT=${Math.round(result.avgDrawdownTime)}min`
         )
         
-        // Save strategies to database for statistics
-        try {
-          if (result.passedEvaluation > 0) {
+        // Save strategies to database for statistics (every 5 cycles to reduce DB writes)
+        if (result.passedEvaluation > 0 && this.cycleCount % 5 === 0) {
+          try {
             await trackStrategyStats(
               this.connectionId,
               symbol,
@@ -77,9 +81,9 @@ export class StrategyProcessor {
               result.avgProfitFactor,
               result.avgDrawdownTime
             )
+          } catch (e) {
+            // Ignore DB errors - processing continues
           }
-        } catch (e) {
-          // Ignore DB errors - processing continues
         }
       }
 
