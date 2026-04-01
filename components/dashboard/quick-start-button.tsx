@@ -8,6 +8,7 @@ import { Zap, Loader2, CheckCircle2, AlertCircle, RefreshCw } from "lucide-react
 import { toast } from "@/lib/simple-toast"
 import { DetailedLoggingDialog } from "./detailed-logging-dialog"
 import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
+import { SystemDetailPanel } from "./system-detail-panel"
 import { useExchange } from "@/lib/exchange-context"
 
 interface QuickStartButtonProps {
@@ -323,6 +324,9 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
           
           {/* Main / Log compact overview button */}
           <QuickstartOverviewDialog connectionId="bingx-x01" />
+
+          {/* System Detail Panel button */}
+          <SystemDetailPanel />
 
           {/* Detailed Logs Button */}
           <DetailedLoggingDialog />
