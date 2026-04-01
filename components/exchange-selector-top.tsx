@@ -62,7 +62,7 @@ export function ExchangeSelectorTop({ variant = "header" }: ExchangeSelectorTopP
 
   return (
     <div className="w-full min-w-0">
-      <div className="flex items-center gap-2 min-w-0 flex-wrap">
+      <div className="flex flex-col gap-1 min-w-0">
         <Select value={defaultValue} onValueChange={handleSelectConnection}>
           <SelectTrigger className={isSidebar ? "w-full h-8 text-sm border-input bg-background hover:bg-muted" : "w-[220px] h-8 text-sm border-input bg-background hover:bg-muted"}>
             <SelectValue placeholder="Select connection" />
@@ -74,7 +74,7 @@ export function ExchangeSelectorTop({ variant = "header" }: ExchangeSelectorTopP
                 <span className="text-muted-foreground text-xs">(Mock)</span>
               </div>
             </SelectItem>
-            
+
             {isLoading ? (
               <div className="px-2 py-2 text-center text-muted-foreground text-xs">Loading...</div>
             ) : activeConnections.length === 0 ? (
@@ -91,7 +91,7 @@ export function ExchangeSelectorTop({ variant = "header" }: ExchangeSelectorTopP
             )}
           </SelectContent>
         </Select>
-        <div className="min-h-5 flex flex-wrap gap-1">
+        <div className="flex flex-wrap gap-1">
           {renderStatusBadges()}
         </div>
       </div>

@@ -29,12 +29,12 @@ export interface ExchangeConnection {
     requests_per_minute: number
   }
   is_enabled: boolean
-  is_enabled_dashboard: boolean
+  is_main_enabled: boolean
   is_live_trade: boolean
   is_preset_trade?: boolean
   is_active?: boolean
-  is_inserted?: boolean
-  is_active_inserted?: boolean
+  is_assigned?: boolean
+  is_main_assigned?: boolean
   is_predefined?: boolean
   connection_priority?: string[]
   use_main_symbols?: boolean
