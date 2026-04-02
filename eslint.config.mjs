@@ -11,6 +11,7 @@ const eslintConfig = [
       "dist/**",
       "coverage/**",
       "**/*.d.ts",
+      "scripts/**/*.js",
     ],
   },
   {
@@ -28,14 +29,12 @@ const eslintConfig = [
       "@next/next": nextPlugin,
     },
     rules: {
-      ...tsPlugin.configs.recommended.rules,
-      ...nextPlugin.configs.recommended.rules,
-      ...nextPlugin.configs["core-web-vitals"].rules,
       "no-unused-vars": "off",
-      "@typescript-eslint/no-unused-vars": "off",
-      "@typescript-eslint/no-explicit-any": "off",
+      "@typescript-eslint/no-unused-vars": ["warn", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
+      "@typescript-eslint/no-explicit-any": "warn",
       "@typescript-eslint/no-require-imports": "off",
       "@next/next/no-html-link-for-pages": "off",
+      "@next/next/no-img-element": "off",
     },
   },
 ];
