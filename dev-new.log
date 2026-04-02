@@ -1,0 +1,16 @@
+
+> my-v0-project@0.1.0 dev
+> next dev -p 3001
+
+   ▲ Next.js 15.5.7
+   - Local:        http://localhost:3001
+   - Network:      http://10.0.0.1:3001
+   - Environments: .env.local
+
+ ✓ Starting...
+[Error: You cannot use different slug names for the same dynamic path ('connectionId' !== 'id').]
+[?25h
+ddress: '::',
+  port: 3001
+}
+[?25h
