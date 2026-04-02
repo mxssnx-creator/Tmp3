@@ -9,7 +9,6 @@ import { toast } from "@/lib/simple-toast"
 import { DetailedLoggingDialog } from "./detailed-logging-dialog"
 import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
 import { SystemDetailPanel } from "./system-detail-panel"
-import { NemotronButton } from "./nemotron-button"
 import { useExchange } from "@/lib/exchange-context"
 
 interface QuickStartButtonProps {
@@ -311,23 +310,20 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
               </>
             )}
           </Button>
-          <Button
-            onClick={() => {
-              setSteps(steps.map(s => ({ ...s, status: "pending", message: undefined })))
-              setIsRunning(false)
-            }}
-            disabled={isRunning}
-            variant="outline"
-            size="icon"
-          >
-            <RefreshCw className="w-4 h-4" />
-          </Button>
-          
+           <Button
+             onClick={() => {
+               setSteps(steps.map(s => ({ ...s, status: "pending", message: undefined })))
+               setIsRunning(false)
+             }}
+             disabled={isRunning}
+             variant="outline"
+             size="icon"
+           >
+             <RefreshCw className="w-4 h-4" />
+           </Button>
+           
            {/* Main / Log compact overview button */}
            <QuickstartOverviewDialog connectionId="bingx-x01" />
-
-           {/* Nemotron 3 Super Button */}
-           <NemotronButton connectionId="bingx-x01" />
 
            {/* System Detail Panel button */}
            <SystemDetailPanel />
