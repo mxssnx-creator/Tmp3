@@ -9,6 +9,7 @@ import { toast } from "@/lib/simple-toast"
 import { DetailedLoggingDialog } from "./detailed-logging-dialog"
 import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
 import { SystemDetailPanel } from "./system-detail-panel"
+import { NemotronButton } from "./nemotron-button"
 import { useExchange } from "@/lib/exchange-context"
 
 interface QuickStartButtonProps {
@@ -322,14 +323,17 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
             <RefreshCw className="w-4 h-4" />
           </Button>
           
-          {/* Main / Log compact overview button */}
-          <QuickstartOverviewDialog connectionId="bingx-x01" />
+           {/* Main / Log compact overview button */}
+           <QuickstartOverviewDialog connectionId="bingx-x01" />
 
-          {/* System Detail Panel button */}
-          <SystemDetailPanel />
+           {/* Nemotron 3 Super Button */}
+           <NemotronButton connectionId="bingx-x01" />
 
-          {/* Detailed Logs Button */}
-          <DetailedLoggingDialog />
+           {/* System Detail Panel button */}
+           <SystemDetailPanel />
+
+           {/* Detailed Logs Button */}
+           <DetailedLoggingDialog />
         </div>
 
         {/* Info Box */}

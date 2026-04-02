@@ -10,14 +10,37 @@ import { BarChart3, RefreshCw } from "lucide-react"
 
 interface Props {
   connectionId?: string
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
 }
 
-export function QuickstartOverviewDialog({ connectionId = "bingx-x01" }: Props) {
-  const [open, setOpen] = useState(false)
+export function QuickstartOverviewDialog({ 
+  connectionId = "bingx-x01", 
+  open: controlledOpen, 
+  onOpenChange 
+}: Props) {
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [stats, setStats] = useState<any>(null)
   const [logs, setLogs] = useState<any[]>([])
   const [resolvedConnectionId, setResolvedConnectionId] = useState(connectionId)
+  
+  const isControlled = controlledOpen !== undefined
+  const isOpen = isControlled ? controlledOpen : uncontrolledOpen
+
+  const setOpen = (value: boolean) => {
+    if (isControlled) {
+      onOpenChange?.(value)
+    } else {
+      setUncontrolledOpen(value)
+    }
+  }
+
+  useEffect(() => {
+    if (isOpen) {
+      void load()
+    }
+  }, [isOpen])
 
   const load = async () => {
     setLoading(true)
@@ -67,7 +90,7 @@ export function QuickstartOverviewDialog({ connectionId = "bingx-x01" }: Props) 
   }, [logs])
 
   return (
-    <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (v) void load() }}>
+     <Dialog open={isOpen} onOpenChange={(v) => { setOpen(v); if (v) void load() }}>
       <DialogTrigger asChild>
         <Button variant="outline" size="icon" title="Main / Log overview">
           <BarChart3 className="h-4 w-4" />
