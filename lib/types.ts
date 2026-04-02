@@ -29,6 +29,9 @@ export interface ExchangeConnection {
     requests_per_minute: number
   }
   is_enabled: boolean
+  is_inserted?: boolean | string
+  is_enabled_dashboard?: boolean | string
+  is_active_inserted?: boolean | string
   is_main_enabled: boolean
   is_live_trade: boolean
   is_preset_trade?: boolean
