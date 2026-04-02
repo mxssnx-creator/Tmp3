@@ -3,11 +3,11 @@ import { initRedis, getRedisClient } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
 
-export async function GET(request: NextRequest, { params }: { params: { connectionId: string } }) {
+export async function GET(request: NextRequest, { params }: { params: { id: string } }) {
   try {
     await initRedis()
     const client = getRedisClient()
-    const connectionId = params.connectionId
+    const connectionId = params.id
 
     if (!connectionId) {
       return NextResponse.json({ error: "Missing connectionId parameter" }, { status: 400 })
