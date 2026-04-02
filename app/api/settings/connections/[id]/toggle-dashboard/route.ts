@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { initRedis, getConnection, updateConnection, setSettings, getSettings, getAllConnections, 
-  getConnectionState, buildMainConnectionEnableUpdate, buildMainConnectionDisableUpdate,
+  getConnectionState, buildMainConnectionEnableUpdate, buildMainConnectionDisableUpdate, buildMainConnectionRemoveUpdate,
   isConnectionReadyForEngine, getRedisClient } from "@/lib/redis-db"
 import { toggleConnectionLimiter } from "@/lib/connection-rate-limiter"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
@@ -65,17 +65,25 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     console.log(`[v0] [Toggle]   Before: main_assigned=${state.main_assigned}, main_enabled=${state.main_enabled}`)
     
     // Determine new state based on request
-    const enableMain = hasDashboardEnabled ? isDashboardEnabled : (hasActiveInserted ? isActiveInserted : state.main_enabled)
+    // If is_active_inserted is explicitly set to false, treat as removal (unassign completely)
+    const isRemoval = hasActiveInserted && !isActiveInserted
+    const enableMain = isRemoval ? false : (hasDashboardEnabled ? isDashboardEnabled : (hasActiveInserted ? isActiveInserted : state.main_enabled))
 
     // Check if state actually changes
     const currentMainEnabled = state.main_enabled
-    const needsUpdate = currentMainEnabled !== enableMain
+    const currentMainAssigned = state.main_assigned
+    const needsUpdate = currentMainEnabled !== enableMain || (isRemoval && currentMainAssigned)
     
     let updatedConnection: any
     let engineAction: "start" | "stop" | null = null
     
     if (needsUpdate) {
-      if (enableMain) {
+      if (isRemoval) {
+        // Remove from Main Connections completely - unassign
+        updatedConnection = buildMainConnectionRemoveUpdate(connection)
+        engineAction = "stop"
+        console.log(`[v0] [Toggle] REMOVING: main_assigned=false, main_enabled=false (complete unassignment)`)
+      } else if (enableMain) {
         // Enable in Main Connections - use clean helper
         updatedConnection = buildMainConnectionEnableUpdate(connection)
         engineAction = "start"

@@ -59,24 +59,26 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
 
-    // Update connection to remove from active
+    // Update connection to remove from active - unassign completely
     const updatedConnection = {
       ...connection,
-      is_enabled_dashboard: "0",
-      is_active: "0",
+      is_active_inserted: "0",      // Remove assignment from main panel
+      is_dashboard_inserted: "0",   // Remove dashboard insertion
+      is_enabled_dashboard: "0",    // Disable dashboard toggle
+      is_active: "0",               // Not active for processing
       updated_at: new Date().toISOString(),
     }
 
     await updateConnection(connectionId, updatedConnection)
 
-    const logMsg = `[v0] [ActiveConnection] ✗ DISABLED: ${connection.name} (${connectionId}) | Exchange: ${connection.exchange}`
+    const logMsg = `[v0] [ActiveConnection] ✗ REMOVED: ${connection.name} (${connectionId}) | Exchange: ${connection.exchange}`
     console.log(logMsg)
-    await SystemLogger.logConnection("Dashboard: Disabled active connection", connectionId, "info")
+    await SystemLogger.logConnection("Dashboard: Removed active connection", connectionId, "info")
 
     return NextResponse.json({
       success: true,
       connection: updatedConnection,
-      message: "Connection disabled on dashboard",
+      message: "Connection removed from active panel",
     })
   } catch (error) {
     console.error(`[v0] [ActiveConnection] ✗ FAILED to disable: ${error instanceof Error ? error.message : String(error)}`)

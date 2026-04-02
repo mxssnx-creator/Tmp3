@@ -1057,6 +1057,23 @@ export function buildMainConnectionDisableUpdate(connection: any): any {
 }
 
 /**
+ * Build connection update object for removing from Main Connections
+ * Completely unassigns the connection from the main panel
+ */
+export function buildMainConnectionRemoveUpdate(connection: any): any {
+  return {
+    ...connection,
+    // Main Connection states - remove completely
+    is_active_inserted: "0",      // main_assigned = false
+    is_dashboard_inserted: "0",   // remove dashboard insertion
+    is_enabled_dashboard: "0",    // main_enabled = false
+    is_active: "0",               // not active for processing
+    
+    updated_at: new Date().toISOString(),
+  }
+}
+
+/**
  * Build connection update object for enabling in Settings (Base)
  */
 export function buildBaseConnectionEnableUpdate(connection: any): any {

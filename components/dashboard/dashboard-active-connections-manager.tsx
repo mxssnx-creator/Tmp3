@@ -270,11 +270,10 @@ export function DashboardActiveConnectionsManager() {
         body: JSON.stringify({ is_live_trade: false }),
       })
       
-      // Remove from dashboard via API
-      await fetch(`/api/settings/connections/${connectionId}/toggle-dashboard`, {
-        method: "POST",
+      // Remove from main panel completely - unassign AND disable
+      await fetch(`/api/settings/connections/${connectionId}/active`, {
+        method: "DELETE",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ is_enabled_dashboard: false }),
       })
       updateActiveConnections(prev => prev.filter(ac => ac.connectionId !== connectionId))
       toast.success("Connection removed", {
