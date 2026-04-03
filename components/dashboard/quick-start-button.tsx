@@ -10,6 +10,7 @@ import { DetailedLoggingDialog } from "./detailed-logging-dialog"
 import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
 import { SystemDetailPanel } from "./system-detail-panel"
 import { SeedSystemDialog } from "./seed-system-dialog"
+import { QuickstartTestProcedureDialog } from "./quickstart-test-procedure-dialog"
 import { useExchange } from "@/lib/exchange-context"
 
 interface QuickStartButtonProps {
@@ -335,19 +336,8 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
             {/* Seed 2.0 System Monitor Button */}
             <SeedSystemDialog />
 
-            {/* Full System Test Results Button */}
-            <Button size="sm" variant="secondary" className="ml-auto text-xs" onClick={() => {
-              const btn = document.createElement('button');
-              btn.onclick = async () => {
-                const results = await fetch('/api/system/monitoring');
-                const data = await results.json();
-                const w = window.open('', '_blank');
-                w?.document.write(`<pre>${JSON.stringify(data, null, 2)}</pre>`);
-              };
-              btn.click();
-            }}>
-              📊 Test Stats
-            </Button>
+            {/* System Test Procedure Dialog */}
+            <QuickstartTestProcedureDialog />
          </div>
 
         {/* Info Box */}
