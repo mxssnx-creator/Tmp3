@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server"
-import { initRedis, getSettings, setSettings } from "@/lib/redis-db"
+import { initRedis, getSettings, setSettings, getConnection } from "@/lib/redis-db"
+import { createExchangeConnector } from "@/lib/exchange-connectors"
 
 export const runtime = "nodejs"
 
@@ -21,36 +22,63 @@ export async function GET(request: NextRequest) {
     let marketData = await getSettings(cacheKey)
 
     if (!marketData) {
-      // Generate mock market data for development
-      const basePrice = getBasePrice(symbol)
-      const variation = basePrice * 0.02
-      
-      marketData = {
-        symbol,
-        exchange,
-        interval,
-        price: basePrice + (Math.random() - 0.5) * variation,
-        open: basePrice,
-        high: basePrice + variation,
-        low: basePrice - variation,
-        close: basePrice + (Math.random() - 0.5) * variation,
-        volume: Math.random() * 1000000,
-        volume_24h: Math.random() * 10000000,
-        high_24h: basePrice + variation,
-        low_24h: basePrice - variation,
-        change_24h: (Math.random() - 0.5) * 5,
-        change_24h_percentage: ((Math.random() - 0.5) * 5).toFixed(2) + "%",
-        timestamp: Date.now(),
-        datetime: new Date().toISOString(),
-        bid: basePrice - 0.5,
-        ask: basePrice + 0.5,
-        bid_volume: Math.random() * 100,
-        ask_volume: Math.random() * 100,
-        last_update: new Date().toISOString(),
-      }
+      // Fetch REAL market data from live exchange
+      try {
+        // Find active connection for this exchange
+        const connections = await import("@/lib/redis-db").then(m => m.getAllConnections())
+        const activeConnection = connections.find((c: any) => 
+          c.exchange?.toLowerCase() === exchange.toLowerCase() && 
+          c.is_assigned === "1" && 
+          c.api_key && c.api_secret
+        )
 
-      // Cache for 5 seconds
-      await setSettings(cacheKey, JSON.stringify(marketData))
+        if (activeConnection) {
+          const connector = await createExchangeConnector(exchange, {
+            apiKey: activeConnection.api_key,
+            apiSecret: activeConnection.api_secret,
+            apiPassphrase: activeConnection.api_passphrase || "",
+            isTestnet: false,
+            apiType: activeConnection.api_type || "perpetual_futures",
+          })
+
+          // Get real ticker data
+          const tickerData = await connector.getTicker(symbol)
+          marketData = {
+            symbol,
+            exchange,
+            interval,
+            ...tickerData,
+            timestamp: Date.now(),
+            datetime: new Date().toISOString(),
+            last_update: new Date().toISOString(),
+          }
+        } else {
+          // Fallback to real price fetch without credentials if possible
+          const connector = await createExchangeConnector(exchange, { isTestnet: false })
+          marketData = await connector.getTicker(symbol)
+        }
+
+        // Cache for 3 seconds for real data
+        await setSettings(cacheKey, JSON.stringify(marketData), { EX: 3 })
+      } catch (fetchError) {
+        console.warn("[Market Data] Failed to fetch real data, using fallback:", fetchError)
+        // Fallback - still generate but don't use random values, use static base prices
+        const basePrice = getBasePrice(symbol)
+        marketData = {
+          symbol,
+          exchange,
+          interval,
+          price: basePrice,
+          open: basePrice,
+          high: basePrice,
+          low: basePrice,
+          close: basePrice,
+          volume: 0,
+          timestamp: Date.now(),
+          datetime: new Date().toISOString(),
+          last_update: new Date().toISOString(),
+        }
+      }
     } else if (typeof marketData === "string") {
       try {
         marketData = JSON.parse(marketData)

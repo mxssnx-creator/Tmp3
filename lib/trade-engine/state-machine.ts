@@ -180,14 +180,11 @@ export class TradeEngineStateMachine {
     if (!this.config) return
 
     try {
-      // Get price data (simplified - would normally fetch from market data stream)
-      const mockPriceData: PriceData = {
-        symbol,
-        prices: [100, 101, 102, 101, 103], // Mock data
-      }
+      // Get REAL price data from exchange connector
+      const priceData = await connector.getLatestPriceData(symbol, 100) // Last 100 candles
 
-      // Evaluate signals
-      const signals = await indicatorCalculator.evaluateSignals(symbol, mockPriceData, this.config.indicators)
+      // Evaluate signals with REAL market data
+      const signals = await indicatorCalculator.evaluateSignals(symbol, priceData, this.config.indicators)
 
       if (signals.signal === "buy" && signals.strength > 0.5) {
         await this.executeBuySignal(symbol, connector, signals.strength)
