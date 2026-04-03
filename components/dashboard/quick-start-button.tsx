@@ -9,6 +9,7 @@ import { toast } from "@/lib/simple-toast"
 import { DetailedLoggingDialog } from "./detailed-logging-dialog"
 import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
 import { SystemDetailPanel } from "./system-detail-panel"
+import { SeedSystemDialog } from "./seed-system-dialog"
 import { useExchange } from "@/lib/exchange-context"
 
 interface QuickStartButtonProps {
@@ -328,9 +329,12 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
            {/* System Detail Panel button */}
            <SystemDetailPanel />
 
-           {/* Detailed Logs Button */}
-           <DetailedLoggingDialog />
-        </div>
+            {/* Detailed Logs Button */}
+            <DetailedLoggingDialog />
+            
+            {/* Seed 2.0 System Monitor Button */}
+            <SeedSystemDialog />
+         </div>
 
         {/* Info Box */}
         <div className="bg-white rounded border border-blue-200 p-3 text-xs text-gray-600">
