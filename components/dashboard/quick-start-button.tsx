@@ -11,6 +11,7 @@ import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
 import { SystemDetailPanel } from "./system-detail-panel"
 import { SeedSystemDialog } from "./seed-system-dialog"
 import { QuickstartTestProcedureDialog } from "./quickstart-test-procedure-dialog"
+import { EngineProcessingLogDialog } from "./engine-processing-log-dialog"
 import { useExchange } from "@/lib/exchange-context"
 
 interface QuickStartButtonProps {
@@ -338,6 +339,9 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
 
             {/* System Test Procedure Dialog */}
             <QuickstartTestProcedureDialog />
+
+            {/* Engine Processing Live Log Dialog */}
+            <EngineProcessingLogDialog />
          </div>
 
         {/* Info Box */}
