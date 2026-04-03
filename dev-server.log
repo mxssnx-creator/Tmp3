@@ -56,3 +56,107 @@ $ next dev -p 3002
  ○ Compiling /monitoring ...
  ✓ Compiled /monitoring in 793ms (1269 modules)
  GET /monitoring 200 in 1288ms
+ ○ Compiling /api/settings/connections/[id]/log ...
+ ✓ Compiled /api/settings/connections/[id]/log in 2.3s (666 modules)
+[v0] [Redis] Client initialized with persistence
+[v0] [Redis] Connection test successful
+[v0] [Redis] Running migrations...
+[v0] [Migrations] Current: v0, Target: v20
+[v0] [Migrations] Running 19 pending migrations...
+[v0] [Migrations] Running: 001-initial-schema (v1)
+[v0] Migration 001: Initial schema created
+[v0] [Migrations] ✓ Completed: 001-initial-schema
+[v0] [Migrations] Running: 002-connection-management (v2)
+[v0] Migration 002: Connection management structure created
+[v0] [Migrations] ✓ Completed: 002-connection-management
+[v0] [Migrations] Running: 003-trade-positions-schema (v3)
+[v0] Migration 003: Trade and position schemas created
+[v0] [Migrations] ✓ Completed: 003-trade-positions-schema
+[v0] [Migrations] Running: 004-preset-strategy-management (v4)
+[v0] Migration 004: Preset and strategy management created
+[v0] [Migrations] ✓ Completed: 004-preset-strategy-management
+[v0] [Migrations] Running: 005-user-authentication (v5)
+[v0] Migration 005: User authentication system created
+[v0] [Migrations] ✓ Completed: 005-user-authentication
+[v0] [Migrations] Running: 006-monitoring-logging (v6)
+[v0] Migration 006: Monitoring and logging system created
+[v0] [Migrations] ✓ Completed: 006-monitoring-logging
+[v0] [Migrations] Running: 007-cache-optimization (v7)
+[v0] Migration 007: Cache optimization created
+[v0] [Migrations] ✓ Completed: 007-cache-optimization
+[v0] [Migrations] Running: 008-performance-optimizations (v8)
+[v0] Migration 008: Performance optimizations configured
+[v0] [Migrations] ✓ Completed: 008-performance-optimizations
+[v0] [Migrations] Running: 009-backup-recovery (v9)
+[v0] Migration 009: Backup and recovery system created
+[v0] [Migrations] ✓ Completed: 009-backup-recovery
+[v0] [Migrations] Running: 010-settings-and-metadata (v10)
+[v0] Migration 010: Settings and metadata finalized
+[v0] [Migrations] ✓ Completed: 010-settings-and-metadata
+[v0] [Migrations] Running: 011-seed-predefined-connections (v11)
+[v0] Migration 011: Seeded 11/11 predefined template connections
+[v0] [Migrations] ✓ Completed: 011-seed-predefined-connections
+[v0] [Migrations] Running: 012-finalize-dashboard-connections (v12)
+[v0] Migration 012: Initializing connections (base templates set to predefined=1, disabled)
+[v0] Migration 012: ✓ bybit-x03 -> predefined=1, inserted=0, enabled=0 (template)
+[v0] Migration 012: ✓ bingx-x01 -> predefined=1, inserted=0, enabled=0 (template)
+[v0] Migration 012: ✓ pionex-x01 -> predefined=1, inserted=0, enabled=0 (template)
+[v0] Migration 012: ✓ orangex-x01 -> predefined=1, inserted=0, enabled=0 (template)
+[v0] Migration 012: COMPLETE - 4 base templates, 7 other templates (all disabled)
+[v0] [Migrations] ✓ Completed: 012-finalize-dashboard-connections
+[v0] [Migrations] Running: 013-risk-management-and-engines (v13)
+[v0] Migration 013: Risk management settings and engine controls added
+[v0] [Migrations] ✓ Completed: 013-risk-management-and-engines
+[v0] [Migrations] Running: 014-update-bingx-credentials (v14)
+[v0] Migration 014: Cleared test credentials, real credentials preserved
+[v0] [Migrations] ✓ Completed: 014-update-bingx-credentials
+[v0] [Migrations] Running: 015-fix-connection-inserted-enabled-states (v15)
+[v0] Migration 015: bybit-x03 -> inserted=1, enabled=1, active_inserted=1, dashboard_enabled=0 (base connection)
+[v0] Migration 015: bingx-x01 -> inserted=1, enabled=1, active_inserted=1, dashboard_enabled=0 (base connection)
+[v0] Migration 015: binance-x01 -> inserted=0, enabled=0 (template only)
+[v0] Migration 015: okx-x01 -> inserted=0, enabled=0 (template only)
+[v0] Migration 015: gateio-x01 -> inserted=0, enabled=0 (template only)
+[v0] Migration 015: kucoin-x01 -> inserted=0, enabled=0 (template only)
+[v0] Migration 015: mexc-x01 -> inserted=0, enabled=0 (template only)
+[v0] Migration 015: bitget-x01 -> inserted=0, enabled=0 (template only)
+[v0] Migration 015: pionex-x01 -> inserted=0, enabled=0 (template only)
+[v0] Migration 015: orangex-x01 -> inserted=0, enabled=0 (template only)
+[v0] Migration 015: huobi-x01 -> inserted=0, enabled=0 (template only)
+[v0] Migration 015: Fixed 2 base connections, 9 template connections
+[v0] [Migrations] ✓ Completed: 015-fix-connection-inserted-enabled-states
+[v0] [Migrations] Running: 016-active-connections-independent-state (v16)
+[v0] Migration 016: Ensuring predefined templates state for 11 connections
+[v0] Migration 016: ✓ bybit-x03 -> inserted=1, enabled=1, dashboard_enabled=0 (base connection)
+[v0] Migration 016: ✓ bingx-x01 -> inserted=1, enabled=1, dashboard_enabled=0 (base connection)
+[v0] Migration 016: COMPLETE - 2 templates verified, 0 user connections updated
+[v0] [Migrations] ✓ Completed: 016-active-connections-independent-state
+[v0] [Migrations] Running: 017-cleanup-base-connections-to-bybit-bingx-only (v17)
+[v0] Migration 017: ✓ bybit-x03 -> corrected to base connection state
+[v0] Migration 017: ✓ bingx-x01 -> corrected to base connection state
+[v0] Migration 017: ✓ binance-x01 -> corrected to template-only state
+[v0] Migration 017: ✓ okx-x01 -> corrected to template-only state
+[v0] Migration 017: ✓ gateio-x01 -> corrected to template-only state
+[v0] Migration 017: ✓ kucoin-x01 -> corrected to template-only state
+[v0] Migration 017: ✓ mexc-x01 -> corrected to template-only state
+[v0] Migration 017: ✓ bitget-x01 -> corrected to template-only state
+[v0] Migration 017: ✓ pionex-x01 -> corrected to template-only state
+[v0] Migration 017: ✓ orangex-x01 -> corrected to template-only state
+[v0] Migration 017: ✓ huobi-x01 -> corrected to template-only state
+[v0] Migration 017: COMPLETE - 2 base connections, 9 templates cleaned up
+[v0] [Migrations] ✓ Completed: 017-cleanup-base-connections-to-bybit-bingx-only
+[v0] [Migrations] Running: 018-remove-auto-assignment-from-main-connections (v18)
+[v0] Migration 018: COMPLETE - fixed 0 connections that were auto-assigned
+[v0] [Migrations] ✓ Completed: 018-remove-auto-assignment-from-main-connections
+[v0] [Migrations] Running: 020-phase3-database-consolidation (v20)
+[v0] Migration 020: PHASE 3 - Database consolidation starting...
+[v0] Migration 020: ✓ Consolidated 11 progression structures
+[v0] Migration 020: ✓ Created 11 connection indexes
+[v0] Migration 020: COMPLETE - Database consolidation done
+[v0] [Migrations] ✓ Completed: 020-phase3-database-consolidation
+[v0] [Migrations] ✓ Successfully migrated v0 -> v20
+[v0] [Migrations] 19 migrations executed
+[v0] [Migrations] ✓ Verification: Schema version is now 20
+[v0] [Migrations] ✓ Ensured 4 base connections; injected credentials for 3
+[v0] [Redis] ✓ Migrations completed
+[v0] [Connections] ✓ Connection initialization skipped (handled by migrations 011-016)
+ GET /api/settings/connections/test/log 200 in 3175ms
