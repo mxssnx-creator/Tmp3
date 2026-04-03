@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { Progress } from "@/components/ui/progress"
 import { Loader2, RefreshCw } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
 
@@ -170,31 +171,54 @@ export function ConnectionLogDialog({ open, onOpenChange, connectionId, connecti
                    </div>
                  </div>
                  
-                 {/* Prehistoric Data Processing */}
-                 {summary.prehistoricData && (
-                   <div className="bg-blue-50 rounded-lg p-4 mb-4">
-                     <div className="flex items-center justify-between mb-2">
-                       <div className="font-medium">Prehistoric Data Processing</div>
-                       <div className="text-xs text-blue-600">
-                         {summary.prehistoricData.phaseActive ? "Active" : "Completed"}
-                       </div>
-                     </div>
-                     <div className="grid grid-cols-3 gap-3 text-sm">
-                       <div>
-                         <div className="font-semibold">{summary.prehistoricData.cyclesCompleted}</div>
-                         <div className="text-xs text-muted-foreground">Cycles</div>
-                       </div>
-                       <div>
-                         <div className="font-semibold">{summary.prehistoricData.symbolsProcessed}</div>
-                         <div className="text-xs text-muted-foreground">Symbols</div>
-                       </div>
-                       <div>
-                         <div className="font-semibold">{summary.prehistoricData.candlesProcessed}</div>
-                         <div className="text-xs text-muted-foreground">Candles</div>
-                       </div>
-                     </div>
-                   </div>
-                 )}
+                  {/* Prehistoric Data Processing */}
+                  {summary.prehistoricData && (
+                    <div className="bg-blue-50 rounded-lg p-4 mb-4">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="font-medium">Prehistoric Data Processing</div>
+                        <div className="text-xs text-blue-600">
+                          {summary.prehistoricData.phaseActive ? "Active" : "Completed"}
+                        </div>
+                      </div>
+
+                      {/* Detailed Prehistoric Progress Bar */}
+                      <div className="mb-3">
+                        <div className="flex justify-between text-xs mb-1">
+                          <span>Progress</span>
+                          <span>
+                            {summary.prehistoricData.symbolsProcessed} / {Math.max(summary.prehistoricData.symbolsProcessed, summary.prehistoricData.cyclesCompleted > 0 ? 128 : 0)} symbols
+                          </span>
+                        </div>
+                        <Progress
+                          value={
+                            summary.prehistoricData.cyclesCompleted > 0
+                              ? Math.min((summary.prehistoricData.symbolsProcessed / Math.max(summary.prehistoricData.symbolsProcessed, 128)) * 100, 100)
+                              : 0
+                          }
+                          className="h-2"
+                        />
+                        <div className="flex justify-between text-[10px] text-muted-foreground mt-1">
+                          <span>Cycles: {summary.prehistoricData.cyclesCompleted}</span>
+                          <span>Candles: {summary.prehistoricData.candlesProcessed.toLocaleString()}</span>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-3 text-sm">
+                        <div>
+                          <div className="font-semibold">{summary.prehistoricData.cyclesCompleted}</div>
+                          <div className="text-xs text-muted-foreground">Cycles</div>
+                        </div>
+                        <div>
+                          <div className="font-semibold">{summary.prehistoricData.symbolsProcessed}</div>
+                          <div className="text-xs text-muted-foreground">Symbols</div>
+                        </div>
+                        <div>
+                          <div className="font-semibold">{summary.prehistoricData.candlesProcessed}</div>
+                          <div className="text-xs text-muted-foreground">Candles</div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                  
                  {/* Indications by Type */}
                  {summary.indicationsCounts && (
