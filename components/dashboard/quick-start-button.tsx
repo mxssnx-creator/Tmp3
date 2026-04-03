@@ -334,6 +334,20 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
             
             {/* Seed 2.0 System Monitor Button */}
             <SeedSystemDialog />
+
+            {/* Full System Test Results Button */}
+            <Button size="sm" variant="secondary" className="ml-auto text-xs" onClick={() => {
+              const btn = document.createElement('button');
+              btn.onclick = async () => {
+                const results = await fetch('/api/system/monitoring');
+                const data = await results.json();
+                const w = window.open('', '_blank');
+                w?.document.write(`<pre>${JSON.stringify(data, null, 2)}</pre>`);
+              };
+              btn.click();
+            }}>
+              📊 Test Stats
+            </Button>
          </div>
 
         {/* Info Box */}
