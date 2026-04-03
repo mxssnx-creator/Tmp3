@@ -11,6 +11,7 @@ import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
 import { SystemDetailPanel } from "./system-detail-panel"
 import { SeedSystemDialog } from "./seed-system-dialog"
 import { QuickstartTestProcedureDialog } from "./quickstart-test-procedure-dialog"
+import { QuickstartFullSystemTestDialog } from "./quickstart-full-system-test-dialog"
 import { EngineProcessingLogDialog } from "./engine-processing-log-dialog"
 import { useExchange } from "@/lib/exchange-context"
 
@@ -337,11 +338,14 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
             {/* Seed 2.0 System Monitor Button */}
             <SeedSystemDialog />
 
-            {/* System Test Procedure Dialog */}
-            <QuickstartTestProcedureDialog />
+             {/* System Test Procedure Dialog */}
+             <QuickstartTestProcedureDialog />
 
-            {/* Engine Processing Live Log Dialog */}
-            <EngineProcessingLogDialog />
+             {/* Full System Monitor Test Dialog */}
+             <QuickstartFullSystemTestDialog />
+
+             {/* Engine Processing Live Log Dialog */}
+             <EngineProcessingLogDialog />
          </div>
 
         {/* Info Box */}
