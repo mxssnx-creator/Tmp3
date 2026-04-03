@@ -46,6 +46,12 @@ async function runTest() {
   const quickstartInit = await fetchApi('/api/trade-engine/quick-start', { method: 'POST' });
   console.log(`Quickstart initialized: ${quickstartInit.success ? '✅ OK' : '⚠️ Warning'}`);
 
+  // 2.5 Explicitly start trade engine
+  await logStep("2.5 Starting trade engine service");
+  const engineStart = await fetchApi('/api/trade-engine/start', { method: 'POST' });
+  console.log(`Engine start status: ${engineStart.success ? '✅ Running' : '⚠️ Already running'}`);
+  await setTimeout(8000);
+
   // 3. Monitor Prehistoric Data Phase
   await logStep("3. Monitoring Prehistoric Data Processing (10s intervals for 2min)");
 
