@@ -47,15 +47,18 @@ export async function POST(request: NextRequest) {
       console.warn("[v0] [Trade Engine] Coordinator worker startup warning:", engineStartError)
     }
 
-    // Auto-resume connections that were paused when global engine was stopped
+    // Auto-resume connections AND enable ALL assigned main connections
     let resumedConnections: string[] = []
+    let startedConnections: string[] = []
     try {
+      const { getConnection, updateConnection, getAllConnections } = await import("@/lib/redis-db")
+      const { loadSettingsAsync } = await import("@/lib/settings-storage")
+      const settings = await loadSettingsAsync()
+      
+      // First resume paused connections
       const pausedRaw = await client.get("trade_engine:paused_connections")
       if (pausedRaw) {
         const pausedIds: string[] = JSON.parse(String(pausedRaw))
-        const { getConnection, updateConnection } = await import("@/lib/redis-db")
-        const { loadSettingsAsync } = await import("@/lib/settings-storage")
-        const settings = await loadSettingsAsync()
         
         for (const connId of pausedIds) {
           try {
@@ -89,6 +92,39 @@ export async function POST(request: NextRequest) {
         
         // Clear the paused main list
         await client.del("trade_engine:paused_connections")
+      }
+      
+      // ALSO: Explicitly start ALL assigned main connections that are enabled (quickstart fixes)
+      const allConnections = await getAllConnections()
+      for (const conn of allConnections) {
+        // Only handle assigned main connections that are enabled
+        if (conn.is_assigned === "1" && conn.is_enabled_dashboard === "1" && conn.is_active === "1" && 
+            !resumedConnections.includes(conn.id)) {
+          try {
+            // Ensure live trade is enabled
+            const updatedConn = {
+              ...conn,
+              is_live_trade: "1",
+              updated_at: new Date().toISOString(),
+            }
+            await updateConnection(conn.id, updatedConn)
+            
+            // Start the engine for this connection
+            await coordinator.startEngine(conn.id, {
+              connectionId: conn.id,
+              connection_name: conn.name,
+              exchange: conn.exchange,
+              indicationInterval: settings?.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 1,
+              strategyInterval: settings?.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 1,
+              realtimeInterval: settings?.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.2,
+            })
+            
+            startedConnections.push(conn.id)
+            console.log("[v0] [Trade Engine] Started assigned connection:", conn.id, conn.name)
+          } catch (startErr) {
+            console.warn("[v0] [Trade Engine] Failed to start assigned connection:", conn.id, startErr)
+          }
+        }
       }
       
       // Also resume preset engines that were paused
@@ -133,19 +169,23 @@ export async function POST(request: NextRequest) {
     const resumeMsg = resumedConnections.length > 0
       ? ` Resumed ${resumedConnections.length} previously paused connection(s).`
       : ""
+    const startedMsg = startedConnections.length > 0
+      ? ` Started ${startedConnections.length} assigned connection(s).`
+      : ""
     
-    console.log("[v0] [Trade Engine] Global Coordinator is running and ready." + resumeMsg)
+    console.log("[v0] [Trade Engine] Global Coordinator is running and ready." + resumeMsg + startedMsg)
     await SystemLogger.logTradeEngine(
-      `Global Coordinator started.${resumeMsg}`,
+      `Global Coordinator started.${resumeMsg}${startedMsg}`,
       "info",
-      { resumedConnections }
+      { resumedConnections, startedConnections }
     )
 
     return NextResponse.json({
       success: true,
-      message: `Global Trade Engine Coordinator started and ready.${resumeMsg}`,
+      message: `Global Trade Engine Coordinator started and ready.${resumeMsg}${startedMsg}`,
       coordinator_status: "running",
       resumedConnections,
+      startedConnections,
     })
 
   } catch (error) {

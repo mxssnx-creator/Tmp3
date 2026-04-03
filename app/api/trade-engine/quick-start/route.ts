@@ -275,53 +275,91 @@ export async function POST(request: Request) {
        testPassed,
      })
      
-     // Step 4: Start engine
-     console.log(`${LOG_PREFIX}: [4/4] Checking if engine should start...`)
-     
-     if (isAssigned && isMainEnabled) {
-       console.log(`${LOG_PREFIX}: [4/4] Connection is explicitly enabled - initializing engine...`)
-       await setSettings(`engine_progression:${connectionId}`, {
-         phase: "initializing",
-         progress: 5,
-         connectionId,
-         connectionName: connection.name,
-         exchange: exchangeName,
-         symbols,
-         testPassed,
-         detail: testPassed 
-           ? "Starting Main Trade Engine..."
-           : `Connection test failed: ${testError}. Fix credentials and retry.`,
-         updated_at: new Date().toISOString(),
-       })
-       
-       try {
-         const coordinator = getGlobalTradeEngineCoordinator()
-         const settings = await loadSettingsAsync()
-         
-         await coordinator.startEngine(connectionId, {
-           connectionId,
-           connection_name: connection.name,
-           exchange: exchangeName,
-           engine_type: "main",
-           indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
-           strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-           realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
-         })
-         
-         console.log(`${LOG_PREFIX} ✓ Engine started for ${connection.name}`)
-         await logProgressionEvent(connectionId, "engine_started", "info", "Main Trade Engine started via QuickStart", {
-           connectionId,
-           connectionName: connection.name,
-           exchange: exchangeName,
-           testPassed,
-         })
-       } catch (engineError) {
-         console.error(`${LOG_PREFIX} Failed to start engine:`, engineError)
-         await logProgressionEvent(connectionId, "engine_start_error", "error", "Failed to start engine", {
-           error: engineError instanceof Error ? engineError.message : String(engineError),
-         })
-       }
-     }
+      // Step 4: Start engine - FIRST ensure Global Coordinator is running
+      console.log(`${LOG_PREFIX}: [4/4] Starting Global Trade Engine Coordinator first...`)
+      await setSettings(`engine_progression:${connectionId}`, {
+        phase: "initializing",
+        progress: 5,
+        connectionId,
+        connectionName: connection.name,
+        exchange: exchangeName,
+        symbols,
+        testPassed,
+        detail: "Starting Global Trade Engine Coordinator...",
+        updated_at: new Date().toISOString(),
+      })
+      
+      try {
+        // ALWAYS start global coordinator - ensures all workers and progression systems are active
+        const coordinator = getGlobalTradeEngineCoordinator()
+        await coordinator.startAll()
+        await coordinator.refreshEngines()
+        
+        // Set global engine state to running
+        await client.hset("trade_engine:global", { 
+          status: "running", 
+          started_at: new Date().toISOString(),
+          coordinator_ready: "true"
+        })
+        
+        console.log(`${LOG_PREFIX} ✓ Global Coordinator started successfully`)
+        await logProgressionEvent("global", "global_coordinator_started", "info", "Global Trade Engine Coordinator started via QuickStart")
+        
+      } catch (globalStartError) {
+        console.warn(`${LOG_PREFIX} Global Coordinator start warning (already running?):`, globalStartError)
+      }
+      
+      if (isAssigned && isMainEnabled) {
+        console.log(`${LOG_PREFIX}: [4/4] Connection is explicitly enabled - initializing Main Engine...`)
+        await setSettings(`engine_progression:${connectionId}`, {
+          phase: "starting",
+          progress: 15,
+          connectionId,
+          connectionName: connection.name,
+          exchange: exchangeName,
+          symbols,
+          testPassed,
+          detail: testPassed 
+            ? "Starting Main Trade Engine..."
+            : `Connection test failed: ${testError}. Fix credentials and retry.`,
+          updated_at: new Date().toISOString(),
+        })
+        
+        try {
+          const settings = await loadSettingsAsync()
+          const coordinator = getGlobalTradeEngineCoordinator()
+          
+          await coordinator.startEngine(connectionId, {
+            connectionId,
+            connection_name: connection.name,
+            exchange: exchangeName,
+            engine_type: "main",
+            indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
+            strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
+            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+          })
+          
+          // Ensure connection is marked as live trade enabled
+          await updateConnection(connectionId, {
+            ...connection,
+            is_live_trade: "1",
+            updated_at: new Date().toISOString(),
+          })
+          
+          console.log(`${LOG_PREFIX} ✓ Main Engine started for ${connection.name}`)
+          await logProgressionEvent(connectionId, "engine_started", "info", "Main Trade Engine started via QuickStart", {
+            connectionId,
+            connectionName: connection.name,
+            exchange: exchangeName,
+            testPassed,
+          })
+        } catch (engineError) {
+          console.error(`${LOG_PREFIX} Failed to start engine:`, engineError)
+          await logProgressionEvent(connectionId, "engine_start_error", "error", "Failed to start engine", {
+            error: engineError instanceof Error ? engineError.message : String(engineError),
+          })
+        }
+      }
     
     // Store in global quickstart state
     await client.set("quickstart:last_run", JSON.stringify({
