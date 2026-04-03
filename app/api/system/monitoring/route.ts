@@ -9,9 +9,19 @@ export async function GET() {
     await initRedis()
     const client = getRedisClient()
 
-    const cpuUsage = process.cpuUsage()
     const memUsage = process.memoryUsage()
-    const cpuPercent = Math.min(100, Math.round((cpuUsage.user / 1000000) * 0.1))
+    // Get system CPU usage (not process CPU time)
+    const os = await import('os')
+    const cpus = os.cpus()
+    let totalIdle = 0
+    let totalTick = 0
+    cpus.forEach(cpu => {
+      for (const type in cpu.times) {
+        totalTick += cpu.times[type as keyof typeof cpu.times]
+      }
+      totalIdle += cpu.times.idle
+    })
+    const cpuPercent = Math.round(100 - (totalIdle / totalTick * 100))
     const memPercent = memUsage.heapTotal > 0
       ? Math.round((memUsage.heapUsed / memUsage.heapTotal) * 100)
       : 0
