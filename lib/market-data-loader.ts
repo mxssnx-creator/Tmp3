@@ -351,19 +351,19 @@ export async function loadHistoricalMarketData(
   timeframe: string = "1h"
 ): Promise<MarketDataCandle[]> {
   try {
-    // Try to fetch real historical data
-    const realData = await fetchRealMarketData(symbol, timeframe, 1000)
+    // Try to fetch real historical data - NO LIMIT
+    const realData = await fetchRealMarketData(symbol, timeframe, 1000000)
     
     if (realData && realData.candles.length > 0) {
       console.log(`[v0] [MarketData] Using real historical data for ${symbol}: ${realData.candles.length} candles`)
       return realData.candles
     }
 
-    // Fall back to synthetic
+    // Fall back to synthetic - NO LIMIT
     console.log(`[v0] [MarketData] Generating synthetic historical data for ${symbol}`)
     const daysDiff = Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))
     const candlesPerDay = timeframe === "1h" ? 24 : timeframe === "4h" ? 6 : 1
-    const totalCandles = Math.min(daysDiff * candlesPerDay, 1000)
+    const totalCandles = daysDiff * candlesPerDay
 
     const candles = generateSyntheticCandles(symbol, 100, totalCandles)
 

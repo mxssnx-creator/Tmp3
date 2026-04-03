@@ -415,30 +415,25 @@ export class PresetTradeEngine {
     console.log(`[v0] Loading historical data for ${symbols.length} symbols...`)
 
     const settings = await this.getSettings()
-    const timeRangeDays = Number.parseInt(settings.timeRangeHistoryDays || "5")
+    const timeRangeDays = Number.parseInt(settings.timeRangeHistoryDays || "36500") // 100 years - NO LIMIT
     const timeframeSeconds = Number.parseFloat(settings.marketDataTimeframe || "1.0")
 
-    const batches = this.createBatches(symbols, this.MAX_CONCURRENT)
+    // NO BATCHING, UNLIMITED CONCURRENCY, NO RATE LIMIT
+    await Promise.all(
+      symbols.map(async (symbol) => {
+        try {
+          // Fetch historical OHLCV data
+          const historicalData = await this.fetchHistoricalOHLCV(symbol, timeRangeDays, timeframeSeconds)
 
-    for (const batch of batches) {
-      await Promise.all(
-        batch.map(async (symbol) => {
-          try {
-            // Fetch historical OHLCV data
-            const historicalData = await this.fetchHistoricalOHLCV(symbol, timeRangeDays, timeframeSeconds)
+          // Store in database for prehistoric calculations
+          await this.storeHistoricalData(symbol, historicalData)
 
-            // Store in database for prehistoric calculations
-            await this.storeHistoricalData(symbol, historicalData)
-
-            console.log(`[v0] Loaded ${historicalData.length} candles for ${symbol}`)
-          } catch (error) {
-            console.error(`[v0] Failed to load historical data for ${symbol}:`, error)
-          }
-        }),
-      )
-
-      await this.delay(this.RATE_LIMIT_DELAY)
-    }
+          console.log(`[v0] Loaded ${historicalData.length} candles for ${symbol}`)
+        } catch (error) {
+          console.error(`[v0] Failed to load historical data for ${symbol}:`, error)
+        }
+      }),
+    )
 
     console.log("[v0] Historical data loading complete")
   }
