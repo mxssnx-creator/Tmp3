@@ -77,55 +77,78 @@ export function SeedSystemDialog() {
   const fetchStats = async () => {
     setLoading(true)
     try {
-      const res = await fetch("/api/trade-engine/functional-overview", { cache: "no-store" })
-      if (res.ok) {
-        const data = await res.json()
-        
-        setStats({
-          evaluations: {
-            total: data.strategiesEvaluated || 0,
-            successRate: Math.round(Math.random() * 25 + 70),
-            averageProfitFactor: +(Math.random() * 2 + 1.2).toFixed(2),
-            maxDrawdown: +(Math.random() * 15 + 5).toFixed(1),
-            drawdownTime: Math.round(Math.random() * 45 + 15)
-          },
-          positions: {
-            live: data.livePositions || 0,
-            pending: Math.round(Math.random() * 8),
-            closed: Math.round(Math.random() * 150 + 50)
-          },
-          database: {
-            requestsPerSec: Math.round(Math.random() * 200 + 80),
-            sizeMb: Math.round(Math.random() * 300 + 120),
-            totalRecords: data.positionsEntriesCreated || 0,
-            connections: Math.round(Math.random() * 8 + 3)
-          },
-          system: {
-            cpuUsage: Math.round(Math.random() * 35 + 20),
-            memoryUsage: Math.round(Math.random() * 1200 + 800),
-            memoryTotal: 4096,
-            uptime: Math.round(Math.random() * 86400 + 3600),
-            processCount: Math.round(Math.random() * 15 + 8)
-          },
-          errors: {
-            total: Math.round(Math.random() * 25 + 5),
-            lastHour: Math.round(Math.random() * 5),
-            critical: Math.round(Math.random() * 2),
-            warning: Math.round(Math.random() * 8)
-          },
-          data: {
-            prehistoricLoaded: data.symbolsActive || 0,
-            realtimeActive: 1,
-            evaluationsProcessed: data.indicationsCalculated || 0,
-            cyclesCompleted: data.counts?.indicationCycles || 0
-          }
-        })
-      }
+      // Fetch comprehensive monitoring data
+      const res = await fetch("/api/monitoring/comprehensive", { cache: "no-store" })
       
-      const logRes = await fetch("/api/trade-engine/detailed-logs?limit=50", { cache: "no-store" })
-      if (logRes.ok) {
-        const logData = await logRes.json()
-        setLogs(logData.logs || [])
+      // Fetch functional overview
+      const funcRes = await fetch("/api/trade-engine/functional-overview", { cache: "no-store" })
+      
+      // Fetch system metrics
+      const metricsRes = await fetch("/api/engine-metrics", { cache: "no-store" })
+      
+      // Fetch detailed logs
+      const logRes = await fetch("/api/monitoring/logs?limit=100", { cache: "no-store" })
+
+      const [monitorData, funcData, metricsData, logData] = await Promise.allSettled([
+        res.ok ? res.json() : null,
+        funcRes.ok ? funcRes.json() : null,
+        metricsRes.ok ? metricsRes.json() : null,
+        logRes.ok ? logRes.json() : null
+      ]).then(results => results.map(r => r.status === 'fulfilled' ? r.value : null))
+
+      const functionalOverview = funcData || {}
+      const monitoring = monitorData || {}
+      const metrics = metricsData || {}
+      
+      setStats({
+        evaluations: {
+          total: functionalOverview.strategiesEvaluated || 0,
+          successRate: metrics.successRate || 0,
+          averageProfitFactor: +(metrics.profitFactor || 0).toFixed(2),
+          maxDrawdown: +(metrics.maxDrawdown || 0).toFixed(1),
+          drawdownTime: metrics.drawdownTime || 0
+        },
+        positions: {
+          live: monitoring.trading?.livePositions || 0,
+          pending: monitoring.trading?.pendingPositions || 0,
+          closed: monitoring.trading?.closedPositions || 0
+        },
+        database: {
+          requestsPerSec: monitoring.database?.requestsPerSecond || 0,
+          sizeMb: monitoring.database?.sizeMb || 0,
+          totalRecords: functionalOverview.positionsEntriesCreated || 0,
+          connections: monitoring.database?.activeConnections || 0
+        },
+        system: {
+          cpuUsage: monitoring.system?.cpuUsage || 0,
+          memoryUsage: Math.round((monitoring.system?.memoryUsed || 0) / 1024 / 1024),
+          memoryTotal: Math.round((monitoring.system?.memoryTotal || 4194304) / 1024 / 1024),
+          uptime: Math.floor(monitoring.system?.uptime || 0),
+          processCount: monitoring.system?.processCount || 0
+        },
+        errors: {
+          total: monitoring.errors?.total || 0,
+          lastHour: monitoring.errors?.lastHour || 0,
+          critical: monitoring.errors?.critical || 0,
+          warning: monitoring.errors?.warnings || 0
+        },
+        data: {
+          prehistoricLoaded: functionalOverview.symbolsActive || 0,
+          realtimeActive: monitoring.connections?.liveTrade || 0,
+          evaluationsProcessed: functionalOverview.indicationsCalculated || 0,
+          cyclesCompleted: functionalOverview.counts?.indicationCycles || 0
+        }
+      })
+
+      if (logData?.logs) {
+        setLogs(logData.logs.map((log: any) => ({
+          id: log.id,
+          timestamp: log.timestamp,
+          category: log.category || "overall",
+          level: log.level || "info",
+          message: log.message,
+          details: log.details
+        })))
       }
     } catch (e) {
       console.warn("System stats fetch failed")
