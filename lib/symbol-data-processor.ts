@@ -180,13 +180,12 @@ export class SymbolDataProcessor {
       const client = getRedisClient()
       const key = `market_data:${symbol}:realtime`
       
-      // Store latest data
-      await client.set(key, JSON.stringify(data), { EX: 3600 }) // 1h TTL
+      // Store latest data - NO EXPIRE, NO LIMIT
+      await client.set(key, JSON.stringify(data))
       
-      // Add to history (bounded list)
+      // Add to history (UNBOUNDED, NO LIMIT)
       const historyKey = `market_data:${symbol}:history`
       await client.lpush(historyKey, JSON.stringify(data))
-      await client.ltrim(historyKey, 0, 999) // Keep last 1000 entries
       
     } catch (error) {
       await this.progressManager.addError(
