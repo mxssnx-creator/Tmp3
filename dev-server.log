@@ -160,3 +160,14 @@ $ next dev -p 3002
 [v0] [Redis] ✓ Migrations completed
 [v0] [Connections] ✓ Connection initialization skipped (handled by migrations 011-016)
  GET /api/settings/connections/test/log 200 in 3175ms
+ ○ Compiling /api/system/monitoring ...
+ ✓ Compiled /api/system/monitoring in 1445ms (710 modules)
+[v0] [Redis] Client initialized with persistence
+[v0] [Redis] Connection test successful
+[v0] [Redis] Running migrations...
+[v0] [Migrations] ✓ Already executed in this process; base ensured=4, credentialsInjected=3
+[v0] [Redis] ✓ Migrations completed
+[v0] [Connections] ✓ Connection initialization skipped (handled by migrations 011-016)
+[v0] GlobalTradeEngineCoordinator initialized with advanced coordination
+[v0] Global trade engine coordinator auto-initialized
+ GET /api/system/monitoring 200 in 1665ms
