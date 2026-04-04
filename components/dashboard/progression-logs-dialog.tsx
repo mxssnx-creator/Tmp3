@@ -51,35 +51,37 @@ export function ProgressionLogsDialog({
   const loadLogs = async () => {
     setIsLoading(true)
     try {
-      // Fetch from progression endpoint which has comprehensive data including state
+      // Fetch from progression endpoint which has comprehensive state data
       const response = await fetch(`/api/connections/progression/${connectionId}?t=${Date.now()}`)
       if (response.ok) {
         const data = await response.json()
-        // Extract logs from the new endpoint format (recentLogs array)
-        const logs = data.recentLogs || []
+        // Extract logs from endpoint
+        const logs = data.logs || data.recentLogs || []
         setLogs(logs)
-        // Extract progression state from the new endpoint format (state object)
-        const state = data.state || {}
+        
+        // Extract progression state directly from progressionState (the endpoint's primary format)
+        // The endpoint returns progressionState object with all the cycle and trade data
+        const progState = data.progressionState || {}
         setProgressionState({
-          cyclesCompleted: state.cyclesCompleted || 0,
-          successfulCycles: state.successfulCycles || 0,
-          failedCycles: state.failedCycles || 0,
-          cycleSuccessRate: state.cycleSuccessRate || 0,
-          totalTrades: state.totalTrades || 0,
-          successfulTrades: state.successfulTrades || 0,
-          totalProfit: state.totalProfit || 0,
-          tradeSuccessRate: state.tradeSuccessRate || 0,
-          // Add stage counts from metrics if available
-          stageMetrics: data.metrics || {},
+          cyclesCompleted: progState.cyclesCompleted || 0,
+          successfulCycles: progState.successfulCycles || 0,
+          failedCycles: progState.failedCycles || 0,
+          cycleSuccessRate: progState.cycleSuccessRate || 0,
+          totalTrades: progState.totalTrades || 0,
+          successfulTrades: progState.successfulTrades || 0,
+          totalProfit: progState.totalProfit || 0,
+          tradeSuccessRate: progState.tradeSuccessRate || 0,
+          // Stage metrics from the comprehensive state object
+          stageMetrics: {
+            indicationsCount: progState.indicationsCount || 0,
+            strategiesCount: progState.strategiesCount || 0,
+            totalStrategiesEvaluated: (progState.strategyEvaluatedBase || 0) + (progState.strategyEvaluatedMain || 0) + (progState.strategyEvaluatedReal || 0),
+            realtimeCycleCount: progState.realtimeCycleCount || 0,
+            prehistoricCyclesCompleted: progState.prehistoricCyclesCompleted || 0,
+          }
         })
       } else {
-        // Fallback: try legacy progression/logs endpoint
-        const logsResponse = await fetch(`/api/connections/progression/${connectionId}/logs?t=${Date.now()}`)
-        if (logsResponse.ok) {
-          const logsData = await logsResponse.json()
-          setLogs(logsData.logs || [])
-          setProgressionState(logsData.progressionState || null)
-        }
+        console.warn("[v0] Failed to fetch progression endpoint")
       }
     } catch (error) {
       console.error("[v0] Failed to load progression logs:", error)
