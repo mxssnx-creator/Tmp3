@@ -5,7 +5,7 @@
 import { readFileSync, writeFileSync } from "fs"
 import { resolve } from "path"
 
-const ROOT = resolve(process.cwd())
+const ROOT = "/vercel/share/v0-project"
 
 function patchFile(filePath, oldStr, newStr) {
   const content = readFileSync(filePath, "utf8")
