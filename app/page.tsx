@@ -73,9 +73,7 @@ export default function Home() {
   return (
     <PageErrorBoundary>
       <DashboardShell>
-        <Suspense fallback={<DashboardLoading />}>
-          <Dashboard />
-        </Suspense>
+        <Dashboard />
       </DashboardShell>
     </PageErrorBoundary>
   )
