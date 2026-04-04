@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge"
 import { Zap, Loader2, CheckCircle2, AlertCircle, RefreshCw } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
 import { DetailedLoggingDialog } from "./detailed-logging-dialog"
+import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
 import { SystemDetailPanel } from "./system-detail-panel"
 import { SeedSystemDialog } from "./seed-system-dialog"
 import { QuickstartTestProcedureDialog } from "./quickstart-test-procedure-dialog"
@@ -327,6 +328,9 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
            
            {/* System Detail Panel button */}
            <SystemDetailPanel />
+
+           {/* Main / Log Overview button */}
+           <QuickstartOverviewDialog />
 
             {/* Detailed Logs Button */}
             <DetailedLoggingDialog />
