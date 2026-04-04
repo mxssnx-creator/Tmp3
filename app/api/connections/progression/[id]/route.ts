@@ -21,27 +21,48 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     const { id } = await params
     const connectionId = id
 
-    await initRedis()
+    // PRODUCTION FIX: Initialize Redis before use
+    try {
+      await initRedis()
+    } catch (redisErr) {
+      console.error(`[v0] [ProgressionAPI] Redis init failed for ${connectionId}:`, redisErr)
+      return getErrorResponse(connectionId, "Redis initialization failed")
+    }
     
     // Force flush any pending logs before fetching
-    await forceFlushLogs(connectionId)
+    try {
+      await forceFlushLogs(connectionId)
+    } catch (flushErr) {
+      console.warn(`[v0] [ProgressionAPI] Failed to flush logs for ${connectionId}:`, flushErr)
+    }
 
     // Get connection details for context
-    const connection = await getConnection(connectionId)
+    const connection = await getConnection(connectionId).catch((e) => {
+      console.warn(`[v0] [ProgressionAPI] Failed to get connection ${connectionId}:`, e)
+      return null
+    })
     const connName = connection?.name || connectionId
 
     // Get progression phase data from engine-manager's updateProgressionPhase
-    const progression = await getSettings(`engine_progression:${connectionId}`)
+    const progression = await getSettings(`engine_progression:${connectionId}`).catch((e) => {
+      console.warn(`[v0] [ProgressionAPI] Failed to get progression settings for ${connectionId}:`, e)
+      return {}
+    })
     
     // Get engine state from the correct Redis key: trade_engine_state:{connectionId}
     const client = getRedisClient()
-    const engineState = await getSettings(`trade_engine_state:${connectionId}`)
+    const engineState = await getSettings(`trade_engine_state:${connectionId}`).catch((e) => {
+      console.warn(`[v0] [ProgressionAPI] Failed to get engine state for ${connectionId}:`, e)
+      return {}
+    })
     
     // Also check global state (stored as Redis HASH via hset, not a string)
     let globalState: any = {}
     try {
-      const globalStateData = await client.hgetall("trade_engine:global")
-      globalState = globalStateData && Object.keys(globalStateData).length > 0 ? globalStateData : {}
+      if (client) {
+        const globalStateData = await client.hgetall("trade_engine:global").catch(() => null)
+        globalState = globalStateData && Object.keys(globalStateData).length > 0 ? globalStateData : {}
+      }
     } catch {
       globalState = {}
     }
@@ -52,11 +73,13 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
      let isEngineRunning = false
      try {
        const coordinator = getGlobalTradeEngineCoordinator()
-       isEngineRunning = coordinator.isEngineRunning(connectionId)
-       console.log(`[v0] [ProgressionAPI] ${connectionId}: Coordinator reports engine running = ${isEngineRunning}`)
+       if (coordinator) {
+         isEngineRunning = coordinator.isEngineRunning(connectionId)
+         console.log(`[v0] [ProgressionAPI] ${connectionId}: Coordinator reports engine running = ${isEngineRunning}`)
+       }
      } catch (e) {
        console.warn(`[v0] [ProgressionAPI] ${connectionId}: Failed to check coordinator state, falling back to Redis flag`)
-       const runningFlag = await getSettings(`engine_is_running:${connectionId}`)
+       const runningFlag = await getSettings(`engine_is_running:${connectionId}`).catch(() => null)
        isEngineRunning = runningFlag === "true" || runningFlag === true
      }
     
@@ -67,38 +90,40 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     const isActiveInserted = connection?.is_active_inserted === "1" || connection?.is_active_inserted === true
     
     // Get progression state (cycles, success rates)
-    const progressionState = await ProgressionStateManager.getProgressionState(connectionId)
+    let progressionState = await ProgressionStateManager.getProgressionState(connectionId).catch((e) => {
+      console.warn(`[v0] [ProgressionAPI] Failed to get progression state for ${connectionId}:`, e)
+      return ProgressionStateManager.getDefaultState(connectionId)
+    })
     
     // Count indications processed for this connection
     let indicationsCount = 0
     let strategiesCount = 0
     try {
-      indicationsCount =
-        toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0)) ||
-        (await client.keys(`indications:${connectionId}:*`).catch(() => [])).length
+      if (client) {
+        indicationsCount =
+          toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0)) ||
+          (await client.keys(`indications:${connectionId}:*`).catch(() => [])).length
 
-      strategiesCount =
-        toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0)) ||
-        (await client.keys(`strategies:${connectionId}:*`).catch(() => [])).length
+        strategiesCount =
+          toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0)) ||
+          (await client.keys(`strategies:${connectionId}:*`).catch(() => [])).length
+      }
     } catch {
       indicationsCount = 0
       strategiesCount = 0
     }
     
     // Check for actual running evidence from cycle counts in engine state
-    const indicationCycleCount = engineState?.indication_cycle_count || 0
-    const strategyCycleCount = engineState?.strategy_cycle_count || 0
+    const indicationCycleCount = toNumber(engineState?.indication_cycle_count)
+    const strategyCycleCount = toNumber(engineState?.strategy_cycle_count)
     const hasRecentActivity = engineState?.last_indication_run 
       ? (Date.now() - new Date(engineState.last_indication_run).getTime()) < 60000 // Active in last 60s
       : false
     
-    // DEBUG: Log what we're reading
+    // DEBUG: Log what we're reading (production safe)
     console.log(`[v0] [ProgressionAPI] ${connectionId}: cycleCount=${indicationCycleCount}, stratCount=${strategyCycleCount}, recent=${hasRecentActivity}, engineState.status=${engineState?.status}, running=${isEngineRunning}`)
-    console.log(`[v0] [ProgressionAPI] ${connectionId}: Full engineState keys=`, Object.keys(engineState || {}))
-    console.log(`[v0] [ProgressionAPI] ${connectionId}: progression.phase=${progression?.phase}, progress=${progression?.progress}`)
     
-    // Engine is running only when there is current runtime evidence.
-    // Historical cycle counters are intentionally excluded to avoid stale "running" state.
+    // Engine is running only when there is current runtime evidence
     const engineRunning = isEngineRunning || 
       (isGloballyRunning && (isActiveInserted || isInserted) && isEnabled) ||
       engineState?.status === "running" ||
@@ -110,34 +135,27 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     let detail = progression?.detail || "Not running"
     
     // Better phase detection based on actual metrics (most reliable)
-    // Priority: actual evidence > stored progression > engine state > idle
-    
     if (indicationCycleCount > 100 || progressionState.cyclesCompleted > 100) {
-      // STRONG evidence: 100+ indication cycles = live trading active
       phase = "live_trading"
       progress = 100
       detail = `Live trading active - ${Math.max(indicationCycleCount, progressionState.cyclesCompleted)} cycles`
       console.log(`[v0] [Phase] ${connectionId}: Strong cycles evidence → live_trading`)
     } else if (indicationCycleCount > 20 || progressionState.cyclesCompleted > 20 || indicationsCount > 50) {
-      // Moderate evidence: 20+ cycles OR 50+ indication keys means we're past initialization
       phase = "live_trading"
       progress = 90 + Math.min(10, indicationCycleCount / 100)
       detail = `Live trading - ${Math.max(indicationCycleCount, progressionState.cyclesCompleted)} cycles`
       console.log(`[v0] [Phase] ${connectionId}: Moderate cycles (${indicationCycleCount}) OR indications (${indicationsCount}) → live_trading`)
     } else if (indicationCycleCount > 0 || indicationsCount > 0 || progressionState.cyclesCompleted > 0) {
-      // Any indication processing = realtime phase
       const totalCycles = Math.max(progressionState.cyclesCompleted, indicationCycleCount)
       phase = "realtime"
       progress = 80 + Math.min(20, totalCycles / 10)
       detail = `Processing - ${totalCycles} cycles`
       console.log(`[v0] [Phase] ${connectionId}: Initial cycles (${indicationCycleCount}) OR keys (${indicationsCount}) → realtime`)
     } else if (progression?.phase && !["ready", "idle", "initializing"].includes(progression.phase)) {
-      // Use stored progression phase only if meaningful
       phase = progression.phase
       progress = Number(progression.progress) || 50
       detail = progression.detail || "Engine running"
     } else if (engineState?.all_phases_started || engineState?.live_trading_started) {
-      // Engine state confirms all phases started
       phase = "live_trading"
       progress = 100
       detail = "All phases active"
@@ -154,7 +172,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       progress = 15
       detail = "Prehistoric data loaded"
     } else if (engineState?.status === "running" || isEngineRunning) {
-      // Engine state says running but no cycles yet
       phase = "initializing"
       progress = 30
       detail = "Engine starting up..."
@@ -169,14 +186,18 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     }
     
     // Get recent logs for context
-    const recentLogs = await getProgressionLogs(connectionId)
-    const lastLog = recentLogs[0] || null
+    let recentLogs: any[] = []
+    try {
+      recentLogs = await getProgressionLogs(connectionId).catch(() => [])
+    } catch {
+      recentLogs = []
+    }
     
     const subItem = progression?.sub_item || ""
     const subCurrent = Number(progression?.sub_current) || 0
     const subTotal = Number(progression?.sub_total) || 0
 
-    // Build comprehensive message from detail + sub-progress info
+    // Build comprehensive message
     let message = detail
     if (subTotal > 0 && subCurrent > 0) {
       message = `${detail} (${subCurrent}/${subTotal}${subItem ? ` - ${subItem}` : ""})`
@@ -243,7 +264,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       metrics: {
         indicationsCount,
         strategiesCount,
-        intervalsProcessed: toNumber(await client.get(`intervals:${connectionId}:processed_count`).catch(() => 0)),
+        intervalsProcessed: toNumber(await client?.get(`intervals:${connectionId}:processed_count`).catch(() => 0)),
         engineRunning,
         isEngineRunning,
         hasRecentActivity,
@@ -278,25 +299,31 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   } catch (error) {
     console.error("[v0] [Progression] Failed to fetch progression:", error)
     const { id } = await params
-    return NextResponse.json({ 
-      success: false,
-      progression: {
-        phase: "error",
-        progress: 0,
-        message: "Failed to fetch progression status",
-        subPhase: null,
-        subProgress: { current: 0, total: 0 },
-        startedAt: null,
-        updatedAt: null,
-        details: {
-          historicalDataLoaded: false,
-          indicationsCalculated: false,
-          strategiesProcessed: false,
-          liveProcessingActive: false,
-          liveTradingActive: false,
-        },
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
-    }, { status: 500 })
+    return getErrorResponse(id, error instanceof Error ? error.message : "Unknown error")
   }
+}
+
+// Production-safe error response helper
+function getErrorResponse(connectionId: string, message: string) {
+  return NextResponse.json({ 
+    success: false,
+    connectionId,
+    progression: {
+      phase: "error",
+      progress: 0,
+      message: "Failed to fetch progression status",
+      subPhase: null,
+      subProgress: { current: 0, total: 0 },
+      startedAt: null,
+      updatedAt: null,
+      details: {
+        historicalDataLoaded: false,
+        indicationsCalculated: false,
+        strategiesProcessed: false,
+        liveProcessingActive: false,
+        liveTradingActive: false,
+      },
+      error: message,
+    },
+  }, { status: 500 })
 }

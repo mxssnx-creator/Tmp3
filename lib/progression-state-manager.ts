@@ -55,45 +55,25 @@ export class ProgressionStateManager {
    */
   static async getProgressionState(connectionId: string): Promise<ProgressionState> {
     try {
+      // PRODUCTION FIX: Always initialize Redis connection before using it
       const client = getRedisClient()
+      if (!client) {
+        console.warn(`[v0] Redis client not initialized for ${connectionId}, returning default state`)
+        return this.getDefaultState(connectionId)
+      }
+
       const key = `progression:${connectionId}`
-      const data = await client.hgetall(key)
+      let data: Record<string, string> = {}
+      
+      try {
+        data = await client.hgetall(key)
+      } catch (redisError) {
+        console.warn(`[v0] Redis connection error reading progression:${connectionId}, using default state:`, redisError)
+        return this.getDefaultState(connectionId)
+      }
 
        if (!data || Object.keys(data).length === 0) {
-         // Return default progression state
-         return {
-           connectionId,
-           cyclesCompleted: 0,
-           successfulCycles: 0,
-           failedCycles: 0,
-           totalTrades: 0,
-           successfulTrades: 0,
-           totalProfit: 0,
-           cycleSuccessRate: 0,
-           tradeSuccessRate: 0,
-         lastCycleTime: undefined,
-         lastUpdate: new Date(),
-         prehistoricCyclesCompleted: 0,
-         prehistoricSymbolsProcessed: [],
-         prehistoricPhaseActive: false,
-         prehistoricCandlesProcessed: 0,
-         prehistoricSymbolsProcessedCount: 0,
-         indicationsDirectionCount: 0,
-         indicationsMoveCount: 0,
-         indicationsActiveCount: 0,
-         indicationsOptimalCount: 0,
-         indicationsAutoCount: 0,
-         strategiesBaseTotal: 0,
-         strategiesMainTotal: 0,
-         strategiesRealTotal: 0,
-         strategyEvaluatedBase: 0,
-         strategyEvaluatedMain: 0,
-         strategyEvaluatedReal: 0,
-         cycleTimeMs: 0,
-         intervalsProcessed: 0,
-         indicationsCount: 0,
-         strategiesCount: 0,
-         }
+         return this.getDefaultState(connectionId)
        }
 
        return {
@@ -131,23 +111,47 @@ export class ProgressionStateManager {
        }
     } catch (error) {
       console.error(`[v0] Failed to get progression state for ${connectionId}:`, error)
-      // Return default on error
-      return {
-        connectionId,
-        cyclesCompleted: 0,
-        successfulCycles: 0,
-        failedCycles: 0,
-        totalTrades: 0,
-        successfulTrades: 0,
-        totalProfit: 0,
-        cycleSuccessRate: 0,
-        tradeSuccessRate: 0,
-        lastCycleTime: undefined,
-        lastUpdate: new Date(),
-        prehistoricCyclesCompleted: 0,
-        prehistoricSymbolsProcessed: [],
-        prehistoricPhaseActive: false,
-      }
+      return this.getDefaultState(connectionId)
+    }
+  }
+
+  /**
+   * Get default progression state (reusable helper)
+   * Public static method to allow callers to get default state on errors
+   */
+  static getDefaultState(connectionId: string): ProgressionState {
+    return {
+      connectionId,
+      cyclesCompleted: 0,
+      successfulCycles: 0,
+      failedCycles: 0,
+      totalTrades: 0,
+      successfulTrades: 0,
+      totalProfit: 0,
+      cycleSuccessRate: 0,
+      tradeSuccessRate: 0,
+      lastCycleTime: undefined,
+      lastUpdate: new Date(),
+      prehistoricCyclesCompleted: 0,
+      prehistoricSymbolsProcessed: [],
+      prehistoricPhaseActive: false,
+      prehistoricCandlesProcessed: 0,
+      prehistoricSymbolsProcessedCount: 0,
+      indicationsDirectionCount: 0,
+      indicationsMoveCount: 0,
+      indicationsActiveCount: 0,
+      indicationsOptimalCount: 0,
+      indicationsAutoCount: 0,
+      strategiesBaseTotal: 0,
+      strategiesMainTotal: 0,
+      strategiesRealTotal: 0,
+      strategyEvaluatedBase: 0,
+      strategyEvaluatedMain: 0,
+      strategyEvaluatedReal: 0,
+      cycleTimeMs: 0,
+      intervalsProcessed: 0,
+      indicationsCount: 0,
+      strategiesCount: 0,
     }
   }
 
@@ -160,12 +164,22 @@ export class ProgressionStateManager {
   static async incrementCycle(connectionId: string, successful: boolean, profit: number = 0): Promise<void> {
     try {
       const client = getRedisClient()
-      if (!client) return
+      if (!client) {
+        console.warn(`[v0] Redis client not available for incrementCycle`)
+        return
+      }
 
       const redisKey = `progression:${connectionId}`
 
       // Read current values from Redis first (to handle server restarts)
-      const existing = await client.hgetall(redisKey)
+      let existing: Record<string, string> = {}
+      try {
+        existing = await client.hgetall(redisKey)
+      } catch (e) {
+        console.warn(`[v0] Failed to read progression data for ${connectionId}:`, e)
+        return
+      }
+
       const currentCompleted = parseInt(existing?.cycles_completed || "0", 10)
       const currentSuccessful = parseInt(existing?.successful_cycles || "0", 10)
       const currentFailed = parseInt(existing?.failed_cycles || "0", 10)
@@ -185,18 +199,23 @@ export class ProgressionStateManager {
       const successRate = newCompleted > 0 ? (newSuccessful / newCompleted) * 100 : 0
 
       // Write update to Redis
-      await client.hset(redisKey, {
-        cycles_completed: String(newCompleted),
-        successful_cycles: String(newSuccessful),
-        failed_cycles: String(newFailed),
-        cycle_success_rate: String(successRate.toFixed(2)),
-        last_cycle_time: new Date().toISOString(),
-        last_update: new Date().toISOString(),
-        connection_id: connectionId,
-      })
+      try {
+        await client.hset(redisKey, {
+          cycles_completed: String(newCompleted),
+          successful_cycles: String(newSuccessful),
+          failed_cycles: String(newFailed),
+          cycle_success_rate: String(successRate.toFixed(2)),
+          last_cycle_time: new Date().toISOString(),
+          last_update: new Date().toISOString(),
+          connection_id: connectionId,
+        })
 
-      // Set expiration
-      await client.expire(redisKey, 7 * 24 * 60 * 60)
+        // Set expiration
+        await client.expire(redisKey, 7 * 24 * 60 * 60)
+      } catch (writeError) {
+        console.warn(`[v0] Failed to write progression data for ${connectionId}:`, writeError)
+        return
+      }
 
       // Log every 25 cycles
       if (newCompleted % 25 === 0 && newCompleted > 0) {
@@ -204,6 +223,7 @@ export class ProgressionStateManager {
       }
     } catch (error) {
       // Silent fail to not block processing
+      console.error(`[v0] Unexpected error in incrementCycle:`, error)
     }
   }
 
