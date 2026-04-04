@@ -1,13 +1,70 @@
 "use client"
 
-import React from "react"
+import React, { type ReactNode } from "react"
+import { PageHeader } from "@/components/page-header"
+import { SystemOverview } from "./system-overview"
+import { GlobalTradeEngineControls } from "./global-trade-engine-controls"
+import { DashboardActiveConnectionsManager } from "./dashboard-active-connections-manager"
+import { StatisticsOverviewV2 } from "./statistics-overview-v2"
+import { SystemMonitoringPanel } from "./system-monitoring-panel"
+import { Card } from "@/components/ui/card"
+
+interface ErrorBoundaryProps { children: ReactNode; name: string }
+interface ErrorBoundaryState { hasError: boolean; error?: Error }
+
+class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props)
+    this.state = { hasError: false }
+  }
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error }
+  }
+  componentDidCatch(error: Error) {
+    console.error(`[Dashboard] Error in ${this.props.name}:`, error)
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <Card className="p-4 border-destructive/50 bg-destructive/5">
+          <p className="text-sm text-destructive font-medium">Failed to load: {this.props.name}</p>
+          <p className="text-xs text-muted-foreground mt-1">{this.state.error?.message}</p>
+        </Card>
+      )
+    }
+    return this.props.children
+  }
+}
 
 export function Dashboard() {
   return (
-    <div className="flex-1 space-y-6 px-4 pb-6 pt-6">
-      <div className="text-center">
-        <h1 className="text-2xl font-bold">CTS v3.2 Dashboard</h1>
-        <p className="text-gray-600">Dashboard loading...</p>
+    <div className="flex-1 flex flex-col min-h-0">
+      <PageHeader
+        title="CTS v3.2 Dashboard"
+        description="Monitor and control your active exchange connections"
+        showExchangeSelector
+      />
+
+      <div className="flex-1 space-y-4 px-3 md:px-4 py-4 pb-8">
+        <ErrorBoundary name="System Overview">
+          <SystemOverview />
+        </ErrorBoundary>
+
+        <ErrorBoundary name="Trade Engine Controls">
+          <GlobalTradeEngineControls />
+        </ErrorBoundary>
+
+        <ErrorBoundary name="Active Connections">
+          <DashboardActiveConnectionsManager />
+        </ErrorBoundary>
+
+        <ErrorBoundary name="Statistics">
+          <StatisticsOverviewV2 connections={[]} />
+        </ErrorBoundary>
+
+        <ErrorBoundary name="System Monitoring">
+          <SystemMonitoringPanel />
+        </ErrorBoundary>
       </div>
     </div>
   )
