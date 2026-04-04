@@ -327,7 +327,7 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
            </Button>
            
            {/* Main / Log compact overview button */}
-           <QuickstartOverviewDialog connectionId="bingx-x01" />
+           <QuickstartOverviewDialog />
 
            {/* System Detail Panel button */}
            <SystemDetailPanel />

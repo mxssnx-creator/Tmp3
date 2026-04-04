@@ -14,6 +14,7 @@ interface ProgressionLogsDialogProps {
   onOpenChange: (open: boolean) => void
   connectionId: string
   connectionName: string
+  progression?: any
 }
 
 interface ProgressionLog {
