@@ -3,7 +3,8 @@
  * Modern connection management with Redis storage, proper state validation, error handling, and UI updates
  */
 
-import { initRedis, getAllConnections, getConnection, updateConnection, type Connection } from "@/lib/redis-db"
+import { initRedis, getAllConnections, getConnection, updateConnection } from "@/lib/redis-db"
+import type { Connection } from "@/lib/db-types"
 import { SystemLogger } from "@/lib/system-logger"
 
 export type ConnectionStatus = "active" | "inactive" | "error" | "testing"

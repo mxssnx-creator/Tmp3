@@ -9,7 +9,6 @@ import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { StrategyCoordinator } from "@/lib/strategy-coordinator"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { trackStrategyStats } from "@/lib/statistics-tracker"
-import { query } from "@/lib/db" // Add database query function
 
 export class StrategyProcessor {
   private connectionId: string

@@ -5,7 +5,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Plus, AlertTriangle, RotateCcw } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
-import type { Connection } from "@/lib/redis-db"
+import type { Connection } from "@/lib/db-types"
 import type { ActiveConnection } from "@/lib/active-connections"
 import { BASE_EXCHANGES } from "@/lib/connection-utils"
 import { COMPONENT_VERSIONS } from "@/lib/system-version"
@@ -54,6 +54,7 @@ export function DashboardActiveConnectionsManager() {
   const loadConnections = async () => {
     try {
       const timestamp = new Date().getTime()
+      console.log(`[v0] [Manager] Loading connections with cache bust: t=${timestamp}`)
       const response = await fetch(`/api/settings/connections?v=${VERSION}&t=${timestamp}`, {
         cache: "no-store",
         headers: {
@@ -64,13 +65,14 @@ export function DashboardActiveConnectionsManager() {
       })
       
       if (!response.ok) {
+        console.error(`[v0] [Manager] API returned ${response.status}`)
         setLoading(false)
         return
       }
       
       const data = await response.json()
       const allConnections: Connection[] = Array.isArray(data) ? data : (data?.connections || [])
-      console.log(`[v0] [Manager] Loaded ${allConnections.length} total connections`)
+      console.log(`[v0] [Manager] Loaded ${allConnections.length} total connections from API`)
       
       const activeConns: ActiveConnectionWithDetails[] = []
       const seenIds = new Set<string>()
@@ -80,17 +82,22 @@ export function DashboardActiveConnectionsManager() {
         const isBase = BASE_EXCHANGES.includes(exchange)
 
         // is_active_inserted = "1" means this connection is in Active panel
+        // is_inserted = "1" means this connection is visible (predefined template)
         // This applies to BOTH predefined templates (when enabled) AND user-created connections
         const isActiveInserted =
           toBoolean(conn.is_active_inserted) ||
-          toBoolean(conn.is_dashboard_inserted)
+          toBoolean(conn.is_dashboard_inserted) ||
+          toBoolean(conn.is_inserted)  // Also show if simply inserted/visible
 
         // isEnabledDashboard = connection's dashboard toggle is ON (processing enabled)
         const isEnabledDashboard =
           toBoolean(conn.is_enabled_dashboard)
 
         if (isBase || isActiveInserted || isEnabledDashboard) {
-          if (seenIds.has(conn.id)) continue
+          if (seenIds.has(conn.id)) {
+            console.warn(`[v0] [Manager] Duplicate connection skipped: ${conn.id}`)
+            continue
+          }
           seenIds.add(conn.id)
           activeConns.push({
             id: `active-${conn.id}`,
@@ -101,10 +108,11 @@ export function DashboardActiveConnectionsManager() {
             addedAt: conn.created_at || new Date().toISOString(),
             details: conn,
           })
+          console.log(`[v0] [Manager]   ${conn.id} (${conn.name}): base=${isBase}, inserted=${isActiveInserted}, enabled=${isEnabledDashboard}`)
         }
       }
       
-      console.log(`[v0] [Manager] Filtered ${activeConns.length} active connections from ${allConnections.length} total`)
+      console.log(`[v0] [Manager] Filtered to ${activeConns.length} active connections (bybit=${activeConns.filter(c => c.connectionId.includes('bybit')).length}, bingx=${activeConns.filter(c => c.connectionId.includes('bingx')).length})`)
       updateActiveConnections(activeConns)
     } catch (error) {
       console.error("[v0] Error loading connections:", error)

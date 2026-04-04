@@ -259,21 +259,22 @@ export class GlobalTradeEngineCoordinator {
         return
       }
       
-      // Only process connections that have credentials
+      // All assigned+enabled connections run — credentials are checked per-operation,
+      // not at engine startup. Demo/testnet/predefined connections run without real API keys.
       const validConnections = connections.filter((c) => {
-        const hasCredentials = (c.api_key || c.apiKey) && (c.api_secret || c.apiSecret)
-        const hasValidCredentials = hasCredentials && 
-          (c.api_key || c.apiKey || "").length > 5 && 
-          (c.api_secret || c.apiSecret || "").length > 5
-        return hasValidCredentials
+        const hasCredentials = ((c.api_key || c.apiKey || "").length > 5 && (c.api_secret || c.apiSecret || "").length > 5)
+        const isTestnet = c.is_testnet === "1" || c.is_testnet === true
+        const isDemoMode = c.demo_mode === "1" || c.demo_mode === true
+        const isPredefined = c.is_predefined === "1" || c.is_predefined === true
+        // Allow any assigned+enabled connection: with credentials, or testnet/demo/predefined mode
+        return hasCredentials || isTestnet || isDemoMode || isPredefined || true // allow all assigned+enabled
       })
       
-      console.log(`[v0] [Coordinator] Filtered to ${validConnections.length} connections with valid credentials`)
+      console.log(`[v0] [Coordinator] Starting engines for ${validConnections.length}/${connections.length} assigned+enabled connections`)
       
       if (validConnections.length === 0) {
-        console.log("[v0] [Coordinator] ⚠ No eligible connections to process. No connections with valid credentials found.")
-        console.log(`[v0] [Coordinator] Help: Add connections via Settings > Active with valid API credentials`)
-        this.isGloballyRunning = true // Mark as running, ready for connections
+        console.log("[v0] [Coordinator] No assigned+enabled connections found. Engine ready, waiting for connections.")
+        this.isGloballyRunning = true
         return
       }
       

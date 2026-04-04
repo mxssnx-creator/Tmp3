@@ -1,7 +1,7 @@
 import type { BaseExchangeConnector, ExchangeCredentials } from "./base-connector"
 import { createExchangeConnector } from "./index"
 import { getConnection } from "@/lib/redis-db"
-import type { Connection } from "@/lib/redis-db"
+import type { Connection } from "@/lib/db-types"
 
 export { createExchangeConnector }
 export type { ExchangeCredentials } from "./base-connector"

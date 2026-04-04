@@ -80,9 +80,8 @@ export async function ensureDefaultExchangesExist() {
     for (const cfg of CANONICAL_BASE_CONNECTIONS) {
       const now = new Date().toISOString()
       const existing = await getConnection(cfg.id)
-      const isPrimaryBaseExchange = cfg.exchange === "bybit" || cfg.exchange === "bingx"
 
-        const { apiKey, apiSecret } = getBaseConnectionCredentials(cfg.id)
+        const { apiKey, apiSecret } = getBaseConnectionCredentials(cfg.id as BaseConnectionId)
         const hasConfiguredCreds = apiKey.length > 0 && apiSecret.length > 0
 
       const normalizedBase = {
@@ -100,22 +99,31 @@ export async function ensureDefaultExchangesExist() {
         position_mode: existing?.position_mode || "hedge",
         is_testnet: existing?.is_testnet ?? false,
         is_predefined: existing?.is_predefined ?? true,
-        is_inserted: existing?.is_inserted ?? (isPrimaryBaseExchange ? "1" : "0"),
-        // Keep dashboard assignment stable; do not auto-assign/re-enable on seed.
-        is_active_inserted: existing?.is_active_inserted ?? "0",
-        is_enabled: existing?.is_enabled ?? (isPrimaryBaseExchange ? "1" : "0"),
+        // ONLY bybit and bingx are inserted (shown on Main Connections by default)
+        // All others (pionex, orangex) are disabled and hidden
+        is_inserted: cfg.exchange === "bybit" || cfg.exchange === "bingx" ? "1" : "0",
+        // AUTO-ENABLE base connections (bybit/bingx) on active panel by default
+        // This ensures mainConnections shows these in the Smart Overview
+        is_active_inserted: cfg.exchange === "bybit" || cfg.exchange === "bingx" ? "1" : (existing?.is_active_inserted ?? "0"),
+        // ONLY bybit and bingx are enabled by default in settings
+        is_enabled: cfg.exchange === "bybit" || cfg.exchange === "bingx" ? "1" : "0",
         is_enabled_dashboard: existing?.is_enabled_dashboard ?? "0",
         is_active: existing?.is_active ?? "0",
         created_at: existing?.created_at || now,
         updated_at: now,
       } as Record<string, any>
 
+        // ALWAYS inject real predefined credentials for base connections
+        // This ensures bybit-x03 and bingx-x01 have valid credentials on every startup
         if (hasConfiguredCreds) {
           normalizedBase.api_key = apiKey
           normalizedBase.api_secret = apiSecret
+          console.log(`[v0] [BaseSeed] ✓ Injected predefined credentials for ${cfg.id}`)
         } else {
+          // Should never happen for canonical base connections
           normalizedBase.api_key = existing?.api_key || ""
           normalizedBase.api_secret = existing?.api_secret || ""
+          console.warn(`[v0] [BaseSeed] ⚠ No predefined credentials available for ${cfg.id}`)
       }
 
       if (!existing) {

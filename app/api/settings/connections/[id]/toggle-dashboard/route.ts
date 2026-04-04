@@ -1,7 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { initRedis, getConnection, updateConnection, setSettings, getSettings, getAllConnections, 
-  getConnectionState, buildMainConnectionEnableUpdate, buildMainConnectionDisableUpdate, buildMainConnectionRemoveUpdate,
-  isConnectionReadyForEngine, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getConnection, updateConnection, setSettings, getSettings, getAllConnections, getRedisClient } from "@/lib/redis-db"
+import { getConnectionState, buildMainConnectionEnableUpdate, buildMainConnectionDisableUpdate, buildMainConnectionRemoveUpdate, isConnectionReadyForEngine } from "@/lib/connection-state-helpers"
 import { toggleConnectionLimiter } from "@/lib/connection-rate-limiter"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { isTruthyFlag, parseBooleanInput, toRedisFlag } from "@/lib/boolean-utils"
