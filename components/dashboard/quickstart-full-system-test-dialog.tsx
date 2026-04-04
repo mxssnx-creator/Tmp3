@@ -282,13 +282,24 @@ export function QuickstartFullSystemTestDialog() {
     const totalIndications = Object.values(finalConn.summary?.indicationsCounts || {}).reduce((a: number, b: any) => a + Number(b || 0), 0)
     const duration = ((Date.now() - startTime) / 1000 / 60).toFixed(1)
 
-    addLog("success", "📋 FINAL RESULTS:")
-    addLog("info", `   Test Duration: ${duration} minutes`)
-    addLog("info", `   Total Cycles: ${finalConn.summary?.enginePerformance?.cyclesCompleted}`)
-    addLog("info", `   Total Indications: ${totalIndications}`)
-    addLog("info", `   Cycle Success Rate: ${finalConn.summary?.enginePerformance?.cycleSuccessRate?.toFixed(1)}%`)
-    addLog("info", `   Average CPU: ${finalMonitor.cpu}%`)
-    addLog("info", `   Average Memory: ${finalMonitor.memory}%`)
+    addLog("success", "📋 FINAL RESULTS TABLE:")
+    addLog("info", `┌────────────────────────────────┬───────────┐`)
+    addLog("info", `│ Metric                         │ Value     │`)
+    addLog("info", `├────────────────────────────────┼───────────┤`)
+    addLog("info", `│ Test Duration                  │ ${((Date.now() - startTime) / 1000).toFixed(0)}s       │`)
+    addLog("info", `│ CPU Average                    │ ${finalMonitor.cpu}%       │`)
+    addLog("info", `│ Memory Average                 │ ${finalMonitor.memory}%       │`)
+    addLog("info", `│ Cycle Success Rate             │ ${finalConn.summary?.enginePerformance?.cycleSuccessRate?.toFixed(1) || 0}%     │`)
+    addLog("info", `│ Avg Cycle Time                 │ ${finalConn.summary?.enginePerformance?.cycleTimeMs || 0}ms     │`)
+    addLog("info", `│ Total Cycles                   │ ${finalConn.summary?.enginePerformance?.cyclesCompleted || 0}         │`)
+    addLog("info", `│ Total Indications Generated    │ ${totalIndications}      │`)
+    addLog("info", `│ Strategies Evaluated           │ ${Object.values(finalConn.summary?.strategyCounts || {}).reduce((a:number,b:any) => a + Number(b||0), 0)}       │`)
+    addLog("info", `│ Prehistoric Candles Processed  │ ${finalConn.summary?.prehistoricData?.candlesProcessed || 0}    │`)
+    addLog("info", `│ Symbols Loaded                 │ ${finalConn.summary?.prehistoricData?.symbolsProcessed || 0}         │`)
+    addLog("info", `│ Database Size                  │ ${(finalMonitor.database.size / 1024 / 1024).toFixed(1)}MB     │`)
+    addLog("info", `│ Database Keys                  │ ${finalMonitor.database.keys}      │`)
+    addLog("info", `│ Positions Generated            │ ${finalMonitor.database.positions1h || 0}         │`)
+    addLog("info", `└────────────────────────────────┴───────────┘`)
 
     addLog("success", "\n✅ TEST COMPLETED SUCCESSFULLY")
     addLog("info", `Test report available at dev-system-test-results.json`)
@@ -392,6 +403,69 @@ export function QuickstartFullSystemTestDialog() {
               </div>
             </Card>
           </ScrollArea>
+
+          {/* Modern Results Overview Card - shown when test completed */}
+          {overallProgress === 100 && !isRunning && (
+            <>
+              <Separator />
+              <Card className="p-4 bg-gradient-to-br from-slate-50 to-slate-100 border-slate-200">
+                <h4 className="text-sm font-semibold mb-3 text-slate-700 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  Test Results Overview
+                </h4>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                  <div className="space-y-1">
+                    <div className="text-slate-500">Total Cycles</div>
+                    <div className="text-lg font-bold text-slate-900">
+                      {logs.find(l => l.message.includes('Total Cycles'))?.message.split(':')[1].trim() || '0'}
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-slate-500">Indications</div>
+                    <div className="text-lg font-bold text-blue-600">
+                      {logs.find(l => l.message.includes('Total Indications'))?.message.split(':')[1].trim() || '0'}
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-slate-500">Prehistoric Candles</div>
+                    <div className="text-lg font-bold text-purple-600">
+                      {logs.find(l => l.message.includes('Prehistoric Candles'))?.message.split(':')[1].trim() || '0'}
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-slate-500">Success Rate</div>
+                    <div className="text-lg font-bold text-emerald-600">
+                      {logs.find(l => l.message.includes('Cycle Success Rate'))?.message.split(':')[1].trim() || '0%'}
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-slate-500">Avg CPU</div>
+                    <div className="text-lg font-bold text-slate-700">
+                      {logs.find(l => l.message.includes('Average CPU'))?.message.split(':')[1].trim() || '0%'}
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-slate-500">Avg Memory</div>
+                    <div className="text-lg font-bold text-slate-700">
+                      {logs.find(l => l.message.includes('Average Memory'))?.message.split(':')[1].trim() || '0%'}
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-slate-500">Database Size</div>
+                    <div className="text-lg font-bold text-slate-700">
+                      {logs.find(l => l.message.includes('Database Size'))?.message.split(':')[1].trim() || '0MB'}
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-slate-500">Positions</div>
+                    <div className="text-lg font-bold text-orange-600">
+                      {logs.find(l => l.message.includes('Positions Generated'))?.message.split(':')[1].trim() || '0'}
+                    </div>
+                  </div>
+                </div>
+              </Card>
+            </>
+          )}
 
           <Separator />
 
