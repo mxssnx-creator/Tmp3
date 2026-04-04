@@ -82,10 +82,12 @@ export function DashboardActiveConnectionsManager() {
         const isBase = BASE_EXCHANGES.includes(exchange)
 
         // is_active_inserted = "1" means this connection is in Active panel
+        // is_inserted = "1" means this connection is visible (predefined template)
         // This applies to BOTH predefined templates (when enabled) AND user-created connections
         const isActiveInserted =
           toBoolean(conn.is_active_inserted) ||
-          toBoolean(conn.is_dashboard_inserted)
+          toBoolean(conn.is_dashboard_inserted) ||
+          toBoolean(conn.is_inserted)  // Also show if simply inserted/visible
 
         // isEnabledDashboard = connection's dashboard toggle is ON (processing enabled)
         const isEnabledDashboard =

@@ -73,8 +73,12 @@ export async function GET() {
     }
     const globalStatus = globalEngineState.status || "stopped"
 
-    // Main Connections: only bybit/bingx connections assigned to active/main panel
-    const mainConnections = connections.filter((c: any) => isBaseExchange(c) && isConnectionInActivePanel(c))
+    // Main Connections: base connections that are either inserted OR in active panel
+    const mainConnections = baseConnections.filter((c: any) => {
+      const isInserted = isTruthyFlag(c.is_inserted)
+      const isActiveInserted = isConnectionInActivePanel(c)
+      return isInserted || isActiveInserted
+    })
     const mainEnabled = mainConnections.length > 0
     
     // Live Trade: runs independently when is_live_trade=true (for real exchange position mirroring)
@@ -105,9 +109,13 @@ export async function GET() {
     const connectionsWithCredentials = baseConnections.filter((c: any) => hasConnectionCredentials(c, 10))
     console.log(`[v0] [SystemStats] Connections with valid credentials: ${connectionsWithCredentials.length}`)
     
-    // EXCHANGE CONNECTIONS = Base connections that are inserted as connection cards (is_active_inserted=1)
-    // Independent of credentials - just counting which are added to the active panel
-    const insertedBaseConnections = baseConnections.filter((c: any) => isConnectionInActivePanel(c))
+    // EXCHANGE CONNECTIONS = Base connections that are inserted (either is_inserted=1 OR is_active_inserted=1)
+    // These are connections visible to the user, regardless of panel placement
+    const insertedBaseConnections = baseConnections.filter((c: any) => {
+      const isInserted = isTruthyFlag(c.is_inserted)
+      const isActiveInserted = isConnectionInActivePanel(c)
+      return isInserted || isActiveInserted
+    })
     console.log(`[v0] [SystemStats] Exchange connections (inserted as cards): ${insertedBaseConnections.length}`)
     
     // Exchange status: healthy if connections with credentials exist, otherwise waiting for credentials
