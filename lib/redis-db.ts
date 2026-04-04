@@ -919,15 +919,16 @@ export async function getActiveConnectionsForEngine(): Promise<any[]> {
     const apiSecret = c.api_secret || c.apiSecret || ""
     const hasCredentials = apiKey.length > 10 && apiSecret.length > 10
     
-    // Check for testnet/demo mode
+    // Check for testnet/demo/predefined mode
     const isTestnet = isEnabledFlag(c.is_testnet)
     const isDemoMode = isEnabledFlag(c.demo_mode)
+    const isPredefined = isEnabledFlag(c.is_predefined)
     
     // Engine processing follows dashboard activation, not settings-default enabled state.
     const isReadyForEngine = isActiveInserted && isDashboardEnabled
     
-    // AND either have valid credentials OR be in testnet/demo mode
-    return isReadyForEngine && (hasCredentials || isTestnet || isDemoMode)
+    // Allow with credentials OR testnet/demo/predefined mode (credentials checked per-operation)
+    return isReadyForEngine && (hasCredentials || isTestnet || isDemoMode || isPredefined)
   })
   
   console.log(`[v0] [Engine] Active connections for engine: ${filtered.length} (from ${allConnections.length} total)`)

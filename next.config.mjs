@@ -10,6 +10,11 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
+  experimental: {
+    serverActions: {
+      allowedOrigins: ["*"],
+    },
+  },
   webpack: (config, { isServer }) => {
     if (!isServer) {
       config.resolve = config.resolve || {}
