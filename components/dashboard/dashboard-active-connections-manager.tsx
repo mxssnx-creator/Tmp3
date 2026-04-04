@@ -54,6 +54,7 @@ export function DashboardActiveConnectionsManager() {
   const loadConnections = async () => {
     try {
       const timestamp = new Date().getTime()
+      console.log(`[v0] [Manager] Loading connections with cache bust: t=${timestamp}`)
       const response = await fetch(`/api/settings/connections?v=${VERSION}&t=${timestamp}`, {
         cache: "no-store",
         headers: {
@@ -64,13 +65,14 @@ export function DashboardActiveConnectionsManager() {
       })
       
       if (!response.ok) {
+        console.error(`[v0] [Manager] API returned ${response.status}`)
         setLoading(false)
         return
       }
       
       const data = await response.json()
       const allConnections: Connection[] = Array.isArray(data) ? data : (data?.connections || [])
-      console.log(`[v0] [Manager] Loaded ${allConnections.length} total connections`)
+      console.log(`[v0] [Manager] Loaded ${allConnections.length} total connections from API`)
       
       const activeConns: ActiveConnectionWithDetails[] = []
       const seenIds = new Set<string>()
@@ -90,7 +92,10 @@ export function DashboardActiveConnectionsManager() {
           toBoolean(conn.is_enabled_dashboard)
 
         if (isBase || isActiveInserted || isEnabledDashboard) {
-          if (seenIds.has(conn.id)) continue
+          if (seenIds.has(conn.id)) {
+            console.warn(`[v0] [Manager] Duplicate connection skipped: ${conn.id}`)
+            continue
+          }
           seenIds.add(conn.id)
           activeConns.push({
             id: `active-${conn.id}`,
@@ -101,10 +106,11 @@ export function DashboardActiveConnectionsManager() {
             addedAt: conn.created_at || new Date().toISOString(),
             details: conn,
           })
+          console.log(`[v0] [Manager]   ${conn.id} (${conn.name}): base=${isBase}, inserted=${isActiveInserted}, enabled=${isEnabledDashboard}`)
         }
       }
       
-      console.log(`[v0] [Manager] Filtered ${activeConns.length} active connections from ${allConnections.length} total`)
+      console.log(`[v0] [Manager] Filtered to ${activeConns.length} active connections (bybit=${activeConns.filter(c => c.connectionId.includes('bybit')).length}, bingx=${activeConns.filter(c => c.connectionId.includes('bingx')).length})`)
       updateActiveConnections(activeConns)
     } catch (error) {
       console.error("[v0] Error loading connections:", error)
