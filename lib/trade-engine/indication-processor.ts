@@ -31,9 +31,9 @@ function getProgressionManager() {
 
 export class IndicationProcessor {
   private connectionId: string
-  private marketDataCache: Map<string, { data: any; timestamp: number }> = new Map()
-  private settingsCache: { data: any; timestamp: number } | null = null
-  private readonly CACHE_TTL = 30000
+  // REMOVED: marketDataCache - All calculations real-time
+  // REMOVED: settingsCache - All calculations real-time
+  // REMOVED: CACHE_TTL constant
 
   constructor(connectionId: string) {
     this.connectionId = connectionId

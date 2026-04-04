@@ -12,12 +12,9 @@ import { trackStrategyStats } from "@/lib/statistics-tracker"
 
 export class StrategyProcessor {
   private connectionId: string
-  private strategyCache: Map<string, { signal: any; timestamp: number }> = new Map()
-  private readonly CACHE_TTL = 60000 // 60 seconds
+  // REMOVED: strategyCache - No caching, all calculations real-time
+  // REMOVED: cycleCount - No batching optimization
   
-  // Cycle tracking for performance optimization
-  private cycleCount = 0
-
   constructor(connectionId: string) {
     this.connectionId = connectionId
   }
@@ -49,7 +46,6 @@ export class StrategyProcessor {
         let totalEvaluated = 0
         let totalLiveReady = 0
         const stageSummary: Record<string, any> = {}
-        this.cycleCount++
 
       for (const result of results) {
         totalEvaluated += result.totalCreated
@@ -68,8 +64,8 @@ export class StrategyProcessor {
           `PF=${result.avgProfitFactor.toFixed(2)} | DDT=${Math.round(result.avgDrawdownTime)}min`
         )
         
-        // Save strategies to database for statistics (every 5 cycles to reduce DB writes)
-        if (result.passedEvaluation > 0 && this.cycleCount % 5 === 0) {
+        // REAL-TIME: Save strategies immediately after calculation, no batching
+        if (result.passedEvaluation > 0) {
           try {
             await trackStrategyStats(
               this.connectionId,
