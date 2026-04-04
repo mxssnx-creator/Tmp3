@@ -51,19 +51,18 @@ export function ProgressionLogsDialog({
   const loadLogs = async () => {
     setIsLoading(true)
     try {
-      // Use the API route instead of direct Redis access
-      const response = await fetch(`/api/connections/progression/${connectionId}/logs`)
+      // Always try the progression logs endpoint first (has more detailed data)
+      const response = await fetch(`/api/connections/progression/${connectionId}/logs?t=${Date.now()}`)
       if (response.ok) {
         const data = await response.json()
         setLogs(data.logs || [])
         setProgressionState(data.progressionState || null)
       } else {
-        // Fallback: try to get logs from progression endpoint
-        const progResponse = await fetch(`/api/connections/progression/${connectionId}`)
-        if (progResponse.ok) {
-          const progData = await progResponse.json()
-          setLogs(progData.recentLogs || [])
-          setProgressionState(progData.state || null)
+        // Fallback: try to get logs from engine-logs endpoint
+        const logsResponse = await fetch(`/api/engine-logs?connectionId=${connectionId}&limit=500`)
+        if (logsResponse.ok) {
+          const logsData = await logsResponse.json()
+          setLogs(logsData.logs || [])
         }
       }
     } catch (error) {

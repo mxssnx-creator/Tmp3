@@ -389,6 +389,12 @@ export function initializeDefaultMetrics(): void {
     help: 'Redis command duration in seconds'
   })
 
+  metricsCollector.registerMetric({
+    name: 'redis_requests_per_second',
+    type: MetricType.GAUGE,
+    help: 'Redis requests per second'
+  })
+
   // Trade engine metrics
   metricsCollector.registerMetric({
     name: 'trade_engine_cycles_total',
@@ -427,6 +433,15 @@ export function updateSystemMetrics(): void {
   metricsCollector.setGauge('process_uptime_seconds', uptime)
   metricsCollector.setGauge('process_memory_heap_used_bytes', memory.heapUsed)
   metricsCollector.setGauge('process_memory_heap_total_bytes', memory.heapTotal)
+  
+  // Add Redis request rate tracking
+  try {
+    const { getRedisRequestsPerSecond } = require("@/lib/redis-db")
+    const requestsPerSecond = getRedisRequestsPerSecond()
+    metricsCollector.setGauge('redis_requests_per_second', requestsPerSecond)
+  } catch (error) {
+    // Silently fail if Redis function not available
+  }
 }
 
 // Initialize default metrics on module load
