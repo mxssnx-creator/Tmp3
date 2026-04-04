@@ -23,6 +23,7 @@ import { Input } from "@/components/ui/input"
 import { toast } from "sonner"
 import type { ExchangeConnection } from "@/lib/types"
 import { Activity, AlertCircle, CheckCircle, Trash2, Settings, Info } from "lucide-react"
+import { ConnectionDetailedLogDialog } from "./connection-detailed-log-dialog"
 
 interface ConnectionCardProps {
   connection: ExchangeConnection
@@ -924,6 +925,8 @@ export function ConnectionCard({
             </Dialog>
 
             {/* Settings Button - configurable parameters */}
+            <ConnectionDetailedLogDialog connection={connection} />
+            
             <Dialog open={showSettings} onOpenChange={setShowSettings}>
               <DialogTrigger asChild>
                 <Button variant="outline" size="sm" className="h-8 w-8 p-0 bg-transparent" title="Quick Settings">
