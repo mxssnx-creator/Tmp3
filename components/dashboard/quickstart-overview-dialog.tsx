@@ -29,8 +29,6 @@ export function QuickstartOverviewDialog({
   
   const isControlled = controlledOpen !== undefined
   const isOpen = isControlled ? controlledOpen : uncontrolledOpen
-
-  // Use exchange context's selected connection, but allow prop override
   const actualConnectionId = propConnectionId || selectedConnectionId || resolvedConnectionId
 
   const setOpen = (value: boolean) => {
@@ -99,7 +97,7 @@ export function QuickstartOverviewDialog({
   }, [logs])
 
   return (
-     <Dialog open={isOpen} onOpenChange={(v) => { setOpen(v); if (v) void load() }}>
+    <Dialog open={isOpen} onOpenChange={(v) => { setOpen(v); if (v) void load() }}>
       <DialogTrigger asChild>
         <Button variant="outline" size="icon" title="Quickstart / Overview dialog">
           <BarChart3 className="h-4 w-4" />
