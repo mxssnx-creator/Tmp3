@@ -52,7 +52,13 @@ export function QuickstartOverviewDialog({
   const load = async () => {
     setLoading(true)
     try {
-      const candidates = [actualConnectionId, actualConnectionId.startsWith("conn-") ? actualConnectionId.replace(/^conn-/, "") : `conn-${actualConnectionId}`]
+      const candidates = [
+        actualConnectionId, 
+        actualConnectionId.startsWith("conn-") 
+          ? actualConnectionId.replace(/^conn-/, "") 
+          : `conn-${actualConnectionId}`
+      ]
+      
       let chosenId = actualConnectionId
       let statsPayload: any = {}
       let logsPayload: any = {}
@@ -64,6 +70,7 @@ export function QuickstartOverviewDialog({
         ])
         const s = await statsRes.json().catch(() => ({}))
         const l = await logsRes.json().catch(() => ({}))
+        
         if (statsRes.ok || (Array.isArray(l?.logs) && l.logs.length > 0)) {
           chosenId = candidate
           statsPayload = s
@@ -89,10 +96,22 @@ export function QuickstartOverviewDialog({
   }, [isOpen, actualConnectionId])
 
   const grouped = useMemo(() => {
-    const overall = logs.filter((l) => ["system", "coordinator"].includes(String(l.engine || "").toLowerCase()))
-    const data = logs.filter((l) => ["prehistoric", "realtime", "market-data"].some((k) => String(l.phase || l.engine || "").toLowerCase().includes(k)))
-    const engine = logs.filter((l) => ["indications", "strategies", "database"].some((k) => String(l.engine || l.phase || "").toLowerCase().includes(k)))
-    const errors = logs.filter((l) => String(l.status || l.level || "").toLowerCase().includes("error"))
+    const overall = logs.filter((l) => 
+      ["system", "coordinator"].includes(String(l.engine || "").toLowerCase())
+    )
+    const data = logs.filter((l) => 
+      ["prehistoric", "realtime", "market-data"].some((k) => 
+        String(l.phase || l.engine || "").toLowerCase().includes(k)
+      )
+    )
+    const engine = logs.filter((l) => 
+      ["indications", "strategies", "database"].some((k) => 
+        String(l.engine || l.phase || "").toLowerCase().includes(k)
+      )
+    )
+    const errors = logs.filter((l) => 
+      String(l.status || l.level || "").toLowerCase().includes("error")
+    )
     return { overall, data, engine, errors }
   }, [logs])
 
@@ -111,7 +130,9 @@ export function QuickstartOverviewDialog({
               <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
             </Button>
           </DialogTitle>
-          <div className="text-xs text-muted-foreground">Selected Connection: {resolvedConnectionId} | Auto-refresh every 15s</div>
+          <div className="text-xs text-muted-foreground">
+            Selected Connection: {resolvedConnectionId} | Auto-refresh every 15s
+          </div>
         </DialogHeader>
 
         <Tabs defaultValue="main" className="space-y-3">
@@ -131,7 +152,9 @@ export function QuickstartOverviewDialog({
               <Badge variant="outline">Sets base/main: {stats?.setsBaseCount || 0}/{stats?.setsMainCount || 0}</Badge>
               <Badge variant="outline">Sets real/total: {stats?.setsRealCount || 0}/{stats?.setsTotalCount || 0}</Badge>
             </div>
-            <div className="text-xs text-muted-foreground">Compact workflow overview (overall/data/engine/errors) is available in the Log tab with expandable rows. All data is for the selected connection: <strong>{resolvedConnectionId}</strong></div>
+            <div className="text-xs text-muted-foreground">
+              Compact workflow overview (overall/data/engine/errors) is available in the Log tab with expandable rows. All data is for the selected connection: <strong>{resolvedConnectionId}</strong>
+            </div>
           </TabsContent>
 
           <TabsContent value="log">
@@ -139,14 +162,18 @@ export function QuickstartOverviewDialog({
               <div className="space-y-2 text-xs">
                 {(["overall", "data", "engine", "errors"] as const).map((section) => (
                   <details key={section} open={section === "errors"} className="rounded border bg-muted/20 px-2 py-1">
-                    <summary className="cursor-pointer font-medium capitalize">{section} ({grouped[section].length})</summary>
+                    <summary className="cursor-pointer font-medium capitalize">
+                      {section} ({grouped[section].length})
+                    </summary>
                     <div className="mt-2 space-y-1">
                       {grouped[section].slice(0, 120).map((log, idx) => (
                         <details key={`${section}-${idx}`} className="rounded border bg-background px-2 py-1">
                           <summary className="cursor-pointer truncate">
                             [{new Date(log.timestamp || Date.now()).toLocaleTimeString()}] {log.engine || log.phase || "engine"} - {log.action || log.message || "event"}
                           </summary>
-                          <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap text-[11px] text-muted-foreground">{JSON.stringify(log, null, 2)}</pre>
+                          <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap text-[11px] text-muted-foreground">
+                            {JSON.stringify(log, null, 2)}
+                          </pre>
                         </details>
                       ))}
                     </div>
