@@ -158,6 +158,11 @@ export class InlineLocalRedis {
       // Same second: increment count
       stats.requestCount++
     }
+    
+    // Log high req/sec for monitoring
+    if (stats.operationsPerSecond > 100) {
+      console.log(`[v0] [Redis] High request rate: ${stats.operationsPerSecond} ops/sec`)
+    }
   }
 
   async ping() {

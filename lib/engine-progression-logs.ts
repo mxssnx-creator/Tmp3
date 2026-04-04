@@ -124,10 +124,13 @@ export async function forceFlushLogs(connectionId: string): Promise<void> {
 
 /**
  * Get all progression logs for a connection
- * OPTIMIZED: Uses native Redis list operations
+ * OPTIMIZED: Uses native Redis list operations and forces flush first
  */
 export async function getProgressionLogs(connectionId: string): Promise<ProgressionLogEntry[]> {
   try {
+    // Force flush all pending logs first to ensure we get the latest entries
+    await flushAllLogBuffers()
+    
     const client = getRedisClient()
     const logKey = `engine_logs:${connectionId}`
 
