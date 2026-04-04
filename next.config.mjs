@@ -10,12 +10,10 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
-  productionBrowserSourceMaps: false,
-  compress: true,
-  staticPageGenerationTimeout: 120,
-  onDemandEntries: {
-    maxInactiveAge: 60 * 1000,
-    pagesBufferLength: 5,
+  experimental: {
+    serverActions: {
+      allowedOrigins: ["*"],
+    },
   },
   webpack: (config, { isServer }) => {
     if (!isServer) {

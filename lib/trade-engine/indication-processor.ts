@@ -11,7 +11,6 @@ import { trackIndicationStats } from "@/lib/statistics-tracker"
 // Pre-import modules at module load time (not per-call)
 import { initRedis, getRedisClient, getMarketData, saveIndication, getSettings } from "@/lib/redis-db"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
-import { query } from "@/lib/db" // Add database query function
 
 // Cached helpers object to avoid object allocation per call
 const redisHelpers = {

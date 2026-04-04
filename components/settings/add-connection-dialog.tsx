@@ -13,7 +13,7 @@ import { Badge } from "@/components/ui/badge"
 import { Loader2, AlertCircle, Lock, ExternalLink, Check, Eye, EyeOff, Zap, ChevronDown } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
 import { isHTMLResponse, parseHTMLResponse, parseCloudflareError } from "@/lib/html-response-parser"
-import type { Connection } from "@/lib/redis-db"
+import type { Connection } from "@/lib/db-types"
 import { 
   CONNECTION_PREDEFINITIONS, 
   type ConnectionPredefinition,

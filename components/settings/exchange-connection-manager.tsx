@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Plus, Loader2, Trash2, Info, Settings, Eye, EyeOff } from 'lucide-react'
 import { toast } from "@/lib/simple-toast"
-import type { Connection } from "@/lib/redis-db"
+import type { Connection } from "@/lib/db-types"
 import { AddConnectionDialog } from "@/components/settings/add-connection-dialog"
 import { ConnectionCard } from "@/components/settings/connection-card"
 import { BingXCredentialsDialog } from "@/components/settings/bingx-credentials-dialog"

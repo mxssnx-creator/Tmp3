@@ -326,11 +326,11 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
              <RefreshCw className="w-4 h-4" />
            </Button>
            
-           {/* Main / Log compact overview button */}
-           <QuickstartOverviewDialog connectionId="bingx-x01" />
-
            {/* System Detail Panel button */}
            <SystemDetailPanel />
+
+           {/* Main / Log Overview button */}
+           <QuickstartOverviewDialog />
 
             {/* Detailed Logs Button */}
             <DetailedLoggingDialog />

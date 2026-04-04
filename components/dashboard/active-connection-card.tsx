@@ -41,7 +41,7 @@ import { VolumeConfigurationPanel } from "@/components/dashboard/volume-configur
 import { OrderSettingsPanel } from "@/components/dashboard/order-settings-panel"
 import { MainTradeCard } from "@/components/dashboard/main-trade-card"
 import { PresetTradeCard } from "@/components/dashboard/preset-trade-card"
-import type { Connection } from "@/lib/redis-db"
+import type { Connection } from "@/lib/db-types"
 import type { ActiveConnection } from "@/lib/active-connections"
 import { toast } from "@/lib/simple-toast"
 

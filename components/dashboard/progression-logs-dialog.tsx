@@ -1,27 +1,13 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog"
+import { useState, useEffect, useCallback } from "react"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Badge } from "@/components/ui/badge"
-import { FileText, Trash2, RefreshCw } from "lucide-react"
+import { Loader2, Zap, TrendingUp, Clock, AlertCircle, RefreshCw, Trash2 } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
-
-interface ProgressionLogEntry {
-  timestamp: string
-  level: string
-  phase: string
-  message: string
-  details?: any
-}
 
 interface ProgressionLogsDialogProps {
   open: boolean
@@ -31,51 +17,90 @@ interface ProgressionLogsDialogProps {
   progression?: any
 }
 
+interface ProgressionLog {
+  timestamp: string
+  level: string
+  phase: string
+  message: string
+  details?: any
+}
+
+interface ProgressionState {
+  cyclesCompleted: number
+  successfulCycles: number
+  failedCycles: number
+  cycleSuccessRate: number
+  totalTrades: number
+  successfulTrades: number
+  tradeSuccessRate: number
+  totalProfit: number
+  indicationsCount: number
+  strategiesCount: number
+  totalStrategiesEvaluated: number
+  realtimeCycleCount: number
+  prehistoricCyclesCompleted: number
+}
+
 export function ProgressionLogsDialog({
   open,
   onOpenChange,
   connectionId,
   connectionName,
-  progression,
 }: ProgressionLogsDialogProps) {
-  const [logs, setLogs] = useState<ProgressionLogEntry[]>([])
-  const [progressionState, setProgressionState] = useState<any>(null)
+  const [logs, setLogs] = useState<ProgressionLog[]>([])
+  const [progressionState, setProgressionState] = useState<Partial<ProgressionState> | null>(null)
   const [isLoading, setIsLoading] = useState(false)
+  const [activeTab, setActiveTab] = useState<"log" | "info">("log")
 
-  useEffect(() => {
-    if (open) {
-      loadLogs()
-    }
-  }, [open, connectionId])
-
-  const loadLogs = async () => {
+  const loadData = useCallback(async () => {
     setIsLoading(true)
     try {
-      // Use the API route instead of direct Redis access
-      const response = await fetch(`/api/connections/progression/${connectionId}/logs`)
+      const response = await fetch(`/api/connections/progression/${connectionId}?t=${Date.now()}`, {
+        cache: "no-store",
+      })
       if (response.ok) {
         const data = await response.json()
-        setLogs(data.logs || [])
-        setProgressionState(data.progressionState || null)
-      } else {
-        // Fallback: try to get logs from progression endpoint
-        const progResponse = await fetch(`/api/connections/progression/${connectionId}`)
-        if (progResponse.ok) {
-          const progData = await progResponse.json()
-          setLogs(progData.recentLogs || [])
-          setProgressionState(progData.state || null)
-        }
+        
+        // Extract and set logs
+        const logsArray = (data.logs || data.recentLogs || []).slice(0, 100)
+        setLogs(logsArray)
+        
+        // Extract progression state with proper field mapping
+        const progState = data.progressionState || {}
+        setProgressionState({
+          cyclesCompleted: parseInt(progState.cyclesCompleted || progState.cycles_completed || "0"),
+          successfulCycles: parseInt(progState.successfulCycles || progState.successful_cycles || "0"),
+          failedCycles: parseInt(progState.failedCycles || progState.failed_cycles || "0"),
+          cycleSuccessRate: parseFloat(progState.cycleSuccessRate || progState.cycle_success_rate || "0"),
+          totalTrades: parseInt(progState.totalTrades || progState.total_trades || "0"),
+          successfulTrades: parseInt(progState.successfulTrades || progState.successful_trades || "0"),
+          tradeSuccessRate: parseFloat(progState.tradeSuccessRate || progState.trade_success_rate || "0"),
+          totalProfit: parseFloat(progState.totalProfit || progState.total_profit || "0"),
+          indicationsCount: parseInt(progState.indicationsCount || progState.indications_count || "0"),
+          strategiesCount: parseInt(progState.strategiesCount || progState.strategies_count || "0"),
+          totalStrategiesEvaluated: parseInt(progState.totalStrategiesEvaluated || "0"),
+          realtimeCycleCount: parseInt(progState.realtimeCycleCount || progState.realtime_cycle_count || "0"),
+          prehistoricCyclesCompleted: parseInt(progState.prehistoricCyclesCompleted || progState.prehistoric_cycles_completed || "0"),
+        })
       }
     } catch (error) {
-      console.error("[v0] Failed to load progression logs:", error)
+      console.error("[v0] Failed to load progression data:", error)
     } finally {
       setIsLoading(false)
     }
-  }
+  }, [connectionId])
+
+  useEffect(() => {
+    if (open) {
+      loadData()
+      // Auto-refresh every 2 seconds while dialog is open
+      const interval = setInterval(loadData, 2000)
+      return () => clearInterval(interval)
+    }
+  }, [open, loadData])
 
   const handleClearLogs = async () => {
-    if (!confirm("Clear all logs for this connection? This cannot be undone.")) return
-
+    if (!confirm("Clear all logs for this connection?")) return
     try {
       const response = await fetch(`/api/connections/progression/${connectionId}/logs`, {
         method: "DELETE",
@@ -92,114 +117,213 @@ export function ProgressionLogsDialog({
     }
   }
 
-  const getLevelBadgeColor = (level: string) => {
-    switch (level) {
-      case "error":
-        return "bg-red-100 text-red-800"
-      case "warning":
-        return "bg-yellow-100 text-yellow-800"
-      case "debug":
-        return "bg-gray-100 text-gray-800"
-      default:
-        return "bg-blue-100 text-blue-800"
+  const formatNumber = (num: number) => {
+    if (num >= 1000000) return (num / 1000000).toFixed(1) + "M"
+    if (num >= 1000) return (num / 1000).toFixed(1) + "K"
+    return num.toString()
+  }
+
+  const getLevelColor = (level: string) => {
+    switch (level?.toLowerCase()) {
+      case "error": return "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-400"
+      case "warning": return "bg-yellow-100 text-yellow-800 dark:bg-yellow-950 dark:text-yellow-400"
+      case "debug": return "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-400"
+      default: return "bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-400"
     }
   }
 
   return (
-      <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[90vh] max-w-5xl flex-col overflow-hidden p-0">
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-4xl max-h-[85vh] overflow-hidden flex flex-col">
         <DialogHeader>
-          <DialogTitle className="px-6 pt-6">Progression Logs - {connectionName}</DialogTitle>
-          <DialogDescription className="px-6">
-            Detailed logs of all engine operations and phase transitions. Use this to debug progression issues.
-          </DialogDescription>
+          <DialogTitle className="flex items-center gap-2">
+            <Zap className="w-5 h-5" />
+            {connectionName} - Engine Progression
+          </DialogTitle>
         </DialogHeader>
 
-        {/* Progression State Summary */}
-        {progressionState && (
-          <div className="mx-6 mb-4 grid grid-cols-2 gap-3 rounded-lg bg-muted p-3 text-xs md:grid-cols-4">
-            <div className="text-center">
-              <div className="text-lg font-semibold">{progressionState.cyclesCompleted || 0}</div>
-              <div className="text-xs text-muted-foreground">Cycles</div>
-            </div>
-            <div className="text-center">
-              <div className="text-lg font-semibold text-green-600">{progressionState.successfulCycles || 0}</div>
-              <div className="text-xs text-muted-foreground">Successful</div>
-            </div>
-            <div className="text-center">
-              <div className="text-lg font-semibold text-red-600">{progressionState.failedCycles || 0}</div>
-              <div className="text-xs text-muted-foreground">Failed</div>
-            </div>
-            <div className="text-center">
-              <div className="text-lg font-semibold">{(progressionState.cycleSuccessRate || 0).toFixed(1)}%</div>
-              <div className="text-xs text-muted-foreground">Success Rate</div>
-            </div>
-          </div>
-        )}
+        <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as "log" | "info")} className="flex-1 flex flex-col min-h-0">
+          {/* Tab Menu */}
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="log">Logs</TabsTrigger>
+            <TabsTrigger value="info">Info</TabsTrigger>
+          </TabsList>
 
-        <div className="mb-4 flex items-center justify-between px-6">
-          <div className="text-sm text-muted-foreground">
-            {logs.length} log entries {isLoading && "(refreshing...)"}
-          </div>
-          <div className="flex gap-2">
-            <Badge variant="outline" className="text-[10px]">Manual refresh only</Badge>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={loadLogs}
-              disabled={isLoading}
-            >
-              <RefreshCw className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`} />
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleClearLogs}
-              className="gap-2"
-              disabled={logs.length === 0}
-            >
-              <Trash2 className="h-4 w-4" />
-              Clear
-            </Button>
-          </div>
-        </div>
+          {/* Logs Tab */}
+          <TabsContent value="log" className="flex-1 overflow-hidden flex flex-col">
+            <div className="flex items-center justify-between px-4 py-3 border-b">
+              <div className="text-sm text-muted-foreground">
+                {logs.length} log entries {isLoading && "(updating...)"}
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={loadData}
+                  disabled={isLoading}
+                >
+                  <RefreshCw className={`w-4 h-4 ${isLoading ? "animate-spin" : ""}`} />
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleClearLogs}
+                  disabled={logs.length === 0}
+                >
+                  <Trash2 className="w-4 h-4" />
+                </Button>
+              </div>
+            </div>
+            
+            <ScrollArea className="flex-1">
+              {isLoading && logs.length === 0 ? (
+                <div className="flex items-center justify-center h-40">
+                  <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                </div>
+              ) : logs.length === 0 ? (
+                <div className="flex items-center justify-center h-40 text-muted-foreground">
+                  <AlertCircle className="w-5 h-5 mr-2" />
+                  No logs yet. Enable connection to start logging.
+                </div>
+              ) : (
+                <div className="space-y-1 p-3">
+                  {logs.map((log, idx) => (
+                    <div key={idx} className="grid grid-cols-[auto_auto_auto_1fr] gap-2 text-xs p-2 rounded hover:bg-muted/50">
+                      <span className="text-muted-foreground min-w-fit whitespace-nowrap">
+                        [{new Date(log.timestamp).toLocaleTimeString()}]
+                      </span>
+                      <Badge className={getLevelColor(log.level)} variant="outline">
+                        {log.level.toUpperCase()}
+                      </Badge>
+                      <Badge variant="outline" className="min-w-fit">
+                        {log.phase}
+                      </Badge>
+                      <span className="break-words">{log.message}</span>
+                      {log.details && (
+                        <div className="col-span-4 mt-1 p-2 rounded bg-muted/30 font-mono text-[10px]">
+                          <pre className="overflow-auto max-h-20">{JSON.stringify(log.details, null, 2)}</pre>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </ScrollArea>
+          </TabsContent>
 
-        <ScrollArea className="mx-6 h-[52vh] w-auto rounded-md border bg-muted/20 px-3 py-2 font-mono text-xs">
-          {isLoading ? (
-            <div className="text-muted-foreground">Loading logs...</div>
-          ) : logs.length === 0 ? (
-            <div className="text-muted-foreground">No logs yet. Enable the connection to start logging.</div>
-          ) : (
-            <div className="space-y-2">
-              {logs.map((log, idx) => {
-                const time = new Date(log.timestamp).toLocaleTimeString()
-                return (
-                  <div key={idx} className="grid grid-cols-[auto_auto_auto_1fr] items-start gap-2 text-xs">
-                    <span className="text-gray-500 min-w-fit">[{time}]</span>
-                    <Badge className={`min-w-fit ${getLevelBadgeColor(log.level)}`}>
-                      {log.level.toUpperCase()}
-                    </Badge>
-                    <Badge variant="outline" className="min-w-fit">
-                      {log.phase}
-                    </Badge>
-                    <div className="min-w-0 space-y-1">
-                      <p className="break-words leading-relaxed text-foreground">{log.message}</p>
-                    {log.details && (
-                      <pre className="max-h-32 overflow-auto rounded bg-background p-2 text-[11px] text-muted-foreground">
-                        {JSON.stringify(log.details, null, 2)}
-                      </pre>
-                    )}
+          {/* Info Tab */}
+          <TabsContent value="info" className="flex-1 overflow-hidden">
+            <ScrollArea className="h-full">
+              <div className="space-y-4 p-4">
+                {/* Cycles Section */}
+                <div className="rounded-lg border p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Clock className="w-4 h-4" />
+                    <h3 className="font-semibold">Engine Cycles</h3>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-3 rounded-lg bg-blue-50 dark:bg-blue-950">
+                      <div className="text-2xl font-bold text-blue-700 dark:text-blue-400">
+                        {formatNumber(progressionState?.cyclesCompleted || 0)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Total Cycles</div>
+                    </div>
+                    <div className="p-3 rounded-lg bg-green-50 dark:bg-green-950">
+                      <div className="text-2xl font-bold text-green-700 dark:text-green-400">
+                        {formatNumber(progressionState?.successfulCycles || 0)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Successful</div>
+                    </div>
+                    <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950">
+                      <div className="text-2xl font-bold text-red-700 dark:text-red-400">
+                        {formatNumber(progressionState?.failedCycles || 0)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Failed</div>
+                    </div>
+                    <div className="p-3 rounded-lg bg-purple-50 dark:bg-purple-950">
+                      <div className="text-2xl font-bold text-purple-700 dark:text-purple-400">
+                        {(progressionState?.cycleSuccessRate || 0).toFixed(1)}%
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Success Rate</div>
                     </div>
                   </div>
-                )
-              })}
-            </div>
-          )}
-        </ScrollArea>
+                </div>
 
-        <div className="mt-4 border-t px-6 pb-6 pt-3 text-xs text-muted-foreground">
-          <p>Logs are retained for 24 hours and show all engine operations including errors, phase transitions, and performance metrics.</p>
-        </div>
+                {/* Trading Activity Section */}
+                <div className="rounded-lg border p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <TrendingUp className="w-4 h-4" />
+                    <h3 className="font-semibold">Trading Activity</h3>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-3 rounded-lg bg-slate-50 dark:bg-slate-900">
+                      <div className="text-2xl font-bold">
+                        {formatNumber(progressionState?.totalTrades || 0)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Total Trades</div>
+                    </div>
+                    <div className="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950">
+                      <div className="text-2xl font-bold text-emerald-700 dark:text-emerald-400">
+                        {formatNumber(progressionState?.successfulTrades || 0)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Profitable</div>
+                    </div>
+                    <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950">
+                      <div className="text-2xl font-bold text-amber-700 dark:text-amber-400">
+                        {(progressionState?.tradeSuccessRate || 0).toFixed(1)}%
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Win Rate</div>
+                    </div>
+                    <div className="p-3 rounded-lg bg-cyan-50 dark:bg-cyan-950">
+                      <div className="text-2xl font-bold text-cyan-700 dark:text-cyan-400">
+                        ${(progressionState?.totalProfit || 0).toFixed(2)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Total Profit</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Processing Metrics Section */}
+                <div className="rounded-lg border p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Zap className="w-4 h-4" />
+                    <h3 className="font-semibold">Processing Metrics</h3>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-3 rounded-lg bg-indigo-50 dark:bg-indigo-950">
+                      <div className="text-2xl font-bold text-indigo-700 dark:text-indigo-400">
+                        {formatNumber(progressionState?.indicationsCount || 0)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Indications Generated</div>
+                    </div>
+                    <div className="p-3 rounded-lg bg-violet-50 dark:bg-violet-950">
+                      <div className="text-2xl font-bold text-violet-700 dark:text-violet-400">
+                        {formatNumber(progressionState?.strategiesCount || 0)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Strategies Created</div>
+                    </div>
+                    <div className="p-3 rounded-lg bg-fuchsia-50 dark:bg-fuchsia-950">
+                      <div className="text-2xl font-bold text-fuchsia-700 dark:text-fuchsia-400">
+                        {formatNumber(progressionState?.totalStrategiesEvaluated || 0)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Total Evaluated</div>
+                    </div>
+                    <div className="p-3 rounded-lg bg-rose-50 dark:bg-rose-950">
+                      <div className="text-2xl font-bold text-rose-700 dark:text-rose-400">
+                        {formatNumber(progressionState?.realtimeCycleCount || 0)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">Realtime Cycles</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="text-xs text-muted-foreground p-3 rounded-lg bg-muted/50">
+                  Data refreshes automatically every 2 seconds. Last updated: {new Date().toLocaleTimeString()}
+                </div>
+              </div>
+            </ScrollArea>
+          </TabsContent>
+        </Tabs>
       </DialogContent>
     </Dialog>
   )
