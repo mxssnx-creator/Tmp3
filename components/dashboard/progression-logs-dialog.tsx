@@ -51,18 +51,34 @@ export function ProgressionLogsDialog({
   const loadLogs = async () => {
     setIsLoading(true)
     try {
-      // Always try the progression logs endpoint first (has more detailed data)
-      const response = await fetch(`/api/connections/progression/${connectionId}/logs?t=${Date.now()}`)
+      // Fetch from progression endpoint which has comprehensive data including state
+      const response = await fetch(`/api/connections/progression/${connectionId}?t=${Date.now()}`)
       if (response.ok) {
         const data = await response.json()
-        setLogs(data.logs || [])
-        setProgressionState(data.progressionState || null)
+        // Extract logs from the new endpoint format (recentLogs array)
+        const logs = data.recentLogs || []
+        setLogs(logs)
+        // Extract progression state from the new endpoint format (state object)
+        const state = data.state || {}
+        setProgressionState({
+          cyclesCompleted: state.cyclesCompleted || 0,
+          successfulCycles: state.successfulCycles || 0,
+          failedCycles: state.failedCycles || 0,
+          cycleSuccessRate: state.cycleSuccessRate || 0,
+          totalTrades: state.totalTrades || 0,
+          successfulTrades: state.successfulTrades || 0,
+          totalProfit: state.totalProfit || 0,
+          tradeSuccessRate: state.tradeSuccessRate || 0,
+          // Add stage counts from metrics if available
+          stageMetrics: data.metrics || {},
+        })
       } else {
-        // Fallback: try to get logs from engine-logs endpoint
-        const logsResponse = await fetch(`/api/engine-logs?connectionId=${connectionId}&limit=500`)
+        // Fallback: try legacy progression/logs endpoint
+        const logsResponse = await fetch(`/api/connections/progression/${connectionId}/logs?t=${Date.now()}`)
         if (logsResponse.ok) {
           const logsData = await logsResponse.json()
           setLogs(logsData.logs || [])
+          setProgressionState(logsData.progressionState || null)
         }
       }
     } catch (error) {
@@ -116,23 +132,68 @@ export function ProgressionLogsDialog({
 
         {/* Progression State Summary */}
         {progressionState && (
-          <div className="mx-6 mb-4 grid grid-cols-2 gap-3 rounded-lg bg-muted p-3 text-xs md:grid-cols-4">
-            <div className="text-center">
-              <div className="text-lg font-semibold">{progressionState.cyclesCompleted || 0}</div>
-              <div className="text-xs text-muted-foreground">Cycles</div>
+          <div className="mx-6 mb-4 space-y-3 rounded-lg bg-muted p-4">
+            {/* Row 1: Main Metrics */}
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              <div className="text-center">
+                <div className="text-lg font-semibold">{progressionState.cyclesCompleted || 0}</div>
+                <div className="text-xs text-muted-foreground">Total Cycles</div>
+              </div>
+              <div className="text-center">
+                <div className="text-lg font-semibold text-green-600">{progressionState.successfulCycles || 0}</div>
+                <div className="text-xs text-muted-foreground">Successful</div>
+              </div>
+              <div className="text-center">
+                <div className="text-lg font-semibold text-red-600">{progressionState.failedCycles || 0}</div>
+                <div className="text-xs text-muted-foreground">Failed</div>
+              </div>
+              <div className="text-center">
+                <div className="text-lg font-semibold">{(progressionState.cycleSuccessRate || 0).toFixed(1)}%</div>
+                <div className="text-xs text-muted-foreground">Success Rate</div>
+              </div>
             </div>
-            <div className="text-center">
-              <div className="text-lg font-semibold text-green-600">{progressionState.successfulCycles || 0}</div>
-              <div className="text-xs text-muted-foreground">Successful</div>
+            
+            {/* Row 2: Trade Metrics */}
+            <div className="grid grid-cols-2 gap-3 border-t pt-3 md:grid-cols-4">
+              <div className="text-center">
+                <div className="text-lg font-semibold">{progressionState.totalTrades || 0}</div>
+                <div className="text-xs text-muted-foreground">Total Trades</div>
+              </div>
+              <div className="text-center">
+                <div className="text-lg font-semibold text-green-600">{progressionState.successfulTrades || 0}</div>
+                <div className="text-xs text-muted-foreground">Profitable</div>
+              </div>
+              <div className="text-center">
+                <div className="text-lg font-semibold">{(progressionState.tradeSuccessRate || 0).toFixed(1)}%</div>
+                <div className="text-xs text-muted-foreground">Trade Win Rate</div>
+              </div>
+              <div className="text-center">
+                <div className="text-lg font-semibold text-blue-600">${(progressionState.totalProfit || 0).toFixed(2)}</div>
+                <div className="text-xs text-muted-foreground">Total Profit</div>
+              </div>
             </div>
-            <div className="text-center">
-              <div className="text-lg font-semibold text-red-600">{progressionState.failedCycles || 0}</div>
-              <div className="text-xs text-muted-foreground">Failed</div>
-            </div>
-            <div className="text-center">
-              <div className="text-lg font-semibold">{(progressionState.cycleSuccessRate || 0).toFixed(1)}%</div>
-              <div className="text-xs text-muted-foreground">Success Rate</div>
-            </div>
+            
+            {/* Row 3: Stage Processing Counts */}
+            {progressionState.stageMetrics && (
+              <div className="grid grid-cols-2 gap-3 border-t pt-3 md:grid-cols-4 text-xs">
+                <div className="text-center">
+                  <div className="font-semibold">{progressionState.stageMetrics.indicationsCount || 0}</div>
+                  <div className="text-muted-foreground">Indications</div>
+                </div>
+                <div className="text-center">
+                  <div className="font-semibold">{progressionState.stageMetrics.strategiesCount || 0}</div>
+                  <div className="text-muted-foreground">Strategies</div>
+                </div>
+                <div className="text-center">
+                  <div className="font-semibold">{progressionState.stageMetrics.totalStrategiesEvaluated || 0}</div>
+                  <div className="text-muted-foreground">Evaluated</div>
+                </div>
+                <div className="text-center">
+                  <div className="font-semibold">{progressionState.stageMetrics.realtimeCycleCount || 0}</div>
+                  <div className="text-muted-foreground">Realtime Cycles</div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
