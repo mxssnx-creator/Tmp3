@@ -84,20 +84,6 @@ export function SystemMonitoringPanel() {
     </Card>
   )
 }
-              size="sm"
-              className="w-full mt-2"
-              onClick={() => handleRestartService("all-services")}
-              disabled={restarting === "all-services"}
-              variant="outline"
-            >
-              <RotateCw className="h-3 w-3 mr-1" />
-              {restarting === "all-services" ? "Restarting..." : "Restart All"}
-            </Button>
-          </CardContent>
-        </Card>
-
-        {/* Modules */}
-        <Card>
           <CardHeader>
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Activity className="h-4 w-4" />

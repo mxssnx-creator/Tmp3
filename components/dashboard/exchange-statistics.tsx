@@ -2,7 +2,6 @@
 
 import { useState, useEffect, memo } from "react"
 import { Card, CardContent } from "@/components/ui/card"
-import { Badge } from "@/components/ui/badge"
 
 interface ExchangeStatisticsProps {
   connectionId: string
@@ -90,14 +89,9 @@ const ExchangeStatisticsComponent = ({ connectionId, connectionName }: ExchangeS
     </Card>
   )
 }
-            </div>
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">Total Indications</p>
-              <p className="text-2xl font-bold">{prehistoric.total_indications}</p>
-            </div>
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">Avg Profit Factor</p>
-              <p className="text-2xl font-bold">{prehistoric.avg_profit_factor.toFixed(2)}</p>
+
+export const ExchangeStatistics = memo(ExchangeStatisticsComponent)
+export default ExchangeStatistics
             </div>
             <div className="space-y-2">
               <p className="text-sm text-muted-foreground">Data Points</p>
