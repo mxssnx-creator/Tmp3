@@ -32,9 +32,9 @@ function getProgressionManager() {
 
 export class IndicationProcessor {
   private connectionId: string
-  // REMOVED: marketDataCache - All calculations real-time
-  // REMOVED: settingsCache - All calculations real-time
-  // REMOVED: CACHE_TTL constant
+  private marketDataCache: Map<string, { data: any; timestamp: number }> = new Map()
+  private settingsCache: { data: any; timestamp: number } | null = null
+  private readonly CACHE_TTL = 500 // ms — short TTL to stay near real-time while cutting Redis ops
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -270,6 +270,7 @@ export class IndicationProcessor {
       const stepDirections: any = {}
       for (const [step, indicators] of Object.entries(stepIndicators)) {
         const ma = indicators.ma as number
+        if (!ma || ma === 0) continue
         const signal = currentClose > ma ? 1 : -1
         stepDirections[step] = { signal, ma, confidence: 0.5 + Math.abs((currentClose - ma) / ma) * 0.45 }
       }
@@ -302,6 +303,7 @@ export class IndicationProcessor {
       const stepRSI: any = {}
       for (const [step, indicators] of Object.entries(stepIndicators)) {
         const rsi = indicators.rsi as number
+        if (rsi === undefined || rsi === null) continue
         stepRSI[step] = { rsi, isOversold: rsi < 30, isOverbought: rsi > 70, confidence: Math.abs(50 - rsi) / 50 }
       }
       
@@ -328,8 +330,10 @@ export class IndicationProcessor {
       const stepMACD: any = {}
       for (const [step, indicators] of Object.entries(stepIndicators)) {
         const macd = indicators.macd as any
-        const signal = macd.macd > macd.signal ? 1 : -1
-        stepMACD[step] = { macd: macd.macd, signal: macd.signal, histogram: macd.macd - macd.signal, direction: signal, confidence: Math.abs(macd.macd - macd.signal) / Math.max(Math.abs(macd.signal), 0.001) }
+        if (!macd || macd.macd === undefined || macd.signal === undefined) continue
+        const macdSignal = macd.macd > macd.signal ? 1 : -1
+        const histogram = macd.macd - macd.signal
+        stepMACD[step] = { macd: macd.macd, signal: macd.signal, histogram, direction: macdSignal, confidence: Math.abs(histogram) / Math.max(Math.abs(macd.signal), 0.001) }
       }
       
       indications.push({
@@ -352,9 +356,12 @@ export class IndicationProcessor {
       const stepBB: any = {}
       for (const [step, indicators] of Object.entries(stepIndicators)) {
         const bb = indicators.bb as any
+        if (!bb || bb.upper === undefined) continue
+        const bbRange = bb.upper - bb.lower
         const isNearUpper = currentClose > (bb.upper * 0.95)
         const isNearLower = currentClose < (bb.lower * 1.05)
-        stepBB[step] = { upper: bb.upper, middle: bb.middle, lower: bb.lower, nearUpper: isNearUpper, nearLower: isNearLower, confidence: Math.min(0.95, 0.5 + (currentClose - bb.lower) / (bb.upper - bb.lower)) }
+        const bbPosition = bbRange > 0 ? (currentClose - bb.lower) / bbRange : 0.5
+        stepBB[step] = { upper: bb.upper, middle: bb.middle, lower: bb.lower, nearUpper: isNearUpper, nearLower: isNearLower, confidence: Math.min(0.95, 0.5 + bbPosition) }
       }
       
       indications.push({
@@ -380,10 +387,14 @@ export class IndicationProcessor {
         // Save ALL indications to the main indication storage key for strategy processor
         const mainKey = `indications:${this.connectionId}`
         
-        // Get existing indications or create new array
-        const redis = await getRedisHelpers()
-        await redis.initRedis()
+        // Get existing indications or create new array — must call initRedis then get client
+        await initRedis()
         const client = getRedisClient()
+        
+        if (!client) {
+          console.error(`[v0] [IndicationProcessor] Redis client not available for ${symbol}`)
+          return indications
+        }
         
         // Read existing indications
         const existingRaw = await client.get(mainKey)
