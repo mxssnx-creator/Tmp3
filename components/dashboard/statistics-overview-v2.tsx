@@ -1,153 +1,137 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { TrendingUp, TrendingDown, Activity, Zap } from "lucide-react"
+import { TrendingUp, TrendingDown } from "lucide-react"
 
-// STRATEGIES: Have base/main/real/live types
-interface StrategyMetrics {
-  type: "base" | "main" | "real" | "live"
-  count: number
-  winRate: number
-  drawdown: number
-  drawdownHours: number
-  profitFactor250: number
-  profitFactor50: number
-}
-
-// INDICATIONS: Have direction/move/active/optimal types (INDEPENDENT from strategies)
-interface IndicationMetrics {
-  type: "direction" | "move" | "active" | "optimal"
-  totalCount: number
-  avgSignalStrength: number
-  lastTrigger: Date | null
-  profitFactor: number
-}
-
-interface SymbolStats {
-  symbol: string
-  livePositions: number
-  profitFactor250: number
-  profitFactor50: number
-}
-
-interface PerformanceMetrics {
-  last250Positions: {
-    total: number
-    winning: number
-    losing: number
-    winRate: number
-    profitFactor: number
-    totalProfit: number
+interface CompactStats {
+  performance: {
+    last250: { winRate: number; profitFactor: number; profit: number }
+    last50: { winRate: number; profitFactor: number; profit: number }
   }
-  last50Positions: {
-    total: number
-    winning: number
-    losing: number
-    winRate: number
-    profitFactor: number
-    totalProfit: number
-  }
-  last32Hours: {
-    totalPositions: number
-    totalProfit: number
-    profitFactor: number
+  engines: {
+    cycles: number
+    avgDuration: number
+    active: number
   }
 }
 
-interface StatisticsOverviewV2Props {
-  connections?: Array<{ id: string; name: string }> | string
-}
-
-export function StatisticsOverviewV2({ connections }: StatisticsOverviewV2Props) {
-  const [strategies, setStrategies] = useState<StrategyMetrics[]>([])
-  const [indications, setIndications] = useState<IndicationMetrics[]>([])
-  const [symbols, setSymbols] = useState<SymbolStats[]>([])
-  const [performance, setPerformance] = useState<PerformanceMetrics | null>(null)
+export function StatisticsOverviewV2() {
+  const [stats, setStats] = useState<CompactStats | null>(null)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-
-  const toNumber = (value: unknown, fallback = 0): number => {
-    if (typeof value === "number" && Number.isFinite(value)) return value
-    if (typeof value === "string") {
-      const parsed = Number(value)
-      return Number.isFinite(parsed) ? parsed : fallback
-    }
-    return fallback
-  }
 
   useEffect(() => {
-    loadStatistics()
-    const interval = setInterval(loadStatistics, 15000)
+    loadStats()
+    const interval = setInterval(loadStats, 10000)
     return () => clearInterval(interval)
-  }, [connections])
+  }, [])
 
-  const loadStatistics = async () => {
+  const loadStats = async () => {
     try {
-      setLoading(true)
-      setError(null)
-
-      const results = await Promise.allSettled([
-        fetch("/api/trading/stats"),
-        fetch("/api/main/strategies-evaluation"),
-        fetch("/api/main/indications-stats"),
-        fetch("/api/exchange-positions/symbols-stats"),
+      const [perfRes, engineRes] = await Promise.allSettled([
+        fetch("/api/trading/stats", { cache: "no-store" }),
+        fetch("/api/trade-engine/status", { cache: "no-store" }),
       ])
 
-      // FETCH 1: Performance metrics
-      if (results[0].status === "fulfilled" && results[0].value.ok) {
-        try {
-          const perfData = await results[0].value.json()
-          setPerformance({
-            last250Positions: {
-              total: perfData.last250?.total || 0,
-              winning: perfData.last250?.wins || 0,
-              losing: perfData.last250?.losses || 0,
-              winRate: perfData.last250?.winRate || 0,
-              profitFactor: perfData.last250?.profitFactor || 0,
-              totalProfit: perfData.last250?.totalProfit || 0,
-            },
-            last50Positions: {
-              total: perfData.last50?.total || 0,
-              winning: perfData.last50?.wins || 0,
-              losing: perfData.last50?.losses || 0,
-              winRate: perfData.last50?.winRate || 0,
-              profitFactor: perfData.last50?.profitFactor || 0,
-              totalProfit: perfData.last50?.totalProfit || 0,
-            },
-            last32Hours: {
-              totalPositions: perfData.last32h?.total || 0,
-              totalProfit: perfData.last32h?.totalProfit || 0,
-              profitFactor: perfData.last32h?.profitFactor || 0,
-            },
-          })
-        } catch (e) { console.warn("[Statistics] Failed to parse performance data") }
+      let performance = { last250: { winRate: 0, profitFactor: 0, profit: 0 }, last50: { winRate: 0, profitFactor: 0, profit: 0 } }
+      let engines = { cycles: 0, avgDuration: 0, active: 0 }
+
+      if (perfRes.status === "fulfilled" && perfRes.value.ok) {
+        const data = await perfRes.value.json()
+        performance = {
+          last250: {
+            winRate: data.last250?.winRate || 0,
+            profitFactor: data.last250?.profitFactor || 0,
+            profit: data.last250?.totalProfit || 0,
+          },
+          last50: {
+            winRate: data.last50?.winRate || 0,
+            profitFactor: data.last50?.profitFactor || 0,
+            profit: data.last50?.totalProfit || 0,
+          },
+        }
       }
 
-      // FETCH 2: Strategies metrics
-      if (results[1].status === "fulfilled" && results[1].value.ok) {
-        try {
-          const stratData = await results[1].value.json()
-          const strategiesData: StrategyMetrics[] = ["base", "main", "real", "live"].map((type) => ({
-            type: type as StrategyMetrics["type"],
-            count: stratData.strategies?.[type]?.count || 0,
-            winRate: stratData.strategies?.[type]?.winRate || 0,
-            drawdown: stratData.strategies?.[type]?.drawdown || 0,
-            drawdownHours: stratData.strategies?.[type]?.drawdownHours || 0,
-            profitFactor250: stratData.strategies?.[type]?.profitFactor250 || 0,
-            profitFactor50: stratData.strategies?.[type]?.profitFactor50 || 0,
-          }))
-          setStrategies(strategiesData)
-        } catch (e) { console.warn("[Statistics] Failed to parse strategies data") }
+      if (engineRes.status === "fulfilled" && engineRes.value.ok) {
+        const data = await engineRes.value.json()
+        engines = {
+          cycles: data.cycles_total || 0,
+          avgDuration: data.avg_cycle_ms || 0,
+          active: data.active_positions || 0,
+        }
       }
 
-      // FETCH 3: Indications metrics
-      if (results[2].status === "fulfilled" && results[2].value.ok) {
-        try {
-          const indicData = await results[2].value.json()
-          const indicationsData: IndicationMetrics[] = ["direction", "move", "active", "optimal"].map((type) => ({
-            type: type as IndicationMetrics["type"],
+      setStats({ performance, engines })
+      setLoading(false)
+    } catch (err) {
+      console.error("[Stats] Error:", err)
+      setLoading(false)
+    }
+  }
+
+  if (loading || !stats) return null
+
+  return (
+    <Card className="border-primary/10 bg-card/50">
+      <CardContent className="p-3">
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-5 lg:grid-cols-7 text-xs">
+          {/* Last 250 Win Rate */}
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">W/L 250</span>
+            <span className={`font-bold ${stats.performance.last250.winRate >= 0.55 ? "text-green-600" : "text-slate-600"}`}>
+              {(stats.performance.last250.winRate * 100).toFixed(0)}%
+            </span>
+          </div>
+
+          {/* Last 250 Profit Factor */}
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">PF 250</span>
+            <span className={`font-bold ${stats.performance.last250.profitFactor >= 1.5 ? "text-green-600" : stats.performance.last250.profitFactor >= 1.0 ? "text-blue-600" : "text-red-600"}`}>
+              {stats.performance.last250.profitFactor.toFixed(1)}
+            </span>
+          </div>
+
+          {/* Last 50 Win Rate */}
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">W/L 50</span>
+            <span className={`font-bold ${stats.performance.last50.winRate >= 0.55 ? "text-green-600" : "text-slate-600"}`}>
+              {(stats.performance.last50.winRate * 100).toFixed(0)}%
+            </span>
+          </div>
+
+          {/* Last 50 Profit Factor */}
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">PF 50</span>
+            <span className={`font-bold ${stats.performance.last50.profitFactor >= 1.5 ? "text-green-600" : stats.performance.last50.profitFactor >= 1.0 ? "text-blue-600" : "text-red-600"}`}>
+              {stats.performance.last50.profitFactor.toFixed(1)}
+            </span>
+          </div>
+
+          {/* Engine Cycles */}
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">Cycles</span>
+            <span className="font-bold text-blue-600">{stats.engines.cycles}</span>
+          </div>
+
+          {/* Avg Duration */}
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">Dur (ms)</span>
+            <span className={`font-bold ${stats.engines.avgDuration <= 1000 ? "text-green-600" : "text-orange-600"}`}>
+              {stats.engines.avgDuration}
+            </span>
+          </div>
+
+          {/* Active Positions */}
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">Active</span>
+            <span className="font-bold text-purple-600">{stats.engines.active}</span>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
             totalCount: indicData.indications?.[type]?.count || 0,
             avgSignalStrength: indicData.indications?.[type]?.avgSignalStrength || 0,
             lastTrigger: indicData.indications?.[type]?.lastTrigger ? new Date(indicData.indications[type].lastTrigger) : null,

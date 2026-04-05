@@ -1,12 +1,8 @@
 "use client"
 
 import { useState, useEffect, memo } from "react"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts"
-import { AlertCircle, TrendingUp, Activity, Zap } from "lucide-react"
-import { Alert, AlertDescription } from "@/components/ui/alert"
 
 interface ExchangeStatisticsProps {
   connectionId: string
@@ -15,89 +11,85 @@ interface ExchangeStatisticsProps {
 
 const ExchangeStatisticsComponent = ({ connectionId, connectionName }: ExchangeStatisticsProps) => {
   const [stats, setStats] = useState<any>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     const loadStats = async () => {
       try {
-        setLoading(true)
-        const res = await fetch(`/api/settings/connections/${connectionId}/statistics`)
-        if (!res.ok) throw new Error("Failed to fetch statistics")
-        const data = await res.json()
-        setStats(data)
-        setError(null)
+        const res = await fetch(`/api/settings/connections/${connectionId}/statistics`, { cache: "no-store" })
+        if (res.ok) {
+          const data = await res.json()
+          setStats(data)
+        }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Unknown error")
-      } finally {
-        setLoading(false)
+        console.error("[Stats] Error:", err)
       }
     }
 
     loadStats()
-    const interval = setInterval(loadStats, 30000) // Refresh every 30s
+    const interval = setInterval(loadStats, 30000)
     return () => clearInterval(interval)
   }, [connectionId])
 
-  if (loading) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle>Loading Statistics...</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-center gap-2 text-muted-foreground">
-            <Activity className="h-4 w-4 animate-spin" />
-            <span>Fetching {connectionName} statistics...</span>
-          </div>
-        </CardContent>
-      </Card>
-    )
-  }
+  if (!stats) return null
 
-  if (error || !stats) {
-    return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertDescription>{error || "Failed to load statistics"}</AlertDescription>
-      </Alert>
-    )
-  }
-
-  const { prehistoric, symbols, metrics, progression } = stats
+  const prehistoric = stats.prehistoric || {}
 
   return (
-    <div className="space-y-4">
-      {/* Header */}
-      <Card>
-        <CardHeader>
-          <div className="flex items-center justify-between">
-            <div>
-              <CardTitle>{connectionName} Statistics</CardTitle>
-              <CardDescription>Prehistoric analysis and trading metrics</CardDescription>
-            </div>
-            <Badge variant="outline" className="gap-1">
-              <TrendingUp className="h-3 w-3" />
-              {new Date(stats.timestamp).toLocaleTimeString()}
-            </Badge>
+    <Card className="border-primary/10 bg-card/50">
+      <CardContent className="p-3">
+        <div className="grid grid-cols-3 gap-2 text-xs md:grid-cols-6 lg:grid-cols-8">
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">Symbols</span>
+            <span className="font-bold">{prehistoric.symbols_analyzed || 0}</span>
           </div>
-        </CardHeader>
-      </Card>
 
-      {/* Prehistoric Data Overview */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Zap className="h-5 w-5" />
-            Prehistoric Data (30-Day Historical Analysis)
-          </CardTitle>
-          <CardDescription>Historical market and strategy analysis</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">Symbols Analyzed</p>
-              <p className="text-2xl font-bold">{prehistoric.symbols_analyzed}</p>
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">Win%</span>
+            <span className={`font-bold ${prehistoric.win_rate >= 0.55 ? "text-green-600" : "text-slate-600"}`}>
+              {((prehistoric.win_rate || 0) * 100).toFixed(0)}%
+            </span>
+          </div>
+
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">PF</span>
+            <span className={`font-bold ${prehistoric.profit_factor >= 1.5 ? "text-green-600" : prehistoric.profit_factor >= 1.0 ? "text-blue-600" : "text-red-600"}`}>
+              {(prehistoric.profit_factor || 0).toFixed(1)}
+            </span>
+          </div>
+
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">Trades</span>
+            <span className="font-bold text-slate-600">{prehistoric.trades || 0}</span>
+          </div>
+
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">Profit</span>
+            <span className={`font-bold ${(prehistoric.profit || 0) >= 0 ? "text-green-600" : "text-red-600"}`}>
+              ${(prehistoric.profit || 0).toFixed(0)}
+            </span>
+          </div>
+
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">DD%</span>
+            <span className={`font-bold ${Math.abs(prehistoric.drawdown || 0) <= 10 ? "text-green-600" : Math.abs(prehistoric.drawdown || 0) <= 25 ? "text-orange-600" : "text-red-600"}`}>
+              {(prehistoric.drawdown || 0).toFixed(1)}%
+            </span>
+          </div>
+
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">Avg W</span>
+            <span className="font-bold text-green-600">{((prehistoric.avg_win || 0) * 100).toFixed(2)}%</span>
+          </div>
+
+          <div className="flex flex-col gap-0.5">
+            <span className="text-muted-foreground">Avg L</span>
+            <span className="font-bold text-red-600">{((prehistoric.avg_loss || 0) * 100).toFixed(2)}%</span>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
             </div>
             <div className="space-y-2">
               <p className="text-sm text-muted-foreground">Total Indications</p>
