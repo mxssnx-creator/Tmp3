@@ -29,11 +29,11 @@ export function SystemMonitoringPanel() {
       if (res.ok) {
         const mon = await res.json()
         setData({
-          engineCycles: mon.cycles_total || 0,
-          activePositions: mon.active_positions || 0,
+          engineCycles: mon.engines?.strategies?.cycleCount || 0,
+          activePositions: mon.database?.positions1h || 0,
           cpu: mon.cpu || 0,
           memory: mon.memory || 0,
-          redisKeys: mon.redis_keys || 0,
+          redisKeys: mon.database?.keys || 0,
           lastUpdate: new Date().toLocaleTimeString(),
         })
       }
@@ -82,122 +82,5 @@ export function SystemMonitoringPanel() {
         </div>
       </CardContent>
     </Card>
-  )
-}
-          <CardHeader>
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <Activity className="h-4 w-4" />
-              Modules Status
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {Object.entries(monitor.modules).map(([module, status]) => (
-              <div key={module} className="flex items-center justify-between p-2 bg-secondary/50 rounded">
-                <div className="flex items-center gap-2">
-                  <div className={`h-2 w-2 rounded-full ${status ? "bg-green-500" : "bg-red-500"}`}></div>
-                  <span className="text-sm capitalize font-medium">
-                    {module.replace(/([A-Z])/g, " $1").trim()}
-                  </span>
-                </div>
-                <Badge variant={status ? "outline" : "destructive"} className="text-xs">
-                  {status ? "Active" : "Inactive"}
-                </Badge>
-              </div>
-            ))}
-            <Button
-              size="sm"
-              className="w-full mt-2"
-              onClick={() => handleRestartService("all-modules")}
-              disabled={restarting === "all-modules"}
-              variant="outline"
-            >
-              <RotateCw className="h-3 w-3 mr-1" />
-              {restarting === "all-modules" ? "Restarting..." : "Restart All"}
-            </Button>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Engines Status */}
-      {monitor.engines && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-sm font-medium flex items-center gap-2">
-                <Zap className="h-4 w-4" />
-                Indications Engine
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <div className="flex items-center justify-between p-2 bg-secondary/50 rounded">
-                <div className="flex items-center gap-2">
-                  <div className={`h-2 w-2 rounded-full ${monitor.engines.indications.running ? "bg-green-500" : "bg-red-500"}`}></div>
-                  <span className="text-sm font-medium">Status</span>
-                </div>
-                <Badge variant={monitor.engines.indications.running ? "outline" : "destructive"} className="text-xs">
-                  {monitor.engines.indications.running ? "Running" : "Stopped"}
-                </Badge>
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground">Cycles</span>
-                <span className="font-medium">{monitor.engines.indications.cycleCount}</span>
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground">Results</span>
-                <span className="font-medium">{monitor.engines.indications.resultsCount}</span>
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-sm font-medium flex items-center gap-2">
-                <Activity className="h-4 w-4" />
-                Strategies Engine
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <div className="flex items-center justify-between p-2 bg-secondary/50 rounded">
-                <div className="flex items-center gap-2">
-                  <div className={`h-2 w-2 rounded-full ${monitor.engines.strategies.running ? "bg-green-500" : "bg-red-500"}`}></div>
-                  <span className="text-sm font-medium">Status</span>
-                </div>
-                <Badge variant={monitor.engines.strategies.running ? "outline" : "destructive"} className="text-xs">
-                  {monitor.engines.strategies.running ? "Running" : "Stopped"}
-                </Badge>
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground">Cycles</span>
-                <span className="font-medium">{monitor.engines.strategies.cycleCount}</span>
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground">Results</span>
-                <span className="font-medium">{monitor.engines.strategies.resultsCount}</span>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
-
-      {/* Alert if critical */}
-      {(monitor.cpu > 90 || monitor.memory > 90) && (
-        <Card className="border-destructive bg-destructive/5">
-          <CardContent className="pt-6">
-            <div className="flex items-start gap-3">
-              <AlertCircle className="h-5 w-5 text-destructive mt-0.5" />
-              <div>
-                <p className="font-medium text-sm">
-                  {monitor.cpu > 90 && "CPU usage critically high. "}
-                  {monitor.memory > 90 && "Memory usage critically high. "}
-                </p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Consider restarting services or optimizing active connections.
-                </p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-    </div>
   )
 }

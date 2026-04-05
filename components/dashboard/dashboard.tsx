@@ -69,7 +69,7 @@ export function Dashboard() {
         </ErrorBoundary>
 
         <ErrorBoundary name="Statistics">
-          <StatisticsOverviewV2 connections={[]} />
+          <StatisticsOverviewV2 />
         </ErrorBoundary>
 
         <ErrorBoundary name="System Monitoring">
