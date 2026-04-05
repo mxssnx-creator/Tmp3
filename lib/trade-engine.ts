@@ -1,8 +1,12 @@
 /**
- * Global Trade Engine Coordinator V3
- * @version 3.0.0 - Updated to use indication-processor-v2
+ * Global Trade Engine Coordinator V3.1
+ * @version 3.1.0 - Added runtime patch for cache initialization fix
  */
-console.log("[v0] Global Trade Engine V3 loading...")
+
+// CRITICAL: Import patch FIRST to fix cache initialization issues in stale webpack bundles
+import "./trade-engine/indication-processor-patch"
+
+console.log("[v0] Global Trade Engine V3.1 loading with cache patch...")
 
 import { TradeEngineManager, type EngineConfig } from "./trade-engine/engine-manager"
 import { getSettings, setSettings } from "./redis-db"
