@@ -1,15 +1,15 @@
 /**
- * Trade Engine Manager V4
+ * Trade Engine Manager V6
  * Manages asynchronous processing for symbols, indications, pseudo positions, and strategies
- * V4: Added inline indication generation fallback to bypass broken IndicationProcessor
- * @version 4.0.0
- * @lastUpdate 2026-04-05T19:30:00Z - Inline indication generation fallback
+ * V6: Enhanced cycle counting logging for production debugging
+ * @version 6.0.0
+ * @lastUpdate 2026-04-05T21:39:00Z - Enhanced cycle counting with detailed logging
  */
 
-const _ENGINE_BUILD_VERSION = "5.0.0"
+const _ENGINE_BUILD_VERSION = "6.0.0"
 
 // Log immediately on module load to confirm new code is running
-console.log(`[v0] EngineManager-V5 module loaded - version ${_ENGINE_BUILD_VERSION} - using indication-processor-fixed`)
+console.log(`[v0] EngineManager-V6 module loaded - version ${_ENGINE_BUILD_VERSION} - with enhanced cycle logging`)
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
@@ -627,8 +627,16 @@ export class TradeEngineManager {
         this.componentHealth.indications.lastCycleDuration = duration
         this.componentHealth.indications.successRate = ((cycleCount - errorCount) / cycleCount) * 100
 
-        // Update progression cycle every cycle
-        await ProgressionStateManager.incrementCycle(this.connectionId, true, 0)
+        // Update progression cycle every cycle with detailed logging
+        try {
+          await ProgressionStateManager.incrementCycle(this.connectionId, true, 0)
+          // Log cycle increment every 10 cycles for debugging
+          if (cycleCount % 10 === 0) {
+            console.log(`[v0] [IndicationCycles] ${this.connectionId}: cycleCount=${cycleCount}, attemptedCycles=${attemptedCycles}`)
+          }
+        } catch (incError) {
+          console.error(`[v0] [IndicationCycles] Error incrementing cycle for ${this.connectionId}:`, incError)
+        }
 
         // Update progression phase periodically
         if (cycleCount % 5 === 0) {
@@ -647,6 +655,7 @@ export class TradeEngineManager {
               indication_avg_duration_ms: totalDuration > 0 ? Math.round(totalDuration / cycleCount) : 0,
               engine_cycles_total: cycleCount,
             })
+            console.log(`[v0] [IndicationCycles] Persisted: indication_cycle_count=${cycleCount}, avg_duration=${totalDuration > 0 ? Math.round(totalDuration / cycleCount) : 0}ms`)
           } catch (err) {
             // Silently fail - non-critical for engine operation
           }
@@ -753,6 +762,16 @@ export class TradeEngineManager {
         this.componentHealth.strategies.lastCycleDuration = duration
         this.componentHealth.strategies.successRate = ((cycleCount - errorCount) / cycleCount) * 100
 
+        // Update progression cycle - CRITICAL: This was missing, causing cycle counts not to increment!
+        try {
+          await ProgressionStateManager.incrementCycle(this.connectionId, true, 0)
+          if (cycleCount % 10 === 0) {
+            console.log(`[v0] [StrategyCycles] ${this.connectionId}: cycleCount=${cycleCount}, evaluated=${evaluatedThisCycle}`)
+          }
+        } catch (incError) {
+          console.error(`[v0] [StrategyCycles] Error incrementing cycle for ${this.connectionId}:`, incError)
+        }
+
         // Persist cycle count every cycle (not just every 5)
         // Update Redis state with latest metrics on EVERY cycle for dashboard real-time visibility
         try {
@@ -766,6 +785,9 @@ export class TradeEngineManager {
             last_cycle_type: "strategies",
             engine_cycles_total: cycleCount,
           })
+          if (cycleCount % 10 === 0) {
+            console.log(`[v0] [StrategyState] Persisted: strategy_cycle_count=${cycleCount}, evaluated=${totalStrategiesEvaluated}`)
+          }
         } catch (err) {
           // Silently fail - non-critical for engine operation
         }
@@ -840,8 +862,15 @@ export class TradeEngineManager {
         this.componentHealth.realtime.lastCycleDuration = duration
         this.componentHealth.realtime.successRate = ((cycleCount - errorCount) / cycleCount) * 100
 
-        // Update progression cycle every cycle
-        await ProgressionStateManager.incrementCycle(this.connectionId, true, 0)
+        // Update progression cycle every cycle with enhanced logging
+        try {
+          await ProgressionStateManager.incrementCycle(this.connectionId, true, 0)
+          if (cycleCount % 10 === 0) {
+            console.log(`[v0] [RealtimeCycles] ${this.connectionId}: cycleCount=${cycleCount}, duration=${duration}ms`)
+          }
+        } catch (incError) {
+          console.error(`[v0] [RealtimeCycles] Error incrementing cycle for ${this.connectionId}:`, incError)
+        }
 
         // Update progression phase periodically
         if (cycleCount % 3 === 0) {
@@ -868,6 +897,9 @@ export class TradeEngineManager {
             last_cycle_type: "realtime",
             engine_cycles_total: cycleCount,
           })
+          if (cycleCount % 10 === 0) {
+            console.log(`[v0] [RealtimeState] Persisted: realtime_cycle_count=${cycleCount}`)
+          }
         } catch (err) {
           // Silently fail - non-critical for engine operation
         }
