@@ -324,6 +324,8 @@ export class StrategyProcessor {
         const { getMarketData } = await import("@/lib/redis-db")
         const marketData = await getMarketData(symbol)
         
+        console.log(`[v0] [StrategyProcessor] Fallback generation for ${symbol}: marketData=${marketData ? 'found' : 'null'}`)
+        
         if (marketData) {
           const close = parseFloat(marketData?.close || marketData?.c || "0")
           const open = parseFloat(marketData?.open || marketData?.o || "0")
@@ -356,7 +358,8 @@ export class StrategyProcessor {
           }
         }
       } catch (genError) {
-        // Fallback generation failed, continue with empty array
+        // Fallback generation failed, log error
+        console.log(`[v0] [StrategyProcessor] Fallback generation error for ${symbol}:`, (genError as Error).message)
       }
       
       console.log(`[v0] [StrategyProcessor] No indications found for ${symbol} in connection ${this.connectionId}`)
