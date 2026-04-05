@@ -8,11 +8,20 @@
  * @lastUpdate 2026-04-05T18:00:00Z - Restored original filename with fixed code
  */
 
-const _INDICATION_BUILD_VERSION = "3.1.0"
-const _BUILD_TIMESTAMP = 1712354400000
+const _INDICATION_BUILD_VERSION = "3.3.0"
+const _BUILD_TIMESTAMP = 1712359000000
 
 // Log immediately on module load to confirm new code is running
-console.log(`[v0] IndicationProcessor module loaded - version ${_INDICATION_BUILD_VERSION} ts=${_BUILD_TIMESTAMP}`)
+console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded`)
+
+// CRITICAL: Create a shared Map that will be used by ALL instances
+// This fixes the issue where class field initialization fails in cached bundles
+const SHARED_MARKET_DATA_CACHE = new Map<string, { data: any; timestamp: number }>()
+const SHARED_SETTINGS_CACHE = { data: null as any, timestamp: 0 }
+const SHARED_CACHE_TTL = 500
+
+// Patch to make the shared cache available globally for old cached code
+;(globalThis as any).__INDICATION_PROCESSOR_CACHE__ = SHARED_MARKET_DATA_CACHE
 
 import { IndicationSetsProcessor } from "@/lib/indication-sets-processor"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
@@ -22,6 +31,9 @@ import { StepBasedIndicators } from "@/lib/step-based-indicators"
 // Pre-import modules at module load time (not per-call)
 import { initRedis, getRedisClient, getMarketData, saveIndication, getSettings } from "@/lib/redis-db"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
+
+// Import standalone cache module to avoid this.marketDataCache issues
+import { getMarketDataCached, getSettingsCached } from "./market-data-cache"
 
 // Cached helpers object to avoid object allocation per call
 const redisHelpers = {
@@ -113,9 +125,21 @@ async function getSettingsCachedModule(): Promise<any> {
 
 export class IndicationProcessor {
   private connectionId: string
+  // Use shared module-level cache to avoid initialization issues in cached webpack bundles
+  private marketDataCache: Map<string, { data: any; timestamp: number }> = SHARED_MARKET_DATA_CACHE
+  private settingsCache: { data: any; timestamp: number } | null = SHARED_SETTINGS_CACHE
+  private readonly CACHE_TTL = SHARED_CACHE_TTL
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
+    // CRITICAL: Force assignment to shared cache in case class field initialization failed
+    // This ensures even old cached webpack bundles will have a working cache
+    if (!this.marketDataCache || !(this.marketDataCache instanceof Map)) {
+      this.marketDataCache = SHARED_MARKET_DATA_CACHE
+    }
+    if (!this.settingsCache) {
+      this.settingsCache = SHARED_SETTINGS_CACHE
+    }
   }
 
   /**
@@ -548,16 +572,18 @@ export class IndicationProcessor {
 
   /**
    * Get latest market data with caching to avoid repeated Redis calls
-   * Uses module-level cache to avoid any `this` context issues
+   * Uses standalone module import to avoid any `this` context issues
    */
   private async getLatestMarketDataCached(symbol: string): Promise<any> {
-    return getMarketDataCachedModule(symbol)
+    // Use imported standalone function from market-data-cache.ts
+    return getMarketDataCached(symbol)
   }
 
   /**
-   * Get indication settings with caching - uses module-level cache
+   * Get indication settings with caching - uses standalone module
    */
   private async getIndicationSettingsCached(): Promise<any> {
-    return getSettingsCachedModule()
+    // Use imported standalone function from market-data-cache.ts
+    return getSettingsCached()
   }
 }
