@@ -1,3 +1,9 @@
+/**
+ * Global Trade Engine Coordinator V3
+ * @version 3.0.0 - Updated to use indication-processor-v2
+ */
+console.log("[v0] Global Trade Engine V3 loading...")
+
 import { TradeEngineManager, type EngineConfig } from "./trade-engine/engine-manager"
 import { getSettings, setSettings } from "./redis-db"
 
@@ -821,8 +827,12 @@ export class GlobalTradeEngineCoordinator {
 
 /**
  * The global trade engine coordinator singleton instance
+ * V3: Reset on module load to pick up new indication-processor-v2
  */
 let globalCoordinator: GlobalTradeEngineCoordinator | null = null
+
+// V3: Force new coordinator creation on module reload to pick up new code
+console.log("[v0] Global Trade Engine V3 - resetting coordinator singleton")
 
 /**
  * Get the global trade engine coordinator singleton instance

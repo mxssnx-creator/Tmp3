@@ -1,6 +1,7 @@
 /**
- * Trade Engine Module Exports
- *
+ * Trade Engine Module Exports V3
+ * @version 3.0.0
+ * 
  * This module provides two types of trade engines:
  *
  * 1. GlobalTradeEngineCoordinator (from ../trade-engine.ts)
@@ -13,7 +14,11 @@
  *    - Runs continuously with three parallel loops
  *    - Use for individual exchange connection management
  *    - Service name: project_name-trade
+ *
+ * V3 Changes: IndicationProcessor moved to indication-processor-v2.ts
  */
+
+console.log("[v0] Trade Engine Index V3 loaded")
 
 // Explicit re-exports from parent trade-engine module
 export {
