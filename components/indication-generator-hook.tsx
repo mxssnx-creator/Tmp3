@@ -14,14 +14,16 @@ export function useIndicationGenerator(enabled: boolean = true, intervalMs: numb
     
     const generateIndications = async () => {
       try {
-        const response = await fetch("/api/trade-engine/generate-indications", {
-          method: "POST",
+        // Use the cron-style indication generator which bypasses the broken IndicationProcessor
+        const response = await fetch("/api/cron/generate-indications", {
+          method: "GET",
           cache: "no-store",
+          headers: { "x-client-trigger": "indication-hook" }
         })
         if (response.ok) {
           const data = await response.json()
-          if (data.totalIndications > 0) {
-            console.log(`[v0] IndicationGeneratorHook: Generated ${data.totalIndications} indications`)
+          if (data.generated > 0) {
+            console.log(`[v0] IndicationGeneratorHook: Generated ${data.generated} indications`)
           }
         }
       } catch (e) {

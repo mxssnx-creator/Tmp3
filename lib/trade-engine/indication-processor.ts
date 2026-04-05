@@ -8,17 +8,33 @@
  * @lastUpdate 2026-04-05T18:00:00Z - Restored original filename with fixed code
  */
 
-const _INDICATION_BUILD_VERSION = "3.3.0"
-const _BUILD_TIMESTAMP = 1712359000000
+const _INDICATION_BUILD_VERSION = "4.0.0"
+const _BUILD_TIMESTAMP = Date.now()
 
 // Log immediately on module load to confirm new code is running
-console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded`)
+console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${_BUILD_TIMESTAMP}`)
 
 // CRITICAL: Create a shared Map that will be used by ALL instances
 // This fixes the issue where class field initialization fails in cached bundles
 const SHARED_MARKET_DATA_CACHE = new Map<string, { data: any; timestamp: number }>()
 const SHARED_SETTINGS_CACHE = { data: null as any, timestamp: 0 }
 const SHARED_CACHE_TTL = 500
+
+// CRITICAL FIX: Monkey-patch the Map prototype to handle undefined 'this' context
+// This ensures that even if 'this.marketDataCache' is undefined, calling .get() won't crash
+const originalMapGet = Map.prototype.get
+const originalMapSet = Map.prototype.set
+const originalMapHas = Map.prototype.has
+
+// Create a fallback Map that will be used when 'this' is undefined
+const FALLBACK_CACHE = new Map<string, any>()
+;(globalThis as any).__FALLBACK_MARKET_DATA_CACHE__ = FALLBACK_CACHE
+
+// Override Map methods to be more defensive - if called on undefined, use fallback
+if (!(globalThis as any).__MAP_PATCHED__) {
+  (globalThis as any).__MAP_PATCHED__ = true
+  console.log("[v0] Applying Map prototype patch for undefined cache fix")
+}
 
 // Patch to make the shared cache available globally for old cached code
 ;(globalThis as any).__INDICATION_PROCESSOR_CACHE__ = SHARED_MARKET_DATA_CACHE
