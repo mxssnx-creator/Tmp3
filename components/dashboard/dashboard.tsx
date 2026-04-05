@@ -7,6 +7,7 @@ import { GlobalTradeEngineControls } from "./global-trade-engine-controls"
 import { DashboardActiveConnectionsManager } from "./dashboard-active-connections-manager"
 import { StatisticsOverviewV2 } from "./statistics-overview-v2"
 import { SystemMonitoringPanel } from "./system-monitoring-panel"
+import { VolatilityScreenerCard } from "./volatility-screener-card"
 import { Card } from "@/components/ui/card"
 import { useIndicationGenerator } from "@/components/indication-generator-hook"
 
@@ -53,6 +54,10 @@ export function Dashboard() {
       <div className="flex-1 space-y-4 px-3 md:px-4 py-4 pb-8">
         <ErrorBoundary name="System Overview">
           <SystemOverview />
+        </ErrorBoundary>
+
+        <ErrorBoundary name="High Volatility Screener">
+          <VolatilityScreenerCard />
         </ErrorBoundary>
 
         <ErrorBoundary name="Trade Engine Controls">
