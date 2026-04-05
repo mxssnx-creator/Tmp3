@@ -5,6 +5,10 @@
   "scripts": {
     "build": "next build",
     "dev": "next dev -p 3002",
+    "dev:debug": "node scripts/dev-debug.js",
+    "dev:debug:verbose": "node scripts/dev-debug.js verbose",
+    "quickstart": "node scripts/quickstart-live-trading.js",
+    "quickstart:debug": "node scripts/quickstart-live-trading.js debug",
     "test": "sh -c 'fuser -k 3002/tcp >/dev/null 2>&1 || true; timeout -s TERM 90s bash -lc \"npm run dev >/tmp/tmp3-test-dev.log 2>&1 & DEV_PID=$!; trap \\\"kill $DEV_PID >/dev/null 2>&1 || true\\\" EXIT; for i in {1..45}; do curl -sf http://localhost:3002 >/dev/null && break; sleep 1; done; curl -sf http://localhost:3002/main >/dev/null && curl -sf http://localhost:3002/strategies >/dev/null && curl -sf http://localhost:3002/settings >/dev/null && curl -sf http://localhost:3002/monitoring >/dev/null\"'",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
