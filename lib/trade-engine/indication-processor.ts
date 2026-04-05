@@ -2,7 +2,12 @@
  * Indication Processor
  * Processes independent indication sets for each type (Direction, Move, Active, Optimal)
  * Each type maintains its own 250-entry pool calculated independently
+ * @version 2.1.0
+ * @lastUpdate 2026-04-05T17:35:00Z - Fixed cache initialization with module-level fallback
  */
+
+// Force module rebuild timestamp: 1712341200000
+const _INDICATION_BUILD_VERSION = "2.1.0"
 
 import { IndicationSetsProcessor } from "@/lib/indication-sets-processor"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"

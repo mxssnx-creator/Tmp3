@@ -1,7 +1,12 @@
 /**
  * Trade Engine Manager
  * Manages asynchronous processing for symbols, indications, pseudo positions, and strategies
+ * @version 2.1.0
+ * @lastUpdate 2026-04-05T17:35:00Z - Added SOL to default symbols, fixed cache initialization
  */
+
+// Force module rebuild timestamp: 1712341200000
+const _ENGINE_BUILD_VERSION = "2.1.0"
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
