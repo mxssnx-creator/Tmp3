@@ -1,55 +1,72 @@
-# CTS v3.1 - Crypto Trading System
+# CTS v3.2 - Crypto Trading System
 
-*Professional automated cryptocurrency trading platform with advanced indication system*
+*Professional automated cryptocurrency trading platform with high-volatility screening and live trading*
 
 [![Deployed on Vercel](https://img.shields.io/badge/Deployed%20on-Vercel-black?style=for-the-badge&logo=vercel)](https://vercel.com)
 [![Built with Next.js](https://img.shields.io/badge/Built%20with-Next.js%2016-black?style=for-the-badge&logo=next.js)](https://nextjs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0-blue?style=for-the-badge&logo=typescript)](https://typescriptlang.org)
+[![Production Ready](https://img.shields.io/badge/Status-Production%20Ready-green?style=for-the-badge)](PRODUCTION_OPERATIONS_GUIDE.md)
 
 ## Overview
 
-CTS v3.1 is a professional-grade crypto trading system featuring:
+CTS v3.2 is a production-ready automated cryptocurrency trading system featuring:
 
-- **Multi-Exchange Support**: Bybit, BingX, Pionex with unified API
-- **Advanced Indication System**: Main (Direction/Move/Active/Optimal) and Common (RSI/MACD/Bollinger/ParabolicSAR/ADX/ATR) indicators
-- **Preset Trade Engine**: Automated trading with configurable strategies
-- **Strategy Categories**: 
-  - **Additional** (Trailing) - Enhancement strategies
-  - **Adjust** (Block/DCA) - Volume/position adjustment strategies
-- **Real-time WebSocket**: Live market data and position tracking
-- **Comprehensive Logging**: System-wide activity monitoring
+- **9 Exchange Support**: BingX, Bybit, Binance, OKX, Gate.io, Kraken, Huobi, Kucoin, PionEx with unified API
+- **High Volatility Screening**: Auto-selects top 3 highest volatility symbols for live trading
+- **4 Core Strategies**: MA_Cross, RSI_Band, MACD_Signal, Bollinger_Bounce
+- **Advanced Indication System**: Direction, Move, Active, Optimal + RSI, MACD, Bollinger, ParabolicSAR, ADX, ATR
+- **Strategy Adjustment**: Block strategy and DCA (Dollar Cost Averaging) enhancement
+- **Real-time Engine**: 1000ms cycle with 6-phase processing (Initializing → Market Data → Prehistoric → Indications → Strategies → Live)
+- **Live Position Management**: Real-time P&L tracking, SL/TP management, position status
+- **Production Monitoring**: Real-time alerts, performance metrics, comprehensive logging
+
+## Key Features - Live Trading Edition
+
+### High Volatility Screener
+The dashboard now includes an automated high-volatility screener that:
+- Scans all available symbols from connected exchanges
+- Calculates 1-hour volatility (high - low) / close × 100
+- **Auto-selects top 3 highest volatility symbols**
+- **Auto-enables live trading for selected symbols**
+- Updates every 30 seconds to catch new opportunities
+- Provides manual toggle buttons for fine-grained control
+
+**Volatility Metrics:**
+- **Volatility %**: 1-hour price range as percentage
+- **Volatility Score**: 0-100 scale (100 = 5%+ range)
+- **High Volatility**: > 2% price range threshold
+- **Status**: Live trading on/off indicator
+
+### Live Trading Features
+- Real-time position tracking with live price updates
+- Unrealized P&L calculations and percentage returns
+- Position management: close, modify SL/TP, adjust leverage
+- Position sorting: by P&L, entry price, creation time
+- Position filtering: all trades, long only, short only
+- One-click position operations
+- Real-time market data updates (1-2 second latency)
+
+### Risk Management
+- Position cost allocation (2% - 20% per set)
+- Maximum positions per set (up to 250)
+- Leverage limits per exchange (1-150x)
+- Stop loss enforced on all positions
+- Take profit defined for all trades
+- Daily drawdown monitoring
+- Portfolio allocation checks
 
 ## Deployment
 
-### Quick Deploy Options
-
-#### Vercel (Recommended - 1 minute)
+### Quick Deploy to Vercel (Recommended)
 ```bash
 # One-click deployment
 vercel --prod
 
-# Or use our deployment script
+# Or use deployment script
 ./vercel-deploy.sh
 ```
 
-#### Docker
-```bash
-# Build and run
-docker-compose up --build
-
-# Or manual build
-docker build -t cts-v3 .
-docker run -p 3001:3001 --env-file .env.local cts-v3
-```
-
-#### Railway / Render
-- Import your GitHub repository
-- Set environment variables (see DEPLOYMENT.md)
-- Deploy automatically
-
 ### Environment Setup
-
-**Required Variables:**
 ```bash
 NEXT_PUBLIC_APP_URL=https://your-app.com
 KV_REST_API_URL=https://your-redis-endpoint.upstash.io
@@ -57,47 +74,34 @@ KV_REST_API_TOKEN=your-redis-token
 JWT_SECRET=your-secure-jwt-secret-32-chars
 ```
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for complete deployment guide.
+See [PRODUCTION_OPERATIONS_GUIDE.md](PRODUCTION_OPERATIONS_GUIDE.md) for complete deployment and operations guide.
 
-## Quick Install
+## Quick Start
 
-### Interactive Setup (Recommended)
-
-The interactive setup script guides you through the complete installation process with prompts for project name, port, and database configuration:
-
-\`\`\`bash
+### Installation
+```bash
 # Clone repository
-git clone https://github.com/your-repo/cts-v3.1.git
-cd cts-v3.1
+git clone https://github.com/your-repo/cts-v3.2.git
+cd cts-v3.2
 
-# Run interactive setup
-npm run setup
-\`\`\`
+# Install dependencies
+pnpm install
 
-The setup script will:
-- Validate Node.js version (18.x - 26.x supported)
-- Prompt for project name (default: CTS-v3)
-- Prompt for application port (default: 3000)
-- Configure database (SQLite or PostgreSQL)
-- Generate secure secrets automatically
-- Install dependencies
-- Create required directories
-- Run database migrations
-- Optional: Build for production
+# Set up environment variables
+cp .env.example .env.local
 
-### One-Line Installation
+# Run development server
+pnpm dev
+```
 
-\`\`\`bash
-curl -fsSL https://raw.githubusercontent.com/mxssnx-creator/v0-cts-v3-zw/main/scripts/download-and-install.sh | bash
-\`\`\`
-
-### Custom Installation
-
-\`\`\`bash
-# Custom port
-curl -fsSL https://raw.githubusercontent.com/mxssnx-creator/v0-cts-v3-zw/main/scripts/download-and-install.sh | bash -s -- --port 8080
-
-# Custom project name
+### First Time Setup
+1. Open http://localhost:3000
+2. Register account
+3. Connect exchange (Settings → Exchange Connections)
+4. Start engine (Dashboard → Start Engine)
+5. View volatility screener (Dashboard → High Volatility Screener)
+6. Enable live trading for top 3 symbols
+7. Monitor positions on Live Trading page (/live-trading)
 curl -fsSL https://raw.githubusercontent.com/mxssnx-creator/v0-cts-v3-zw/main/scripts/download-and-install.sh | bash -s -- --name my-trading-bot
 
 # Multiple instances
