@@ -377,25 +377,62 @@ export class IndicationProcessor {
 
       // Store indications in Redis for progression tracking (batch save)
       try {
-        const connKey = `${this.connectionId}:${symbol}:realtime`
-        // Batch save all indications at once instead of one-by-one
-        if (indications.length > 0) {
-          await saveIndication(connKey, indications[0]) // Single write with latest
-          console.log(`[v0] [IndicationProcessor] Saved ${indications.length} indications for ${symbol}`)
-          
-          // Track each indication to database for statistics and historical analysis
-          for (const indication of indications) {
-            try {
-              await trackIndicationStats(
-                this.connectionId,
-                symbol,
-                indication.type,
-                indication.value,
-                indication.confidence
-              )
-            } catch (e) {
-              console.warn(`[v0] [IndicationProcessor] Failed to track indication:`, e)
+        // Save ALL indications to the main indication storage key for strategy processor
+        const mainKey = `indications:${this.connectionId}`
+        
+        // Get existing indications or create new array
+        const redis = await getRedisHelpers()
+        await redis.initRedis()
+        const client = getRedisClient()
+        
+        // Read existing indications
+        const existingRaw = await client.get(mainKey)
+        let existingIndications: any[] = []
+        if (existingRaw) {
+          try {
+            existingIndications = JSON.parse(typeof existingRaw === "string" ? existingRaw : JSON.stringify(existingRaw))
+            if (!Array.isArray(existingIndications)) {
+              existingIndications = []
             }
+          } catch {
+            existingIndications = []
+          }
+        }
+        
+        // Add new indications with symbol context
+        for (const ind of indications) {
+          existingIndications.push({
+            ...ind,
+            symbol,
+            timestamp: new Date().toISOString(),
+          })
+        }
+        
+        // Keep only latest 1000 indications per connection to avoid memory bloat
+        if (existingIndications.length > 1000) {
+          existingIndications = existingIndications.slice(-1000)
+        }
+        
+        // Save back to Redis
+        await client.set(mainKey, JSON.stringify(existingIndications), { EX: 3600 })
+        console.log(`[v0] [IndicationProcessor] Saved ${indications.length} indications for ${symbol} to ${mainKey}`)
+        
+        // Also save per-symbol for debugging
+        const symbolKey = `${this.connectionId}:${symbol}:realtime`
+        await saveIndication(symbolKey, indications[0])
+        
+        // Track each indication to database for statistics and historical analysis
+        for (const indication of indications) {
+          try {
+            await trackIndicationStats(
+              this.connectionId,
+              symbol,
+              indication.type,
+              indication.value,
+              indication.confidence
+            )
+          } catch (e) {
+            console.warn(`[v0] [IndicationProcessor] Failed to track indication:`, e)
           }
         }
       } catch (redisErr) {
