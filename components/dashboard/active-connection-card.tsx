@@ -94,6 +94,7 @@ interface ActiveConnectionCardProps {
   onToggle: (connectionId: string, currentState: boolean) => Promise<void>
   onRemove: (connectionId: string, name: string) => Promise<void>
   isToggling: boolean
+  isRemoving?: boolean
   globalEngineRunning: boolean
 }
 
@@ -104,6 +105,7 @@ export function ActiveConnectionCard({
   onToggle,
   onRemove,
   isToggling,
+  isRemoving = false,
   globalEngineRunning,
 }: ActiveConnectionCardProps) {
   const [progression, setProgression] = useState<ProgressionData | null>(null)
@@ -509,8 +511,13 @@ export function ActiveConnectionCard({
                       variant="ghost"
                       size="sm"
                       className="h-7 w-7 p-0 text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                      disabled={isRemoving}
                     >
-                      <Trash2 className="h-3.5 w-3.5" />
+                      {isRemoving ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Trash2 className="h-3.5 w-3.5" />
+                      )}
                     </Button>
                   </AlertDialogTrigger>
                   <AlertDialogContent>
@@ -521,12 +528,19 @@ export function ActiveConnectionCard({
                       </AlertDialogDescription>
                     </AlertDialogHeader>
                     <div className="flex gap-2 justify-end">
-                      <AlertDialogCancel>Cancel</AlertDialogCancel>
+                      <AlertDialogCancel disabled={isRemoving}>Cancel</AlertDialogCancel>
                       <AlertDialogAction
                         onClick={() => onRemove(connection.connectionId, connName)}
+                        disabled={isRemoving}
                         className="bg-red-600 hover:bg-red-700"
                       >
-                        Remove
+                        {isRemoving ? (
+                          <span className="flex items-center gap-2">
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Removing...
+                          </span>
+                        ) : (
+                          "Remove"
+                        )}
                       </AlertDialogAction>
                     </div>
                   </AlertDialogContent>
