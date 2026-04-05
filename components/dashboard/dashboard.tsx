@@ -2,6 +2,7 @@
 
 import React, { type ReactNode } from "react"
 import { PageHeader } from "@/components/page-header"
+import { QuickstartSection } from "./quickstart-section"
 import { SystemOverview } from "./system-overview"
 import { GlobalTradeEngineControls } from "./global-trade-engine-controls"
 import { DashboardActiveConnectionsManager } from "./dashboard-active-connections-manager"
@@ -52,6 +53,10 @@ export function Dashboard() {
       />
 
       <div className="flex-1 space-y-4 px-3 md:px-4 py-4 pb-8">
+        <ErrorBoundary name="Quickstart">
+          <QuickstartSection />
+        </ErrorBoundary>
+
         <ErrorBoundary name="System Overview">
           <SystemOverview />
         </ErrorBoundary>
