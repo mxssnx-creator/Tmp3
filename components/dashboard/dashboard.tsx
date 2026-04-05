@@ -8,6 +8,7 @@ import { DashboardActiveConnectionsManager } from "./dashboard-active-connection
 import { StatisticsOverviewV2 } from "./statistics-overview-v2"
 import { SystemMonitoringPanel } from "./system-monitoring-panel"
 import { Card } from "@/components/ui/card"
+import { useIndicationGenerator } from "@/components/indication-generator-hook"
 
 interface ErrorBoundaryProps { children: ReactNode; name: string }
 interface ErrorBoundaryState { hasError: boolean; error?: Error }
@@ -37,6 +38,10 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
 }
 
 export function Dashboard() {
+  // Auto-generate indications every 3 seconds using the simple generator
+  // This bypasses the stale webpack bundle issue with IndicationProcessor
+  useIndicationGenerator(true, 3000)
+  
   return (
     <div className="flex-1 flex flex-col min-h-0">
       <PageHeader

@@ -1,0 +1,51 @@
+"use client"
+
+import { useEffect } from "react"
+
+/**
+ * Client-side hook that periodically generates indications by calling the API
+ * This bypasses the stale webpack bundle issue by using a fresh API endpoint
+ */
+export function useIndicationGenerator(enabled: boolean = true, intervalMs: number = 3000) {
+  useEffect(() => {
+    if (!enabled) return
+    
+    console.log("[v0] IndicationGeneratorHook: Starting indication generation loop")
+    
+    const generateIndications = async () => {
+      try {
+        const response = await fetch("/api/trade-engine/generate-indications", {
+          method: "POST",
+          cache: "no-store",
+        })
+        if (response.ok) {
+          const data = await response.json()
+          if (data.totalIndications > 0) {
+            console.log(`[v0] IndicationGeneratorHook: Generated ${data.totalIndications} indications`)
+          }
+        }
+      } catch (e) {
+        // Silently ignore errors
+      }
+    }
+    
+    // Generate immediately
+    generateIndications()
+    
+    // Then generate periodically
+    const interval = setInterval(generateIndications, intervalMs)
+    
+    return () => {
+      console.log("[v0] IndicationGeneratorHook: Stopping indication generation loop")
+      clearInterval(interval)
+    }
+  }, [enabled, intervalMs])
+}
+
+/**
+ * Component version that can be dropped into any page
+ */
+export function IndicationGeneratorProvider({ children }: { children?: React.ReactNode }) {
+  useIndicationGenerator(true, 3000)
+  return <>{children}</>
+}

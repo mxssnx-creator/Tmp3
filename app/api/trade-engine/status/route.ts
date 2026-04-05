@@ -1,11 +1,19 @@
 import { NextResponse } from "next/server"
-import { getRedisClient, initRedis, getActiveConnectionsForEngine } from "@/lib/redis-db"
+import { getRedisClient, initRedis, getActiveConnectionsForEngine, getAllConnections } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { generateAndSaveIndications } from "@/lib/trade-engine/simple-indication-generator"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
 export const fetchCache = "force-no-store"
+
+// Symbols to generate indications for
+const INDICATION_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+// Track last generation time to avoid spamming
+let lastIndicationGeneration = 0
+const GENERATION_INTERVAL = 2000 // Generate every 2 seconds max
 
 // RUNTIME FIX: Patch IndicationProcessor cache on every API call
 // This fixes the "Cannot read properties of undefined (reading 'get')" error
@@ -34,6 +42,28 @@ function patchIndicationProcessorCaches(coordinator: any) {
   }
 }
 
+// Generate indications using the simple generator (bypasses broken IndicationProcessor)
+async function generateIndicationsIfNeeded() {
+  const now = Date.now()
+  if (now - lastIndicationGeneration < GENERATION_INTERVAL) {
+    return // Too soon, skip
+  }
+  lastIndicationGeneration = now
+  
+  try {
+    const connections = await getAllConnections()
+    const activeConnections = connections.filter((c: any) => c.isActive || c.is_active)
+    
+    for (const connection of activeConnections) {
+      for (const symbol of INDICATION_SYMBOLS) {
+        await generateAndSaveIndications(symbol, connection.id)
+      }
+    }
+  } catch (e) {
+    // Silently ignore generation errors
+  }
+}
+
 export async function GET() {
   try {
     await initRedis()
@@ -42,6 +72,9 @@ export async function GET() {
     
     // Apply cache fix to all indication processors
     patchIndicationProcessorCaches(coordinator)
+    
+    // Generate indications using the simple generator (bypasses broken IndicationProcessor)
+    await generateIndicationsIfNeeded()
     
     // Read global engine state from Redis hash
     const engineHash = await client.hgetall("trade_engine:global") || {}
