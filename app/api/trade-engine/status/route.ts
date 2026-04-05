@@ -7,11 +7,41 @@ export const dynamic = "force-dynamic"
 export const revalidate = 0
 export const fetchCache = "force-no-store"
 
+// RUNTIME FIX: Patch IndicationProcessor cache on every API call
+// This fixes the "Cannot read properties of undefined (reading 'get')" error
+function patchIndicationProcessorCaches(coordinator: any) {
+  if (!coordinator) return
+  
+  try {
+    // Access all engine managers and patch their indication processors
+    const engines = coordinator.engines || coordinator._engines || new Map()
+    for (const [, manager] of engines) {
+      if (manager?.indicationProcessor) {
+        const proc = manager.indicationProcessor
+        if (!proc.marketDataCache || !(proc.marketDataCache instanceof Map)) {
+          proc.marketDataCache = new Map()
+        }
+        if (!proc.settingsCache) {
+          proc.settingsCache = { data: null, timestamp: 0 }
+        }
+        if (!proc.CACHE_TTL) {
+          proc.CACHE_TTL = 500
+        }
+      }
+    }
+  } catch (e) {
+    // Silently ignore patch errors
+  }
+}
+
 export async function GET() {
   try {
     await initRedis()
     const client = getRedisClient()
     const coordinator = getGlobalTradeEngineCoordinator()
+    
+    // Apply cache fix to all indication processors
+    patchIndicationProcessorCaches(coordinator)
     
     // Read global engine state from Redis hash
     const engineHash = await client.hgetall("trade_engine:global") || {}
