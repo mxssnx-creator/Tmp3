@@ -258,33 +258,47 @@ export class StrategyProcessor {
 
   /**
    * Get active indications from Redis
-   * Indications are saved by the indication processor with key: indications:${connectionId}:${symbol}
+   * Indications are saved by the indication processor with key: indications:${connectionId}
    */
   private async getActiveIndications(symbol: string): Promise<any[]> {
     try {
       await initRedis()
 
-      // Primary key: indication processor saves to this key
-      const primaryKey = `${this.connectionId}:${symbol}:realtime`
-      const indications = await getIndications(primaryKey)
+      // PRIMARY KEY: Main indication storage key where all indications are saved per connection
+      // This is where IndicationProcessor now saves ALL 4 indication types for all symbols
+      const primaryKey = `indications:${this.connectionId}`
+      const allIndications = await getIndications(primaryKey)
 
-      if (indications && Array.isArray(indications) && indications.length > 0) {
-        console.log(`[v0] [StrategyProcessor] Retrieved ${indications.length} indications for ${symbol} from primary key=${primaryKey}`)
-        return indications
+      if (allIndications && Array.isArray(allIndications) && allIndications.length > 0) {
+        // Filter indications for this specific symbol
+        const symbolIndications = allIndications.filter((ind: any) => ind.symbol === symbol)
+        if (symbolIndications.length > 0) {
+          console.log(`[v0] [StrategyProcessor] Retrieved ${symbolIndications.length} indications for ${symbol} from main key`)
+          return symbolIndications
+        }
       }
 
-      // Secondary key: some processors might save without :realtime
-      const secondaryKey = `${this.connectionId}:${symbol}`
-      const secondaryIndications = await getIndications(secondaryKey)
-      if (secondaryIndications && Array.isArray(secondaryIndications) && secondaryIndications.length > 0) {
-        console.log(`[v0] [StrategyProcessor] Retrieved ${secondaryIndications.length} indications from secondary key=${secondaryKey}`)
-        return secondaryIndications
+      // FALLBACK 1: Old format - per-symbol real-time key
+      const realtimeKey = `${this.connectionId}:${symbol}:realtime`
+      const realtimeIndications = await getIndications(realtimeKey)
+      if (realtimeIndications && Array.isArray(realtimeIndications) && realtimeIndications.length > 0) {
+        console.log(`[v0] [StrategyProcessor] Retrieved ${realtimeIndications.length} indications for ${symbol} from realtime key (legacy)`)
+        return realtimeIndications
       }
 
-      // Try broader search for any indications for this connection
+      // FALLBACK 2: Older format without :realtime suffix
+      const legacyKey = `${this.connectionId}:${symbol}`
+      const legacyIndications = await getIndications(legacyKey)
+      if (legacyIndications && Array.isArray(legacyIndications) && legacyIndications.length > 0) {
+        console.log(`[v0] [StrategyProcessor] Retrieved ${legacyIndications.length} indications from legacy key=${legacyKey}`)
+        return legacyIndications
+      }
+
+      // FALLBACK 3: Broad search for any indications matching this symbol
       const client = (await import("@/lib/redis-db")).getRedisClient()
-      const allKeys = await client.keys(`${this.connectionId}:${symbol}:*`)
+      const allKeys = await client.keys(`*${symbol}*`)
       for (const key of allKeys) {
+        if (!key.includes("indications")) continue // Skip non-indication keys
         try {
           const altIndications = await getIndications(key)
           if (altIndications && Array.isArray(altIndications) && altIndications.length > 0) {

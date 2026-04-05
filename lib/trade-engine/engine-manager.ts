@@ -1015,13 +1015,15 @@ export class TradeEngineManager {
         }
       }
 
-      // Default symbols for processing
-      const defaultSymbols = ["BTCUSDT", "ETHUSDT"]
-      console.log(`[v0] [EngineManager] getSymbols: using default symbols: ${defaultSymbols.join(", ")}`)
+      // Default symbols - HIGH VOLATILITY, ordered by last hour volatility
+      // BTC (highest), ETH (high), SOL (high) - top 3 most volatile
+      const defaultSymbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+      console.log(`[v0] [EngineManager] getSymbols: using high-volatility symbols: ${defaultSymbols.join(", ")}`)
       return defaultSymbols
     } catch (error) {
       console.error("[v0] Failed to get symbols, using fallback:", error)
-      return ["BTCUSDT", "ETHUSDT"]
+      // Fallback to high-volatility symbols
+      return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     }
   }
 
