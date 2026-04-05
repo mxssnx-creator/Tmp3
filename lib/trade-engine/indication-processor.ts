@@ -30,6 +30,10 @@ function getProgressionManager() {
   return ProgressionStateManager
 }
 
+// MODULE-LEVEL fallback caches - guaranteed to exist even if class fields fail
+const MODULE_MARKET_DATA_CACHE = new Map<string, { data: any; timestamp: number }>()
+const MODULE_CACHE_TTL = 500
+
 export class IndicationProcessor {
   private connectionId: string
   private marketDataCache: Map<string, { data: any; timestamp: number }> = new Map()
@@ -38,6 +42,10 @@ export class IndicationProcessor {
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
+    // Ensure cache is initialized
+    if (!this.marketDataCache) {
+      this.marketDataCache = MODULE_MARKET_DATA_CACHE
+    }
   }
 
   /**
@@ -207,6 +215,11 @@ export class IndicationProcessor {
    */
   async processIndication(symbol: string): Promise<any[]> {
     try {
+      // Defensive initialization - ensure cache exists even if constructor failed
+      if (!this.marketDataCache) {
+        this.marketDataCache = new Map()
+      }
+      
       let marketData = await this.getLatestMarketDataCached(symbol)
       if (!marketData) {
         // Try to load market data if not available
@@ -468,9 +481,14 @@ export class IndicationProcessor {
    */
   private async getLatestMarketDataCached(symbol: string): Promise<any> {
     const now = Date.now()
-    const cached = this.marketDataCache.get(symbol)
+    
+    // Use module-level fallback if instance cache is undefined
+    const cache = this.marketDataCache || MODULE_MARKET_DATA_CACHE
+    const ttl = this.CACHE_TTL || MODULE_CACHE_TTL
+    
+    const cached = cache.get(symbol)
 
-    if (cached && now - cached.timestamp < this.CACHE_TTL) {
+    if (cached && now - cached.timestamp < ttl) {
       return cached.data
     }
 
@@ -486,7 +504,7 @@ export class IndicationProcessor {
       const latest = Array.isArray(rawData) ? rawData[0] : rawData
 
       if (latest) {
-        this.marketDataCache.set(symbol, { data: latest, timestamp: now })
+        cache.set(symbol, { data: latest, timestamp: now })
         return latest
       }
       return null
