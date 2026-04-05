@@ -8,8 +8,8 @@
  * @lastUpdate 2026-04-05T18:00:00Z - Restored original filename with fixed code
  */
 
-const _INDICATION_BUILD_VERSION = "4.0.0"
-const _BUILD_TIMESTAMP = Date.now()
+const _INDICATION_BUILD_VERSION = "5.0.0"
+const _BUILD_TIMESTAMP = 1712361600000 // Fixed timestamp to avoid constant rebuilds
 
 // Log immediately on module load to confirm new code is running
 console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${_BUILD_TIMESTAMP}`)
@@ -588,18 +588,53 @@ export class IndicationProcessor {
 
   /**
    * Get latest market data with caching to avoid repeated Redis calls
-   * Uses standalone module import to avoid any `this` context issues
+   * CRITICAL: This method MUST NOT use this.marketDataCache - it may be undefined in cached webpack bundles
+   * Instead, we use a completely inline implementation with module-level cache
    */
   private async getLatestMarketDataCached(symbol: string): Promise<any> {
-    // Use imported standalone function from market-data-cache.ts
-    return getMarketDataCached(symbol)
+    // CRITICAL FIX: Use module-level SHARED_MARKET_DATA_CACHE directly, never this.marketDataCache
+    const cache = SHARED_MARKET_DATA_CACHE
+    const cached = cache.get(symbol)
+    const now = Date.now()
+    
+    if (cached && (now - cached.timestamp) < SHARED_CACHE_TTL) {
+      return cached.data
+    }
+    
+    // Fetch fresh data from Redis using dynamic import to avoid any stale references
+    try {
+      const { getMarketData } = await import("@/lib/redis-db")
+      const data = await getMarketData(symbol)
+      if (data) {
+        cache.set(symbol, { data, timestamp: now })
+      }
+      return data
+    } catch (e) {
+      return cached?.data || null
+    }
   }
 
   /**
-   * Get indication settings with caching - uses standalone module
+   * Get indication settings with caching - uses module-level cache
+   * CRITICAL: This method MUST NOT use this.settingsCache - it may be undefined
    */
   private async getIndicationSettingsCached(): Promise<any> {
-    // Use imported standalone function from market-data-cache.ts
-    return getSettingsCached()
+    // Use module-level SHARED_SETTINGS_CACHE directly
+    const now = Date.now()
+    if (SHARED_SETTINGS_CACHE.data && (now - SHARED_SETTINGS_CACHE.timestamp) < SHARED_CACHE_TTL) {
+      return SHARED_SETTINGS_CACHE.data
+    }
+    
+    try {
+      const { getSettings } = await import("@/lib/redis-db")
+      const data = await getSettings("indication_settings")
+      if (data) {
+        SHARED_SETTINGS_CACHE.data = data
+        SHARED_SETTINGS_CACHE.timestamp = now
+      }
+      return data || {}
+    } catch (e) {
+      return SHARED_SETTINGS_CACHE.data || {}
+    }
   }
 }
