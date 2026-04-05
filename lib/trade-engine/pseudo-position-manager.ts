@@ -112,8 +112,12 @@ export class PseudoPositionManager {
         params.entryPrice,
       )
 
+      // Check if volume calculation succeeded and meets minimum requirements
       if (!volumeCalc.finalVolume || volumeCalc.finalVolume <= 0) {
-        console.error(`[v0] Failed to calculate valid volume for ${params.symbol}: ${volumeCalc.finalVolume}`)
+        console.warn(
+          `[v0] Cannot create position for ${params.symbol}: ` +
+          `volume too small (${volumeCalc.finalVolume}) - ${volumeCalc.adjustmentReason || 'below minimum'}`
+        )
         return null
       }
 
