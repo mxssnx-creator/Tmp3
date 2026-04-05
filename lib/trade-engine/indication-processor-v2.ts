@@ -1,19 +1,17 @@
 /**
- * Indication Processor
+ * Indication Processor V2 - Module-Level Caching
  * Processes independent indication sets for each type (Direction, Move, Active, Optimal)
  * Each type maintains its own 250-entry pool calculated independently
- * @version 2.1.0
- * @lastUpdate 2026-04-05T17:35:00Z - Fixed cache initialization with module-level fallback
+ * 
+ * V2 CHANGES: All caching moved to module-level functions to avoid `this` context issues
+ * @version 3.0.0
+ * @lastUpdate 2026-04-05T17:40:00Z - Renamed to v2, module-level caching
  */
 
-// Force module rebuild - unique ID to bust webpack cache
-const _INDICATION_MODULE_ID = `indication_${Date.now()}_v2.2.1`
-const _INDICATION_BUILD_VERSION = "2.2.1"
+const _INDICATION_BUILD_VERSION = "3.0.0"
 
 // Log immediately on module load to confirm new code is running
-if (typeof console !== "undefined") {
-  console.log(`[v0] IndicationProcessor module loaded - ${_INDICATION_BUILD_VERSION} (${_INDICATION_MODULE_ID})`)
-}
+console.log(`[v0] IndicationProcessor-V2 module loaded - version ${_INDICATION_BUILD_VERSION}`)
 
 import { IndicationSetsProcessor } from "@/lib/indication-sets-processor"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"

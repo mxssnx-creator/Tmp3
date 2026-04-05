@@ -1,22 +1,19 @@
 /**
- * Trade Engine Manager
+ * Trade Engine Manager V3
  * Manages asynchronous processing for symbols, indications, pseudo positions, and strategies
- * @version 2.1.0
- * @lastUpdate 2026-04-05T17:35:00Z - Added SOL to default symbols, fixed cache initialization
+ * V3: Uses indication-processor-v2 with module-level caching
+ * @version 3.0.0
+ * @lastUpdate 2026-04-05T17:40:00Z - Updated to use indication-processor-v2
  */
 
-// Force module rebuild - unique ID to bust webpack cache
-const _ENGINE_MODULE_ID = `engine_${Date.now()}_v2.2.1`
-const _ENGINE_BUILD_VERSION = "2.2.1"
+const _ENGINE_BUILD_VERSION = "3.0.0"
 
 // Log immediately on module load to confirm new code is running
-if (typeof console !== "undefined") {
-  console.log(`[v0] EngineManager module loaded - ${_ENGINE_BUILD_VERSION} (${_ENGINE_MODULE_ID})`)
-}
+console.log(`[v0] EngineManager-V3 module loaded - version ${_ENGINE_BUILD_VERSION}`)
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
-import { IndicationProcessor } from "./indication-processor"
+import { IndicationProcessor } from "./indication-processor-v2"
 import { StrategyProcessor } from "./strategy-processor"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { RealtimeProcessor } from "./realtime-processor"
