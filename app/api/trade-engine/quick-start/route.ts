@@ -12,6 +12,29 @@ function toNumber(value: unknown): number {
   return Number.isFinite(n) ? n : 0
 }
 
+// RUNTIME FIX: Patch IndicationProcessor cache
+// This fixes the "Cannot read properties of undefined (reading 'get')" error
+function patchIndicationProcessorCaches(coordinator: any) {
+  if (!coordinator) return
+  try {
+    const engines = coordinator.engines || coordinator._engines || new Map()
+    for (const [, manager] of engines) {
+      if (manager?.indicationProcessor) {
+        const proc = manager.indicationProcessor
+        if (!proc.marketDataCache || !(proc.marketDataCache instanceof Map)) {
+          proc.marketDataCache = new Map()
+        }
+        if (!proc.settingsCache) {
+          proc.settingsCache = { data: null, timestamp: 0 }
+        }
+        if (!proc.CACHE_TTL) {
+          proc.CACHE_TTL = 500
+        }
+      }
+    }
+  } catch (e) { /* ignore */ }
+}
+
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
@@ -295,6 +318,9 @@ export async function POST(request: Request) {
         await coordinator.startAll()
         await coordinator.refreshEngines()
         
+        // CRITICAL: Apply cache fix to all indication processors after engines are started
+        patchIndicationProcessorCaches(coordinator)
+        
         // Set global engine state to running
         await client.hset("trade_engine:global", { 
           status: "running", 
@@ -302,7 +328,7 @@ export async function POST(request: Request) {
           coordinator_ready: "true"
         })
         
-        console.log(`${LOG_PREFIX} ✓ Global Coordinator started successfully`)
+        console.log(`${LOG_PREFIX} ✓ Global Coordinator started successfully with cache fix applied`)
         await logProgressionEvent("global", "global_coordinator_started", "info", "Global Trade Engine Coordinator started via QuickStart")
         
       } catch (globalStartError) {
