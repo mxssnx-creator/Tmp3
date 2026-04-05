@@ -9,7 +9,7 @@
  */
 
 import { sql, query, getDatabaseType } from "@/lib/db"
-import { IndicationProcessor } from "./indication-processor-v2"
+import { IndicationProcessor } from "./indication-processor"
 import { StrategyProcessor } from "./strategy-processor"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { RealtimeProcessor } from "./realtime-processor"

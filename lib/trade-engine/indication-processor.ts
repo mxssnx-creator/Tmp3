@@ -1,17 +1,18 @@
 /**
- * Indication Processor V2 - Module-Level Caching
+ * Indication Processor - Module-Level Caching (Fixed)
  * Processes independent indication sets for each type (Direction, Move, Active, Optimal)
  * Each type maintains its own 250-entry pool calculated independently
  * 
- * V2 CHANGES: All caching moved to module-level functions to avoid `this` context issues
- * @version 3.0.0
- * @lastUpdate 2026-04-05T17:40:00Z - Renamed to v2, module-level caching
+ * FIX: All caching uses module-level functions to avoid `this` context issues
+ * @version 3.1.0
+ * @lastUpdate 2026-04-05T18:00:00Z - Restored original filename with fixed code
  */
 
-const _INDICATION_BUILD_VERSION = "3.0.0"
+const _INDICATION_BUILD_VERSION = "3.1.0"
+const _BUILD_TIMESTAMP = 1712354400000
 
 // Log immediately on module load to confirm new code is running
-console.log(`[v0] IndicationProcessor-V2 module loaded - version ${_INDICATION_BUILD_VERSION}`)
+console.log(`[v0] IndicationProcessor module loaded - version ${_INDICATION_BUILD_VERSION} ts=${_BUILD_TIMESTAMP}`)
 
 import { IndicationSetsProcessor } from "@/lib/indication-sets-processor"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"

@@ -844,9 +844,11 @@ export async function flushAll(): Promise<void> {
   console.log("[v0] [Redis] flushAll called - cleared all data")
 }
 
-export async function getIndications(connectionId: string): Promise<any[]> {
+export async function getIndications(key: string): Promise<any[]> {
   const client = getClient()
-  const value = await client.get(`indications:${connectionId}`)
+  // Support both formats: full key ("indications:conn-id") or just connection ID ("conn-id")
+  const actualKey = key.startsWith("indications:") ? key : `indications:${key}`
+  const value = await client.get(actualKey)
   if (!value) return []
   try {
     return JSON.parse(value)
@@ -855,13 +857,15 @@ export async function getIndications(connectionId: string): Promise<any[]> {
   }
 }
 
-export async function saveIndication(connectionId: string, indication: any): Promise<void> {
+export async function saveIndication(key: string, indication: any): Promise<void> {
   const client = getClient()
-  const existing = await getIndications(connectionId)
+  // Support both formats: full key ("indications:conn-id") or just connection ID ("conn-id")
+  const actualKey = key.startsWith("indications:") ? key : `indications:${key}`
+  const existing = await getIndications(actualKey)
   existing.push(indication)
   // Keep last 1000 indications
   const trimmed = existing.slice(-1000)
-  await client.set(`indications:${connectionId}`, JSON.stringify(trimmed))
+  await client.set(actualKey, JSON.stringify(trimmed))
 }
 
 export async function getRedisStats(): Promise<any> {
