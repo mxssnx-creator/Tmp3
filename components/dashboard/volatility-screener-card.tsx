@@ -4,8 +4,7 @@ import React, { useEffect, useState } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { TrendingUp, TrendingDown, AlertCircle, CheckCircle2 } from "lucide-react"
-import type { VolatilityMetrics } from "@/lib/volatility-calculator"
+import { TrendingUp, AlertCircle, CheckCircle2, Zap } from "lucide-react"
 
 interface VolatilityScreenResult {
   success: boolean
@@ -26,6 +25,8 @@ export function VolatilityScreenerCard() {
   const [screening, setScreening] = useState(false)
   const [results, setResults] = useState<VolatilityScreenResult | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [liveTradeEnabled, setLiveTradeEnabled] = useState<{ [key: string]: boolean }>({})
+  const [enabling, setEnabling] = useState(false)
 
   const screenSymbols = async () => {
     setScreening(true)
@@ -34,7 +35,22 @@ export function VolatilityScreenerCard() {
       const response = await fetch("/api/symbols/screen-volatility", { cache: "no-store" })
       if (!response.ok) throw new Error("Failed to screen symbols")
       const data = await response.json()
-      setResults(data)
+      
+      // Get top 3 highest volatility symbols
+      const top3Symbols = data.results
+        .filter((r: any) => r.isHighVolatility)
+        .slice(0, 3)
+        .map((r: any) => r.symbol)
+      
+      setResults({
+        ...data,
+        selectedSymbols: top3Symbols,
+      })
+
+      // Auto-enable live trading for top 3
+      if (top3Symbols.length > 0) {
+        await enableLiveTrading(top3Symbols)
+      }
     } catch (err) {
       setError((err as Error).message)
       console.error("[v0] Error screening symbols:", err)
@@ -43,10 +59,58 @@ export function VolatilityScreenerCard() {
     }
   }
 
+  const enableLiveTrading = async (symbols: string[]) => {
+    setEnabling(true)
+    try {
+      const response = await fetch("/api/trade-engine/enable-symbols", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ symbols }),
+      })
+
+      if (response.ok) {
+        const statusMap: { [key: string]: boolean } = {}
+        symbols.forEach(s => {
+          statusMap[s] = true
+        })
+        setLiveTradeEnabled(prev => ({ ...prev, ...statusMap }))
+      }
+    } catch (err) {
+      console.error("[v0] Error enabling live trading:", err)
+    } finally {
+      setEnabling(false)
+    }
+  }
+
+  const toggleLiveTrading = async (symbol: string) => {
+    const newStatus = !liveTradeEnabled[symbol]
+    try {
+      const response = await fetch("/api/trade-engine/toggle-symbol", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ symbol, enabled: newStatus }),
+      })
+
+      if (response.ok) {
+        setLiveTradeEnabled(prev => ({
+          ...prev,
+          [symbol]: newStatus,
+        }))
+      }
+    } catch (err) {
+      console.error("[v0] Error toggling live trading:", err)
+    }
+  }
+
   useEffect(() => {
-    // Auto-screen on mount
     screenSymbols()
   }, [])
+
+  // Top 3 symbols
+  const topThree = results?.results.slice(0, 3) || []
+  const otherSymbols = results?.results.slice(3) || []
 
   return (
     <Card className="border-0 shadow-md">
@@ -58,16 +122,16 @@ export function VolatilityScreenerCard() {
               High Volatility Screener
             </CardTitle>
             <CardDescription>
-              Last Hour Analysis - Symbols with &gt;2% price range
+              Top 3 highest volatility symbols - Auto-selected for live trading
             </CardDescription>
           </div>
           <Button
             onClick={screenSymbols}
-            disabled={screening}
+            disabled={screening || enabling}
             variant="outline"
             size="sm"
           >
-            {screening ? "Scanning..." : "Rescan"}
+            {screening ? "Scanning..." : enabling ? "Enabling..." : "Rescan"}
           </Button>
         </div>
       </CardHeader>
@@ -93,16 +157,65 @@ export function VolatilityScreenerCard() {
                 <div className="text-lg font-semibold text-green-700">{results.highVolatile}</div>
               </div>
               <div className="rounded-lg bg-purple-50 p-2">
-                <div className="text-xs text-purple-600">Selected</div>
-                <div className="text-lg font-semibold text-purple-700">{results.selectedSymbols.length}</div>
+                <div className="text-xs text-purple-600">Live Trading</div>
+                <div className="text-lg font-semibold text-purple-700">
+                  {Object.values(liveTradeEnabled).filter(Boolean).length}
+                </div>
               </div>
             </div>
 
-            {/* Selected Symbols */}
+            {/* Top 3 Symbols - Highlighted for Live Trading */}
+            {topThree.length > 0 && (
+              <div className="space-y-2 border-2 border-green-200 rounded-lg p-3 bg-green-50">
+                <div className="flex items-center gap-2 mb-3">
+                  <Zap className="h-4 w-4 text-green-600" />
+                  <span className="font-semibold text-green-900">Top 3 for Live Trading</span>
+                </div>
+                <div className="space-y-2">
+                  {topThree.map((result, idx) => (
+                    <div
+                      key={result.symbol}
+                      className="rounded-lg p-3 border-2 border-green-300 bg-white flex items-start justify-between"
+                    >
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 mb-2">
+                          <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-green-600 text-white text-sm font-bold">
+                            {idx + 1}
+                          </span>
+                          <span className="font-semibold text-lg text-green-900">{result.symbol}</span>
+                          <Badge className="bg-green-600 text-white">High Vol</Badge>
+                          {liveTradeEnabled[result.symbol] && (
+                            <Badge className="bg-emerald-600 text-white flex items-center gap-1">
+                              <CheckCircle2 className="h-3 w-3" />
+                              Live Trading
+                            </Badge>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-2 gap-2 text-sm text-gray-600">
+                          <div>Range: <span className="font-semibold text-green-700">{result.volatility}</span></div>
+                          <div>Score: <span className="font-semibold">{result.score}/100</span></div>
+                        </div>
+                      </div>
+                      <Button
+                        onClick={() => toggleLiveTrading(result.symbol)}
+                        variant={liveTradeEnabled[result.symbol] ? "default" : "outline"}
+                        size="sm"
+                        className={liveTradeEnabled[result.symbol] ? "bg-emerald-600 hover:bg-emerald-700" : ""}
+                      >
+                        {liveTradeEnabled[result.symbol] ? "Trading ON" : "Enable"}
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Selected Symbols Summary */}
             {results.selectedSymbols.length > 0 && (
-              <div className="flex gap-2 flex-wrap">
+              <div className="flex gap-2 flex-wrap p-3 bg-blue-50 rounded-lg">
+                <span className="text-sm text-blue-700 font-semibold">Selected:</span>
                 {results.selectedSymbols.map((symbol) => (
-                  <Badge key={symbol} variant="default" className="text-base py-1 px-2">
+                  <Badge key={symbol} variant="secondary" className="bg-blue-200 text-blue-900">
                     <CheckCircle2 className="h-3 w-3 mr-1" />
                     {symbol}
                   </Badge>
@@ -110,52 +223,39 @@ export function VolatilityScreenerCard() {
               </div>
             )}
 
-            {/* Detailed Results */}
-            <div className="space-y-2 max-h-64 overflow-y-auto">
-              {results.results.length > 0 ? (
-                results.results.map((result, idx) => (
-                  <div
-                    key={result.symbol}
-                    className={`rounded-lg p-3 border ${
-                      result.isHighVolatility
-                        ? "border-green-200 bg-green-50"
-                        : "border-gray-200 bg-gray-50"
-                    }`}
-                  >
-                    <div className="flex items-start justify-between mb-1">
-                      <div className="flex items-center gap-2">
-                        <span className="font-semibold text-lg">{result.symbol}</span>
-                        {result.isHighVolatility ? (
-                          <Badge variant="secondary" className="bg-green-100 text-green-800">
-                            ✓ High Vol
-                          </Badge>
-                        ) : (
-                          <Badge variant="outline">Standard</Badge>
-                        )}
-                      </div>
-                      <div className="text-right">
-                        <div className="text-sm font-semibold text-green-600">
-                          {result.volatility} Range
+            {/* Other High Volatility Symbols */}
+            {otherSymbols.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-sm font-semibold text-gray-700">Other High Volatility Symbols</div>
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {otherSymbols.map((result) => (
+                    <div
+                      key={result.symbol}
+                      className="rounded-lg p-2 border border-gray-200 bg-gray-50 flex items-center justify-between"
+                    >
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-gray-800">{result.symbol}</span>
+                          <Badge variant="outline" className="text-xs">{result.volatility}</Badge>
                         </div>
-                        <div className="text-xs text-gray-500">
-                          Score: {result.score}/100
-                        </div>
+                        <div className="text-xs text-gray-500">Score: {result.score}/100</div>
                       </div>
+                      <Button
+                        onClick={() => toggleLiveTrading(result.symbol)}
+                        variant="outline"
+                        size="sm"
+                        className="text-xs"
+                      >
+                        {liveTradeEnabled[result.symbol] ? "ON" : "Enable"}
+                      </Button>
                     </div>
-                    <div className="text-xs text-gray-600">
-                      Price Range: {result.range}
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-700">
-                  No high-volatility symbols found in the last hour. Try again later.
+                  ))}
                 </div>
-              )}
-            </div>
+              </div>
+            )}
 
             {/* Last Updated */}
-            <div className="text-xs text-gray-500 text-center">
+            <div className="text-xs text-gray-500 text-center pt-2 border-t">
               Updated: {new Date(results.timestamp).toLocaleTimeString()}
             </div>
           </>
