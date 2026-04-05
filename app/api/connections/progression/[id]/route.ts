@@ -251,7 +251,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       running: engineRunning,
     })
 
-     const response = {
+    // Get recent logs for this connection
+    const recentLogs = await getProgressionLogs(connectionId)
+
+    const response = {
       success: true,
       connectionId,
       connectionName: connName,
