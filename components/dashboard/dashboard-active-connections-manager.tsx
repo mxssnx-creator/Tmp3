@@ -145,8 +145,8 @@ export function DashboardActiveConnectionsManager() {
     console.log(`[v0] [Manager] Initializing active connections manager (version: ${COMPONENT_VERSIONS.dashboardManager})`)
     loadConnections()
     checkGlobalEngine()
-    const connInterval = setInterval(loadConnections, 5000)
-    const engineInterval = setInterval(checkGlobalEngine, 3000)
+    const connInterval = setInterval(loadConnections, 60000) // Increased from 5s to 60s
+    const engineInterval = setInterval(checkGlobalEngine, 60000) // Increased from 3s to 60s
     
     // Listen for relevant events and refresh
     const handleEngineStateChange = () => {

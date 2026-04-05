@@ -19,7 +19,7 @@ export function SystemMonitoringPanel() {
 
   useEffect(() => {
     loadData()
-    const interval = setInterval(loadData, 8000)
+    const interval = setInterval(loadData, 45000) // Increased from 8s to 45s
     return () => clearInterval(interval)
   }, [])
 

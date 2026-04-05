@@ -18,7 +18,7 @@ export function StatisticsOverviewV2() {
 
   useEffect(() => {
     loadStats()
-    const interval = setInterval(loadStats, 15000)
+    const interval = setInterval(loadStats, 45000) // Increased from 15s to 45s
     return () => clearInterval(interval)
   }, [])
 
