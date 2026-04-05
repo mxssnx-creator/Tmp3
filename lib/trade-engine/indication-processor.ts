@@ -7,6 +7,7 @@
 import { IndicationSetsProcessor } from "@/lib/indication-sets-processor"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { trackIndicationStats } from "@/lib/statistics-tracker"
+import { StepBasedIndicators } from "@/lib/step-based-indicators"
 
 // Pre-import modules at module load time (not per-call)
 import { initRedis, getRedisClient, getMarketData, saveIndication, getSettings } from "@/lib/redis-db"
@@ -201,6 +202,7 @@ export class IndicationProcessor {
 
   /**
    * Process real-time indication - delegates to independent sets processor
+   * Now calculates step-based indicators for all position cost steps (3-30)
    * Returns array of active indications for strategy processing
    */
   async processIndication(symbol: string): Promise<any[]> {
@@ -225,6 +227,19 @@ export class IndicationProcessor {
         // Continue with the loaded market data
         marketData = retryMarketData
       }
+
+      // Get historical candles for step-based calculations
+      const candles = await this.getHistoricalCandles(symbol)
+      if (candles.length === 0) {
+        // Fallback to single candle if no history
+        candles.push(marketData)
+      }
+
+      // Calculate STEP-BASED indicators (3-30 steps)
+      const stepRange = Array.from({ length: 28 }, (_, i) => i + 3) // Steps 3 through 30
+      const stepIndicators = StepBasedIndicators.calculateAll(candles, stepRange)
+
+      console.log(`[v0] [IndicationProcessor] Step-based indicators calculated for ${symbol}: ${stepRange.length} steps analyzed`)
 
       // Market data is a single candle object with fields: price, open, high, low, close, volume, timestamp
       // Extract price information from the single candle
@@ -251,7 +266,14 @@ export class IndicationProcessor {
       // Calculate simple indications from current candle OHLC
       const indications: any[] = []
       
-      // Direction indication: based on close vs open
+      // Step-based indicators for DIRECTION indication
+      const stepDirections: any = {}
+      for (const [step, indicators] of Object.entries(stepIndicators)) {
+        const ma = indicators.ma as number
+        const signal = currentClose > ma ? 1 : -1
+        stepDirections[step] = { signal, ma, confidence: 0.5 + Math.abs((currentClose - ma) / ma) * 0.45 }
+      }
+      
       indications.push({
         type: "direction",
         symbol,
@@ -261,6 +283,7 @@ export class IndicationProcessor {
         confidence: directionConfidence,
         positionState: "new",
         continuousPosition: false,
+        stepIndicators: stepDirections,
         metadata: {
           direction,
           priceChange,
@@ -271,10 +294,16 @@ export class IndicationProcessor {
         }
       })
       
-      // Move indication: based on high-low range
+      // Move indication: based on high-low range AND step-based RSI
       const range = currentHigh - currentLow
       const rangePercent = (range / currentClose) * 100
       const moveConfidence = Math.min(0.95, 0.5 + Math.min(rangePercent, 10) / 20)
+      
+      const stepRSI: any = {}
+      for (const [step, indicators] of Object.entries(stepIndicators)) {
+        const rsi = indicators.rsi as number
+        stepRSI[step] = { rsi, isOversold: rsi < 30, isOverbought: rsi > 70, confidence: Math.abs(50 - rsi) / 50 }
+      }
       
       indications.push({
         type: "move",
@@ -285,6 +314,7 @@ export class IndicationProcessor {
         confidence: moveConfidence,
         positionState: "new",
         continuousPosition: false,
+        stepIndicators: stepRSI,
         metadata: {
           range,
           rangePercent,
@@ -292,8 +322,15 @@ export class IndicationProcessor {
         }
       })
       
-      // Active indication: based on volume
+      // Active indication: based on volume AND step-based MACD
       const activeConfidence = Math.min(0.95, 0.5 + Math.min(currentVolume, 1000) / 2000)
+      
+      const stepMACD: any = {}
+      for (const [step, indicators] of Object.entries(stepIndicators)) {
+        const macd = indicators.macd as any
+        const signal = macd.macd > macd.signal ? 1 : -1
+        stepMACD[step] = { macd: macd.macd, signal: macd.signal, histogram: macd.macd - macd.signal, direction: signal, confidence: Math.abs(macd.macd - macd.signal) / Math.max(Math.abs(macd.signal), 0.001) }
+      }
       
       indications.push({
         type: "active",
@@ -304,9 +341,35 @@ export class IndicationProcessor {
         confidence: activeConfidence,
         positionState: "new",
         continuousPosition: false,
+        stepIndicators: stepMACD,
         metadata: {
           volume: currentVolume,
           volumeActive: currentVolume > 0,
+        }
+      })
+      
+      // Optimal indication: step-based Bollinger Bands
+      const stepBB: any = {}
+      for (const [step, indicators] of Object.entries(stepIndicators)) {
+        const bb = indicators.bb as any
+        const isNearUpper = currentClose > (bb.upper * 0.95)
+        const isNearLower = currentClose < (bb.lower * 1.05)
+        stepBB[step] = { upper: bb.upper, middle: bb.middle, lower: bb.lower, nearUpper: isNearUpper, nearLower: isNearLower, confidence: Math.min(0.95, 0.5 + (currentClose - bb.lower) / (bb.upper - bb.lower)) }
+      }
+      
+      indications.push({
+        type: "optimal",
+        symbol,
+        value: currentClose > currentOpen ? 1 : -1,
+        profitFactor: 1.0 + Math.abs(priceChange) / 100,
+        drawdownTime: 0,
+        confidence: directionConfidence,
+        positionState: "new",
+        continuousPosition: false,
+        stepIndicators: stepBB,
+        metadata: {
+          allStepsAnalyzed: stepRange.length,
+          stepRange: { min: 3, max: 30 },
         }
       })
       
