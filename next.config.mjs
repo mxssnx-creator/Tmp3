@@ -15,7 +15,6 @@ const nextConfig = {
       allowedOrigins: ["*"],
     },
   },
-  },
   webpack: (config, { isServer }) => {
     if (!isServer) {
       config.resolve = config.resolve || {}
