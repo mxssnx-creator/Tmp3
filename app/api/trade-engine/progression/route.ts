@@ -1,15 +1,25 @@
 import { NextResponse } from "next/server"
-import { getActiveConnectionsForEngine, getConnectionTrades, getConnectionPositions, initRedis } from "@/lib/redis-db"
+import { getActiveConnectionsForEngine, getConnectionTrades, getConnectionPositions, initRedis, getRedisClient } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 export const dynamic = "force-dynamic"
 
+// In-memory cache for progression data (5 second TTL for high-frequency access)
+const progressionCache = new Map<string, { data: any; timestamp: number }>()
+const CACHE_TTL = 5000 // 5 seconds for high-frequency updates
+
 export async function GET() {
   try {
-    console.log("[v0] Fetching real-time trade engine progression data")
+    // Check cache first for ultra-fast responses
+    const cacheKey = "progression_all"
+    const cached = progressionCache.get(cacheKey)
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      return NextResponse.json(cached.data)
+    }
+
+    console.log("[v0] [ProgressionEngine] Fetching real-time trade engine progression data")
     
-    // PRODUCTION FIX: Initialize Redis first and check connection
     try {
       await initRedis()
     } catch (redisInitError) {
@@ -25,70 +35,43 @@ export async function GET() {
     }
     
     const activeConnections = await getActiveConnectionsForEngine()
-    console.log(`[v0] Processing ${activeConnections.length} active enabled connections`)
+    console.log(`[v0] [ProgressionEngine] Processing ${activeConnections.length} active connections`)
     
-    // Import the global coordinator to get real engine status
+    // Import the global coordinator for engine status
     const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
     const coordinator = getGlobalTradeEngineCoordinator()
     
     if (!coordinator) {
-      console.warn("[v0] Coordinator not initialized, returning empty progression")
-      return NextResponse.json({
+      const response = {
         success: true,
         connections: [],
         totalConnections: 0,
         runningEngines: 0,
         timestamp: new Date().toISOString(),
-      })
+      }
+      progressionCache.set(cacheKey, { data: response, timestamp: Date.now() })
+      return NextResponse.json(response)
     }
     
-    // Get progression status for each connection with REAL data
-    const progressionData = await Promise.all(
+    // OPTIMIZATION: Use Promise.allSettled for high-frequency non-blocking parallel execution
+    const redis = getRedisClient()
+    const progressionData = await Promise.allSettled(
       activeConnections.map(async (conn) => {
         try {
-          console.log(`[v0] Getting progression for ${conn.name}...`)
-          
-          // PRODUCTION FIX: Wrap coordinator call with try-catch for stability
-          let engineStatus: any = null
-          let isEngineRunning = false
-          try {
-            engineStatus = await coordinator.getEngineStatus(conn.id)
-            isEngineRunning = engineStatus !== null
-          } catch (statusError) {
-            console.warn(`[v0] Failed to get engine status for ${conn.id}:`, statusError)
-            isEngineRunning = false
-          }
-          
-          const [trades, positions, progressionState] = await Promise.all([
-            getConnectionTrades(conn.id).catch((e) => {
-              console.warn(`[v0] Failed to get trades for ${conn.id}:`, e)
-              return []
-            }),
-            getConnectionPositions(conn.id).catch((e) => {
-              console.warn(`[v0] Failed to get positions for ${conn.id}:`, e)
-              return []
-            }),
-            ProgressionStateManager.getProgressionState(conn.id).catch((e) => {
-              console.warn(`[v0] Failed to get progression state for ${conn.id}:`, e)
-              return ProgressionStateManager.getDefaultState(conn.id)
-            }),
+          // OPTIMIZATION: Batch load all data in parallel per connection
+          const [trades, positions, progressionState, engineStatus] = await Promise.all([
+            getConnectionTrades(conn.id).catch(() => []),
+            getConnectionPositions(conn.id).catch(() => []),
+            ProgressionStateManager.getProgressionState(conn.id).catch(() => ProgressionStateManager.getDefaultState(conn.id)),
+            coordinator.getEngineStatus(conn.id).catch(() => null),
           ])
 
-          const tradeCount = trades ? trades.length : 0
-          const pseudoCount = positions ? positions.length : 0
+          const tradeCount = trades?.length || 0
+          const pseudoCount = positions?.length || 0
+          const isEngineRunning = engineStatus !== null
           const engineState = isEngineRunning ? "running" : "idle"
           const updatedAt = progressionState.lastUpdate?.toISOString?.() || null
           const prehistoricLoaded = (progressionState.prehistoricCyclesCompleted || 0) > 0
-          
-          // Get cycle metrics from engine status if available
-          const cycleMetrics = engineStatus ? {
-            indicationCycles: engineStatus.indication_cycle_count || engineStatus.engine_cycles_total || 0,
-            strategyCycles: engineStatus.strategy_cycle_count || engineStatus.engine_cycles_total || 0,
-            realtimeCycles: engineStatus.realtime_cycle_count || engineStatus.engine_cycles_total || 0,
-            lastCycleAt: engineStatus.last_cycle_at || engineStatus.last_realtime_run || null,
-          } : null
-          
-          console.log(`[v0] ${conn.name}: ${engineState}, ${tradeCount} trades, ${pseudoCount} positions, running=${isEngineRunning}`)
           
           return {
             connectionId: conn.id,
@@ -103,7 +86,6 @@ export async function GET() {
             pseudoPositionCount: pseudoCount,
             prehistoricDataLoaded: prehistoricLoaded,
             lastUpdate: updatedAt,
-            cycleMetrics,
             progression: {
               cyclesCompleted: progressionState.cyclesCompleted,
               successfulCycles: progressionState.successfulCycles,
@@ -112,42 +94,53 @@ export async function GET() {
               totalTrades: progressionState.totalTrades,
               successfulTrades: progressionState.successfulTrades,
               totalProfit: progressionState.totalProfit,
+              indicationsDirectionCount: progressionState.indicationsDirectionCount || 0,
+              indicationsMoveCount: progressionState.indicationsMoveCount || 0,
+              indicationsActiveCount: progressionState.indicationsActiveCount || 0,
+              indicationsOptimalCount: progressionState.indicationsOptimalCount || 0,
+              strategiesBaseTotal: progressionState.strategiesBaseTotal || 0,
+              strategiesMainTotal: progressionState.strategiesMainTotal || 0,
+              strategiesRealTotal: progressionState.strategiesRealTotal || 0,
             },
-            realTimeData: true, // Flag indicating this is real data
           }
         } catch (err) {
-          console.warn(`[v0] Failed to get progression for ${conn.id}:`, err)
+          console.warn(`[v0] Error processing ${conn.id}:`, err instanceof Error ? err.message : String(err))
           return {
             connectionId: conn.id,
             connectionName: conn.name,
             exchange: conn.exchange,
-            isEnabled: conn.is_enabled,
-            isActive: conn.is_active,
-            isLiveTrading: conn.is_live_trade,
             isEngineRunning: false,
             engineState: 'error',
-            tradeCount: 0,
-            pseudoPositionCount: 0,
-            prehistoricDataLoaded: false,
-            lastUpdate: null,
-            cycleMetrics: null,
             error: err instanceof Error ? err.message : String(err),
-            realTimeData: false,
           }
         }
       })
     )
+
+    // Extract successful results, skip failed ones gracefully
+    const results = progressionData.filter(r => r.status === 'fulfilled').map(r => (r as PromiseFulfilledResult<any>).value)
     
-    console.log(`[v0] Returned real-time progression data for ${progressionData.length} connections`)
-    return NextResponse.json({
+    const response = {
       success: true,
-      connections: progressionData,
-      totalConnections: progressionData.length,
-      runningEngines: progressionData.filter(c => c.isEngineRunning).length,
+      connections: results,
+      totalConnections: results.length,
+      runningEngines: results.filter(c => c.isEngineRunning).length,
       timestamp: new Date().toISOString(),
-    })
+    }
+    
+    // Cache the response for 5 seconds
+    progressionCache.set(cacheKey, { data: response, timestamp: Date.now() })
+    
+    return NextResponse.json(response)
   } catch (error) {
-    console.error("[v0] Failed to fetch progression:", error)
+    console.error("[v0] [ProgressionEngine] Critical error:", error)
+    return NextResponse.json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error",
+      connections: [],
+    }, { status: 500 })
+  }
+}
     await SystemLogger.logError(error, "api", "GET /api/trade-engine/progression").catch(() => {})
     return NextResponse.json({ 
       success: false,
