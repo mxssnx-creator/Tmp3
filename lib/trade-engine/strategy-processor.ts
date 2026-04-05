@@ -2,7 +2,12 @@
  * Strategy Processor
  * Coordinates progressive strategy flow: BASE → MAIN → REAL → LIVE
  * Each stage evaluates strategies with stricter thresholds
+ * @version 2.1.0
+ * @lastUpdate 2026-04-05T17:35:00Z - Fixed indication lookup from main key
  */
+
+// Force module rebuild timestamp: 1712341200000
+const _STRATEGY_BUILD_VERSION = "2.1.0"
 
 import { initRedis, getSettings, getIndications, createPosition } from "@/lib/redis-db"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
