@@ -5,8 +5,14 @@
  * @lastUpdate 2026-04-05T17:35:00Z - Added SOL to default symbols, fixed cache initialization
  */
 
-// Force module rebuild timestamp: 1712341200000
-const _ENGINE_BUILD_VERSION = "2.1.0"
+// Force module rebuild - unique ID to bust webpack cache
+const _ENGINE_MODULE_ID = `engine_${Date.now()}_v2.2.1`
+const _ENGINE_BUILD_VERSION = "2.2.1"
+
+// Log immediately on module load to confirm new code is running
+if (typeof console !== "undefined") {
+  console.log(`[v0] EngineManager module loaded - ${_ENGINE_BUILD_VERSION} (${_ENGINE_MODULE_ID})`)
+}
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
