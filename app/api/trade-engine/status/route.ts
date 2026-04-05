@@ -2,7 +2,6 @@ import { NextResponse } from "next/server"
 import { getRedisClient, initRedis, getActiveConnectionsForEngine, getAllConnections } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
-import { generateAndSaveIndications } from "@/lib/trade-engine/simple-indication-generator"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -42,7 +41,7 @@ function patchIndicationProcessorCaches(coordinator: any) {
   }
 }
 
-// Generate indications using the simple generator (bypasses broken IndicationProcessor)
+// Generate indications using inline logic (bypasses broken IndicationProcessor)
 async function generateIndicationsIfNeeded() {
   const now = Date.now()
   if (now - lastIndicationGeneration < GENERATION_INTERVAL) {
@@ -54,13 +53,52 @@ async function generateIndicationsIfNeeded() {
     const connections = await getAllConnections()
     const activeConnections = connections.filter((c: any) => c.isActive || c.is_active)
     
+    if (activeConnections.length === 0) return
+    
+    const client = getRedisClient()
+    let totalGenerated = 0
+    
     for (const connection of activeConnections) {
       for (const symbol of INDICATION_SYMBOLS) {
-        await generateAndSaveIndications(symbol, connection.id)
+        // Generate indications inline
+        const hashData = await client.hgetall(`market_data:${symbol}`)
+        if (!hashData || Object.keys(hashData).length === 0) continue
+        
+        const close = parseFloat(hashData?.close || hashData?.c || "0")
+        const open = parseFloat(hashData?.open || hashData?.o || "0")
+        const high = parseFloat(hashData?.high || hashData?.h || "0")
+        const low = parseFloat(hashData?.low || hashData?.l || "0")
+        
+        if (close === 0) continue
+        
+        const direction = close >= open ? "long" : "short"
+        const range = high - low
+        const rangePercent = (range / close) * 100
+        
+        const indications = [
+          { type: "direction", symbol, value: direction === "long" ? 1 : -1, profitFactor: 1.2, confidence: 0.7, timestamp: now },
+          { type: "move", symbol, value: rangePercent > 2 ? 1 : 0, profitFactor: 1.0 + rangePercent/100, confidence: 0.6, timestamp: now },
+          { type: "active", symbol, value: rangePercent > 1 ? 1 : 0, profitFactor: 1.1, confidence: 0.65, timestamp: now },
+          { type: "optimal", symbol, value: direction === "long" && rangePercent > 1.5 ? 1 : 0, profitFactor: 1.3, confidence: 0.75, timestamp: now },
+        ]
+        
+        // Save to Redis
+        const key = `indications:${connection.id}`
+        const existing = await client.get(key).catch(() => null)
+        const existingArr = existing ? JSON.parse(existing) : []
+        existingArr.push(...indications)
+        const trimmed = existingArr.slice(-1000)
+        await client.set(key, JSON.stringify(trimmed))
+        
+        totalGenerated += indications.length
       }
     }
+    
+    if (totalGenerated > 0) {
+      console.log(`[v0] [StatusAPI] Generated ${totalGenerated} indications for ${activeConnections.length} connections`)
+    }
   } catch (e) {
-    // Silently ignore generation errors
+    console.error(`[v0] [StatusAPI] Error generating indications:`, (e as Error).message)
   }
 }
 

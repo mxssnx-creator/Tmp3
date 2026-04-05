@@ -6,14 +6,14 @@
  * @lastUpdate 2026-04-05T19:30:00Z - Inline indication generation fallback
  */
 
-const _ENGINE_BUILD_VERSION = "3.0.0"
+const _ENGINE_BUILD_VERSION = "5.0.0"
 
 // Log immediately on module load to confirm new code is running
-console.log(`[v0] EngineManager-V3 module loaded - version ${_ENGINE_BUILD_VERSION}`)
+console.log(`[v0] EngineManager-V5 module loaded - version ${_ENGINE_BUILD_VERSION} - using indication-processor-fixed`)
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
-import { IndicationProcessor } from "./indication-processor"
+import { IndicationProcessor } from "./indication-processor-fixed"
 import { StrategyProcessor } from "./strategy-processor"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { RealtimeProcessor } from "./realtime-processor"

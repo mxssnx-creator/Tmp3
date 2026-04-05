@@ -6,7 +6,7 @@
  * @version 1.0.0
  */
 
-import { IndicationProcessor } from "./indication-processor"
+import { IndicationProcessor } from "./indication-processor-fixed"
 
 console.log("[v0] Loading indication-processor-patch.ts")
 
