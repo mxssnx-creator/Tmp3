@@ -191,7 +191,7 @@ export class TradeEngineManager {
       // Force an immediate indication cycle so the engine does not wait for the first interval tick
       let immediateSymbols = await this.getSymbols()
       if (!immediateSymbols || immediateSymbols.length === 0) {
-        immediateSymbols = ["BTCUSDT", "ETHUSDT"]
+        immediateSymbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
       }
       console.log(`[v0] [EngineManager] Running immediate indication cycle for ${immediateSymbols.length} symbols`)
       const immediateResults = await Promise.all(immediateSymbols.map((symbol) => this.indicationProcessor.processIndication(symbol).catch(() => [])))
@@ -380,7 +380,7 @@ export class TradeEngineManager {
         })
         // Fallback: load minimal market data
         try {
-          const fallbackSymbols = ["BTCUSDT", "ETHUSDT"]
+          const fallbackSymbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
           await loadMarketDataForEngine(fallbackSymbols)
           console.log(`[v0] [EngineManager] Fallback market data loaded for ${fallbackSymbols.join(", ")}`)
         } catch (fallbackErr) {

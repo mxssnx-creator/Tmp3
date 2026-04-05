@@ -276,6 +276,9 @@ export class StrategyProcessor {
           console.log(`[v0] [StrategyProcessor] Retrieved ${symbolIndications.length} indications for ${symbol} from main key`)
           return symbolIndications
         }
+        console.log(`[v0] [StrategyProcessor] Found ${allIndications.length} indications but none for symbol ${symbol}`)
+      } else {
+        console.log(`[v0] [StrategyProcessor] Primary key ${primaryKey} has no indications`)
       }
 
       // FALLBACK 1: Old format - per-symbol real-time key

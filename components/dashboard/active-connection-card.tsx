@@ -59,6 +59,16 @@ interface ProgressionData {
     liveProcessingActive: boolean
     liveTradingActive: boolean
   }
+  prehistoricProgress?: {
+    symbolsProcessed: number
+    symbolsTotal: number
+    candlesLoaded: number
+    candlesTotal: number
+    indicatorsCalculated: number
+    currentSymbol: string
+    duration: number
+    percentComplete: number
+  }
   error: string | null
 }
 
@@ -542,6 +552,57 @@ export function ActiveConnectionCard({
                     {progression.subPhase && <span className="ml-1">- {progression.subPhase}</span>}
                   </p>
                 )}
+                
+                {/* Detailed prehistoric progress display */}
+                {phase === "prehistoric_data" && progression?.prehistoricProgress && (
+                  <div className="mt-2 p-2 bg-amber-50/50 dark:bg-amber-950/20 rounded border border-amber-200/50 dark:border-amber-800/30 space-y-1">
+                    <div className="text-[10px] font-medium text-amber-700 dark:text-amber-400">Historical Data Loading</div>
+                    
+                    {/* Symbols progress */}
+                    <div className="flex items-center justify-between text-[10px]">
+                      <span className="text-muted-foreground">Symbols</span>
+                      <span className="font-medium">
+                        {progression.prehistoricProgress.symbolsProcessed}/{progression.prehistoricProgress.symbolsTotal}
+                      </span>
+                    </div>
+                    {progression.prehistoricProgress.currentSymbol && (
+                      <div className="text-[10px] text-muted-foreground">
+                        Processing: <span className="font-mono font-medium">{progression.prehistoricProgress.currentSymbol}</span>
+                      </div>
+                    )}
+                    
+                    {/* Candles progress */}
+                    {progression.prehistoricProgress.candlesTotal > 0 && (
+                      <div className="flex items-center justify-between text-[10px]">
+                        <span className="text-muted-foreground">Candles</span>
+                        <span className="font-medium">
+                          {progression.prehistoricProgress.candlesLoaded}/{progression.prehistoricProgress.candlesTotal}
+                        </span>
+                      </div>
+                    )}
+                    
+                    {/* Indicators calculated */}
+                    {progression.prehistoricProgress.indicatorsCalculated > 0 && (
+                      <div className="flex items-center justify-between text-[10px]">
+                        <span className="text-muted-foreground">Indicators</span>
+                        <span className="font-medium">
+                          {progression.prehistoricProgress.indicatorsCalculated}
+                        </span>
+                      </div>
+                    )}
+                    
+                    {/* Duration */}
+                    {progression.prehistoricProgress.duration > 0 && (
+                      <div className="flex items-center justify-between text-[10px]">
+                        <span className="text-muted-foreground">Duration</span>
+                        <span className="font-medium">
+                          {(progression.prehistoricProgress.duration / 1000).toFixed(1)}s
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+                
                 {progression?.error && (
                   <p className="text-[11px] text-red-500 font-medium truncate">
                     {progression.error}

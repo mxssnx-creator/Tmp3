@@ -396,6 +396,8 @@ export class IndicationProcessor {
           return indications
         }
         
+        console.log(`[v0] [IndicationProcessor] Processing ${indications.length} indications for ${symbol}`)
+        
         // Read existing indications
         const existingRaw = await client.get(mainKey)
         let existingIndications: any[] = []
@@ -410,6 +412,8 @@ export class IndicationProcessor {
           }
         }
         
+        console.log(`[v0] [IndicationProcessor] Found ${existingIndications.length} existing indications in Redis at ${mainKey}`)
+        
         // Add new indications with symbol context
         for (const ind of indications) {
           existingIndications.push({
@@ -419,6 +423,8 @@ export class IndicationProcessor {
           })
         }
         
+        console.log(`[v0] [IndicationProcessor] Total indications after merge: ${existingIndications.length}`)
+        
         // Keep only latest 1000 indications per connection to avoid memory bloat
         if (existingIndications.length > 1000) {
           existingIndications = existingIndications.slice(-1000)
@@ -426,7 +432,7 @@ export class IndicationProcessor {
         
         // Save back to Redis
         await client.set(mainKey, JSON.stringify(existingIndications), { EX: 3600 })
-        console.log(`[v0] [IndicationProcessor] Saved ${indications.length} indications for ${symbol} to ${mainKey}`)
+        console.log(`[v0] [IndicationProcessor] ✓ Saved ${indications.length} indications for ${symbol} to ${mainKey}, total now=${existingIndications.length}`)
         
         // Also save per-symbol for debugging
         const symbolKey = `${this.connectionId}:${symbol}:realtime`
