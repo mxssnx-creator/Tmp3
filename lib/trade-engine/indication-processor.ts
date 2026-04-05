@@ -6,8 +6,14 @@
  * @lastUpdate 2026-04-05T17:35:00Z - Fixed cache initialization with module-level fallback
  */
 
-// Force module rebuild timestamp: 1712341200000
-const _INDICATION_BUILD_VERSION = "2.1.0"
+// Force module rebuild - unique ID to bust webpack cache
+const _INDICATION_MODULE_ID = `indication_${Date.now()}_v2.2.1`
+const _INDICATION_BUILD_VERSION = "2.2.1"
+
+// Log immediately on module load to confirm new code is running
+if (typeof console !== "undefined") {
+  console.log(`[v0] IndicationProcessor module loaded - ${_INDICATION_BUILD_VERSION} (${_INDICATION_MODULE_ID})`)
+}
 
 import { IndicationSetsProcessor } from "@/lib/indication-sets-processor"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
@@ -35,22 +41,82 @@ function getProgressionManager() {
   return ProgressionStateManager
 }
 
-// MODULE-LEVEL fallback caches - guaranteed to exist even if class fields fail
+// MODULE-LEVEL caches - guaranteed to exist, avoids `this` context issues entirely
 const MODULE_MARKET_DATA_CACHE = new Map<string, { data: any; timestamp: number }>()
 const MODULE_CACHE_TTL = 500
 
+// Module-level settings cache
+let MODULE_SETTINGS_CACHE: { data: any; timestamp: number } | null = null
+
+/**
+ * Module-level market data fetcher with caching
+ * Completely avoids any `this` context issues by using module-level state
+ */
+async function getMarketDataCachedModule(symbol: string): Promise<any> {
+  const now = Date.now()
+  const cached = MODULE_MARKET_DATA_CACHE.get(symbol)
+
+  if (cached && now - cached.timestamp < MODULE_CACHE_TTL) {
+    return cached.data
+  }
+
+  try {
+    await initRedis()
+    const rawData = await getMarketData(symbol)
+
+    if (!rawData) {
+      return null
+    }
+
+    const latest = Array.isArray(rawData) ? rawData[0] : rawData
+
+    if (latest) {
+      MODULE_MARKET_DATA_CACHE.set(symbol, { data: latest, timestamp: now })
+      return latest
+    }
+    return null
+  } catch (error) {
+    console.error(`[v0] Failed to get market data for ${symbol}:`, error)
+    return null
+  }
+}
+
+/**
+ * Module-level settings fetcher with caching
+ */
+async function getSettingsCachedModule(): Promise<any> {
+  const now = Date.now()
+
+  if (MODULE_SETTINGS_CACHE && now - MODULE_SETTINGS_CACHE.timestamp < MODULE_CACHE_TTL) {
+    return MODULE_SETTINGS_CACHE.data
+  }
+
+  try {
+    await initRedis()
+    const settings = await getSettings("all_settings") || {}
+
+    const indicationSettings = {
+      minProfitFactor: settings.minProfitFactor || 1.2,
+      minConfidence: settings.minConfidence || 0.6,
+      timeframes: settings.timeframes || ["1h", "4h", "1d"],
+    }
+
+    MODULE_SETTINGS_CACHE = { data: indicationSettings, timestamp: now }
+    return indicationSettings
+  } catch {
+    return {
+      minProfitFactor: 1.2,
+      minConfidence: 0.6,
+      timeframes: ["1h", "4h", "1d"],
+    }
+  }
+}
+
 export class IndicationProcessor {
   private connectionId: string
-  private marketDataCache: Map<string, { data: any; timestamp: number }> = new Map()
-  private settingsCache: { data: any; timestamp: number } | null = null
-  private readonly CACHE_TTL = 500 // ms — short TTL to stay near real-time while cutting Redis ops
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
-    // Ensure cache is initialized
-    if (!this.marketDataCache) {
-      this.marketDataCache = MODULE_MARKET_DATA_CACHE
-    }
   }
 
   /**
@@ -483,70 +549,16 @@ export class IndicationProcessor {
 
   /**
    * Get latest market data with caching to avoid repeated Redis calls
+   * Uses module-level cache to avoid any `this` context issues
    */
   private async getLatestMarketDataCached(symbol: string): Promise<any> {
-    const now = Date.now()
-    
-    // Use module-level fallback if instance cache is undefined
-    const cache = this.marketDataCache || MODULE_MARKET_DATA_CACHE
-    const ttl = this.CACHE_TTL || MODULE_CACHE_TTL
-    
-    const cached = cache.get(symbol)
-
-    if (cached && now - cached.timestamp < ttl) {
-      return cached.data
-    }
-
-    try {
-      const redis = await getRedisHelpers()
-      await redis.initRedis()
-      const rawData = await redis.getMarketData(symbol)
-
-      if (!rawData) {
-        return null
-      }
-
-      const latest = Array.isArray(rawData) ? rawData[0] : rawData
-
-      if (latest) {
-        cache.set(symbol, { data: latest, timestamp: now })
-        return latest
-      }
-      return null
-    } catch (error) {
-      console.error(`[v0] Failed to get market data for ${symbol}:`, error)
-      return null
-    }
+    return getMarketDataCachedModule(symbol)
   }
 
   /**
-   * Get indication settings with caching
+   * Get indication settings with caching - uses module-level cache
    */
   private async getIndicationSettingsCached(): Promise<any> {
-    const now = Date.now()
-
-    if (this.settingsCache && now - this.settingsCache.timestamp < this.CACHE_TTL) {
-      return this.settingsCache.data
-    }
-
-    try {
-      const redis = await getRedisHelpers()
-      const settings = await redis.getSettings("all_settings") || {}
-
-      const indicationSettings = {
-        minProfitFactor: settings.minProfitFactor || 1.2,
-        minConfidence: settings.minConfidence || 0.6,
-        timeframes: settings.timeframes || ["1h", "4h", "1d"],
-      }
-
-      this.settingsCache = { data: indicationSettings, timestamp: now }
-      return indicationSettings
-    } catch {
-      return {
-        minProfitFactor: 1.2,
-        minConfidence: 0.6,
-        timeframes: ["1h", "4h", "1d"],
-      }
-    }
+    return getSettingsCachedModule()
   }
 }
