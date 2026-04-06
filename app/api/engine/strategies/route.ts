@@ -4,12 +4,35 @@ import { initRedis, getSettings, getRedisClient } from "@/lib/redis-db"
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
-// High-performance cache for strategy data (5 second TTL)
+// High-performance cache for strategy data (3 second TTL)
 const strategiesCache = new Map<string, { data: any; timestamp: number }>()
-const CACHE_TTL = 5000
+const CACHE_TTL = 3000
+const MAX_CACHE_SIZE = 50 // Max entries to prevent memory bloat
+
+function cleanCache(cache: Map<string, any>) {
+  // Remove expired entries
+  const now = Date.now()
+  for (const [key, value] of cache.entries()) {
+    if (now - value.timestamp > CACHE_TTL) {
+      cache.delete(key)
+    }
+  }
+  
+  // If still too large, clear oldest entries
+  if (cache.size > MAX_CACHE_SIZE) {
+    const sortedEntries = Array.from(cache.entries())
+      .sort((a, b) => a[1].timestamp - b[1].timestamp)
+    
+    const toDelete = sortedEntries.slice(0, cache.size - MAX_CACHE_SIZE)
+    toDelete.forEach(([key]) => cache.delete(key))
+  }
+}
 
 export async function GET(req: NextRequest) {
   try {
+    // Clean cache to prevent memory bloat
+    cleanCache(strategiesCache)
+    
     const { searchParams } = new URL(req.url)
     const connectionId = searchParams.get("connectionId") || searchParams.get("id")
     
@@ -38,7 +61,8 @@ export async function GET(req: NextRequest) {
     }
     
     try {
-      // OPTIMIZATION: Batch scan all strategy keys at once instead of querying hardcoded symbols
+      // OPTIMIZATION: Query only the aggregated strategy counts (no SCAN to avoid hangs)
+      // Use specific Redis keys pattern instead of full SCAN
       let baseStrategyCount = 0
       let mainStrategyCount = 0
       let realStrategyCount = 0
@@ -46,55 +70,54 @@ export async function GET(req: NextRequest) {
       let evaluatedMain = 0
       let evaluatedReal = 0
       
-      // Use SCAN to efficiently get all strategy keys in batch (high-frequency optimized)
-      let cursor = "0"
-      const batchSize = 100
-      let iterations = 0
-      const maxIterations = 50 // Safety limit to prevent infinite loops
-      
-      do {
-        try {
-          // Scan for strategy keys matching pattern (non-blocking)
-          const result = await redis.scan(cursor, {
-            match: `strategies:${connectionId}:*`,
-            count: batchSize,
-          })
-          
-          cursor = result[0]
-          const keys = result[1] || []
-          
-          // Process keys efficiently
-          for (const key of keys) {
-            try {
-              const data = await redis.get(key)
-              if (!data) continue
-              
-              const parsed = JSON.parse(data)
-              const count = parsed.count || parsed.strategies?.length || 0
-              const evaluated = parsed.evaluated || 0
-              
-              if (key.includes(":base")) {
-                baseStrategyCount += count
-                evaluatedBase += evaluated
-              } else if (key.includes(":main")) {
-                mainStrategyCount += count
-                evaluatedMain += evaluated
-              } else if (key.includes(":real")) {
-                realStrategyCount += count
-                evaluatedReal += evaluated
-              }
-            } catch (parseErr) {
-              // Skip malformed data
-              continue
+      // Query aggregated counts stored in Redis by the engine
+      try {
+        const aggregatedKey = `strategies:${connectionId}:aggregated`
+        const aggregated = await redis.get(aggregatedKey)
+        
+        if (aggregated) {
+          const data = JSON.parse(aggregated)
+          baseStrategyCount = data.base?.count || 0
+          mainStrategyCount = data.main?.count || 0
+          realStrategyCount = data.real?.count || 0
+          evaluatedBase = data.base?.evaluated || 0
+          evaluatedMain = data.main?.evaluated || 0
+          evaluatedReal = data.real?.evaluated || 0
+        } else {
+          // Fallback: Query only top-level keys without deep scanning
+          try {
+            const baseKey = `strategies:${connectionId}:base:aggregated`
+            const mainKey = `strategies:${connectionId}:main:aggregated`
+            const realKey = `strategies:${connectionId}:real:aggregated`
+            
+            const [baseData, mainData, realData] = await Promise.all([
+              redis.get(baseKey).catch(() => null),
+              redis.get(mainKey).catch(() => null),
+              redis.get(realKey).catch(() => null),
+            ])
+            
+            if (baseData) {
+              const parsed = JSON.parse(baseData)
+              baseStrategyCount = parsed.count || 0
+              evaluatedBase = parsed.evaluated || 0
             }
+            if (mainData) {
+              const parsed = JSON.parse(mainData)
+              mainStrategyCount = parsed.count || 0
+              evaluatedMain = parsed.evaluated || 0
+            }
+            if (realData) {
+              const parsed = JSON.parse(realData)
+              realStrategyCount = parsed.count || 0
+              evaluatedReal = parsed.evaluated || 0
+            }
+          } catch (parseErr) {
+            // Continue with zeros
           }
-          
-          iterations++
-        } catch (scanErr) {
-          console.warn(`[v0] [EngineStrategies] Error during scan:`, scanErr)
-          break
         }
-      } while (cursor !== "0" && iterations < maxIterations)
+      } catch (queryErr) {
+        console.warn(`[v0] [EngineStrategies] Error querying strategy counts:`, queryErr)
+      }
       
       const response = {
         connectionId,
@@ -113,7 +136,7 @@ export async function GET(req: NextRequest) {
         timestamp: new Date().toISOString(),
       }
       
-      // Cache for 5 seconds (high-frequency access)
+      // Cache for 3 seconds (ultra-fast)
       strategiesCache.set(cacheKey, { data: response, timestamp: Date.now() })
       
       return NextResponse.json(response)

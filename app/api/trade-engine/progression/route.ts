@@ -5,12 +5,35 @@ import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 export const dynamic = "force-dynamic"
 
-// In-memory cache for progression data (5 second TTL for high-frequency access)
+// In-memory cache for progression data (3 second TTL for high-frequency access)
 const progressionCache = new Map<string, { data: any; timestamp: number }>()
-const CACHE_TTL = 5000 // 5 seconds for high-frequency updates
+const CACHE_TTL = 3000 // 3 seconds for high-frequency updates
+const MAX_CACHE_SIZE = 50 // Max entries to prevent memory bloat
+
+function cleanCache(cache: Map<string, any>) {
+  // Remove expired entries
+  const now = Date.now()
+  for (const [key, value] of cache.entries()) {
+    if (now - value.timestamp > CACHE_TTL) {
+      cache.delete(key)
+    }
+  }
+  
+  // If still too large, clear oldest entries
+  if (cache.size > MAX_CACHE_SIZE) {
+    const sortedEntries = Array.from(cache.entries())
+      .sort((a, b) => a[1].timestamp - b[1].timestamp)
+    
+    const toDelete = sortedEntries.slice(0, cache.size - MAX_CACHE_SIZE)
+    toDelete.forEach(([key]) => cache.delete(key))
+  }
+}
 
 export async function GET() {
   try {
+    // Clean cache to prevent memory bloat
+    cleanCache(progressionCache)
+    
     // Check cache first for ultra-fast responses
     const cacheKey = "progression_all"
     const cached = progressionCache.get(cacheKey)
