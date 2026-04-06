@@ -1,12 +1,26 @@
 /**
- * Global Trade Engine Coordinator V3.1
- * @version 3.1.0 - Added runtime patch for cache initialization fix
+ * Global Trade Engine Coordinator V4.0
+ * @version 4.0.0 - Force engine restart on version change to fix stale closures
  */
 
 // CRITICAL: Import patch FIRST to fix cache initialization issues in stale webpack bundles
 import "./trade-engine/indication-processor-patch"
 
-console.log("[v0] Global Trade Engine V3.1 loading with cache patch...")
+const COORDINATOR_VERSION = "4.0.0"
+
+// Force clear stale engine instances on version change
+const coordGlobal = globalThis as unknown as { 
+  __coordinator_version?: string
+  __global_coordinator?: unknown
+}
+
+if (coordGlobal.__coordinator_version !== COORDINATOR_VERSION) {
+  console.log(`[v0] Coordinator version changed from ${coordGlobal.__coordinator_version} to ${COORDINATOR_VERSION}, clearing stale engines...`)
+  coordGlobal.__global_coordinator = undefined
+  coordGlobal.__coordinator_version = COORDINATOR_VERSION
+}
+
+console.log(`[v0] Global Trade Engine V${COORDINATOR_VERSION} loading with cache patch...`)
 
 import { TradeEngineManager, type EngineConfig } from "./trade-engine/engine-manager"
 import { getSettings, setSettings } from "./redis-db"

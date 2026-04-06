@@ -1,12 +1,24 @@
 /**
- * Trade Engine Manager V6
+ * Trade Engine Manager V7
  * Manages asynchronous processing for symbols, indications, pseudo positions, and strategies
- * V6: Enhanced cycle counting logging for production debugging
- * @version 6.0.0
- * @lastUpdate 2026-04-05T21:39:00Z - Enhanced cycle counting with detailed logging
+ * V7: Fixed totalStrategiesEvaluated variable declaration
+ * @version 7.0.0
+ * @lastUpdate 2026-04-06T02:52:00Z - Fixed ReferenceError in indication processor
  */
 
-const _ENGINE_BUILD_VERSION = "6.0.0"
+const _ENGINE_BUILD_VERSION = "7.0.0"
+
+// Force module invalidation on version change
+if (typeof globalThis !== "undefined") {
+  const engineGlobal = globalThis as unknown as { __engine_version?: string; __engine_instances?: Map<string, unknown> }
+  if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
+    // Clear old engine instances to force recreation with new code
+    if (engineGlobal.__engine_instances) {
+      engineGlobal.__engine_instances.clear()
+    }
+    engineGlobal.__engine_version = _ENGINE_BUILD_VERSION
+  }
+}
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
@@ -481,12 +493,14 @@ export class TradeEngineManager {
    * Runs every 1 second with debouncing to prevent overlaps
    */
   // Indication processor - runs strategy evaluation on interval
+  // Version 2.1 - Fixed totalStrategiesEvaluated declaration
   private startIndicationProcessor(intervalSeconds: number = 1): void {
+    // Counter variables for metrics tracking
     let cycleCount = 0
     let attemptedCycles = 0
     let totalDuration = 0
     let errorCount = 0
-    let totalStrategiesEvaluated = 0 // Track total strategies evaluated across all cycles
+    let totalStrategiesEvaluated = 0
     let isProcessing = false
 
     this.indicationTimer = setInterval(async () => {
