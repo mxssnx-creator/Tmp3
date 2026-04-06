@@ -845,12 +845,42 @@ export class GlobalTradeEngineCoordinator {
 
 /**
  * The global trade engine coordinator singleton instance
- * V3: Reset on module load to pick up new indication-processor-v2
+ * V4: Use globalThis to persist across module reloads so we can stop old engines
  */
-let globalCoordinator: GlobalTradeEngineCoordinator | null = null
+const engineGlobalThis = globalThis as unknown as {
+  __tradeEngineCoordinator?: GlobalTradeEngineCoordinator
+  __tradeEngineVersion?: string
+}
 
-// V3: Force new coordinator creation on module reload to pick up new code
-console.log("[v0] Global Trade Engine V3 - resetting coordinator singleton")
+const TRADE_ENGINE_VERSION = "4.0.1"
+
+// V4: Stop old engines if version changed (module was reloaded with new code)
+if (engineGlobalThis.__tradeEngineVersion !== TRADE_ENGINE_VERSION && engineGlobalThis.__tradeEngineCoordinator) {
+  console.log(`[v0] Trade Engine version changed ${engineGlobalThis.__tradeEngineVersion} -> ${TRADE_ENGINE_VERSION}, stopping old engines...`)
+  try {
+    // Synchronously clear timers by accessing engines directly
+    const oldCoord = engineGlobalThis.__tradeEngineCoordinator
+    // @ts-expect-error - accessing private member for cleanup
+    if (oldCoord.engineManagers) {
+      // @ts-expect-error - accessing private member for cleanup
+      for (const manager of oldCoord.engineManagers.values()) {
+        try {
+          manager.stop().catch(() => {})
+        } catch {}
+      }
+      // @ts-expect-error - accessing private member for cleanup
+      oldCoord.engineManagers.clear()
+    }
+  } catch {
+    // Ignore cleanup errors
+  }
+  engineGlobalThis.__tradeEngineCoordinator = undefined
+}
+
+engineGlobalThis.__tradeEngineVersion = TRADE_ENGINE_VERSION
+let globalCoordinator: GlobalTradeEngineCoordinator | null = engineGlobalThis.__tradeEngineCoordinator || null
+
+console.log(`[v0] Global Trade Engine V${TRADE_ENGINE_VERSION} loaded`)
 
 /**
  * Get the global trade engine coordinator singleton instance
@@ -867,6 +897,7 @@ export function getTradeEngine(): GlobalTradeEngineCoordinator | null {
 export function initializeGlobalCoordinator(): GlobalTradeEngineCoordinator {
   if (!globalCoordinator) {
     globalCoordinator = new GlobalTradeEngineCoordinator()
+    engineGlobalThis.__tradeEngineCoordinator = globalCoordinator
     console.log("[v0] Global trade engine coordinator initialized")
   }
   return globalCoordinator
@@ -879,6 +910,7 @@ export function getGlobalCoordinator(): GlobalTradeEngineCoordinator | null {
 export function getGlobalTradeEngineCoordinator(): GlobalTradeEngineCoordinator {
   if (!globalCoordinator) {
     globalCoordinator = new GlobalTradeEngineCoordinator()
+    engineGlobalThis.__tradeEngineCoordinator = globalCoordinator
     console.log("[v0] Global trade engine coordinator auto-initialized")
   }
   return globalCoordinator
