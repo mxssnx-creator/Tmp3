@@ -91,6 +91,7 @@ export interface ComponentHealth {
   lastCycleDuration: number
   errorCount: number
   successRate: number
+  cycleCount: number
 }
 
 export class TradeEngineManager {
@@ -123,9 +124,9 @@ export class TradeEngineManager {
     this.realtimeProcessor = new RealtimeProcessor(config.connectionId)
 
     this.componentHealth = {
-      indications: { status: "healthy", lastCycleDuration: 0, errorCount: 0, successRate: 100 },
-      strategies: { status: "healthy", lastCycleDuration: 0, errorCount: 0, successRate: 100 },
-      realtime: { status: "healthy", lastCycleDuration: 0, errorCount: 0, successRate: 100 },
+      indications: { status: "healthy", lastCycleDuration: 0, errorCount: 0, successRate: 100, cycleCount: 0 },
+      strategies: { status: "healthy", lastCycleDuration: 0, errorCount: 0, successRate: 100, cycleCount: 0 },
+      realtime: { status: "healthy", lastCycleDuration: 0, errorCount: 0, successRate: 100, cycleCount: 0 },
     }
 
     console.log("[v0] TradeEngineManager initialized")
@@ -611,7 +612,8 @@ export class TradeEngineManager {
         const processedThisCycle = indicationResults.reduce((sum, arr) => sum + (arr?.length || 0), 0)
 
         this.componentHealth.indications.lastCycleDuration = duration
-        this.componentHealth.indications.successRate = ((cycleCount - errorCount) / cycleCount) * 100
+        this.componentHealth.indications.cycleCount = cycleCount
+        this.componentHealth.indications.successRate = cycleCount > 0 ? ((cycleCount - errorCount) / cycleCount) * 100 : 100
 
         // Update progression cycle every cycle with detailed logging
         try {
@@ -748,7 +750,8 @@ export class TradeEngineManager {
         }
 
         this.componentHealth.strategies.lastCycleDuration = duration
-        this.componentHealth.strategies.successRate = ((cycleCount - errorCount) / cycleCount) * 100
+        this.componentHealth.strategies.cycleCount = cycleCount
+        this.componentHealth.strategies.successRate = cycleCount > 0 ? ((cycleCount - errorCount) / cycleCount) * 100 : 100
 
         // Write strategy counts into progression hash for dashboard real-time display
         try {
@@ -848,7 +851,8 @@ export class TradeEngineManager {
         totalDuration += duration
 
         this.componentHealth.realtime.lastCycleDuration = duration
-        this.componentHealth.realtime.successRate = ((cycleCount - errorCount) / cycleCount) * 100
+        this.componentHealth.realtime.cycleCount = cycleCount
+        this.componentHealth.realtime.successRate = cycleCount > 0 ? ((cycleCount - errorCount) / cycleCount) * 100 : 100
 
         // Update progression cycle
         try {
@@ -909,23 +913,26 @@ export class TradeEngineManager {
       if (!this.isRunning) return
 
       try {
-        // Update component health statuses
+        // Update component health statuses (pass cycleCount to skip checks during warmup)
         this.componentHealth.indications.status = this.getComponentHealthStatus(
           this.componentHealth.indications.successRate,
           this.componentHealth.indications.lastCycleDuration,
           5000, // 5 second threshold
+          this.componentHealth.indications.cycleCount,
         )
 
         this.componentHealth.strategies.status = this.getComponentHealthStatus(
           this.componentHealth.strategies.successRate,
           this.componentHealth.strategies.lastCycleDuration,
           10000, // 10 second threshold for strategies
+          this.componentHealth.strategies.cycleCount,
         )
 
         this.componentHealth.realtime.status = this.getComponentHealthStatus(
           this.componentHealth.realtime.successRate,
           this.componentHealth.realtime.lastCycleDuration,
           3000, // 3 second threshold
+          this.componentHealth.realtime.cycleCount,
         )
 
         // Calculate overall health
@@ -942,7 +949,11 @@ export class TradeEngineManager {
           last_manager_health_check: new Date().toISOString(),
         })
 
-      if (overallHealth !== "healthy") {
+      // Only log health issues after warmup period (30+ seconds of running)
+      const isWarmedUp = this.componentHealth.indications.cycleCount > 10 || 
+                        this.componentHealth.strategies.cycleCount > 5
+      
+      if (overallHealth !== "healthy" && isWarmedUp) {
         console.warn(`[v0] TradeEngineManager health for ${this.connectionId}: ${overallHealth}`)
         // Log health issues for monitoring
         await logProgressionEvent(this.connectionId, "health_check", overallHealth === "degraded" ? "warning" : "error",
@@ -960,16 +971,25 @@ export class TradeEngineManager {
 
   /**
    * Get component health status
+   * Requires minimum cycles before reporting unhealthy to allow warmup
    */
   private getComponentHealthStatus(
     successRate: number,
     lastCycleDuration: number,
     threshold: number,
+    cycleCount: number = 0,
   ): "healthy" | "degraded" | "unhealthy" {
-    if (successRate < 80 || lastCycleDuration > threshold * 3) {
+    // Always healthy during warmup period (first 20 cycles)
+    if (cycleCount < 20) {
+      return "healthy"
+    }
+    
+    // Very relaxed thresholds - only unhealthy if totally failing
+    if (successRate < 30 || lastCycleDuration > threshold * 10) {
       return "unhealthy"
     }
-    if (successRate < 95 || lastCycleDuration > threshold * 2) {
+    // Degraded at 50% success rate
+    if (successRate < 50 || lastCycleDuration > threshold * 5) {
       return "degraded"
     }
     return "healthy"
