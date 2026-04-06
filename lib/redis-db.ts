@@ -1,8 +1,8 @@
 /**
- * Redis Database Layer
+ * Redis Database Layer - High Performance Edition
  * In-memory Redis client for Next.js runtime
  * Handles all database operations for connections, trades, positions, settings
- * High-performance optimized: logging disabled for 80K+ ops/sec
+ * Optimized for 80K+ ops/sec with logging disabled
  *
  * IMPORTANT: This file must NOT import 'fs' or 'path' as it's used by client components
  */
