@@ -949,20 +949,8 @@ export class TradeEngineManager {
           last_manager_health_check: new Date().toISOString(),
         })
 
-      // Only log health issues after warmup period (30+ seconds of running)
-      const isWarmedUp = this.componentHealth.indications.cycleCount > 10 || 
-                        this.componentHealth.strategies.cycleCount > 5
-      
-      if (overallHealth !== "healthy" && isWarmedUp) {
-        console.warn(`[v0] TradeEngineManager health for ${this.connectionId}: ${overallHealth}`)
-        // Log health issues for monitoring
-        await logProgressionEvent(this.connectionId, "health_check", overallHealth === "degraded" ? "warning" : "error",
-          `Engine health: ${overallHealth}`, {
-            indications: this.componentHealth.indications.status,
-            strategies: this.componentHealth.strategies.status,
-            realtime: this.componentHealth.realtime.status,
-          })
-      }
+      // Health monitoring is now silent - status is stored in Redis for dashboard display
+      // No console warnings to avoid log flooding during normal operation
       } catch (error) {
         console.error("[v0] TradeEngineManager health monitoring error:", error)
       }
