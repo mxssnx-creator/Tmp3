@@ -38,6 +38,12 @@ export async function trackIndicationStats(
     const latestKey = `indications:${connectionId}:${indicationType}:latest`
     await client.set(latestKey, JSON.stringify({ symbol, value, confidence, timestamp: Date.now() }))
     await client.expire(latestKey, 3600) // 1h TTL
+
+    // Also increment per-type counter in the progression hash so dashboard reads real values
+    const field = `indications_${indicationType}_count`
+    await client.hincrby(`progression:${connectionId}`, field, 1)
+    await client.hincrby(`progression:${connectionId}`, "indications_count", 1)
+    await client.expire(`progression:${connectionId}`, 7 * 24 * 60 * 60)
   } catch (e) {
     console.error(`[v0] [Stats] Failed to track indication in Redis:`, e instanceof Error ? e.message : String(e))
   }
@@ -96,6 +102,16 @@ export async function trackStrategyStats(
       }),
     )
     await client.expire(`strategies:${connectionId}:${strategyType}:latest`, 3600)
+
+    // Also increment strategy counts in the progression hash for dashboard real-time display
+    const baseField = strategyType === "base" ? "strategies_base_total"
+      : strategyType === "main" ? "strategies_main_total" : "strategies_real_total"
+    const evaluatedField = strategyType === "base" ? "strategy_evaluated_base"
+      : strategyType === "main" ? "strategy_evaluated_main" : "strategy_evaluated_real"
+    await client.hincrby(`progression:${connectionId}`, baseField, totalCreated)
+    await client.hincrby(`progression:${connectionId}`, evaluatedField, passedCount)
+    await client.hincrby(`progression:${connectionId}`, "strategies_count", totalCreated)
+    await client.expire(`progression:${connectionId}`, 7 * 24 * 60 * 60)
   } catch (e) {
     console.error(`[v0] [Stats] Failed to track strategy in Redis:`, e instanceof Error ? e.message : String(e))
   }

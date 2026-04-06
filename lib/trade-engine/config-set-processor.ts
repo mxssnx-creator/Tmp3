@@ -127,11 +127,30 @@ export class ConfigSetProcessor {
         candlesProcessed += candles.length
         symbolsProcessed++
 
+        // Write intermediate prehistoric progress to progression hash so dashboard shows live tracking
+        try {
+          await client.hincrby(`progression:${this.connectionId}`, "prehistoric_candles_processed", candles.length)
+          await client.hincrby(`progression:${this.connectionId}`, "prehistoric_symbols_processed_count", 1)
+          await client.expire(`progression:${this.connectionId}`, 7 * 24 * 60 * 60)
+        } catch { /* non-critical */ }
+
         const indicationResults = await this.processIndicationConfigs(symbol, candles, indicationConfigs)
         totalIndicationResults += indicationResults
 
+        // Write indication result counts into progression hash
+        try {
+          await client.hincrby(`progression:${this.connectionId}`, "indications_count", indicationResults)
+          await client.expire(`progression:${this.connectionId}`, 7 * 24 * 60 * 60)
+        } catch { /* non-critical */ }
+
         const strategyPositions = await this.processStrategyConfigs(symbol, candles, strategyConfigs)
         totalStrategyPositions += strategyPositions
+
+        // Write strategy position counts into progression hash
+        try {
+          await client.hincrby(`progression:${this.connectionId}`, "strategies_base_total", strategyPositions)
+          await client.expire(`progression:${this.connectionId}`, 7 * 24 * 60 * 60)
+        } catch { /* non-critical */ }
 
       } catch (error) {
         console.error(`[v0] [ConfigSetProcessor] Error processing ${symbol}:`, error)
