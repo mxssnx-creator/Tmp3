@@ -48,7 +48,8 @@ async function fetchMostVolatileSymbol(exchange: string): Promise<{ symbol: stri
         }))
 
     } else if (exchange === "bybit") {
-      // Bybit blocks some IPs - try alternative endpoint or use fallback gracefully
+      // Bybit blocks some IPs (403) - silently fallback to Binance data for USDT pairs
+      // v2.0 - Removed all error throwing to prevent log spam
       try {
         const res = await fetch("https://api.bybit.com/v5/market/tickers?category=linear", {
           headers: { 
