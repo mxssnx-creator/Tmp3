@@ -129,8 +129,8 @@ async function fetchMostVolatileSymbol(exchange: string): Promise<{ symbol: stri
           priceChangePercent: Math.abs(parseFloat(t.sodUtc8 || "0")),
         }))
     }
-  } catch (fetchErr) {
-    console.warn(`[v0] [TopSymbols] Exchange API failed for ${exchange}:`, fetchErr instanceof Error ? fetchErr.message : fetchErr)
+  } catch {
+    // Silently handle - will use fallback below
   }
 
   if (tickers.length === 0) {
