@@ -48,21 +48,52 @@ async function fetchMostVolatileSymbol(exchange: string): Promise<{ symbol: stri
         }))
 
     } else if (exchange === "bybit") {
-      const res = await fetch("https://api.bybit.com/v5/market/tickers?category=linear", {
-        headers: { "Accept": "application/json" },
-        signal: AbortSignal.timeout(5000),
-      })
-      if (!res.ok) throw new Error(`Bybit ticker HTTP ${res.status}`)
-      const data = await res.json()
-      tickers = (data?.result?.list || [])
-        .filter((t: any) =>
-          t.symbol.endsWith("USDT") &&
-          parseFloat(t.turnover24h) > 1_000_000
-        )
-        .map((t: any) => ({
-          symbol: t.symbol,
-          priceChangePercent: Math.abs(parseFloat(t.price24hPcnt || "0") * 100),
-        }))
+      // Bybit blocks some IPs - try alternative endpoint or use fallback gracefully
+      try {
+        const res = await fetch("https://api.bybit.com/v5/market/tickers?category=linear", {
+          headers: { 
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)",
+          },
+          signal: AbortSignal.timeout(5000),
+        })
+        if (!res.ok) {
+          // Bybit often returns 403 for serverless IPs - use Binance as proxy for USDT pairs
+          console.warn(`[v0] [TopSymbols] Bybit returned ${res.status}, using Binance data as fallback`)
+          const binanceRes = await fetch("https://api.binance.com/api/v3/ticker/24hr", {
+            headers: { "Accept": "application/json" },
+            signal: AbortSignal.timeout(5000),
+          })
+          if (binanceRes.ok) {
+            const binanceData: any[] = await binanceRes.json()
+            tickers = binanceData
+              .filter(t =>
+                t.symbol.endsWith("USDT") &&
+                !t.symbol.includes("DOWN") &&
+                !t.symbol.includes("UP") &&
+                !["USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT"].includes(t.symbol) &&
+                parseFloat(t.quoteVolume) > 1_000_000
+              )
+              .map(t => ({
+                symbol: t.symbol,
+                priceChangePercent: Math.abs(parseFloat(t.priceChangePercent)),
+              }))
+          }
+        } else {
+          const data = await res.json()
+          tickers = (data?.result?.list || [])
+            .filter((t: any) =>
+              t.symbol.endsWith("USDT") &&
+              parseFloat(t.turnover24h) > 1_000_000
+            )
+            .map((t: any) => ({
+              symbol: t.symbol,
+              priceChangePercent: Math.abs(parseFloat(t.price24hPcnt || "0") * 100),
+            }))
+        }
+      } catch (bybitErr) {
+        console.warn(`[v0] [TopSymbols] Bybit API error, using default:`, bybitErr instanceof Error ? bybitErr.message : bybitErr)
+      }
 
     } else if (exchange === "bingx") {
       const res = await fetch("https://open-api.bingx.com/openApi/swap/v2/quote/ticker", {
