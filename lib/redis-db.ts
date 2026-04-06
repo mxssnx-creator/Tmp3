@@ -552,8 +552,12 @@ function flattenForHmset(obj: Record<string, any>): Record<string, string> {
   return result
 }
 
-function parseHashValue(value: string | undefined | null): any {
+function parseHashValue(value: any): any {
   if (value === undefined || value === null) return null
+  
+  // If not a string, return as-is (already parsed or primitive)
+  if (typeof value !== "string") return value
+  
   if (value === "") return ""
   
   // Try to parse as JSON first
@@ -1209,4 +1213,27 @@ export async function logProgressionEvent(
   await client.ltrim(logsKey, 0, 99)
   // Set TTL of 7 days
   await client.expire(logsKey, 7 * 24 * 60 * 60)
+}
+
+// ========== Connection Filter Functions ==========
+
+export async function getEnabledConnections(): Promise<any[]> {
+  const allConnections = await getAllConnections()
+  return allConnections.filter(conn => isEnabledFlag(conn.is_enabled) || isEnabledFlag(conn.enabled))
+}
+
+export async function getAssignedAndEnabledConnections(): Promise<any[]> {
+  const allConnections = await getAllConnections()
+  return allConnections.filter(conn => 
+    (isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned)) &&
+    (isEnabledFlag(conn.is_enabled) || isEnabledFlag(conn.enabled))
+  )
+}
+
+export async function getConnectionsByExchange(exchange: string): Promise<any[]> {
+  const allConnections = await getAllConnections()
+  return allConnections.filter(conn => 
+    conn.exchange?.toLowerCase() === exchange.toLowerCase() ||
+    conn.exchange_name?.toLowerCase() === exchange.toLowerCase()
+  )
 }
