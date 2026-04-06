@@ -1061,14 +1061,15 @@ export function getConnectionState(connection: any): ConnectionState {
   }
 }
 
-/**
- * Check if connection is ready for engine processing
- * Must be assigned AND enabled in Main Connections
- */
-export function isConnectionReadyForEngine(connection: any): boolean {
-  const state = getConnectionState(connection)
-  return state.main_assigned && state.main_enabled
-}
+  /**
+   * Track operation count for monitoring (disabled for now due to log flood)
+   * High-frequency operations at 75K+/sec cause event loop blocking when logging
+   */
+  private trackOperation(): void {
+    // DISABLED: Tracking causes massive log flood at high ops/sec
+    // This was blocking the event loop and hanging the server
+    // Re-enable only if needed for debugging, with proper sampling
+  }
 
 /**
  * Check if connection is active (assigned to Main Connections)
