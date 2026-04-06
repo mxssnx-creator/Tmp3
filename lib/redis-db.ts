@@ -1,11 +1,16 @@
 /**
- * Redis Database Layer - High Performance Edition
+ * Redis Database Layer - High Performance Edition v3.0
  * In-memory Redis client for Next.js runtime
  * Handles all database operations for connections, trades, positions, settings
  * Optimized for 80K+ ops/sec with logging disabled
+ * @version 3.0.0 - Cache rebuild forced
  *
  * IMPORTANT: This file must NOT import 'fs' or 'path' as it's used by client components
  */
+
+// Force webpack cache invalidation
+const REDIS_DB_VERSION = "3.0.0"
+void REDIS_DB_VERSION
 
 interface RedisData {
   strings: Map<string, string>
