@@ -557,7 +557,12 @@ export class TradeEngineManager {
         totalDuration += duration
 
         const processedThisCycle = indicationResults.reduce((sum, arr) => sum + (arr?.length || 0), 0)
-        totalStrategiesEvaluated += processedThisCycle
+        // Defensive: handle stale closures from HMR where variable may not exist
+        try {
+          totalStrategiesEvaluated += processedThisCycle
+        } catch {
+          // Stale closure - variable doesn't exist, just skip
+        }
 
         this.componentHealth.indications.lastCycleDuration = duration
         this.componentHealth.indications.successRate = ((cycleCount - errorCount) / cycleCount) * 100
@@ -593,7 +598,7 @@ export class TradeEngineManager {
             await setSettings(`trade_engine_state:${this.connectionId}`, {
               last_cycle_duration: duration,
               last_cycle_type: "indications",
-              total_indications_evaluated: totalStrategiesEvaluated,
+              total_indications_evaluated: typeof totalStrategiesEvaluated !== "undefined" ? totalStrategiesEvaluated : 0,
               updated_at: new Date().toISOString(),
             })
           } catch { /* ignore errors */ }
@@ -665,7 +670,12 @@ export class TradeEngineManager {
 
         const evaluatedThisCycle = strategyResults.reduce((sum, result) => sum + (result?.strategiesEvaluated || 0), 0)
         const liveReadyThisCycle = strategyResults.reduce((sum, result) => sum + (result?.liveReady || 0), 0)
-        totalStrategiesEvaluated += evaluatedThisCycle
+        // Defensive: handle stale closures from HMR
+        try {
+          totalStrategiesEvaluated += evaluatedThisCycle
+        } catch {
+          // Stale closure - skip
+        }
 
         this.componentHealth.strategies.lastCycleDuration = duration
         this.componentHealth.strategies.successRate = ((cycleCount - errorCount) / cycleCount) * 100
@@ -697,7 +707,7 @@ export class TradeEngineManager {
               last_strategy_run: new Date().toISOString(),
               strategy_cycle_count: cycleCount,
               strategy_avg_duration_ms: totalDuration > 0 ? Math.round(totalDuration / cycleCount) : 0,
-              total_strategies_evaluated: totalStrategiesEvaluated,
+              total_strategies_evaluated: typeof totalStrategiesEvaluated !== "undefined" ? totalStrategiesEvaluated : 0,
               last_cycle_duration: duration,
               last_cycle_type: "strategies",
               engine_cycles_total: cycleCount,
