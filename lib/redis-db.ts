@@ -1152,6 +1152,9 @@ export async function closeRedis(): Promise<void> {
   isConnected = false
 }
 
+// Cache buster - forces rebuild when file is updated
+export const REDIS_DB_BUILD_VERSION = "2.0.0"
+
 // ========== Position Operations ==========
 
 export async function createPosition(data: Record<string, any>): Promise<void> {
