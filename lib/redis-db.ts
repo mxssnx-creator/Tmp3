@@ -1079,21 +1079,6 @@ export async function getIndications(symbol?: string): Promise<any[]> {
   return indications
 }
 
-export async function saveMarketData(symbol: string, timeframe: string, data: any): Promise<void> {
-  const client = getRedisClient()
-  const key = `market_data:${symbol}:${timeframe}`
-  await client.set(key, JSON.stringify(data))
-  // Set 24 hour TTL for market data
-  await client.expire(key, 86400)
-}
-
-export async function getMarketData(symbol: string, timeframe: string): Promise<any | null> {
-  const client = getRedisClient()
-  const key = `market_data:${symbol}:${timeframe}`
-  const data = await client.get(key)
-  return data ? JSON.parse(data) : null
-}
-
 export async function verifyRedisHealth(): Promise<{ healthy: boolean; latency: number; error?: string }> {
   const start = Date.now()
   try {
@@ -1113,4 +1098,115 @@ export async function verifyRedisHealth(): Promise<{ healthy: boolean; latency: 
       error: error instanceof Error ? error.message : String(error),
     }
   }
+}
+
+// ========== Connection Position and Trade Operations ==========
+
+export async function getConnectionPositions(connectionId: string): Promise<any[]> {
+  const client = getRedisClient()
+  const keys = await client.keys(`position:${connectionId}:*`)
+  const positions: any[] = []
+  
+  for (const key of keys) {
+    const data = await client.hgetall(key)
+    if (data && Object.keys(data).length > 0) {
+      positions.push({
+        id: key.replace(`position:${connectionId}:`, ""),
+        connection_id: connectionId,
+        ...data,
+      })
+    }
+  }
+  
+  // Also check global positions that reference this connection
+  const globalKeys = await client.keys("position:*")
+  for (const key of globalKeys) {
+    if (key.startsWith(`position:${connectionId}:`)) continue // Already processed
+    const data = await client.hgetall(key)
+    if (data && data.connection_id === connectionId) {
+      positions.push({
+        id: key.replace("position:", ""),
+        ...data,
+      })
+    }
+  }
+  
+  return positions
+}
+
+export async function getConnectionTrades(connectionId: string): Promise<any[]> {
+  const client = getRedisClient()
+  const keys = await client.keys(`trade:${connectionId}:*`)
+  const trades: any[] = []
+  
+  for (const key of keys) {
+    const data = await client.hgetall(key)
+    if (data && Object.keys(data).length > 0) {
+      trades.push({
+        id: key.replace(`trade:${connectionId}:`, ""),
+        connection_id: connectionId,
+        ...data,
+      })
+    }
+  }
+  
+  // Also check global trades that reference this connection
+  const globalKeys = await client.keys("trade:*")
+  for (const key of globalKeys) {
+    if (key.startsWith(`trade:${connectionId}:`)) continue // Already processed
+    const data = await client.hgetall(key)
+    if (data && data.connection_id === connectionId) {
+      trades.push({
+        id: key.replace("trade:", ""),
+        ...data,
+      })
+    }
+  }
+  
+  return trades
+}
+
+export async function getProgressionLogs(connectionId: string, limit: number = 50): Promise<any[]> {
+  const client = getRedisClient()
+  // Get logs from sorted set or list
+  const logsKey = `progression:${connectionId}:logs`
+  const logsList = await client.lrange(logsKey, 0, limit - 1)
+  
+  const logs: any[] = []
+  for (const logStr of logsList) {
+    try {
+      const log = typeof logStr === "string" ? JSON.parse(logStr) : logStr
+      logs.push(log)
+    } catch {
+      logs.push({ message: logStr, timestamp: new Date().toISOString() })
+    }
+  }
+  
+  return logs
+}
+
+export async function logProgressionEvent(
+  connectionId: string,
+  phase: string,
+  level: "info" | "warning" | "error",
+  message: string,
+  metadata?: Record<string, any>
+): Promise<void> {
+  const client = getRedisClient()
+  const logsKey = `progression:${connectionId}:logs`
+  
+  const logEntry = JSON.stringify({
+    timestamp: new Date().toISOString(),
+    phase,
+    level,
+    message,
+    ...metadata,
+  })
+  
+  // Add to list (prepend for newest first)
+  await client.lpush(logsKey, logEntry)
+  // Keep only last 100 logs
+  await client.ltrim(logsKey, 0, 99)
+  // Set TTL of 7 days
+  await client.expire(logsKey, 7 * 24 * 60 * 60)
 }
