@@ -154,12 +154,10 @@ export class InlineLocalRedis {
       stats.operationsPerSecond = stats.requestCount
       stats.requestCount = 1
       stats.lastSecond = now
-      // Log high req/sec once per second when rolling over (not on every single operation)
-      if (stats.operationsPerSecond > 100) {
-        console.log(`[v0] [Redis] High request rate: ${stats.operationsPerSecond} ops/sec`)
-      }
+      // DISABLED: console.log was blocking event loop at 80K+ ops/sec
+      // Monitoring moved to getRedisRequestsPerSecond() function if needed
     } else {
-      // Same second: increment count — no logging here to avoid log flood
+      // Same second: increment count
       stats.requestCount++
     }
   }
@@ -1060,16 +1058,6 @@ export function getConnectionState(connection: any): ConnectionState {
     is_active: isEnabledFlag(connection.is_active_inserted) && isEnabledFlag(connection.is_enabled_dashboard),
   }
 }
-
-  /**
-   * Track operation count for monitoring (disabled for now due to log flood)
-   * High-frequency operations at 75K+/sec cause event loop blocking when logging
-   */
-  private trackOperation(): void {
-    // DISABLED: Tracking causes massive log flood at high ops/sec
-    // This was blocking the event loop and hanging the server
-    // Re-enable only if needed for debugging, with proper sampling
-  }
 
 /**
  * Check if connection is active (assigned to Main Connections)
