@@ -971,3 +971,146 @@ export function haveMigrationsRun(): boolean {
 export function setMigrationsRun(value: boolean): void {
   globalMigrationState.__migrations_run = value
 }
+
+// ========== Engine Connection Operations ==========
+
+export async function getActiveConnectionsForEngine(): Promise<any[]> {
+  const client = getRedisClient()
+  const keys = await client.keys("connection:*")
+  const connections: any[] = []
+  
+  for (const key of keys) {
+    if (key.includes(":settings") || key.includes(":state")) continue
+    const data = await client.hgetall(key)
+    if (data && Object.keys(data).length > 0) {
+      // Check if connection is active for engine (is_active_inserted = 1)
+      if (isEnabledFlag(data.is_active_inserted) || isEnabledFlag(data.is_active)) {
+        connections.push({
+          id: key.replace("connection:", ""),
+          ...data,
+        })
+      }
+    }
+  }
+  
+  return connections
+}
+
+export async function getAllConnectionsWithStatus(): Promise<any[]> {
+  const client = getRedisClient()
+  const keys = await client.keys("connection:*")
+  const connections: any[] = []
+  
+  for (const key of keys) {
+    if (key.includes(":settings") || key.includes(":state")) continue
+    const data = await client.hgetall(key)
+    if (data && Object.keys(data).length > 0) {
+      connections.push({
+        id: key.replace("connection:", ""),
+        ...data,
+      })
+    }
+  }
+  
+  return connections
+}
+
+// ========== Additional CRUD Operations ==========
+
+export async function createConnection(data: any): Promise<any> {
+  const client = getRedisClient()
+  const id = data.id || `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+  const connectionData = {
+    ...data,
+    id,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }
+  await client.hset(`connection:${id}`, connectionData)
+  return connectionData
+}
+
+export async function updateConnection(id: string, updates: any): Promise<any> {
+  const client = getRedisClient()
+  const existing = await client.hgetall(`connection:${id}`)
+  if (!existing || Object.keys(existing).length === 0) {
+    return null
+  }
+  const updated = {
+    ...existing,
+    ...updates,
+    updated_at: new Date().toISOString(),
+  }
+  await client.hset(`connection:${id}`, updated)
+  return updated
+}
+
+export async function createPosition(data: any): Promise<any> {
+  const client = getRedisClient()
+  const id = data.id || `pos_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+  const positionData = {
+    ...data,
+    id,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }
+  await client.hset(`position:${id}`, positionData)
+  // Also add to positions set for easy listing
+  await client.sadd("positions:all", id)
+  return positionData
+}
+
+export async function getIndications(symbol?: string): Promise<any[]> {
+  const client = getRedisClient()
+  const pattern = symbol ? `indication:${symbol}:*` : "indication:*"
+  const keys = await client.keys(pattern)
+  const indications: any[] = []
+  
+  for (const key of keys) {
+    const data = await client.hgetall(key)
+    if (data && Object.keys(data).length > 0) {
+      indications.push({
+        id: key.replace("indication:", ""),
+        ...data,
+      })
+    }
+  }
+  
+  return indications
+}
+
+export async function saveMarketData(symbol: string, timeframe: string, data: any): Promise<void> {
+  const client = getRedisClient()
+  const key = `market_data:${symbol}:${timeframe}`
+  await client.set(key, JSON.stringify(data))
+  // Set 24 hour TTL for market data
+  await client.expire(key, 86400)
+}
+
+export async function getMarketData(symbol: string, timeframe: string): Promise<any | null> {
+  const client = getRedisClient()
+  const key = `market_data:${symbol}:${timeframe}`
+  const data = await client.get(key)
+  return data ? JSON.parse(data) : null
+}
+
+export async function verifyRedisHealth(): Promise<{ healthy: boolean; latency: number; error?: string }> {
+  const start = Date.now()
+  try {
+    const client = getRedisClient()
+    // Simple ping test
+    await client.set("health:check", Date.now().toString())
+    const result = await client.get("health:check")
+    const latency = Date.now() - start
+    return {
+      healthy: result !== null,
+      latency,
+    }
+  } catch (error) {
+    return {
+      healthy: false,
+      latency: Date.now() - start,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
