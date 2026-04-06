@@ -5,6 +5,24 @@ import { SystemLogger } from "@/lib/system-logger"
 
 export const dynamic = "force-dynamic"
 
+// Clear ALL stale engine timers on startup
+// This fixes ReferenceError from stale closures after code updates
+function clearStaleEngineTimers() {
+  const engineGlobal = globalThis as unknown as {
+    __engine_timers?: Set<ReturnType<typeof setInterval>>
+  }
+  
+  if (engineGlobal.__engine_timers && engineGlobal.__engine_timers.size > 0) {
+    console.log(`[v0] [Trade Engine] Clearing ${engineGlobal.__engine_timers.size} stale engine timers...`)
+    for (const timer of engineGlobal.__engine_timers) {
+      try {
+        clearInterval(timer)
+      } catch {}
+    }
+    engineGlobal.__engine_timers.clear()
+  }
+}
+
 // RUNTIME FIX: Patch IndicationProcessor cache on every API call
 // This fixes the "Cannot read properties of undefined (reading 'get')" error
 function patchIndicationProcessorCaches(coordinator: any) {
@@ -45,6 +63,10 @@ function patchIndicationProcessorCaches(coordinator: any) {
 export async function POST(request: NextRequest) {
   try {
     console.log("[v0] [Trade Engine] Starting Global Trade Engine Coordinator (independent of connections)")
+    
+    // CRITICAL: Clear any stale timers from previous code versions first
+    clearStaleEngineTimers()
+    
     await SystemLogger.logTradeEngine(`Starting Global Coordinator`, "info")
 
     const coordinator = getGlobalTradeEngineCoordinator()

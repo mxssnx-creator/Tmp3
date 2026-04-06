@@ -1,12 +1,23 @@
 /**
- * Trade Engine Manager V9
+ * Trade Engine Manager V10
  * Manages asynchronous processing for symbols, indications, pseudo positions, and strategies
- * V9: Coordinated cleanup with trade-engine.ts V5
- * @version 9.0.0
- * @lastUpdate 2026-04-06T03:57:00Z - Coordinated timer cleanup
+ * V10: Define totalStrategiesEvaluated globally to prevent stale closure ReferenceError
+ * @version 10.0.0
+ * @lastUpdate 2026-04-06T04:01:00Z - Global variable fallback for stale closures
  */
 
-const _ENGINE_BUILD_VERSION = "9.0.0"
+const _ENGINE_BUILD_VERSION = "10.0.0"
+
+// CRITICAL FIX: Define totalStrategiesEvaluated in global scope as fallback
+// This allows stale closures from old code to continue without ReferenceError
+// The variable is defined but not used - new code doesn't reference it
+declare global {
+  // eslint-disable-next-line no-var
+  var totalStrategiesEvaluated: number
+}
+if (typeof globalThis.totalStrategiesEvaluated === "undefined") {
+  globalThis.totalStrategiesEvaluated = 0
+}
 
 // Type for global engine state
 interface EngineGlobalState {
