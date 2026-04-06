@@ -480,12 +480,13 @@ export class TradeEngineManager {
    * Start indication processor (async)
    * Runs every 1 second with debouncing to prevent overlaps
    */
+  // Indication processor - runs strategy evaluation on interval
   private startIndicationProcessor(intervalSeconds: number = 1): void {
     let cycleCount = 0
     let attemptedCycles = 0
     let totalDuration = 0
     let errorCount = 0
-    let totalStrategiesEvaluated = 0
+    let totalStrategiesEvaluated = 0 // Track total strategies evaluated across all cycles
     let isProcessing = false
 
     this.indicationTimer = setInterval(async () => {
