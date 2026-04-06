@@ -493,14 +493,13 @@ export class TradeEngineManager {
    * Runs every 1 second with debouncing to prevent overlaps
    */
   // Indication processor - runs strategy evaluation on interval
-  // Version 2.1 - Fixed totalStrategiesEvaluated declaration
+  // Version 3.0 - Removed totalStrategiesEvaluated to fix stale closure issues
   private startIndicationProcessor(intervalSeconds: number = 1): void {
-    // Counter variables for metrics tracking
+    // Counter variables for metrics tracking - simplified to avoid closure issues
     let cycleCount = 0
     let attemptedCycles = 0
     let totalDuration = 0
     let errorCount = 0
-    let totalStrategiesEvaluated = 0
     let isProcessing = false
 
     this.indicationTimer = setInterval(async () => {
@@ -557,12 +556,6 @@ export class TradeEngineManager {
         totalDuration += duration
 
         const processedThisCycle = indicationResults.reduce((sum, arr) => sum + (arr?.length || 0), 0)
-        // Defensive: handle stale closures from HMR where variable may not exist
-        try {
-          totalStrategiesEvaluated += processedThisCycle
-        } catch {
-          // Stale closure - variable doesn't exist, just skip
-        }
 
         this.componentHealth.indications.lastCycleDuration = duration
         this.componentHealth.indications.successRate = ((cycleCount - errorCount) / cycleCount) * 100
@@ -598,7 +591,7 @@ export class TradeEngineManager {
             await setSettings(`trade_engine_state:${this.connectionId}`, {
               last_cycle_duration: duration,
               last_cycle_type: "indications",
-              total_indications_evaluated: typeof totalStrategiesEvaluated !== "undefined" ? totalStrategiesEvaluated : 0,
+              total_indications_evaluated: processedThisCycle,
               updated_at: new Date().toISOString(),
             })
           } catch { /* ignore errors */ }
