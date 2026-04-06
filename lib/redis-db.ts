@@ -54,27 +54,17 @@ export class InlineLocalRedis {
     this.startTTLCleanup()
   }
   
-  /**
-   * Start periodic TTL cleanup to remove expired keys
-   */
   private startTTLCleanup(): void {
-    // Only start once per process
     const globalCleanup = globalThis as unknown as { __redis_cleanup_started?: boolean }
     if (globalCleanup.__redis_cleanup_started) return
     globalCleanup.__redis_cleanup_started = true
     
     const ttlCleanupTimer = setInterval(() => {
       this.cleanupExpiredKeys()
-    }, 60000) // Every 60 seconds
-
-    // Avoid blocking script/test process exit.
+    }, 60000)
     ttlCleanupTimer.unref?.()
   }
   
-  /**
-   * Remove all expired keys
-   * @returns Number of keys removed
-   */
   private cleanupExpiredKeys(): number {
     const now = Date.now()
     const ttlMap = this.data.ttl
@@ -88,16 +78,9 @@ export class InlineLocalRedis {
         cleaned++
       }
     }
-    
-    if (cleaned > 0) {
-      console.log(`[v0] [Redis] TTL cleanup: removed ${cleaned} expired keys`)
-    }
     return cleaned
   }
   
-  /**
-   * Check if key is expired and delete if so
-   */
   private isExpired(key: string): boolean {
     const ttlMap = this.data.ttl
     if (!ttlMap) return false
@@ -111,9 +94,6 @@ export class InlineLocalRedis {
     return false
   }
   
-  /**
-   * Delete a key from all data structures
-   */
   private deleteKey(key: string): void {
     this.data.strings.delete(key)
     this.data.hashes.delete(key)
@@ -123,9 +103,6 @@ export class InlineLocalRedis {
     this.data.ttl?.delete(key)
   }
   
-  /**
-   * Set TTL for a key
-   */
   private setKeyTTL(key: string, seconds: number): void {
     if (!this.data.ttl) {
       this.data.ttl = new Map()
@@ -133,34 +110,8 @@ export class InlineLocalRedis {
     this.data.ttl.set(key, Date.now() + seconds * 1000)
   }
 
-  /**
-   * Track a Redis operation for accurate requests per second calculation
-   */
   private trackOperation(): void {
-    const now = Math.floor(Date.now() / 1000)
-    
-    // Initialize requestStats if it doesn't exist (for existing data without this field)
-    if (!this.data.requestStats) {
-      this.data.requestStats = {
-        lastSecond: now,
-        requestCount: 0,
-        operationsPerSecond: 0,
-      }
-    }
-    
-    const stats = this.data.requestStats
-    
-    if (now > stats.lastSecond) {
-      // New second: save current count and reset
-      stats.operationsPerSecond = stats.requestCount
-      stats.requestCount = 1
-      stats.lastSecond = now
-      // DISABLED: console.log was blocking event loop at 80K+ ops/sec
-      // Monitoring moved to getRedisRequestsPerSecond() function if needed
-    } else {
-      // Same second: increment count
-      stats.requestCount++
-    }
+    // Disabled for high performance - was causing event loop blocking at 80K+ ops/sec
   }
 
   async ping() {
@@ -168,19 +119,16 @@ export class InlineLocalRedis {
   }
 
   async info(): Promise<string> {
-    this.trackOperation()
     const totalKeys = await this.dbSize()
     return [`redis_version:local-inline`, `db0:keys=${totalKeys}`, `uptime_in_seconds:${Math.floor(process.uptime())}`].join("\n")
   }
 
   async get(key: string): Promise<string | null> {
-    this.trackOperation()
     if (this.isExpired(key)) return null
     return this.data.strings.get(key) ?? null
   }
 
   async set(key: string, value: string, options?: { EX?: number }): Promise<void> {
-    this.trackOperation()
     this.data.strings.set(key, value)
     if (options?.EX) {
       this.setKeyTTL(key, options.EX)
@@ -188,13 +136,11 @@ export class InlineLocalRedis {
   }
   
   async setex(key: string, seconds: number, value: string): Promise<void> {
-    this.trackOperation()
     this.data.strings.set(key, value)
     this.setKeyTTL(key, seconds)
   }
 
   async incr(key: string): Promise<number> {
-    this.trackOperation()
     if (this.isExpired(key)) {
       this.data.strings.set(key, "1")
       return 1
@@ -206,7 +152,6 @@ export class InlineLocalRedis {
   }
 
   async del(...keys: string[]): Promise<number> {
-    this.trackOperation()
     let count = 0
     for (const key of keys) {
       const exists = this.data.strings.has(key) ||
@@ -224,7 +169,6 @@ export class InlineLocalRedis {
   }
 
   async flushDb(): Promise<void> {
-    this.trackOperation()
     this.data.strings.clear()
     this.data.hashes.clear()
     this.data.sets.clear()
@@ -234,7 +178,6 @@ export class InlineLocalRedis {
   }
 
   async hset(key: string, data: Record<string, string>): Promise<number> {
-    this.trackOperation()
     const existing = this.data.hashes.get(key) || {}
     const updates = Object.keys(data).length
     this.data.hashes.set(key, { ...existing, ...data })
@@ -252,26 +195,22 @@ export class InlineLocalRedis {
   }
 
   async hgetall(key: string): Promise<Record<string, string> | null> {
-    this.trackOperation()
     if (this.isExpired(key)) return null
     return this.data.hashes.get(key) ?? null
   }
 
   async hlen(key: string): Promise<number> {
-    this.trackOperation()
     const hash = this.data.hashes.get(key)
     return hash ? Object.keys(hash).length : 0
   }
 
   async hget(key: string, field: string): Promise<string | null> {
-    this.trackOperation()
     if (this.isExpired(key)) return null
     const hash = this.data.hashes.get(key)
     return hash?.[field] ?? null
   }
 
   async hdel(key: string, ...fields: string[]): Promise<number> {
-    this.trackOperation()
     const hash = this.data.hashes.get(key)
     if (!hash) return 0
     let deleted = 0
@@ -288,7 +227,6 @@ export class InlineLocalRedis {
   }
 
   async hincrby(key: string, field: string, increment: number): Promise<number> {
-    this.trackOperation()
     const hash = this.data.hashes.get(key) || {}
     const currentValue = parseInt(hash[field] || "0", 10)
     const newValue = currentValue + increment
@@ -298,7 +236,6 @@ export class InlineLocalRedis {
   }
 
   async hincrbyfloat(key: string, field: string, increment: number): Promise<number> {
-    this.trackOperation()
     const hash = this.data.hashes.get(key) || {}
     const currentValue = parseFloat(hash[field] || "0")
     const newValue = currentValue + increment
@@ -308,7 +245,6 @@ export class InlineLocalRedis {
   }
 
   async sadd(key: string, ...members: string[]): Promise<number> {
-    this.trackOperation()
     const set = this.data.sets.get(key) || new Set()
     const sizeBefore = set.size
     for (const member of members) {
@@ -319,26 +255,22 @@ export class InlineLocalRedis {
   }
 
   async scard(key: string): Promise<number> {
-    this.trackOperation()
     if (this.isExpired(key)) return 0
     return this.data.sets.get(key)?.size ?? 0
   }
 
   async smembers(key: string): Promise<string[]> {
-    this.trackOperation()
     if (this.isExpired(key)) return []
     return Array.from(this.data.sets.get(key) || new Set())
   }
 
   async sismember(key: string, member: string): Promise<number> {
-    this.trackOperation()
     if (this.isExpired(key)) return 0
     const set = this.data.sets.get(key)
     return set?.has(member) ? 1 : 0
   }
 
   async srem(key: string, ...members: string[]): Promise<number> {
-    this.trackOperation()
     const set = this.data.sets.get(key)
     if (!set) return 0
     let removed = 0
@@ -351,8 +283,6 @@ export class InlineLocalRedis {
   }
 
   async expire(key: string, seconds: number): Promise<number> {
-    this.trackOperation()
-    // Check if key exists in any data structure
     const exists = this.data.strings.has(key) || 
                    this.data.hashes.has(key) || 
                    this.data.sets.has(key) ||
@@ -365,12 +295,8 @@ export class InlineLocalRedis {
     return 0
   }
 
-  // ========== List Operations ==========
-
   async lpush(key: string, ...values: string[]): Promise<number> {
-    this.trackOperation()
     const list = this.data.lists.get(key) || []
-    // lpush adds to the beginning of the list
     for (let i = values.length - 1; i >= 0; i--) {
       list.unshift(values[i])
     }
@@ -379,19 +305,15 @@ export class InlineLocalRedis {
   }
 
   async rpush(key: string, ...values: string[]): Promise<number> {
-    this.trackOperation()
     const list = this.data.lists.get(key) || []
-    // rpush adds to the end of the list
     list.push(...values)
     this.data.lists.set(key, list)
     return list.length
   }
 
   async lrange(key: string, start: number, stop: number): Promise<string[]> {
-    this.trackOperation()
     if (this.isExpired(key)) return []
     const list = this.data.lists.get(key) || []
-    // Handle negative indices like Redis
     const len = list.length
     const normalizedStart = start < 0 ? Math.max(0, len + start) : start
     const normalizedStop = stop < 0 ? len + stop : stop
@@ -399,10 +321,8 @@ export class InlineLocalRedis {
   }
 
   async ltrim(key: string, start: number, stop: number): Promise<void> {
-    this.trackOperation()
     const list = this.data.lists.get(key)
     if (!list) return
-    // Handle negative indices like Redis
     const len = list.length
     const normalizedStart = start < 0 ? Math.max(0, len + start) : start
     const normalizedStop = stop < 0 ? len + stop : stop
@@ -411,21 +331,15 @@ export class InlineLocalRedis {
   }
 
   async llen(key: string): Promise<number> {
-    this.trackOperation()
     if (this.isExpired(key)) return 0
     return this.data.lists.get(key)?.length ?? 0
   }
 
   async dbSize(): Promise<number> {
-    this.trackOperation()
-    // Clean up expired keys first for accurate count
-    this.cleanupExpiredKeys() // ignore return value
     return this.data.strings.size + this.data.hashes.size + this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
   }
 
   async keys(pattern: string): Promise<string[]> {
-    this.trackOperation()
-    // Convert Redis glob pattern to regex
     const regexPattern = pattern
       .replace(/\*/g, ".*")
       .replace(/\?/g, ".")
@@ -451,7 +365,6 @@ export class InlineLocalRedis {
   }
 
   async zadd(key: string, score: number, member: string): Promise<number> {
-    this.trackOperation()
     const set = this.data.sorted_sets.get(key) || []
     const existingIndex = set.findIndex((entry) => entry.member === member)
     if (existingIndex >= 0) {
@@ -465,7 +378,6 @@ export class InlineLocalRedis {
   }
 
   async zrangebyscore(key: string, min: number | string, max: number | string): Promise<string[]> {
-    this.trackOperation()
     if (this.isExpired(key)) return []
     const set = this.data.sorted_sets.get(key) || []
     const minValue = min === "-inf" ? Number.NEGATIVE_INFINITY : Number(min)
@@ -474,7 +386,6 @@ export class InlineLocalRedis {
   }
 
   async zremrangebyscore(key: string, min: number | string, max: number | string): Promise<number> {
-    this.trackOperation()
     const set = this.data.sorted_sets.get(key) || []
     const minValue = min === "-inf" ? Number.NEGATIVE_INFINITY : Number(min)
     const maxValue = max === "+inf" ? Number.POSITIVE_INFINITY : Number(max)
@@ -485,34 +396,25 @@ export class InlineLocalRedis {
     return before - remaining.length
   }
 
-  /**
-   * Track database write operations for per-minute limit enforcement
-   * Uses a sliding 60-second window stored in memory
-   * Returns: { current: count, limit: max_allowed, exceeded: boolean }
-   */
   async trackDatabaseOperation(limit: number): Promise<{ current: number; limit: number; exceeded: boolean }> {
     const globalTracker = globalThis as unknown as { __db_ops_tracker?: { timestamp: number; count: number } }
     const now = Date.now()
     
-    // Initialize tracker on first call
     if (!globalTracker.__db_ops_tracker) {
       globalTracker.__db_ops_tracker = { timestamp: now, count: 0 }
     }
     
     const tracker = globalTracker.__db_ops_tracker
-    const windowStart = now - 60000 // 60 second window in milliseconds
+    const windowStart = now - 60000
     
-    // Reset counter if window has expired (new minute)
     if (tracker.timestamp < windowStart) {
       tracker.timestamp = now
       tracker.count = 0
     }
     
-    // Increment operation count
     tracker.count++
     tracker.timestamp = now
     
-    // Return current status
     return {
       current: tracker.count,
       limit: limit,
@@ -520,9 +422,6 @@ export class InlineLocalRedis {
     }
   }
 
-  /**
-   * Get current per-minute operation count
-   */
   async getDatabaseOperationCount(): Promise<number> {
     const globalTracker = globalThis as unknown as { __db_ops_tracker?: { timestamp: number; count: number } }
     if (!globalTracker.__db_ops_tracker) return 0
@@ -530,7 +429,6 @@ export class InlineLocalRedis {
     const now = Date.now()
     const windowStart = now - 60000
     
-    // If window has expired, count is 0
     if (globalTracker.__db_ops_tracker.timestamp < windowStart) {
       return 0
     }
@@ -542,16 +440,10 @@ export class InlineLocalRedis {
     // No-op: data is already in global memory
   }
 
-  /**
-   * Public wrapper for cleanupExpiredKeys for monitoring systems
-   */
   async cleanupExpiredKeysPublic(): Promise<number> {
     return this.cleanupExpiredKeys()
   }
 
-  /**
-   * Check if key exists in any data structure
-   */
   async exists(key: string): Promise<number> {
     const exists = this.data.strings.has(key) || 
                    this.data.hashes.has(key) || 
@@ -561,25 +453,21 @@ export class InlineLocalRedis {
     return exists ? 1 : 0
   }
 
-  /**
-   * Get TTL for a key (returns -1 if no TTL, -2 if key doesn't exist)
-   */
   async ttl(key: string): Promise<number> {
     const ttlMap = this.data.ttl
     if (!ttlMap || !ttlMap.has(key)) {
-      // Check if key exists at all
       const existsResult = await this.exists(key)
-      if (existsResult === 0) return -2 // key doesn't exist
-      return -1 // key exists but has no expiry
+      if (existsResult === 0) return -2
+      return -1
     }
     
     const expireAt = ttlMap.get(key)!
     const now = Date.now()
     if (now >= expireAt) {
-      return -2 // Expired (treat as non-existent)
+      return -2
     }
     
-    return Math.floor((expireAt - now) / 1000) // Return seconds
+    return Math.floor((expireAt - now) / 1000)
   }
 }
 
@@ -597,34 +485,25 @@ export async function initRedis(): Promise<void> {
   }
 
   isConnected = true
-  console.log("[v0] [Redis] Client initialized with persistence")
 
   const pong = await redisInstance.ping()
-  if (pong === "PONG") {
-    console.log("[v0] [Redis] Connection test successful")
+  if (pong !== "PONG") {
+    console.error("[v0] [Redis] Connection test failed")
   }
 
-  // Run migrations on first connection (lazy initialization)
   if (!migrationsRan) {
     try {
       migrationsRan = true
-      console.log("[v0] [Redis] Running migrations...")
       const { runMigrations } = await import("@/lib/redis-migrations")
       await runMigrations()
-      console.log("[v0] [Redis] ✓ Migrations completed")
     } catch (error) {
-      console.error("[v0] [Redis] Migration error (continuing anyway):", error)
-      migrationsRan = true // Prevent retry loop
+      console.error("[v0] [Redis] Migration error:", error)
+      migrationsRan = true
     }
   }
 
-  // NOTE: Do NOT initialize user-created connections here
-  // Migrations 011-016 already set up all 15 predefined template connections
-  // and mark 4 as "base" (is_inserted=1, is_enabled=1, is_active_inserted=1)
-  // Creating separate "conn-*" connections would create duplicates on dashboard
   if (!connectionsInitialized) {
     connectionsInitialized = true
-    console.log("[v0] [Connections] ✓ Connection initialization skipped (handled by migrations 011-016)")
   }
 }
 
@@ -636,6 +515,10 @@ export function getClient(): InlineLocalRedis {
   return redisInstance
 }
 
+export function getRedisClient(): InlineLocalRedis {
+  return getClient()
+}
+
 export function isRedisConnected(): boolean {
   return isConnected
 }
@@ -643,12 +526,9 @@ export function isRedisConnected(): boolean {
 // ========== Helpers ==========
 
 function convertToString(value: any): string {
-  // Handle booleans specially
   if (value === true) return "1"
   if (value === false) return "0"
-  // Handle null/undefined
   if (value === null || value === undefined) return ""
-  // Convert everything else to string
   return String(value)
 }
 
@@ -656,491 +536,397 @@ function isEnabledFlag(value: unknown): boolean {
   return value === true || value === 1 || value === "1" || value === "true"
 }
 
-function flattenForHmset(obj: Record<string, string>): string[] {
-  const args: string[] = []
-  for (const [k, v] of Object.entries(obj)) {
-    args.push(k, v)
+function flattenForHmset(obj: Record<string, any>): Record<string, string> {
+  const result: Record<string, string> = {}
+  for (const [key, value] of Object.entries(obj)) {
+    if (value !== undefined && value !== null) {
+      if (typeof value === "object" && !Array.isArray(value)) {
+        result[key] = JSON.stringify(value)
+      } else if (Array.isArray(value)) {
+        result[key] = JSON.stringify(value)
+      } else {
+        result[key] = convertToString(value)
+      }
+    }
   }
-  return args
+  return result
+}
+
+function parseHashValue(value: string | undefined | null): any {
+  if (value === undefined || value === null) return null
+  if (value === "") return ""
+  
+  // Try to parse as JSON first
+  if ((value.startsWith("{") && value.endsWith("}")) || 
+      (value.startsWith("[") && value.endsWith("]"))) {
+    try {
+      return JSON.parse(value)
+    } catch {
+      return value
+    }
+  }
+  
+  // Check for boolean-like values
+  if (value === "1" || value === "true") return true
+  if (value === "0" || value === "false") return false
+  
+  // Check for numeric values
+  if (/^-?\d+$/.test(value)) return parseInt(value, 10)
+  if (/^-?\d+\.\d+$/.test(value)) return parseFloat(value)
+  
+  return value
+}
+
+function parseHash(hash: Record<string, string> | null): Record<string, any> | null {
+  if (!hash) return null
+  const result: Record<string, any> = {}
+  for (const [key, value] of Object.entries(hash)) {
+    result[key] = parseHashValue(value)
+  }
+  return result
 }
 
 // ========== Connection Operations ==========
 
-export async function getAllConnections(): Promise<any[]> {
-  const client = getClient()
-  const connIds = await client.smembers("connections")
-
-  if (!connIds || connIds.length === 0) {
-    console.log("[v0] [Connections] No connections found in set")
-    return []
-  }
-
-  const connectionRecords = await Promise.all(connIds.map((id) => client.hgetall(`connection:${id}`)))
-  return connectionRecords.filter((data): data is Record<string, string> => !!data && Object.keys(data).length > 0)
-}
-
 export async function getConnection(id: string): Promise<any | null> {
+  await initRedis()
   const client = getClient()
-  const data = await client.hgetall(`connection:${id}`)
-  return data && Object.keys(data).length > 0 ? data : null
+  const hash = await client.hgetall(`connection:${id}`)
+  return parseHash(hash)
 }
 
-export async function createConnection(data: Record<string, any>): Promise<void> {
+export async function getAllConnections(): Promise<any[]> {
+  await initRedis()
   const client = getClient()
-  const id = data.id
-  if (!id) throw new Error("Connection ID is required")
-
-  const flattened: Record<string, string> = {}
-  for (const [k, v] of Object.entries(data)) {
-    flattened[k] = convertToString(v)
+  const keys = await client.keys("connection:*")
+  const connections: any[] = []
+  
+  for (const key of keys) {
+    // Skip special keys like connection:settings:*
+    if (key.includes(":settings:") || key.includes(":stats:") || key.includes(":logs:")) {
+      continue
+    }
+    const hash = await client.hgetall(key)
+    if (hash) {
+      connections.push(parseHash(hash))
+    }
   }
-
-  await client.hset(`connection:${id}`, flattened)
-  await client.sadd("connections", id)
+  
+  return connections
 }
 
-export async function updateConnection(id: string, updates: Record<string, any>): Promise<void> {
+export async function saveConnection(connection: any): Promise<void> {
+  await initRedis()
   const client = getClient()
-  const flattened: Record<string, string> = {}
-  for (const [k, v] of Object.entries(updates)) {
-    flattened[k] = convertToString(v)
+  const id = connection.id || connection.name
+  if (!id) {
+    throw new Error("Connection must have an id or name")
   }
-
-  await client.hset(`connection:${id}`, flattened)
+  
+  const data = flattenForHmset({
+    ...connection,
+    id,
+    updated_at: new Date().toISOString(),
+  })
+  
+  await client.hset(`connection:${id}`, data)
 }
 
 export async function deleteConnection(id: string): Promise<void> {
+  await initRedis()
   const client = getClient()
   await client.del(`connection:${id}`)
-  await client.srem("connections", id)
 }
 
 // ========== Settings Operations ==========
 
-export async function setSettings(key: string, value: any): Promise<void> {
-  const client = getClient()
-  const serialized = typeof value === "string" ? value : JSON.stringify(value)
-  await client.set(`settings:${key}`, serialized)
-}
-
 export async function getSettings(key: string): Promise<any | null> {
+  await initRedis()
   const client = getClient()
-  const value = await client.get(`settings:${key}`)
-  if (!value) return null
-  try {
-    return JSON.parse(value)
-  } catch {
-    // Return null on parse failure to maintain consistent return type
-    console.warn(`[v0] [Redis] getSettings: Failed to parse ${key}, returning null`)
-    return null
-  }
+  const hash = await client.hgetall(`settings:${key}`)
+  return parseHash(hash)
 }
 
-// ========== Market Data ==========
-
-export async function saveMarketData(symbol: string, data: any): Promise<void> {
+export async function setSettings(key: string, value: any): Promise<void> {
+  await initRedis()
   const client = getClient()
-  const key = `market_data:${symbol}`
-  await client.set(key, JSON.stringify(data))
+  const data = flattenForHmset(value)
+  await client.hset(`settings:${key}`, data)
 }
 
-// Track last indication generation per symbol to avoid flooding
-const indicationGenerationTracker = new Map<string, number>()
-const INDICATION_GENERATION_INTERVAL = 2000 // 2 seconds
-
-// Auto-generate indications when market data is fetched
-// This bypasses the broken IndicationProcessor class which has cache initialization issues
-async function autoGenerateIndications(symbol: string, marketData: any, client: InlineLocalRedis) {
-  const now = Date.now()
-  const lastGenerated = indicationGenerationTracker.get(symbol) || 0
+export async function getAllSettings(): Promise<Record<string, any>> {
+  await initRedis()
+  const client = getClient()
+  const keys = await client.keys("settings:*")
+  const settings: Record<string, any> = {}
   
-  if (now - lastGenerated < INDICATION_GENERATION_INTERVAL) {
-    return // Skip if generated recently
-  }
-  
-  indicationGenerationTracker.set(symbol, now)
-  
-  try {
-    const close = parseFloat(marketData?.close || marketData?.c || "0")
-    const open = parseFloat(marketData?.open || marketData?.o || "0")
-    const high = parseFloat(marketData?.high || marketData?.h || "0")
-    const low = parseFloat(marketData?.low || marketData?.l || "0")
-    
-    if (close === 0) return
-    
-    const direction = close >= open ? "long" : "short"
-    const range = high - low
-    const rangePercent = (range / close) * 100
-    
-    const indications = [
-      { type: "direction", symbol, value: direction === "long" ? 1 : -1, profitFactor: 1.2, confidence: 0.7, timestamp: now },
-      { type: "move", symbol, value: rangePercent > 2 ? 1 : 0, profitFactor: 1.0 + rangePercent/100, confidence: 0.6, timestamp: now },
-      { type: "active", symbol, value: rangePercent > 1 ? 1 : 0, profitFactor: 1.1, confidence: 0.65, timestamp: now },
-      { type: "optimal", symbol, value: direction === "long" && rangePercent > 1.5 ? 1 : 0, profitFactor: 1.3, confidence: 0.75, timestamp: now },
-    ]
-    
-    // Get active connections and save indications for each
-    const connMembers = await client.smembers("connections").catch(() => [])
-    for (const connId of connMembers) {
-      const connData = await client.hgetall(`connection:${connId}`).catch(() => ({}))
-      if (connData?.isActive === "true" || connData?.is_active === "true") {
-        const key = `indications:${connId}`
-        const existing = await client.get(key).catch(() => null)
-        const existingArr = existing ? JSON.parse(existing) : []
-        existingArr.push(...indications)
-        // Keep last 1000
-        const trimmed = existingArr.slice(-1000)
-        await client.set(key, JSON.stringify(trimmed))
-      }
+  for (const key of keys) {
+    const settingKey = key.replace("settings:", "")
+    const hash = await client.hgetall(key)
+    if (hash) {
+      settings[settingKey] = parseHash(hash)
     }
-  } catch (e) {
-    // Silently ignore indication generation errors
   }
+  
+  return settings
 }
 
-export async function getMarketData(symbol: string): Promise<any | null> {
+// ========== Market Data Operations ==========
+
+export async function getMarketData(symbol: string, interval: string): Promise<any | null> {
+  await initRedis()
   const client = getClient()
-  
-  // Priority 1: Check hash format (used by market-data-loader.ts via hmset)
-  const hashData = await client.hgetall(`market_data:${symbol}`)
-  if (hashData && Object.keys(hashData).length > 0) {
-    // Auto-generate indications when market data is fetched
-    autoGenerateIndications(symbol, hashData, client).catch(() => {})
-    return hashData
-  }
-  
-  // Priority 2: Check string format (fallback for older data)
-  const value = await client.get(`market_data:${symbol}`)
-  if (!value) return null
+  const data = await client.get(`market_data:${symbol}:${interval}`)
+  if (!data) return null
   try {
-    const parsed = JSON.parse(value)
-    // Auto-generate indications when market data is fetched
-    autoGenerateIndications(symbol, parsed, client).catch(() => {})
-    return parsed
+    return JSON.parse(data)
   } catch {
     return null
   }
 }
 
-// ========== Migration State ==========
-
-export async function setMigrationsRun(): Promise<void> {
+export async function setMarketData(symbol: string, interval: string, data: any, ttlSeconds: number = 300): Promise<void> {
+  await initRedis()
   const client = getClient()
-  await client.set("_migrations_run", "true")
-  ;(globalThis as any).__migrations_run = true
+  await client.set(`market_data:${symbol}:${interval}`, JSON.stringify(data), { EX: ttlSeconds })
 }
 
-export function haveMigrationsRun(): boolean {
-  // Process-local guard to avoid repeated migration scans in the same runtime.
-  return (globalThis as any).__migrations_run === true
-}
+// ========== Position Operations ==========
 
-// ========== Aliases for backward compatibility ==========
-
-// Alias: getRedisClient -> getClient (used by many modules)
-export function getRedisClient(): InlineLocalRedis {
-  return getClient()
-}
-
-// Alias: saveConnection -> createConnection (used by some modules)
-export async function saveConnection(data: Record<string, any>): Promise<void> {
-  return createConnection(data)
-}
-
-// Additional aliases for direct exports
-export const redisGetSettings = getSettings;
-export const redisSetSettings = setSettings;
-
-// ========== Additional operations for compatibility ==========
-
-export async function deleteSettings(key: string): Promise<void> {
+export async function getPosition(id: string): Promise<any | null> {
+  await initRedis()
   const client = getClient()
-  await client.del(`settings:${key}`)
+  const hash = await client.hgetall(`position:${id}`)
+  return parseHash(hash)
 }
 
-export async function flushAll(): Promise<void> {
-  // Clear all data - dangerous operation
+export async function getAllPositions(): Promise<any[]> {
+  await initRedis()
   const client = getClient()
+  const keys = await client.keys("position:*")
+  const positions: any[] = []
   
-  // Clear all connection data
-  const connKeys = await client.smembers("connections")
-  for (const k of connKeys) {
-    await client.del(`connection:${k}`)
-  }
-  await client.del("connections")
-  
-  // Clear all other data sets
-  const dataSets = [
-    "connections:bybit", "connections:bingx", "connections:pionex", "connections:orangex",
-    "connections:active", "connections:inactive",
-    "trades:all", "trades:open", "trades:closed", "trades:pending",
-    "positions:all", "positions:open", "positions:closed",
-    "indications", "strategies", "presets",
-  ]
-  
-  for (const setKey of dataSets) {
-    const keys = await client.smembers(setKey).catch(() => [])
-    for (const key of keys) {
-      await client.del(`${setKey}:${key}`)
+  for (const key of keys) {
+    const hash = await client.hgetall(key)
+    if (hash) {
+      positions.push(parseHash(hash))
     }
-    await client.del(setKey)
   }
   
-  // Clear all settings
-  const allKeys = await client.keys("settings:*").catch(() => [])
-  for (const key of allKeys) {
-    await client.del(key)
+  return positions
+}
+
+export async function savePosition(position: any): Promise<void> {
+  await initRedis()
+  const client = getClient()
+  const id = position.id
+  if (!id) {
+    throw new Error("Position must have an id")
   }
   
-  // Clear all cache
-  const cacheKeys = await client.keys("cache:*").catch(() => [])
-  for (const key of cacheKeys) {
-    await client.del(key)
-  }
-  
-  console.log("[v0] [Redis] flushAll called - cleared all data")
-}
-
-export async function getIndications(key: string): Promise<any[]> {
-  const client = getClient()
-  // Support both formats: full key ("indications:conn-id") or just connection ID ("conn-id")
-  const actualKey = key.startsWith("indications:") ? key : `indications:${key}`
-  const value = await client.get(actualKey)
-  if (!value) return []
-  try {
-    return JSON.parse(value)
-  } catch {
-    return []
-  }
-}
-
-export async function saveIndication(key: string, indication: any): Promise<void> {
-  const client = getClient()
-  // Support both formats: full key ("indications:conn-id") or just connection ID ("conn-id")
-  const actualKey = key.startsWith("indications:") ? key : `indications:${key}`
-  const existing = await getIndications(actualKey)
-  existing.push(indication)
-  // Keep last 1000 indications
-  const trimmed = existing.slice(-1000)
-  await client.set(actualKey, JSON.stringify(trimmed))
-}
-
-export async function getRedisStats(): Promise<any> {
-  const client = getClient()
-  const size = await client.dbSize()
-  const allKeys = await client.keys("*").catch(() => [])
-  const keyCount = Array.isArray(allKeys) ? allKeys.length : size
-  return {
-    connected: isConnected,
-    dbSize: size,
-    keyCount: keyCount,
-    total_keys: keyCount,
-    uptimeSeconds: process.uptime(),
-    uptime_seconds: process.uptime(),
-    memory_used: "N/A",
-  }
-}
-
-export function getRedisRequestsPerSecond(): number {
-  // Get the accurate requests per second from tracking
-  const globalData = globalThis as unknown as { __redis_data?: RedisData }
-  if (!globalData.__redis_data?.requestStats) return 0
-
-  const now = Math.floor(Date.now() / 1000)
-  const stats = globalData.__redis_data.requestStats
-
-  // If there were no operations in the previous second window, report 0.
-  if (now - stats.lastSecond > 1) {
-    return 0
-  }
-
-  // Return the operations from the last completed second
-  const rps = stats.operationsPerSecond
-  return Math.max(0, rps)
-}
-
-export async function verifyRedisHealth(): Promise<{ healthy: boolean; message: string }> {
-  try {
-    const client = getClient()
-    const pong = await client.ping()
-    return { healthy: pong === "PONG", message: "Redis is healthy" }
-  } catch (e) {
-    return { healthy: false, message: e instanceof Error ? e.message : "Unknown error" }
-  }
-}
-
-// ========== Connection Queries ==========
-
-export async function getActiveConnectionsForEngine(): Promise<any[]> {
-  const allConnections = await getAllConnections()
-  // Filter for connections that are:
-  // 1. Added to active panel AND explicitly enabled on dashboard
-  // 2. Either has credentials OR is set to testnet/demo mode
-  const filtered = allConnections.filter((c: any) => {
-    const isActiveInserted = isEnabledFlag(c.is_active_inserted)
-    const isDashboardEnabled = isEnabledFlag(c.is_enabled_dashboard)
-    
-    // Check for credentials (from connection OR from environment)
-    const apiKey = c.api_key || c.apiKey || ""
-    const apiSecret = c.api_secret || c.apiSecret || ""
-    const hasCredentials = apiKey.length > 10 && apiSecret.length > 10
-    
-    // Check for testnet/demo/predefined mode
-    const isTestnet = isEnabledFlag(c.is_testnet)
-    const isDemoMode = isEnabledFlag(c.demo_mode)
-    const isPredefined = isEnabledFlag(c.is_predefined)
-    
-    // Engine processing follows dashboard activation, not settings-default enabled state.
-    const isReadyForEngine = isActiveInserted && isDashboardEnabled
-    
-    // Allow with credentials OR testnet/demo/predefined mode (credentials checked per-operation)
-    return isReadyForEngine && (hasCredentials || isTestnet || isDemoMode || isPredefined)
+  const data = flattenForHmset({
+    ...position,
+    updated_at: new Date().toISOString(),
   })
   
-  console.log(`[v0] [Engine] Active connections for engine: ${filtered.length} (from ${allConnections.length} total)`)
-  return filtered
+  await client.hset(`position:${id}`, data)
 }
 
-export async function getEnabledConnections(): Promise<any[]> {
-  const allConnections = await getAllConnections()
-  return allConnections.filter((c: any) => isEnabledFlag(c.is_enabled))
+export async function deletePosition(id: string): Promise<void> {
+  await initRedis()
+  const client = getClient()
+  await client.del(`position:${id}`)
 }
 
-export async function getAssignedAndEnabledConnections(): Promise<any[]> {
-  const allConnections = await getAllConnections()
-  // Return connections that are:
-  // 1. Active-inserted into Active panel (is_active_inserted="1")
-  // 2. AND dashboard-enabled (is_enabled_dashboard="1")
-  // This is the filter used by the trade engine coordinator to find active connections
-  return allConnections.filter((c: any) => {
-    // Check for active panel flags (modern approach)
-    const isActiveInserted = isEnabledFlag(c.is_active_inserted)
-    const isDashboardEnabled = isEnabledFlag(c.is_enabled_dashboard)
-    return isActiveInserted && isDashboardEnabled
+// ========== Trade Operations ==========
+
+export async function getTrade(id: string): Promise<any | null> {
+  await initRedis()
+  const client = getClient()
+  const hash = await client.hgetall(`trade:${id}`)
+  return parseHash(hash)
+}
+
+export async function getAllTrades(): Promise<any[]> {
+  await initRedis()
+  const client = getClient()
+  const keys = await client.keys("trade:*")
+  const trades: any[] = []
+  
+  for (const key of keys) {
+    const hash = await client.hgetall(key)
+    if (hash) {
+      trades.push(parseHash(hash))
+    }
+  }
+  
+  return trades
+}
+
+export async function saveTrade(trade: any): Promise<void> {
+  await initRedis()
+  const client = getClient()
+  const id = trade.id
+  if (!id) {
+    throw new Error("Trade must have an id")
+  }
+  
+  const data = flattenForHmset({
+    ...trade,
+    updated_at: new Date().toISOString(),
   })
+  
+  await client.hset(`trade:${id}`, data)
 }
 
-// ========== Clean Connection State Model ==========
-// Organizes chaos: base connections (Settings) vs main connections (Dashboard/Active)
-// 
-// BASE CONNECTIONS (Settings panel):
-// - base_enabled: maps to is_enabled - connection is enabled in Settings
-// - base_inserted: maps to is_inserted - connection exists in Settings
-//
-// MAIN CONNECTIONS (Dashboard/Active panel):
-// - main_enabled: maps to is_enabled_dashboard - connection is enabled in Main Connections
-// - main_assigned: maps to is_active_inserted - connection is assigned to Main Connections
-//
-// This eliminates the confusing doubled states (is_enabled, is_dashboard_inserted, etc.)
+// ========== Indication Operations ==========
 
-export interface ConnectionState {
+export async function getIndication(id: string): Promise<any | null> {
+  await initRedis()
+  const client = getClient()
+  const hash = await client.hgetall(`indication:${id}`)
+  return parseHash(hash)
+}
+
+export async function getAllIndications(): Promise<any[]> {
+  await initRedis()
+  const client = getClient()
+  const keys = await client.keys("indication:*")
+  const indications: any[] = []
+  
+  for (const key of keys) {
+    const hash = await client.hgetall(key)
+    if (hash) {
+      indications.push(parseHash(hash))
+    }
+  }
+  
+  return indications
+}
+
+export async function saveIndication(indication: any): Promise<void> {
+  await initRedis()
+  const client = getClient()
+  const id = indication.id
+  if (!id) {
+    throw new Error("Indication must have an id")
+  }
+  
+  const data = flattenForHmset({
+    ...indication,
+    updated_at: new Date().toISOString(),
+  })
+  
+  await client.hset(`indication:${id}`, data)
+}
+
+// ========== Strategy Operations ==========
+
+export async function getStrategy(id: string): Promise<any | null> {
+  await initRedis()
+  const client = getClient()
+  const hash = await client.hgetall(`strategy:${id}`)
+  return parseHash(hash)
+}
+
+export async function getAllStrategies(): Promise<any[]> {
+  await initRedis()
+  const client = getClient()
+  const keys = await client.keys("strategy:*")
+  const strategies: any[] = []
+  
+  for (const key of keys) {
+    const hash = await client.hgetall(key)
+    if (hash) {
+      strategies.push(parseHash(hash))
+    }
+  }
+  
+  return strategies
+}
+
+export async function saveStrategy(strategy: any): Promise<void> {
+  await initRedis()
+  const client = getClient()
+  const id = strategy.id
+  if (!id) {
+    throw new Error("Strategy must have an id")
+  }
+  
+  const data = flattenForHmset({
+    ...strategy,
+    updated_at: new Date().toISOString(),
+  })
+  
+  await client.hset(`strategy:${id}`, data)
+}
+
+// ========== Connection State Helpers ==========
+
+export function getConnectionStates(connection: any): {
   base_enabled: boolean
   base_inserted: boolean
   main_enabled: boolean
   main_assigned: boolean
-  is_active: boolean  // derived: main_assigned && main_enabled
-}
-
-/**
- * Get clean connection state from a connection object
- * Normalizes all the confusing doubled states into a clean model
- */
-export function getConnectionState(connection: any): ConnectionState {
+  is_active: boolean
+} {
   return {
-    // Base Connection states (Settings)
     base_enabled: isEnabledFlag(connection.is_enabled),
     base_inserted: isEnabledFlag(connection.is_inserted),
-    
-    // Main Connection states (Dashboard/Active)
     main_enabled: isEnabledFlag(connection.is_enabled_dashboard),
     main_assigned: isEnabledFlag(connection.is_active_inserted),
-    
-    // Derived: active for processing = assigned AND enabled in main
     is_active: isEnabledFlag(connection.is_active_inserted) && isEnabledFlag(connection.is_enabled_dashboard),
   }
 }
 
-/**
- * Check if connection is active (assigned to Main Connections)
- */
 export function isConnectionAssignedToMain(connection: any): boolean {
   return isEnabledFlag(connection.is_active_inserted)
 }
 
-/**
- * Check if connection is enabled in Main Connections
- */
 export function isConnectionMainEnabled(connection: any): boolean {
   return isEnabledFlag(connection.is_enabled_dashboard)
 }
 
-/**
- * Check if connection is enabled in Settings (Base)
- */
 export function isConnectionBaseEnabled(connection: any): boolean {
   return isEnabledFlag(connection.is_enabled)
 }
 
-/**
- * Build connection update object for enabling in Main Connections
- * Sets both main_assigned and main_enabled
- */
 export function buildMainConnectionEnableUpdate(connection: any): any {
   return {
     ...connection,
-    // Main Connection states
-    is_enabled_dashboard: "1",  // main_enabled = true
-    is_dashboard_inserted: "1",  // backward compatibility
-    is_active_inserted: "1",     // main_assigned = true
-    is_active: "1",              // active for processing
-    
+    is_enabled_dashboard: "1",
+    is_dashboard_inserted: "1",
+    is_active_inserted: "1",
+    is_active: "1",
     updated_at: new Date().toISOString(),
   }
 }
 
-/**
- * Build connection update object for disabling in Main Connections
- * Disables main but keeps base states intact
- */
 export function buildMainConnectionDisableUpdate(connection: any): any {
   return {
     ...connection,
-    // Main Connection states - disable
-    is_enabled_dashboard: "0",  // main_enabled = false
-    is_active: "0",             // not active for processing
-    // Keep is_active_inserted = "1" so it stays in active panel (just disabled)
-    
+    is_enabled_dashboard: "0",
+    is_active: "0",
     updated_at: new Date().toISOString(),
   }
 }
 
-/**
- * Build connection update object for removing from Main Connections
- * Completely unassigns the connection from the main panel
- */
 export function buildMainConnectionRemoveUpdate(connection: any): any {
   return {
     ...connection,
-    // Main Connection states - remove completely
-    is_active_inserted: "0",      // main_assigned = false
-    is_dashboard_inserted: "0",   // remove dashboard insertion
-    is_enabled_dashboard: "0",    // main_enabled = false
-    is_active: "0",               // not active for processing
-    
+    is_active_inserted: "0",
+    is_dashboard_inserted: "0",
+    is_enabled_dashboard: "0",
+    is_active: "0",
     updated_at: new Date().toISOString(),
   }
 }
 
-/**
- * Build connection update object for enabling in Settings (Base)
- */
 export function buildBaseConnectionEnableUpdate(connection: any): any {
   return {
     ...connection,
-    // Base Connection states
-    is_enabled: "1",   // base_enabled = true
-    is_inserted: "1",  // base_inserted = true
-    
+    is_enabled: "1",
+    is_inserted: "1",
     updated_at: new Date().toISOString(),
   }
 }
@@ -1148,272 +934,40 @@ export function buildBaseConnectionEnableUpdate(connection: any): any {
 // ========== Stats Operations ==========
 
 export async function closeRedis(): Promise<void> {
-  // No-op for in-memory implementation
   isConnected = false
 }
 
-// Cache buster - forces rebuild when file is updated
-export const REDIS_DB_BUILD_VERSION = "2.0.0"
-
-// ========== Position Operations ==========
-
-export async function createPosition(data: Record<string, any>): Promise<void> {
-  const client = getClient()
-  const id = data.id || `pos_${Date.now()}`
-  const flattened: Record<string, string> = { id }
-  for (const [k, v] of Object.entries(data)) {
-    flattened[k] = convertToString(v)
-  }
-  await client.hset(`position:${id}`, flattened)
-  await client.sadd("positions", id)
-  const connectionId = data.connection_id || data.connectionId
-  if (connectionId) {
-    await client.sadd(`positions:by-connection:${connectionId}`, id)
-  }
+export async function getRedisRequestsPerSecond(): Promise<number> {
+  const data = globalForRedis.__redis_data
+  if (!data || !data.requestStats) return 0
+  return data.requestStats.operationsPerSecond
 }
 
-export async function getPosition(id: string): Promise<any | null> {
-  const client = getClient()
-  const data = await client.hgetall(`position:${id}`)
-  return data && Object.keys(data).length > 0 ? data : null
+export function getConnectionState(id: string): { isRunning: boolean } {
+  // Simple state check based on global tracking
+  const globalEngineState = globalThis as unknown as { __engine_states?: Map<string, boolean> }
+  if (!globalEngineState.__engine_states) {
+    globalEngineState.__engine_states = new Map()
+  }
+  return { isRunning: globalEngineState.__engine_states.get(id) ?? false }
 }
 
-export async function updatePosition(id: string, updates: Record<string, any>): Promise<void> {
-  const client = getClient()
-  const existing = await getPosition(id)
-  const flattened: Record<string, string> = {}
-  for (const [k, v] of Object.entries(updates)) {
-    flattened[k] = convertToString(v)
+export function setConnectionRunningState(id: string, isRunning: boolean): void {
+  const globalEngineState = globalThis as unknown as { __engine_states?: Map<string, boolean> }
+  if (!globalEngineState.__engine_states) {
+    globalEngineState.__engine_states = new Map()
   }
-  await client.hset(`position:${id}`, flattened)
-
-  const previousConnectionId = existing?.connection_id
-  const newConnectionId = updates.connection_id || updates.connectionId
-  if (previousConnectionId && newConnectionId && previousConnectionId !== newConnectionId) {
-    await client.srem(`positions:by-connection:${previousConnectionId}`, id)
-    await client.sadd(`positions:by-connection:${newConnectionId}`, id)
-  } else if (newConnectionId) {
-    await client.sadd(`positions:by-connection:${newConnectionId}`, id)
-  }
+  globalEngineState.__engine_states.set(id, isRunning)
 }
 
-export async function deletePosition(id: string): Promise<void> {
-  const client = getClient()
-  const existing = await getPosition(id)
-  await client.del(`position:${id}`)
-  await client.srem("positions", id)
-  if (existing?.connection_id) {
-    await client.srem(`positions:by-connection:${existing.connection_id}`, id)
-  }
+// ========== Migration State Management ==========
+
+const globalMigrationState = globalThis as unknown as { __migrations_run?: boolean }
+
+export function haveMigrationsRun(): boolean {
+  return globalMigrationState.__migrations_run ?? false
 }
 
-export async function getConnectionPositions(connectionId: string): Promise<any[]> {
-  const client = getClient()
-  const indexedIds = await client.smembers(`positions:by-connection:${connectionId}`)
-  if (indexedIds.length > 0) {
-    const positions = await Promise.all(indexedIds.map((id) => getPosition(id)))
-    const staleIds = indexedIds.filter((_, index) => !positions[index])
-    if (staleIds.length > 0) {
-      await client.srem(`positions:by-connection:${connectionId}`, ...staleIds)
-    }
-    return positions.filter(Boolean)
-  }
-
-  // Backward-compat fallback: scan global set once and hydrate per-connection index.
-  const positionIds = await client.smembers("positions")
-  const positions = await Promise.all(positionIds.map((id) => getPosition(id)))
-  const filtered = positions.filter((pos) => pos && pos.connection_id === connectionId)
-  if (filtered.length > 0) {
-    await client.sadd(`positions:by-connection:${connectionId}`, ...filtered.map((pos) => pos.id))
-  }
-  return filtered
-}
-
-// ========== Trade Operations ==========
-
-export async function createTrade(data: Record<string, any>): Promise<void> {
-  const client = getClient()
-  const id = data.id || `trade_${Date.now()}`
-  const flattened: Record<string, string> = { id }
-  for (const [k, v] of Object.entries(data)) {
-    flattened[k] = convertToString(v)
-  }
-  await client.hset(`trade:${id}`, flattened)
-  await client.sadd("trades", id)
-  const connectionId = data.connection_id || data.connectionId
-  if (connectionId) {
-    await client.sadd(`trades:by-connection:${connectionId}`, id)
-  }
-}
-
-export async function getTrade(id: string): Promise<any | null> {
-  const client = getClient()
-  const data = await client.hgetall(`trade:${id}`)
-  return data && Object.keys(data).length > 0 ? data : null
-}
-
-export async function updateTrade(id: string, updates: Record<string, any>): Promise<void> {
-  const client = getClient()
-  const existing = await getTrade(id)
-  const flattened: Record<string, string> = {}
-  for (const [k, v] of Object.entries(updates)) {
-    flattened[k] = convertToString(v)
-  }
-  await client.hset(`trade:${id}`, flattened)
-
-  const previousConnectionId = existing?.connection_id
-  const newConnectionId = updates.connection_id || updates.connectionId
-  if (previousConnectionId && newConnectionId && previousConnectionId !== newConnectionId) {
-    await client.srem(`trades:by-connection:${previousConnectionId}`, id)
-    await client.sadd(`trades:by-connection:${newConnectionId}`, id)
-  } else if (newConnectionId) {
-    await client.sadd(`trades:by-connection:${newConnectionId}`, id)
-  }
-}
-
-export async function getConnectionTrades(connectionId: string): Promise<any[]> {
-  const client = getClient()
-  const indexedIds = await client.smembers(`trades:by-connection:${connectionId}`)
-  if (indexedIds.length > 0) {
-    const trades = await Promise.all(indexedIds.map((id) => getTrade(id)))
-    const staleIds = indexedIds.filter((_, index) => !trades[index])
-    if (staleIds.length > 0) {
-      await client.srem(`trades:by-connection:${connectionId}`, ...staleIds)
-    }
-    return trades.filter(Boolean)
-  }
-
-  // Backward-compat fallback: scan global set once and hydrate per-connection index.
-  const tradeIds = await client.smembers("trades")
-  const trades = await Promise.all(tradeIds.map((id) => getTrade(id)))
-  const filtered = trades.filter((trade) => trade && trade.connection_id === connectionId)
-  if (filtered.length > 0) {
-    await client.sadd(`trades:by-connection:${connectionId}`, ...filtered.map((trade) => trade.id))
-  }
-  return filtered
-}
-
-export interface Connection {
-  id: string
-  name: string
-  exchange: string
-  api_key: string
-  api_secret: string
-  api_passphrase?: string
-  api_type?: string
-  api_subtype?: string
-  connection_method?: string
-  connection_library?: string
-  margin_type?: string
-  position_mode?: string
-  is_testnet?: boolean
-  is_enabled?: boolean
-  is_enabled_dashboard?: boolean
-  is_live_trade?: boolean
-  is_active?: boolean
-  is_predefined?: boolean
-  is_inserted?: boolean
-  is_active_inserted?: boolean
-  demo_mode?: boolean
-  created_at?: string
-  updated_at?: string
-  last_test_log?: string[]
-  last_test_status?: string
-  last_test_balance?: number
-  last_test_error?: string
-  last_test_timestamp?: string
-  last_test_btc_price?: number
-  last_test_at?: string
-  [key: string]: any
-}
-
-export const redisDb = {
-  get: async (key: string): Promise<string | null> => {
-    const client = getClient()
-    return client.get(key)
-  },
-  set: async (key: string, value: string, options?: { ex?: number }): Promise<void> => {
-    const client = getClient()
-    if (options?.ex) {
-      await client.setex(key, options.ex, value)
-    } else {
-      await client.set(key, value)
-    }
-  },
-  del: async (key: string): Promise<number> => {
-    const client = getClient()
-    return client.del(key)
-  },
-  hget: async (key: string, field: string): Promise<string | null> => {
-    const client = getClient()
-    return client.hget(key, field)
-  },
-  hset: async (key: string, data: Record<string, string>): Promise<number> => {
-    const client = getClient()
-    return client.hset(key, data)
-  },
-  hgetall: async (key: string): Promise<Record<string, string> | null> => {
-    const client = getClient()
-    return client.hgetall(key)
-  },
-  hdel: async (key: string, ...fields: string[]): Promise<number> => {
-    const client = getClient()
-    return client.hdel(key, ...fields)
-  },
-  sadd: async (key: string, ...members: string[]): Promise<number> => {
-    const client = getClient()
-    return client.sadd(key, ...members)
-  },
-  smembers: async (key: string): Promise<string[]> => {
-    const client = getClient()
-    return client.smembers(key)
-  },
-  srem: async (key: string, ...members: string[]): Promise<number> => {
-    const client = getClient()
-    return client.srem(key, ...members)
-  },
-  keys: async (pattern: string): Promise<string[]> => {
-    const client = getClient()
-    return client.keys(pattern)
-  },
-  expire: async (key: string, seconds: number): Promise<number> => {
-    const client = getClient()
-    return client.expire(key, seconds)
-  },
-  lpush: async (key: string, ...values: string[]): Promise<number> => {
-    const client = getClient()
-    return client.lpush(key, ...values)
-  },
-  rpush: async (key: string, ...values: string[]): Promise<number> => {
-    const client = getClient()
-    return client.rpush(key, ...values)
-  },
-  lrange: async (key: string, start: number, stop: number): Promise<string[]> => {
-    const client = getClient()
-    return client.lrange(key, start, stop)
-  },
-  zadd: async (key: string, score: number, member: string): Promise<number> => {
-    const client = getClient()
-    return client.zadd(key, score, member)
-  },
-  zrangebyscore: async (key: string, min: number | string, max: number | string): Promise<string[]> => {
-    const client = getClient()
-    return client.zrangebyscore(key, min, max)
-  },
-  zremrangebyscore: async (key: string, min: number | string, max: number | string): Promise<number> => {
-    const client = getClient()
-    return client.zremrangebyscore(key, min, max)
-  },
-  ping: async (): Promise<string> => {
-    const client = getClient()
-    return client.ping()
-  },
-  info: async (): Promise<string> => {
-    const client = getClient()
-    return client.info()
-  },
-  dbSize: async (): Promise<number> => {
-    const client = getClient()
-    return client.dbSize()
-  },
+export function setMigrationsRun(value: boolean): void {
+  globalMigrationState.__migrations_run = value
 }
