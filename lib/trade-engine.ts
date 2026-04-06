@@ -845,36 +845,51 @@ export class GlobalTradeEngineCoordinator {
 
 /**
  * The global trade engine coordinator singleton instance
- * V4: Use globalThis to persist across module reloads so we can stop old engines
+ * V5: Aggressive timer cleanup - also clear timers from engine-manager.ts
  */
 const engineGlobalThis = globalThis as unknown as {
   __tradeEngineCoordinator?: GlobalTradeEngineCoordinator
   __tradeEngineVersion?: string
+  __engine_timers?: Set<ReturnType<typeof setInterval>>
 }
 
-const TRADE_ENGINE_VERSION = "4.0.1"
+const TRADE_ENGINE_VERSION = "5.0.0"
 
-// V4: Stop old engines if version changed (module was reloaded with new code)
-if (engineGlobalThis.__tradeEngineVersion !== TRADE_ENGINE_VERSION && engineGlobalThis.__tradeEngineCoordinator) {
-  console.log(`[v0] Trade Engine version changed ${engineGlobalThis.__tradeEngineVersion} -> ${TRADE_ENGINE_VERSION}, stopping old engines...`)
-  try {
-    // Synchronously clear timers by accessing engines directly
-    const oldCoord = engineGlobalThis.__tradeEngineCoordinator
-    // @ts-expect-error - accessing private member for cleanup
-    if (oldCoord.engineManagers) {
-      // @ts-expect-error - accessing private member for cleanup
-      for (const manager of oldCoord.engineManagers.values()) {
-        try {
-          manager.stop().catch(() => {})
-        } catch {}
-      }
-      // @ts-expect-error - accessing private member for cleanup
-      oldCoord.engineManagers.clear()
+// V5: Aggressive cleanup - clear ALL registered engine timers on version change
+if (engineGlobalThis.__tradeEngineVersion !== TRADE_ENGINE_VERSION) {
+  console.log(`[v0] Trade Engine version changed ${engineGlobalThis.__tradeEngineVersion} -> ${TRADE_ENGINE_VERSION}, aggressive cleanup...`)
+  
+  // Clear timers registered by engine-manager.ts
+  if (engineGlobalThis.__engine_timers) {
+    console.log(`[v0] Clearing ${engineGlobalThis.__engine_timers.size} registered engine timers...`)
+    for (const timer of engineGlobalThis.__engine_timers) {
+      try {
+        clearInterval(timer)
+      } catch {}
     }
-  } catch {
-    // Ignore cleanup errors
+    engineGlobalThis.__engine_timers.clear()
   }
-  engineGlobalThis.__tradeEngineCoordinator = undefined
+  
+  // Stop old coordinator's engines
+  if (engineGlobalThis.__tradeEngineCoordinator) {
+    try {
+      const oldCoord = engineGlobalThis.__tradeEngineCoordinator
+      // @ts-expect-error - accessing private member for cleanup
+      if (oldCoord.engineManagers) {
+        // @ts-expect-error - accessing private member for cleanup
+        for (const manager of oldCoord.engineManagers.values()) {
+          try {
+            manager.stop().catch(() => {})
+          } catch {}
+        }
+        // @ts-expect-error - accessing private member for cleanup
+        oldCoord.engineManagers.clear()
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+    engineGlobalThis.__tradeEngineCoordinator = undefined
+  }
 }
 
 engineGlobalThis.__tradeEngineVersion = TRADE_ENGINE_VERSION

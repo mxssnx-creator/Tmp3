@@ -1,23 +1,55 @@
 /**
- * Trade Engine Manager V7
+ * Trade Engine Manager V9
  * Manages asynchronous processing for symbols, indications, pseudo positions, and strategies
- * V7: Fixed totalStrategiesEvaluated variable declaration
- * @version 7.0.0
- * @lastUpdate 2026-04-06T02:52:00Z - Fixed ReferenceError in indication processor
+ * V9: Coordinated cleanup with trade-engine.ts V5
+ * @version 9.0.0
+ * @lastUpdate 2026-04-06T03:57:00Z - Coordinated timer cleanup
  */
 
-const _ENGINE_BUILD_VERSION = "7.0.0"
+const _ENGINE_BUILD_VERSION = "9.0.0"
 
-// Force module invalidation on version change
-if (typeof globalThis !== "undefined") {
-  const engineGlobal = globalThis as unknown as { __engine_version?: string; __engine_instances?: Map<string, unknown> }
-  if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
-    // Clear old engine instances to force recreation with new code
-    if (engineGlobal.__engine_instances) {
-      engineGlobal.__engine_instances.clear()
+// Type for global engine state
+interface EngineGlobalState {
+  __engine_version?: string
+  __engine_timers?: Set<ReturnType<typeof setInterval>>
+  __engine_instances?: Map<string, unknown>
+}
+
+const engineGlobal = (typeof globalThis !== "undefined" ? globalThis : {}) as EngineGlobalState
+
+// Force clear ALL old timers when module version changes
+if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
+  console.log(`[v0] Engine version change: ${engineGlobal.__engine_version} -> ${_ENGINE_BUILD_VERSION}, clearing stale timers...`)
+  
+  // Clear any registered timers from old version
+  if (engineGlobal.__engine_timers) {
+    for (const timer of engineGlobal.__engine_timers) {
+      clearInterval(timer)
     }
-    engineGlobal.__engine_version = _ENGINE_BUILD_VERSION
+    engineGlobal.__engine_timers.clear()
+    console.log(`[v0] Cleared stale engine timers`)
   }
+  
+  // Clear old engine instances
+  if (engineGlobal.__engine_instances) {
+    engineGlobal.__engine_instances.clear()
+  }
+  
+  engineGlobal.__engine_version = _ENGINE_BUILD_VERSION
+}
+
+// Initialize timer set for this version
+if (!engineGlobal.__engine_timers) {
+  engineGlobal.__engine_timers = new Set()
+}
+
+// Helper to register timers so they can be cleaned up on reload
+function registerEngineTimer(timer: ReturnType<typeof setInterval>): void {
+  engineGlobal.__engine_timers?.add(timer)
+}
+
+function unregisterEngineTimer(timer: ReturnType<typeof setInterval>): void {
+  engineGlobal.__engine_timers?.delete(timer)
 }
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
@@ -506,6 +538,16 @@ export class TradeEngineManager {
       if (isProcessing) return
       isProcessing = true
       const startTime = Date.now()
+      
+      // V8: Early exit if this timer is from a stale module version
+      if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
+        console.log(`[v0] Stale timer detected (version mismatch), self-clearing...`)
+        if (this.indicationTimer) {
+          clearInterval(this.indicationTimer)
+          unregisterEngineTimer(this.indicationTimer)
+        }
+        return
+      }
 
       try {
         const symbols = await this.getSymbols()
@@ -631,6 +673,9 @@ export class TradeEngineManager {
         isProcessing = false
       }
     }, intervalSeconds * 1000)
+    
+    // Register timer for cleanup on module reload
+    registerEngineTimer(this.indicationTimer)
   }
 
   /**
@@ -648,6 +693,16 @@ export class TradeEngineManager {
       if (isProcessing) return
       isProcessing = true
       const startTime = Date.now()
+      
+      // V8: Early exit if this timer is from a stale module version
+      if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
+        console.log(`[v0] Stale strategy timer detected, self-clearing...`)
+        if (this.strategyTimer) {
+          clearInterval(this.strategyTimer)
+          unregisterEngineTimer(this.strategyTimer)
+        }
+        return
+      }
 
       try {
         const symbols = await this.getSymbols()
@@ -734,6 +789,9 @@ export class TradeEngineManager {
         isProcessing = false
       }
     }, intervalSeconds * 1000)
+    
+    // Register timer for cleanup on module reload
+    registerEngineTimer(this.strategyTimer)
   }
 
   /**
@@ -747,6 +805,14 @@ export class TradeEngineManager {
     let isProcessing = false
 
     this.realtimeTimer = setInterval(async () => {
+      // V8: Early exit if this timer is from a stale module version
+      if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
+        if (this.realtimeTimer) {
+          clearInterval(this.realtimeTimer)
+          unregisterEngineTimer(this.realtimeTimer)
+        }
+        return
+      }
       if (isProcessing) return
       isProcessing = true
       const startTime = Date.now()
@@ -806,6 +872,9 @@ export class TradeEngineManager {
         isProcessing = false
       }
     }, intervalSeconds * 1000)
+    
+    // Register timer for cleanup on module reload
+    registerEngineTimer(this.realtimeTimer)
   }
 
   /**
