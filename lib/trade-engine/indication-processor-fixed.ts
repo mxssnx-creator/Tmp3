@@ -18,7 +18,9 @@ console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${
 // This fixes the issue where class field initialization fails in cached bundles
 const SHARED_MARKET_DATA_CACHE = new Map<string, { data: any; timestamp: number }>()
 const SHARED_SETTINGS_CACHE = { data: null as any, timestamp: 0 }
-const SHARED_CACHE_TTL = 500
+// High-frequency TTL: 200ms matches the batch-prefetch window in market-data-cache.ts
+// so processIndication always reads from the same fresh batch within each 1s cycle
+const SHARED_CACHE_TTL = 200
 
 // CRITICAL FIX: Monkey-patch the Map prototype to handle undefined 'this' context
 // This ensures that even if 'this.marketDataCache' is undefined, calling .get() won't crash
@@ -70,7 +72,7 @@ function getProgressionManager() {
 
 // MODULE-LEVEL caches - guaranteed to exist, avoids `this` context issues entirely
 const MODULE_MARKET_DATA_CACHE = new Map<string, { data: any; timestamp: number }>()
-const MODULE_CACHE_TTL = 500
+const MODULE_CACHE_TTL = 200 // 200ms matches the batch-prefetch window
 
 // Module-level settings cache
 let MODULE_SETTINGS_CACHE: { data: any; timestamp: number } | null = null

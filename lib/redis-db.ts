@@ -154,14 +154,13 @@ export class InlineLocalRedis {
       stats.operationsPerSecond = stats.requestCount
       stats.requestCount = 1
       stats.lastSecond = now
+      // Log high req/sec once per second when rolling over (not on every single operation)
+      if (stats.operationsPerSecond > 100) {
+        console.log(`[v0] [Redis] High request rate: ${stats.operationsPerSecond} ops/sec`)
+      }
     } else {
-      // Same second: increment count
+      // Same second: increment count — no logging here to avoid log flood
       stats.requestCount++
-    }
-    
-    // Log high req/sec for monitoring
-    if (stats.operationsPerSecond > 100) {
-      console.log(`[v0] [Redis] High request rate: ${stats.operationsPerSecond} ops/sec`)
     }
   }
 
