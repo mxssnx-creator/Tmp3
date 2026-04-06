@@ -712,10 +712,17 @@ export class BybitConnector extends BaseExchangeConnector {
         `${baseUrl}/v5/market/kline?category=${category}&symbol=${symbol}&interval=${interval}&limit=${limit}`
       )
 
+      // Check for HTML response (API gateway error pages like 403)
+      const contentType = response.headers.get("content-type") || ""
+      if (contentType.includes("text/html") || !response.ok) {
+        // Silently return null - OHLCV will retry next cycle
+        return null
+      }
+
       const data = await response.json()
 
       if (data.retCode !== 0 || !data.result?.list) {
-        this.logError(`✗ Failed to fetch OHLCV: ${data.retMsg || "Unknown error"}`)
+        // Silently return null to avoid log flooding
         return null
       }
 
@@ -731,9 +738,8 @@ export class BybitConnector extends BaseExchangeConnector {
 
       this.log(`✓ OHLCV fetched: ${candles.length} candles`)
       return candles
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error)
-      this.logError(`✗ Failed to fetch OHLCV: ${errorMsg}`)
+    } catch {
+      // Silently return null - Bybit often returns 403 from serverless IPs
       return null
     }
   }
