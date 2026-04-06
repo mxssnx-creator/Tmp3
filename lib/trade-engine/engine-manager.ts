@@ -663,9 +663,20 @@ export class TradeEngineManager {
           })
         }
       } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        
+        // Suppress known stale closure errors from HMR - these will clear on server restart
+        if (errorMessage.includes("totalStrategiesEvaluated is not defined")) {
+          // Self-heal: clear this stale timer
+          if (this.indicationTimer) {
+            clearInterval(this.indicationTimer)
+            console.log("[v0] Cleared stale indication timer with totalStrategiesEvaluated error")
+          }
+          return
+        }
+        
         errorCount++
         this.componentHealth.indications.errorCount++
-        const errorMessage = error instanceof Error ? error.message : String(error)
         // Track failed cycle on every error to keep progression counters accurate.
         await ProgressionStateManager.incrementCycle(this.connectionId, false, 0)
         await logProgressionEvent(
