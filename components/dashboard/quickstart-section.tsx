@@ -35,7 +35,7 @@ export function QuickstartSection() {
           <h3 className="text-sm font-semibold">Quickstart</h3>
         </div>
 
-        {/* Action Buttons - First Row */}
+        {/* Action Buttons - First Row (Primary Actions) */}
         <div className="flex flex-wrap gap-2">
           <Button
             size="sm"
@@ -68,16 +68,16 @@ export function QuickstartSection() {
           </Button>
         </div>
 
-        {/* Log Buttons - New Line for Better Overview */}
+        {/* Log Buttons - Second Row (View/Debug Actions) */}
         <div className="flex flex-wrap gap-2 pt-2 border-t border-border/30">
           <Button
             size="sm"
             variant="ghost"
             onClick={handleViewLogs}
-            className="flex items-center gap-1 text-xs"
+            className="flex items-center gap-1 text-xs h-8 px-2.5"
           >
-            <FileText className="w-3.5 h-3.5" />
-            View Logs
+            <FileText className="w-3 h-3" />
+            Logs
           </Button>
 
           <Button
@@ -87,9 +87,9 @@ export function QuickstartSection() {
               console.log("[v0] [Quickstart] Opening progression logs...")
               window.dispatchEvent(new CustomEvent("open-progression-logs"))
             }}
-            className="flex items-center gap-1 text-xs"
+            className="flex items-center gap-1 text-xs h-8 px-2.5"
           >
-            <FileText className="w-3.5 h-3.5" />
+            <FileText className="w-3 h-3" />
             Progression
           </Button>
 
@@ -100,9 +100,9 @@ export function QuickstartSection() {
               console.log("[v0] [Quickstart] Opening indications logs...")
               window.dispatchEvent(new CustomEvent("open-indications-logs"))
             }}
-            className="flex items-center gap-1 text-xs"
+            className="flex items-center gap-1 text-xs h-8 px-2.5"
           >
-            <FileText className="w-3.5 h-3.5" />
+            <FileText className="w-3 h-3" />
             Indications
           </Button>
 
@@ -113,9 +113,9 @@ export function QuickstartSection() {
               console.log("[v0] [Quickstart] Opening strategies logs...")
               window.dispatchEvent(new CustomEvent("open-strategies-logs"))
             }}
-            className="flex items-center gap-1 text-xs"
+            className="flex items-center gap-1 text-xs h-8 px-2.5"
           >
-            <FileText className="w-3.5 h-3.5" />
+            <FileText className="w-3 h-3" />
             Strategies
           </Button>
         </div>
