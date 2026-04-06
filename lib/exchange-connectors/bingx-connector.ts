@@ -878,10 +878,17 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
+      // Check for HTML response (API gateway error pages)
+      const contentType = response.headers.get("content-type") || ""
+      if (contentType.includes("text/html") || !response.ok) {
+        // Silently return null - OHLCV data not critical, will retry next cycle
+        return null
+      }
+
       const data = await response.json()
 
       if (data.code !== 0 && data.code !== "0") {
-        this.logError(`✗ Failed to fetch OHLCV: ${data.msg || "Unknown error"}`)
+        // Silently return null to avoid log flooding
         return null
       }
 
@@ -899,9 +906,9 @@ export class BingXConnector extends BaseExchangeConnector {
 
       this.log(`✓ OHLCV fetched: ${candles.length} candles`)
       return candles
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error)
-      this.logError(`✗ Failed to fetch OHLCV: ${errorMsg}`)
+    } catch {
+      // Silently return null - OHLCV errors are expected when API returns HTML error pages
+      // Will retry on next cycle
       return null
     }
   }
