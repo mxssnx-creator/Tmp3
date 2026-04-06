@@ -557,33 +557,40 @@ function flattenForHmset(obj: Record<string, any>): Record<string, string> {
   return result
 }
 
-function parseHashValue(value: any): any {
+function parseHashValue(value: unknown): unknown {
+  // Guard against undefined/null
   if (value === undefined || value === null) return null
   
-  // If not a string, return as-is (already parsed or primitive)
-  if (typeof value !== "string") return value
+  // CRITICAL: Must be string to use string methods - fixes "value.startsWith is not a function"
+  if (typeof value !== "string") {
+    // Return non-string values as-is (numbers, booleans, objects already parsed)
+    return value
+  }
   
-  if (value === "") return ""
+  // Now value is guaranteed to be a string
+  const strValue: string = value
   
-  // Try to parse as JSON first
-  if ((value.startsWith("{") && value.endsWith("}")) || 
-      (value.startsWith("[") && value.endsWith("]"))) {
+  if (strValue === "") return ""
+  
+  // Try to parse as JSON first (only for strings that look like JSON)
+  if ((strValue.startsWith("{") && strValue.endsWith("}")) || 
+      (strValue.startsWith("[") && strValue.endsWith("]"))) {
     try {
-      return JSON.parse(value)
+      return JSON.parse(strValue)
     } catch {
-      return value
+      return strValue
     }
   }
   
   // Check for boolean-like values
-  if (value === "1" || value === "true") return true
-  if (value === "0" || value === "false") return false
+  if (strValue === "1" || strValue === "true") return true
+  if (strValue === "0" || strValue === "false") return false
   
   // Check for numeric values
-  if (/^-?\d+$/.test(value)) return parseInt(value, 10)
-  if (/^-?\d+\.\d+$/.test(value)) return parseFloat(value)
+  if (/^-?\d+$/.test(strValue)) return parseInt(strValue, 10)
+  if (/^-?\d+\.\d+$/.test(strValue)) return parseFloat(strValue)
   
-  return value
+  return strValue
 }
 
 function parseHash(hash: Record<string, string> | null): Record<string, any> | null {
@@ -1241,4 +1248,49 @@ export async function getConnectionsByExchange(exchange: string): Promise<any[]>
     conn.exchange?.toLowerCase() === exchange.toLowerCase() ||
     conn.exchange_name?.toLowerCase() === exchange.toLowerCase()
   )
+}
+
+// ========== Missing Exports for db.ts compatibility ==========
+
+export async function deleteSettings(key: string): Promise<void> {
+  const client = getRedisClient()
+  await client.del(`settings:${key}`)
+}
+
+export async function flushAll(): Promise<void> {
+  const client = getRedisClient()
+  await client.flushall()
+}
+
+export async function getRedisStats(): Promise<{
+  connected: boolean
+  memoryUsage: number
+  keyCount: number
+  uptime: number
+}> {
+  try {
+    const client = getRedisClient()
+    const keys = await client.keys("*")
+    return {
+      connected: true,
+      memoryUsage: 0, // In-memory implementation doesn't track this
+      keyCount: keys.length,
+      uptime: Date.now() - (globalThis as any).__redis_start_time || 0,
+    }
+  } catch {
+    return {
+      connected: false,
+      memoryUsage: 0,
+      keyCount: 0,
+      uptime: 0,
+    }
+  }
+}
+
+export async function saveMarketData(symbol: string, timeframe: string, data: any): Promise<void> {
+  const client = getRedisClient()
+  const key = `market_data:${symbol}:${timeframe}`
+  await client.set(key, JSON.stringify(data))
+  // Set 24 hour TTL for market data
+  await client.expire(key, 86400)
 }
