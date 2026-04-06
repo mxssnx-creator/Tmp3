@@ -485,6 +485,7 @@ export class TradeEngineManager {
     let attemptedCycles = 0
     let totalDuration = 0
     let errorCount = 0
+    let totalStrategiesEvaluated = 0
     let isProcessing = false
 
     this.indicationTimer = setInterval(async () => {
