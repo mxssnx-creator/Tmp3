@@ -58,8 +58,7 @@ async function fetchMostVolatileSymbol(exchange: string): Promise<{ symbol: stri
           signal: AbortSignal.timeout(5000),
         })
         if (!res.ok) {
-          // Bybit often returns 403 for serverless IPs - use Binance as proxy for USDT pairs
-          console.warn(`[v0] [TopSymbols] Bybit returned ${res.status}, using Binance data as fallback`)
+          // Bybit often returns 403 for serverless IPs - use Binance as proxy for USDT pairs (silent fallback)
           const binanceRes = await fetch("https://api.binance.com/api/v3/ticker/24hr", {
             headers: { "Accept": "application/json" },
             signal: AbortSignal.timeout(5000),
