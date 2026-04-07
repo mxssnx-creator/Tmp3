@@ -1076,23 +1076,133 @@ export async function createPosition(data: any): Promise<any> {
   return positionData
 }
 
-export async function getIndications(symbol?: string): Promise<any[]> {
+export async function getIndications(connectionId?: string, symbol?: string): Promise<any[]> {
   const client = getRedisClient()
-  const pattern = symbol ? `indication:${symbol}:*` : "indication:*"
+  let pattern: string
+  
+  if (connectionId && symbol) {
+    // Specific connection and symbol: look for both main key and per-type sets
+    pattern = `indications:${connectionId}:${symbol}:*`
+  } else if (connectionId) {
+    // All symbols for a connection
+    pattern = `indications:${connectionId}:*`
+  } else if (symbol) {
+    // All connections for a symbol (legacy support)
+    pattern = `indication:${symbol}:*`
+  } else {
+    // All indications
+    pattern = `indications:*`
+  }
+  
   const keys = await client.keys(pattern)
   const indications: any[] = []
   
   for (const key of keys) {
-    const data = await client.hgetall(key)
-    if (data && Object.keys(data).length > 0) {
-      indications.push({
-        id: key.replace("indication:", ""),
-        ...data,
-      })
+    try {
+      // Try to get as string first (indication-processor saves as JSON string)
+      const stringData = await client.get(key)
+      if (stringData) {
+        try {
+          const parsed = typeof stringData === "string" ? JSON.parse(stringData) : stringData
+          const arr = Array.isArray(parsed) ? parsed : [parsed]
+          indications.push(...arr)
+        } catch (e) {
+          console.warn(`[v0] Failed to parse indication key ${key}:`, e)
+        }
+        continue
+      }
+      
+      // Try as hash (fallback for legacy format)
+      const hashData = await client.hgetall(key)
+      if (hashData && Object.keys(hashData).length > 0) {
+        indications.push({
+          id: key.replace(/^indications?:/, ""),
+          ...hashData,
+        })
+      }
+    } catch (e) {
+      console.warn(`[v0] Error reading indication key ${key}:`, e)
     }
   }
   
   return indications
+}
+
+/**
+ * Store indications for a connection - HIGH FREQUENCY OPTIMIZED
+ * Maintains independent sets per configuration type for optimal performance
+ */
+export async function storeIndications(connectionId: string, symbol: string, indications: any[]): Promise<void> {
+  if (!indications || indications.length === 0) return
+  
+  const client = getRedisClient()
+  const mainKey = `indications:${connectionId}`
+  
+  try {
+    // Read existing indications
+    const existingRaw = await client.get(mainKey)
+    let existing: any[] = []
+    if (existingRaw) {
+      try {
+        existing = JSON.parse(typeof existingRaw === "string" ? existingRaw : JSON.stringify(existingRaw))
+        if (!Array.isArray(existing)) existing = []
+      } catch {
+        existing = []
+      }
+    }
+    
+    // Add new indications with metadata for per-config tracking
+    const newIndications = indications.map(ind => ({
+      ...ind,
+      symbol,
+      connectionId,
+      timestamp: new Date().toISOString(),
+      configSet: getConfigurationSet(ind.type, ind.value), // Track which config set this belongs to
+    }))
+    
+    existing.push(...newIndications)
+    
+    // Keep only latest 2500 indications per connection (250 per symbol × 10 symbols typical)
+    if (existing.length > 2500) {
+      existing = existing.slice(-2500)
+    }
+    
+    // Save to main key with 1-hour TTL
+    await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
+    
+    // Also maintain per-type independent sets for high-frequency lookups
+    const typeKey = `indications:${connectionId}:${ind.type}`
+    const typeIndications = indications.filter(i => i.type === ind.type)
+    if (typeIndications.length > 0) {
+      await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
+    }
+    
+  } catch (error) {
+    console.error(`[v0] Error storing indications for ${connectionId}:`, error)
+  }
+}
+
+/**
+ * Determine configuration set based on indication parameters
+ * Used for organizing independent sets per configuration combination
+ */
+function getConfigurationSet(type: string, value: any): string {
+  // Map indication characteristics to configuration sets for independent tracking
+  // This allows parallel processing of different configuration combinations
+  if (!value || typeof value !== "object") return "config:default"
+  
+  const stepCount = value.stepCount || 10
+  const drawdown = value.drawdownRatio || 0.2
+  const activity = value.activityRatio || 0.05
+  const rangeRatio = value.rangeRatio || 0.2
+  
+  // Create configuration hash to group similar configs together
+  const configHash = Math.abs(
+    ((stepCount * 7) ^ (Math.round(drawdown * 100) * 11) ^ 
+     (Math.round(activity * 1000) * 13) ^ (Math.round(rangeRatio * 100) * 17)) % 1000
+  )
+  
+  return `config:${type}:${configHash}`
 }
 
 export async function verifyRedisHealth(): Promise<{ healthy: boolean; latency: number; error?: string }> {
