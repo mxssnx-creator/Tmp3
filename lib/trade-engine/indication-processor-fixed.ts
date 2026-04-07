@@ -388,10 +388,11 @@ export class IndicationProcessor {
       const priceChange = ((currentClose - currentOpen) / currentOpen) * 100
       const directionConfidence = Math.min(0.95, 0.5 + Math.abs(priceChange) / 100)
       
-      // Calculate simple indications from current candle OHLC
+      // Calculate comprehensive indications from current candle OHLC
       const indications: any[] = []
       
-      // Step-based indicators for DIRECTION indication
+      // CORE INDICATIONS (4):
+      // 1. DIRECTION Indication
       const stepDirections: any = {}
       for (const [step, indicators] of Object.entries(stepIndicators)) {
         const ma = indicators.ma as number
@@ -420,7 +421,7 @@ export class IndicationProcessor {
         }
       })
       
-      // Move indication: based on high-low range AND step-based RSI
+      // 2. MOVE Indication: based on high-low range AND step-based RSI
       const range = currentHigh - currentLow
       const rangePercent = (range / currentClose) * 100
       const moveConfidence = Math.min(0.95, 0.5 + Math.min(rangePercent, 10) / 20)
@@ -449,7 +450,7 @@ export class IndicationProcessor {
         }
       })
       
-      // Active indication: based on volume AND step-based MACD
+      // 3. ACTIVE Indication: based on volume AND step-based MACD
       const activeConfidence = Math.min(0.95, 0.5 + Math.min(currentVolume, 1000) / 2000)
       
       const stepMACD: any = {}
@@ -477,7 +478,7 @@ export class IndicationProcessor {
         }
       })
       
-      // Optimal indication: step-based Bollinger Bands
+      // 4. OPTIMAL Indication: step-based Bollinger Bands
       const stepBB: any = {}
       for (const [step, indicators] of Object.entries(stepIndicators)) {
         const bb = indicators.bb as any
@@ -505,6 +506,87 @@ export class IndicationProcessor {
         }
       })
       
+      // ADVANCED INDICATIONS (8+ per symbol for comprehensive analysis):
+      // 5. RSI-based Indication (Overbought/Oversold signals)
+      const avgRSI = Object.values(stepRSI).reduce((sum: number, item: any) => sum + (item.rsi || 50), 0) / Object.keys(stepRSI).length
+      indications.push({
+        type: "rsi_signal",
+        symbol,
+        value: avgRSI < 30 ? 1 : (avgRSI > 70 ? -1 : 0),
+        confidence: Math.abs(avgRSI - 50) / 50,
+        metadata: { avgRSI, isOversold: avgRSI < 30, isOverbought: avgRSI > 70 }
+      })
+      
+      // 6. MACD-based Indication
+      const avgMACD = Object.values(stepMACD).reduce((sum: number, item: any) => sum + (item.macd || 0), 0) / Object.keys(stepMACD).length
+      const avgSignal = Object.values(stepMACD).reduce((sum: number, item: any) => sum + (item.signal || 0), 0) / Object.keys(stepMACD).length
+      indications.push({
+        type: "macd_signal",
+        symbol,
+        value: avgMACD > avgSignal ? 1 : -1,
+        confidence: Math.abs(avgMACD - avgSignal) / Math.max(Math.abs(avgSignal), 0.001),
+        metadata: { avgMACD, avgSignal, histogram: avgMACD - avgSignal }
+      })
+      
+      // 7. Volatility Indication
+      indications.push({
+        type: "volatility",
+        symbol,
+        value: rangePercent > 3 ? 1 : 0,
+        confidence: Math.min(1, rangePercent / 5),
+        metadata: { rangePercent, isHighVolatility: rangePercent > 3 }
+      })
+      
+      // 8. Trend Strength Indication
+      const avgMA = Object.values(stepDirections).reduce((sum: number, item: any) => sum + (item.ma || 0), 0) / Object.keys(stepDirections).length
+      const distanceFromMA = Math.abs(currentClose - avgMA) / avgMA * 100
+      indications.push({
+        type: "trend_strength",
+        symbol,
+        value: distanceFromMA > 2 ? 1 : 0,
+        confidence: Math.min(1, distanceFromMA / 5),
+        metadata: { distanceFromMA, avgMA, strongTrend: distanceFromMA > 2 }
+      })
+      
+      // 9. Volume-based Indication
+      indications.push({
+        type: "volume_signal",
+        symbol,
+        value: currentVolume > 100 ? 1 : 0,
+        confidence: Math.min(1, currentVolume / 1000),
+        metadata: { volume: currentVolume, volumeStrength: currentVolume / 1000 }
+      })
+      
+      // 10. Price Action Indication
+      indications.push({
+        type: "price_action",
+        symbol,
+        value: priceChange > 0 ? 1 : -1,
+        confidence: Math.abs(priceChange) / 2,
+        metadata: { priceChange, direction, momentum: priceChange }
+      })
+      
+      // 11. Support/Resistance from BB
+      const avgBBLower = Object.values(stepBB).reduce((sum: number, item: any) => sum + (item.lower || 0), 0) / Object.keys(stepBB).length
+      const avgBBUpper = Object.values(stepBB).reduce((sum: number, item: any) => sum + (item.upper || 0), 0) / Object.keys(stepBB).length
+      indications.push({
+        type: "support_resistance",
+        symbol,
+        value: currentClose < avgBBLower * 1.02 ? 1 : (currentClose > avgBBUpper * 0.98 ? -1 : 0),
+        confidence: currentClose < avgBBLower * 1.02 || currentClose > avgBBUpper * 0.98 ? 0.8 : 0.5,
+        metadata: { support: avgBBLower, resistance: avgBBUpper, nearSupport: currentClose < avgBBLower * 1.02, nearResistance: currentClose > avgBBUpper * 0.98 }
+      })
+      
+      // 12. Multi-timeframe Confirmation
+      const indicationTypes = indications.slice(0, 4).filter(ind => ind.value !== 0).length
+      indications.push({
+        type: "multi_tf_confirmation",
+        symbol,
+        value: indicationTypes > 2 ? 1 : 0,
+        confidence: indicationTypes / 4,
+        metadata: { confirmingIndicators: indicationTypes, isConfirmed: indicationTypes > 2 }
+      })
+      
       // Disabled per-cycle logging - only store and return
 
       // Store indications in Redis for progression tracking (batch save)
@@ -522,6 +604,10 @@ export class IndicationProcessor {
         }
         
         console.log(`[v0] [IndicationProcessor] Processing ${indications.length} indications for ${symbol}`)
+        
+        // Log detailed indicator breakdown
+        const indicatorTypes = indications.map(i => i.type).join(", ")
+        console.log(`[v0] [IndicationProcessor] ✓ ${symbol}: ${indications.length} indicators generated [${indicatorTypes}]`)
         
         // Read existing indications
         const existingRaw = await client.get(mainKey)

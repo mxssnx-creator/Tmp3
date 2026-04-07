@@ -583,24 +583,41 @@ export class TradeEngineManager {
           )
         )
 
+        // Comprehensive indication logging with per-type breakdown
+        const indicationTypeCounts: Record<string, number> = {}
+        const symbolIndicationCounts: Record<string, number> = {}
+        for (let i = 0; i < indicationResults.length; i++) {
+          const arr = indicationResults[i]
+          const symbol = symbols[i]
+          symbolIndicationCounts[symbol] = arr?.length || 0
+          for (const ind of arr) {
+            const t = ind?.type as string
+            if (t) {
+              indicationTypeCounts[t] = (indicationTypeCounts[t] || 0) + 1
+            }
+          }
+        }
+
+        const totalIndications = indicationResults.reduce((sum, arr) => sum + (arr?.length || 0), 0)
+        
+        // Log detailed breakdown
+        console.log(`[v0] [IndicationProcessor CYCLE ${cycleCount}] Symbols: ${symbols.length} | Total Indications: ${totalIndications}`)
+        console.log(`[v0] [IndicationProcessor] Per-symbol: ${JSON.stringify(symbolIndicationCounts)}`)
+        console.log(`[v0] [IndicationProcessor] Per-type: ${JSON.stringify(indicationTypeCounts)}`)
+
         // Write per-type counters into progression hash so dashboard reads real values
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
-          const typeCounts: Record<string, number> = {}
-          for (const arr of indicationResults) {
-            for (const ind of arr) {
-              const t = ind?.type as string
-              if (t) typeCounts[t] = (typeCounts[t] || 0) + 1
-            }
-          }
-          if (Object.keys(typeCounts).length > 0) {
+          if (Object.keys(indicationTypeCounts).length > 0) {
             // Atomically increment per-type fields in the progression hash
-            for (const [type, count] of Object.entries(typeCounts)) {
+            for (const [type, count] of Object.entries(indicationTypeCounts)) {
               const field = `indications_${type}_count`
               await client.hincrby(redisKey, field, count)
             }
-            await client.hincrby(redisKey, "indications_count", Object.values(typeCounts).reduce((a, b) => a + b, 0))
+            await client.hincrby(redisKey, "indications_count", totalIndications)
+            await client.hset(redisKey, "indication_cycle_count", String(cycleCount))
+            await client.hset(redisKey, "symbols_processed", String(symbols.length))
             await client.expire(redisKey, 7 * 24 * 60 * 60)
           }
         } catch { /* non-critical */ }
@@ -617,7 +634,7 @@ export class TradeEngineManager {
 
         // Update progression cycle every cycle with detailed logging
         try {
-          await ProgressionStateManager.incrementCycle(this.connectionId, true, 0)
+          await ProgressionStateManager.incrementCycle(this.connectionId, true, processedThisCycle)
         } catch (incError) {
           console.error(`[v0] [Engine] Cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
         }
@@ -633,37 +650,19 @@ export class TradeEngineManager {
               indication_cycle_count: cycleCount,
               indication_avg_duration_ms: totalDuration > 0 ? Math.round(totalDuration / cycleCount) : 0,
               engine_cycles_total: cycleCount,
+              total_indications_generated: totalIndications * cycleCount,
+              symbols_in_scope: symbols.length,
             })
           } catch { /* silently fail */ }
         }
 
-        // Track intervals processed in Redis for dashboard display (every 100 cycles)
-        if (cycleCount % 100 === 0) {
-          try {
-            const client = getRedisClient()
-            await client.incr(`intervals:${this.connectionId}:processed_count`)
-            await client.expire(`intervals:${this.connectionId}:processed_count`, 86400)
-            await setSettings(`trade_engine_state:${this.connectionId}`, {
-              last_cycle_duration: duration,
-              last_cycle_type: "indications",
-              total_indications_evaluated: processedThisCycle,
-              updated_at: new Date().toISOString(),
-            })
-          } catch { /* ignore errors */ }
-        }
-
-        // Track detailed performance metrics
-        if (cycleCount % 100 === 0) {
-          await engineMonitor.trackCycle(this.connectionId, "indications", {
-            cycleNumber: cycleCount,
-            startTime,
-            endTime: Date.now(),
-            durationMs: duration,
-            symbolsProcessed: symbols.length,
-            indicationsGenerated: processedThisCycle,
-            errors: errorCount,
-          })
-        }
+        // Track intervals processed in Redis for dashboard display (every cycle)
+        try {
+          const client = getRedisClient()
+          const indication_key = `indication_cycles:${this.connectionId}`
+          await client.incr(indication_key)
+          await client.expire(indication_key, 86400)
+        } catch { /* ignore errors */ }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error)
         
@@ -742,12 +741,22 @@ export class TradeEngineManager {
 
         const evaluatedThisCycle = strategyResults.reduce((sum, result) => sum + (result?.strategiesEvaluated || 0), 0)
         const liveReadyThisCycle = strategyResults.reduce((sum, result) => sum + (result?.liveReady || 0), 0)
+        
         // Defensive: handle stale closures from HMR
         try {
           totalStrategiesEvaluated += evaluatedThisCycle
         } catch {
           // Stale closure - skip
         }
+
+        // Detailed per-symbol strategy breakdown
+        const symbolStrategyBreakdown: Record<string, number> = {}
+        for (let i = 0; i < strategyResults.length; i++) {
+          symbolStrategyBreakdown[symbols[i]] = strategyResults[i]?.strategiesEvaluated || 0
+        }
+
+        console.log(`[v0] [StrategyProcessor CYCLE ${cycleCount}] Total Evaluated: ${evaluatedThisCycle} | Live Ready: ${liveReadyThisCycle} | Total Cumulative: ${totalStrategiesEvaluated}`)
+        console.log(`[v0] [StrategyProcessor] Per-symbol breakdown: ${JSON.stringify(symbolStrategyBreakdown)}`)
 
         this.componentHealth.strategies.lastCycleDuration = duration
         this.componentHealth.strategies.cycleCount = cycleCount
@@ -761,19 +770,22 @@ export class TradeEngineManager {
             await client.hincrby(redisKey, "strategies_count", evaluatedThisCycle)
             await client.hincrby(redisKey, "strategies_real_total", liveReadyThisCycle)
             await client.hincrby(redisKey, "strategy_evaluated_real", liveReadyThisCycle)
+            await client.hset(redisKey, "strategy_cycle_count", String(cycleCount))
+            await client.hset(redisKey, "total_strategies_evaluated", String(totalStrategiesEvaluated))
+            await client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle))
             await client.expire(redisKey, 7 * 24 * 60 * 60)
           }
         } catch { /* non-critical */ }
 
         // Update progression cycle
         try {
-          await ProgressionStateManager.incrementCycle(this.connectionId, true, 0)
+          await ProgressionStateManager.incrementCycle(this.connectionId, true, evaluatedThisCycle)
         } catch (incError) {
           console.error(`[v0] [Engine] Strategy cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
         }
 
-        // Persist cycle count every 100 cycles
-        if (cycleCount % 100 === 0) {
+        // Persist cycle count every 50 cycles (faster update rate for strategies)
+        if (cycleCount % 50 === 0) {
           try {
             await setSettings(`trade_engine_state:${this.connectionId}`, {
               status: "running",
@@ -781,6 +793,7 @@ export class TradeEngineManager {
               strategy_cycle_count: cycleCount,
               strategy_avg_duration_ms: totalDuration > 0 ? Math.round(totalDuration / cycleCount) : 0,
               total_strategies_evaluated: typeof totalStrategiesEvaluated !== "undefined" ? totalStrategiesEvaluated : 0,
+              strategies_live_ready: liveReadyThisCycle,
               last_cycle_duration: duration,
               last_cycle_type: "strategies",
               engine_cycles_total: cycleCount,
@@ -788,17 +801,19 @@ export class TradeEngineManager {
           } catch { /* silently fail */ }
         }
 
-        // Track detailed performance metrics
-        if (cycleCount % 100 === 0) {
+        // Track detailed performance metrics every 50 cycles
+        if (cycleCount % 50 === 0) {
           await engineMonitor.trackCycle(this.connectionId, "strategies", {
             cycleNumber: cycleCount,
             startTime,
             endTime: Date.now(),
-          durationMs: duration,
-          symbolsProcessed: symbols.length,
-          strategiesEvaluated: evaluatedThisCycle,
-          errors: errorCount,
-        })
+            durationMs: duration,
+            symbolsProcessed: symbols.length,
+            strategiesEvaluated: evaluatedThisCycle,
+            strategiesLiveReady: liveReadyThisCycle,
+            totalCumulativeStrategies: totalStrategiesEvaluated,
+            errors: errorCount,
+          })
         }
       } catch (error) {
         errorCount++
