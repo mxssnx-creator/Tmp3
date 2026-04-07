@@ -1,3 +1,19 @@
+// CRITICAL: Define totalStrategiesEvaluated globally BEFORE any other code loads
+// This fixes ReferenceError in stale closures from previous code versions
+// eslint-disable-next-line no-var
+declare global { var totalStrategiesEvaluated: number }
+;(globalThis as any).totalStrategiesEvaluated = 0
+
+// Also clear any stale engine timers from previous versions
+const engineGlobal = globalThis as any
+if (engineGlobal.__engine_timers?.size > 0) {
+  console.log(`[v0] [Instrumentation] Clearing ${engineGlobal.__engine_timers.size} stale engine timers`)
+  for (const timer of engineGlobal.__engine_timers) {
+    try { clearInterval(timer) } catch {}
+  }
+  engineGlobal.__engine_timers.clear()
+}
+
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") {
     return

@@ -1,3 +1,27 @@
+/**
+ * Global Trade Engine Coordinator V4.0
+ * @version 4.0.0 - Force engine restart on version change to fix stale closures
+ */
+
+// CRITICAL: Import patch FIRST to fix cache initialization issues in stale webpack bundles
+import "./trade-engine/indication-processor-patch"
+
+const COORDINATOR_VERSION = "4.0.0"
+
+// Force clear stale engine instances on version change
+const coordGlobal = globalThis as unknown as { 
+  __coordinator_version?: string
+  __global_coordinator?: unknown
+}
+
+if (coordGlobal.__coordinator_version !== COORDINATOR_VERSION) {
+  console.log(`[v0] Coordinator version changed from ${coordGlobal.__coordinator_version} to ${COORDINATOR_VERSION}, clearing stale engines...`)
+  coordGlobal.__global_coordinator = undefined
+  coordGlobal.__coordinator_version = COORDINATOR_VERSION
+}
+
+console.log(`[v0] Global Trade Engine V${COORDINATOR_VERSION} loading with cache patch...`)
+
 import { TradeEngineManager, type EngineConfig } from "./trade-engine/engine-manager"
 import { getSettings, setSettings } from "./redis-db"
 
@@ -821,8 +845,57 @@ export class GlobalTradeEngineCoordinator {
 
 /**
  * The global trade engine coordinator singleton instance
+ * V5: Aggressive timer cleanup - also clear timers from engine-manager.ts
  */
-let globalCoordinator: GlobalTradeEngineCoordinator | null = null
+const engineGlobalThis = globalThis as unknown as {
+  __tradeEngineCoordinator?: GlobalTradeEngineCoordinator
+  __tradeEngineVersion?: string
+  __engine_timers?: Set<ReturnType<typeof setInterval>>
+}
+
+const TRADE_ENGINE_VERSION = "5.0.0"
+
+// V5: Aggressive cleanup - clear ALL registered engine timers on version change
+if (engineGlobalThis.__tradeEngineVersion !== TRADE_ENGINE_VERSION) {
+  console.log(`[v0] Trade Engine version changed ${engineGlobalThis.__tradeEngineVersion} -> ${TRADE_ENGINE_VERSION}, aggressive cleanup...`)
+  
+  // Clear timers registered by engine-manager.ts
+  if (engineGlobalThis.__engine_timers) {
+    console.log(`[v0] Clearing ${engineGlobalThis.__engine_timers.size} registered engine timers...`)
+    for (const timer of engineGlobalThis.__engine_timers) {
+      try {
+        clearInterval(timer)
+      } catch {}
+    }
+    engineGlobalThis.__engine_timers.clear()
+  }
+  
+  // Stop old coordinator's engines
+  if (engineGlobalThis.__tradeEngineCoordinator) {
+    try {
+      const oldCoord = engineGlobalThis.__tradeEngineCoordinator
+      // @ts-expect-error - accessing private member for cleanup
+      if (oldCoord.engineManagers) {
+        // @ts-expect-error - accessing private member for cleanup
+        for (const manager of oldCoord.engineManagers.values()) {
+          try {
+            manager.stop().catch(() => {})
+          } catch {}
+        }
+        // @ts-expect-error - accessing private member for cleanup
+        oldCoord.engineManagers.clear()
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+    engineGlobalThis.__tradeEngineCoordinator = undefined
+  }
+}
+
+engineGlobalThis.__tradeEngineVersion = TRADE_ENGINE_VERSION
+let globalCoordinator: GlobalTradeEngineCoordinator | null = engineGlobalThis.__tradeEngineCoordinator || null
+
+console.log(`[v0] Global Trade Engine V${TRADE_ENGINE_VERSION} loaded`)
 
 /**
  * Get the global trade engine coordinator singleton instance
@@ -839,6 +912,7 @@ export function getTradeEngine(): GlobalTradeEngineCoordinator | null {
 export function initializeGlobalCoordinator(): GlobalTradeEngineCoordinator {
   if (!globalCoordinator) {
     globalCoordinator = new GlobalTradeEngineCoordinator()
+    engineGlobalThis.__tradeEngineCoordinator = globalCoordinator
     console.log("[v0] Global trade engine coordinator initialized")
   }
   return globalCoordinator
@@ -851,6 +925,7 @@ export function getGlobalCoordinator(): GlobalTradeEngineCoordinator | null {
 export function getGlobalTradeEngineCoordinator(): GlobalTradeEngineCoordinator {
   if (!globalCoordinator) {
     globalCoordinator = new GlobalTradeEngineCoordinator()
+    engineGlobalThis.__tradeEngineCoordinator = globalCoordinator
     console.log("[v0] Global trade engine coordinator auto-initialized")
   }
   return globalCoordinator

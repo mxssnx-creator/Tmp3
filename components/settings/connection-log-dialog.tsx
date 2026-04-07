@@ -125,7 +125,7 @@ export function ConnectionLogDialog({ open, onOpenChange, connectionId, connecti
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-4xl max-h-[80vh]">
+      <DialogContent className="max-w-4xl max-h-[78vh]">
         <DialogHeader>
           <div className="flex items-center justify-between">
             <div>

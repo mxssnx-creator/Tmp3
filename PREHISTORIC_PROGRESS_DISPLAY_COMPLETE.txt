@@ -1,0 +1,74 @@
+PREHISTORIC PROGRESS DISPLAY - IMPLEMENTATION COMPLETE
+=======================================================
+
+FEATURE: Detailed progress information now displays when prehistoric data calculation occurs in main connection cards.
+
+THREE COMPONENTS ENHANCED:
+
+1. Progression API Enhancement (app/api/connections/progression/[id]/route.ts)
+   - Added detailed prehistoric progress tracking object returned in API response
+   - Tracks: current_symbol, candles_loaded, candles_total, indicators_calculated, duration
+   - Automatically counts completed symbols from Redis keys
+   - Calculates percentage complete based on symbols processed
+
+2. Prehistoric Calculator Updates (lib/prehistoric-calculator.ts)
+   - Added real-time Redis progress updates during candle processing
+   - Updates every 10 candles to avoid excessive Redis writes
+   - Tracks: current_symbol, candles_loaded, total_candles, indicators_calculated, duration
+   - Final state persisted to Redis after completion
+
+3. Connection Card Display Enhancement (components/dashboard/active-connection-card.tsx)
+   - Updated ProgressionData interface to include prehistoricProgress object
+   - Added detailed progress panel when phase === "prehistoric_data"
+   - Displays in amber-themed box with breakdown of:
+     * Symbols processed (e.g., 1/3)
+     * Current symbol being processed (e.g., "BTCUSDT")
+     * Candles loaded (e.g., 120/480)
+     * Indicators calculated count
+     * Processing duration in seconds
+
+REDIS TRACKING KEYS:
+- prehistoric:{connectionId} = HASH with real-time progress
+  - current_symbol: Which symbol is currently being processed
+  - candles_loaded: How many candles processed for current symbol
+  - candles_total: Total candles to process for current symbol
+  - indicators_calculated: Total indicators generated across all symbols
+  - duration: Time elapsed in milliseconds
+  - start_time: When processing started
+
+DATA FLOW:
+1. Engine starts prehistoric phase for symbol (e.g., BTCUSDT)
+2. PrehistoricCalculator.processSymbol() called with candles array
+3. As each candle is processed, Redis HASH is updated every 10 candles
+4. ProgressionAPI polls and reads prehistoric:{connectionId} HASH
+5. API calculates symbols processed by checking completed keys
+6. API returns prehistoricProgress object with current state
+7. Connection card fetches progression every 1000ms (during active phases)
+8. Card renders detailed amber panel showing live progress breakdown
+
+DISPLAY FORMAT (in Connection Card):
+┌─────────────────────────────────────────┐
+│ ⚠ Historical Data Loading              │
+├─────────────────────────────────────────┤
+│ Symbols                  1/3             │
+│ Processing: BTCUSDT                      │
+│ Candles                  120/480         │
+│ Indicators               480             │
+│ Duration                 2.3s            │
+└─────────────────────────────────────────┘
+
+UPDATES OCCUR WHEN:
+- Engine is running globally
+- Connection is enabled/active on dashboard
+- Engine progression phase = "prehistoric_data"
+- Polling interval = 1000ms (every second while active)
+
+BENEFIT:
+Users can now see exactly what's happening during prehistoric data loading:
+- Which symbols are being processed
+- How many candles have been analyzed
+- How many indicators calculated so far
+- Total time elapsed
+- Real-time progress without needing to open logs
+
+All three symbols (BTC/ETH/SOL) progress can be tracked from start to finish.

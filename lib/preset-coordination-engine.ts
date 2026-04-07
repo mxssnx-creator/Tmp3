@@ -792,7 +792,7 @@ export class PresetCoordinationEngine {
   private async getTopSymbolsByExchange(configSet: PresetConfigurationSet): Promise<string[]> {
     // Fetch top symbols from exchange based on order_by criteria
     // This is a placeholder - actual implementation depends on exchange API
-    return ["BTCUSDT", "ETHUSDT"]
+    return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
   }
 
   private generateIndicationCombinations(configSet: PresetConfigurationSet): any[] {

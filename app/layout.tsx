@@ -1,6 +1,7 @@
 import type { Metadata } from "next"
 import "@/app/globals.css"
 import { Providers } from "@/components/providers"
+import { IndicationGeneratorProvider } from "@/components/indication-generator-hook"
 
 export const metadata: Metadata = {
   title: "CTS v3.2 Dashboard",
@@ -16,7 +17,9 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <body className="font-sans antialiased">
         <Providers>
-          {children}
+          <IndicationGeneratorProvider>
+            {children}
+          </IndicationGeneratorProvider>
         </Providers>
       </body>
     </html>

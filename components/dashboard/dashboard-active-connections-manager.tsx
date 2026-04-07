@@ -28,6 +28,7 @@ export function DashboardActiveConnectionsManager() {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [togglingIds, setTogglingIds] = useState<Set<string>>(new Set())
+  const [removingIds, setRemovingIds] = useState<Set<string>>(new Set())
   const [resetting, setResetting] = useState(false)
   const [globalEngineRunning, setGlobalEngineRunning] = useState(false)
   const [globalEngineLoading, setGlobalEngineLoading] = useState(true)
@@ -145,8 +146,8 @@ export function DashboardActiveConnectionsManager() {
     console.log(`[v0] [Manager] Initializing active connections manager (version: ${COMPONENT_VERSIONS.dashboardManager})`)
     loadConnections()
     checkGlobalEngine()
-    const connInterval = setInterval(loadConnections, 5000)
-    const engineInterval = setInterval(checkGlobalEngine, 3000)
+    const connInterval = setInterval(loadConnections, 60000) // Increased from 5s to 60s
+    const engineInterval = setInterval(checkGlobalEngine, 60000) // Increased from 3s to 60s
     
     // Listen for relevant events and refresh
     const handleEngineStateChange = () => {
@@ -270,25 +271,73 @@ export function DashboardActiveConnectionsManager() {
   }
 
   const handleRemove = async (connectionId: string, connectionName: string) => {
+    console.log(`[v0] [Manager] Remove requested: ${connectionId} (${connectionName})`)
     try {
-      // Stop engine first if running
-      await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ is_live_trade: false }),
-      })
+      setRemovingIds(prev => new Set(prev).add(connectionId))
       
-      // Remove from main panel completely - unassign AND disable
-      await fetch(`/api/settings/connections/${connectionId}/active`, {
+      // Step 1: Stop engine if running
+      console.log(`[v0] [Manager] → Stopping engine for ${connectionName}...`)
+      try {
+        await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ is_live_trade: false }),
+          cache: "no-store"
+        })
+        console.log(`[v0] [Manager] ✓ Engine stopped`)
+      } catch (engineErr) {
+        console.warn(`[v0] [Manager] ⚠ Engine stop failed (non-critical):`, engineErr)
+      }
+      
+      // Step 2: Remove from main panel via DELETE API
+      console.log(`[v0] [Manager] → Calling DELETE /api/settings/connections/${connectionId}/active...`)
+      const removeRes = await fetch(`/api/settings/connections/${connectionId}/active`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
+        cache: "no-store"
       })
+      
+      if (!removeRes.ok) {
+        const errorData = await removeRes.json().catch(() => ({ error: "Unknown error" }))
+        throw new Error(`Remove API failed: ${errorData.error || removeRes.statusText}`)
+      }
+      
+      const removeResult = await removeRes.json()
+      console.log(`[v0] [Manager] ✓ DELETE API succeeded:`, removeResult)
+      
+      // Step 3: Update local state
+      console.log(`[v0] [Manager] → Updating local state...`)
       updateActiveConnections(prev => prev.filter(ac => ac.connectionId !== connectionId))
+      
+      // Step 4: Dispatch event
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("connection-removed", {
+          detail: { connectionId, name: connectionName }
+        }))
+      }
+      
       toast.success("Connection removed", {
         description: `${connectionName} has been removed from active connections`
       })
+      
+      console.log(`[v0] [Manager] ✓ Remove complete: ${connectionName}`)
+      
+      // Refresh connections list
+      setTimeout(() => {
+        console.log(`[v0] [Manager] → Refreshing connections list...`)
+        loadConnections()
+      }, 500)
     } catch (error) {
-      toast.error("Failed to remove connection")
+      console.error(`[v0] [Manager] ✗ Remove error for ${connectionName}:`, error)
+      toast.error("Failed to remove connection", {
+        description: error instanceof Error ? error.message : "Unknown error"
+      })
+    } finally {
+      setRemovingIds(prev => {
+        const next = new Set(prev)
+        next.delete(connectionId)
+        return next
+      })
     }
   }
 
@@ -390,6 +439,7 @@ export function DashboardActiveConnectionsManager() {
               onToggle={handleToggle}
               onRemove={handleRemove}
               isToggling={togglingIds.has(conn.connectionId)}
+              isRemoving={removingIds.has(conn.connectionId)}
               globalEngineRunning={globalEngineRunning}
             />
           ))}

@@ -56,6 +56,16 @@ export class PrehistoricCalculator {
     await this.logger.logPrehistoric(symbol, `Processing ${candles.length} candles...`)
 
     try {
+      // Update Redis with prehistoric progress tracking
+      const client = getRedisClient()
+      if (client) {
+        await client.hset(`prehistoric:${this.connectionId}`, {
+          current_symbol: symbol,
+          candles_total: candles.length.toString(),
+          start_time: startTime.toString(),
+        })
+      }
+
       // Calculate all indicators for each candle
       for (let i = 0; i < candles.length; i++) {
         const candle = candles[i]
@@ -67,9 +77,27 @@ export class PrehistoricCalculator {
 
         // Store calculated data
         await this.storeCalculatedData(symbol, candle, indicators)
+
+        // Update progress every 10 candles
+        if (i % 10 === 0 && client) {
+          await client.hset(`prehistoric:${this.connectionId}`, {
+            candles_loaded: (i + 1).toString(),
+            indicators_calculated: results.length.toString(),
+            duration: (Date.now() - startTime).toString(),
+          })
+        }
       }
 
       const duration = Date.now() - startTime
+
+      // Update final progress
+      if (client) {
+        await client.hset(`prehistoric:${this.connectionId}`, {
+          candles_loaded: candles.length.toString(),
+          indicators_calculated: results.length.toString(),
+          duration: duration.toString(),
+        })
+      }
 
       await this.progressManager.updateSymbolPrehistoric(
         symbol,

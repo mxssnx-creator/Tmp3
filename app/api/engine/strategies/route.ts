@@ -4,8 +4,35 @@ import { initRedis, getSettings, getRedisClient } from "@/lib/redis-db"
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
+// High-performance cache for strategy data (3 second TTL)
+const strategiesCache = new Map<string, { data: any; timestamp: number }>()
+const CACHE_TTL = 3000
+const MAX_CACHE_SIZE = 50 // Max entries to prevent memory bloat
+
+function cleanCache(cache: Map<string, any>) {
+  // Remove expired entries
+  const now = Date.now()
+  for (const [key, value] of cache.entries()) {
+    if (now - value.timestamp > CACHE_TTL) {
+      cache.delete(key)
+    }
+  }
+  
+  // If still too large, clear oldest entries
+  if (cache.size > MAX_CACHE_SIZE) {
+    const sortedEntries = Array.from(cache.entries())
+      .sort((a, b) => a[1].timestamp - b[1].timestamp)
+    
+    const toDelete = sortedEntries.slice(0, cache.size - MAX_CACHE_SIZE)
+    toDelete.forEach(([key]) => cache.delete(key))
+  }
+}
+
 export async function GET(req: NextRequest) {
   try {
+    // Clean cache to prevent memory bloat
+    cleanCache(strategiesCache)
+    
     const { searchParams } = new URL(req.url)
     const connectionId = searchParams.get("connectionId") || searchParams.get("id")
     
@@ -16,64 +43,112 @@ export async function GET(req: NextRequest) {
       )
     }
     
+    // Check high-performance cache first
+    const cacheKey = `strategies:${connectionId}`
+    const cached = strategiesCache.get(cacheKey)
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      return NextResponse.json(cached.data)
+    }
+    
     await initRedis()
     const redis = getRedisClient()
     
-    // Get strategy sets from Redis for this connection
-    let baseStrategyCount = 0
-    let mainStrategyCount = 0
-    let realStrategyCount = 0
-    let liveStrategyCount = 0
-    
-    try {
-      // Query Redis for strategy sets by symbol
-      const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-      
-      for (const symbol of symbols) {
-        const baseKey = `strategies:${connectionId}:${symbol}:base`
-        const mainKey = `strategies:${connectionId}:${symbol}:main`
-        const realKey = `strategies:${connectionId}:${symbol}:real`
-        const liveKey = `strategies:${connectionId}:${symbol}:live`
-        
-        const baseJson = await redis.get(baseKey)
-        const mainJson = await redis.get(mainKey)
-        const realJson = await redis.get(realKey)
-        const liveJson = await redis.get(liveKey)
-        
-        if (baseJson) {
-          const data = JSON.parse(baseJson)
-          baseStrategyCount += data.count || data.strategies?.length || 0
-        }
-        if (mainJson) {
-          const data = JSON.parse(mainJson)
-          mainStrategyCount += data.count || data.strategies?.length || 0
-        }
-        if (realJson) {
-          const data = JSON.parse(realJson)
-          realStrategyCount += data.count || data.strategies?.length || 0
-        }
-        if (liveJson) {
-          const data = JSON.parse(liveJson)
-          liveStrategyCount += data.count || data.strategies?.length || 0
-        }
-      }
-    } catch (e) {
-      console.log(`[v0] [EngineStrategies] Error reading Redis:`, e)
+    if (!redis) {
+      return NextResponse.json(
+        { error: "Redis not available" },
+        { status: 503 }
+      )
     }
     
-    return NextResponse.json({
-      connectionId,
-      strategies: {
-        base: baseStrategyCount,
-        main: mainStrategyCount,
-        real: realStrategyCount,
-        live: liveStrategyCount,
-        total: baseStrategyCount + mainStrategyCount + realStrategyCount + liveStrategyCount,
-      },
-      timestamp: new Date().toISOString(),
-    })
+    try {
+      // OPTIMIZATION: Query only the aggregated strategy counts (no SCAN to avoid hangs)
+      // Use specific Redis keys pattern instead of full SCAN
+      let baseStrategyCount = 0
+      let mainStrategyCount = 0
+      let realStrategyCount = 0
+      let evaluatedBase = 0
+      let evaluatedMain = 0
+      let evaluatedReal = 0
+      
+      // Query aggregated counts stored in Redis by the engine
+      try {
+        const aggregatedKey = `strategies:${connectionId}:aggregated`
+        const aggregated = await redis.get(aggregatedKey)
+        
+        if (aggregated) {
+          const data = JSON.parse(aggregated)
+          baseStrategyCount = data.base?.count || 0
+          mainStrategyCount = data.main?.count || 0
+          realStrategyCount = data.real?.count || 0
+          evaluatedBase = data.base?.evaluated || 0
+          evaluatedMain = data.main?.evaluated || 0
+          evaluatedReal = data.real?.evaluated || 0
+        } else {
+          // Fallback: Query only top-level keys without deep scanning
+          try {
+            const baseKey = `strategies:${connectionId}:base:aggregated`
+            const mainKey = `strategies:${connectionId}:main:aggregated`
+            const realKey = `strategies:${connectionId}:real:aggregated`
+            
+            const [baseData, mainData, realData] = await Promise.all([
+              redis.get(baseKey).catch(() => null),
+              redis.get(mainKey).catch(() => null),
+              redis.get(realKey).catch(() => null),
+            ])
+            
+            if (baseData) {
+              const parsed = JSON.parse(baseData)
+              baseStrategyCount = parsed.count || 0
+              evaluatedBase = parsed.evaluated || 0
+            }
+            if (mainData) {
+              const parsed = JSON.parse(mainData)
+              mainStrategyCount = parsed.count || 0
+              evaluatedMain = parsed.evaluated || 0
+            }
+            if (realData) {
+              const parsed = JSON.parse(realData)
+              realStrategyCount = parsed.count || 0
+              evaluatedReal = parsed.evaluated || 0
+            }
+          } catch (parseErr) {
+            // Continue with zeros
+          }
+        }
+      } catch (queryErr) {
+        console.warn(`[v0] [EngineStrategies] Error querying strategy counts:`, queryErr)
+      }
+      
+      const response = {
+        connectionId,
+        strategies: {
+          base: baseStrategyCount,
+          main: mainStrategyCount,
+          real: realStrategyCount,
+          total: baseStrategyCount + mainStrategyCount + realStrategyCount,
+        },
+        evaluated: {
+          base: evaluatedBase,
+          main: evaluatedMain,
+          real: evaluatedReal,
+          total: evaluatedBase + evaluatedMain + evaluatedReal,
+        },
+        timestamp: new Date().toISOString(),
+      }
+      
+      // Cache for 3 seconds (ultra-fast)
+      strategiesCache.set(cacheKey, { data: response, timestamp: Date.now() })
+      
+      return NextResponse.json(response)
+    } catch (redisErr) {
+      console.error(`[v0] [EngineStrategies] Redis error:`, redisErr)
+      return NextResponse.json(
+        { error: "Failed to fetch strategies from Redis" },
+        { status: 503 }
+      )
+    }
   } catch (error) {
-    console.error("[v0] [EngineStrategies] Error:", error)
+    console.error("[v0] [EngineStrategies] Fatal error:", error)
     return NextResponse.json(
       { error: "Failed to fetch strategies status" },
       { status: 500 }

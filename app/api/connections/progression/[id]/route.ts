@@ -185,12 +185,46 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       detail = progression.detail || "Ready - toggle Enable on dashboard to start"
     }
     
-    // Get recent logs for context
-    let recentLogs: any[] = []
+    // Get detailed prehistoric progress tracking
+    let prehistoricProgress = {
+      symbolsProcessed: 0,
+      symbolsTotal: 3, // BTC, ETH, SOL
+      candlesLoaded: 0,
+      candlesTotal: 0,
+      indicatorsCalculated: 0,
+      currentSymbol: "",
+      duration: 0,
+      percentComplete: 0,
+    }
+    
     try {
-      recentLogs = await getProgressionLogs(connectionId).catch(() => [])
-    } catch {
-      recentLogs = []
+      if (client) {
+        // Check for prehistoric progress tracking in Redis
+        const prehistoricData = await client.hgetall(`prehistoric:${connectionId}`).catch(() => ({}))
+        if (prehistoricData && Object.keys(prehistoricData).length > 0) {
+          prehistoricProgress.currentSymbol = prehistoricData.current_symbol || ""
+          prehistoricProgress.candlesLoaded = Number(prehistoricData.candles_loaded || 0)
+          prehistoricProgress.candlesTotal = Number(prehistoricData.candles_total || 0)
+          prehistoricProgress.indicatorsCalculated = Number(prehistoricData.indicators_calculated || 0)
+          prehistoricProgress.duration = Number(prehistoricData.duration || 0)
+          
+          // Count symbols processed based on completed prehistoric phases tracked in engine state
+          const prehistoricSymbols = await client.keys(`prehistoric:${connectionId}:*:completed`).catch(() => [])
+          prehistoricProgress.symbolsProcessed = Math.min(prehistoricSymbols.length, prehistoricProgress.symbolsTotal)
+          
+          // If no completed symbols tracked yet, infer from current activity
+          if (prehistoricProgress.symbolsProcessed === 0 && prehistoricProgress.currentSymbol) {
+            prehistoricProgress.symbolsProcessed = 1
+          }
+          
+          // Calculate percentage (symbols based, since that's the main progress unit)
+          prehistoricProgress.percentComplete = prehistoricProgress.symbolsTotal > 0
+            ? Math.round((prehistoricProgress.symbolsProcessed / prehistoricProgress.symbolsTotal) * 100)
+            : 0
+        }
+      }
+    } catch (e) {
+      console.warn(`[v0] [ProgressionAPI] Failed to get prehistoric progress for ${connectionId}:`, e)
     }
     
     const subItem = progression?.sub_item || ""
@@ -217,7 +251,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       running: engineRunning,
     })
 
-     const response = {
+    // Get recent logs for this connection
+    const recentLogs = await getProgressionLogs(connectionId)
+
+    const response = {
       success: true,
       connectionId,
       connectionName: connName,
@@ -246,6 +283,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
           liveProcessingActive: currentIdx >= 5 || engineRunning,
           liveTradingActive: phase === "live_trading",
         },
+        prehistoricProgress: prehistoricProgress,
         error: phase === "error" ? detail : null,
       },
       state: {
