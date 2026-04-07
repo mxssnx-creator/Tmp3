@@ -153,7 +153,7 @@ export function LogDialog({ connectionId, logs, onRefresh }: LogDialogProps) {
         </div>
 
         {/* Logs */}
-        <ScrollArea className="h-[500px] pr-4">
+        <ScrollArea className="h-[340px] pr-4">
           <div className="space-y-1">
             {filteredLogs.map((log) => (
               <div key={log.id} className="border rounded-lg overflow-hidden">

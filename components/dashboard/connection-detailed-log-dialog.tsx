@@ -72,16 +72,18 @@ export function ConnectionDetailedLogDialog({ connection }: ConnectionDetailedLo
       const metricsData = await metricsRes.json().catch(() => ({}))
 
       setMetrics({
-        cyclesCompleted: metricsData.summary?.enginePerformance?.cyclesCompleted || 0,
-        cycleSuccessRate: metricsData.summary?.enginePerformance?.cycleSuccessRate || 0,
-        averageCycleTime: metricsData.summary?.enginePerformance?.cycleTimeMs || 0,
-        indicationsTotal: Object.values(metricsData.summary?.indicationsCounts || {}).reduce((a: number, b: any) => a + Number(b || 0), 0),
-        strategiesEvaluated: Object.values(metricsData.summary?.strategyCounts || {}).reduce((a: number, b: any) => a + Number(b || 0), 0),
-        prehistoricCandles: metricsData.summary?.prehistoricData?.candlesProcessed || 0,
-        symbolsLoaded: metricsData.summary?.prehistoricData?.symbolsProcessed || 0,
+        cyclesCompleted: metricsData.state?.cyclesCompleted || 0,
+        cycleSuccessRate: metricsData.state?.cycleSuccessRate || 0,
+        averageCycleTime: metricsData.metrics?.cycleTimeMs || 0,
+        indicationsTotal: Object.values(metricsData.state?.indicationEvaluatedDirection || {}).reduce((a: number, b: any) => a + Number(b || 0), 0) +
+                          Object.values(metricsData.state?.indicationEvaluatedMove || {}).reduce((a: number, b: any) => a + Number(b || 0), 0) +
+                          Object.values(metricsData.state?.indicationEvaluatedActive || {}).reduce((a: number, b: any) => a + Number(b || 0), 0),
+        strategiesEvaluated: metricsData.metrics?.totalStrategiesEvaluated || metricsData.state?.strategyEvaluatedBase + metricsData.state?.strategyEvaluatedMain + metricsData.state?.strategyEvaluatedReal || 0,
+        prehistoricCandles: metricsData.metrics?.prehistoricCandlesProcessed || 0,
+        symbolsLoaded: metricsData.metrics?.prehistoricSymbolsProcessed || 0,
         cpuUsage: metricsData.monitoring?.cpu || 0,
         memoryUsage: metricsData.monitoring?.memory || 0,
-        positionsGenerated: metricsData.database?.positions1h || 0,
+        positionsGenerated: metricsData.metrics?.intervalsProcessed || 0,
       })
 
       setLogs(logsData.logs?.slice(-200) || [])
@@ -144,7 +146,7 @@ export function ConnectionDetailedLogDialog({ connection }: ConnectionDetailedLo
         </Button>
       </DialogTrigger>
 
-      <DialogContent className="max-w-5xl max-h-[92vh]">
+      <DialogContent className="max-w-4xl max-h-[84vh]">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Activity className="w-5 h-5" />
@@ -176,7 +178,7 @@ export function ConnectionDetailedLogDialog({ connection }: ConnectionDetailedLo
 
           {/* Overview Tab */}
           <TabsContent value="overview" className="mt-0">
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
               <Card className="p-3 space-y-1">
                 <div className="text-xs text-slate-500">Total Cycles</div>
                 <div className="text-xl font-bold text-slate-900">{metrics?.cyclesCompleted || 0}</div>
