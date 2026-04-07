@@ -37,6 +37,7 @@ interface VolumeCalculationResult {
 export class VolumeCalculator {
   /**
    * Calculate position volume with risk management (pure math, no DB)
+   * CRITICAL: If exchange minimum > calculated volume, REJECT position (don't force increase)
    */
   static calculatePositionVolume(params: VolumeCalculationParams): VolumeCalculationResult {
     const {
@@ -60,10 +61,16 @@ export class VolumeCalculator {
       const calculatedVolume = positionSizeUsd / currentPrice
       finalVolume = calculatedVolume
 
+      // CRITICAL: Check minimum volume constraint BEFORE accepting
       if (exchangeMinVolume > 0 && calculatedVolume < exchangeMinVolume) {
-        finalVolume = exchangeMinVolume
-        volumeAdjusted = true
-        adjustmentReason = "Adjusted to meet exchange minimum volume requirement"
+        // Position too small - REJECT instead of forcing
+        return {
+          volume: 0,
+          volumeUsd: 0,
+          leverage,
+          volumeAdjusted: true,
+          adjustmentReason: `Calculated volume ${calculatedVolume.toFixed(8)} is below exchange minimum ${exchangeMinVolume}. Position rejected.`,
+        }
       }
 
       return {
@@ -85,10 +92,18 @@ export class VolumeCalculator {
       const positionSize = adjustedRisk / (riskPercentage / 100)
       finalVolume = positionSize / (currentPrice * calculatedLeverage)
 
+      // CRITICAL: Check minimum volume constraint BEFORE accepting
       if (exchangeMinVolume > 0 && finalVolume < exchangeMinVolume) {
-        finalVolume = exchangeMinVolume
-        volumeAdjusted = true
-        adjustmentReason = "Adjusted to meet exchange minimum volume requirement"
+        // Position too small - REJECT instead of forcing
+        return {
+          calculatedVolume: finalVolume,
+          finalVolume: 0,
+          leverage: calculatedLeverage,
+          positionSize,
+          volumeAdjusted: true,
+          adjustmentReason: `Calculated volume ${finalVolume.toFixed(8)} is below exchange minimum ${exchangeMinVolume}. Position rejected.`,
+          riskAmount: adjustedRisk,
+        }
       }
 
       return {

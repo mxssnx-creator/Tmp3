@@ -5,6 +5,52 @@ import { SystemLogger } from "@/lib/system-logger"
 
 export const dynamic = "force-dynamic"
 
+// Clear ALL stale engine timers on startup
+// This fixes ReferenceError from stale closures after code updates
+function clearStaleEngineTimers() {
+  const engineGlobal = globalThis as unknown as {
+    __engine_timers?: Set<ReturnType<typeof setInterval>>
+  }
+  
+  if (engineGlobal.__engine_timers && engineGlobal.__engine_timers.size > 0) {
+    console.log(`[v0] [Trade Engine] Clearing ${engineGlobal.__engine_timers.size} stale engine timers...`)
+    for (const timer of engineGlobal.__engine_timers) {
+      try {
+        clearInterval(timer)
+      } catch {}
+    }
+    engineGlobal.__engine_timers.clear()
+  }
+}
+
+// RUNTIME FIX: Patch IndicationProcessor cache on every API call
+// This fixes the "Cannot read properties of undefined (reading 'get')" error
+function patchIndicationProcessorCaches(coordinator: any) {
+  if (!coordinator) return
+  
+  try {
+    // Access all engine managers and patch their indication processors
+    const engines = coordinator.engines || coordinator._engines || new Map()
+    for (const [, manager] of engines) {
+      if (manager?.indicationProcessor) {
+        const proc = manager.indicationProcessor
+        if (!proc.marketDataCache || !(proc.marketDataCache instanceof Map)) {
+          proc.marketDataCache = new Map()
+          console.log("[v0] [CacheFix] Patched marketDataCache for indication processor")
+        }
+        if (!proc.settingsCache) {
+          proc.settingsCache = { data: null, timestamp: 0 }
+        }
+        if (!proc.CACHE_TTL) {
+          proc.CACHE_TTL = 500
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[v0] [CacheFix] Error patching caches:", e)
+  }
+}
+
 /**
  * POST /api/trade-engine/start
  * Start the Global Trade Engine Coordinator (independent of any connections)
@@ -17,6 +63,10 @@ export const dynamic = "force-dynamic"
 export async function POST(request: NextRequest) {
   try {
     console.log("[v0] [Trade Engine] Starting Global Trade Engine Coordinator (independent of connections)")
+    
+    // CRITICAL: Clear any stale timers from previous code versions first
+    clearStaleEngineTimers()
+    
     await SystemLogger.logTradeEngine(`Starting Global Coordinator`, "info")
 
     const coordinator = getGlobalTradeEngineCoordinator()
@@ -42,7 +92,11 @@ export async function POST(request: NextRequest) {
     try {
       await coordinator.startAll()
       await coordinator.refreshEngines()
-      console.log("[v0] [Trade Engine] Coordinator workers started and refreshed")
+      
+      // CRITICAL: Apply cache fix to all indication processors after engines are started
+      patchIndicationProcessorCaches(coordinator)
+      
+      console.log("[v0] [Trade Engine] Coordinator workers started and refreshed with cache fix applied")
     } catch (engineStartError) {
       console.warn("[v0] [Trade Engine] Coordinator worker startup warning:", engineStartError)
     }

@@ -10,9 +10,10 @@
  * 5. LIVE: Final executable strategies for real exchange trading
  */
 
-import { initRedis, getSettings, setSettings } from "@/lib/redis-db"
+import { initRedis, getSettings, setSettings, getRedisClient } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { PositionThresholdManager } from "@/lib/position-threshold-manager"
+import { PseudoPositionManager } from "@/lib/trade-engine/pseudo-position-manager"
 
 export interface EvaluationMetrics {
   maxDrawdownTime: number // in minutes
@@ -341,6 +342,7 @@ export class StrategyCoordinator {
 
   /**
    * STAGE 5: Create LIVE strategies - Final production-ready strategies
+   * Also creates pseudo positions for each live strategy so positions are trackable.
    */
   private async createLiveStrategies(symbol: string, realCount: number): Promise<StrategyEvaluation> {
     const metrics = this.METRICS.live
@@ -359,6 +361,76 @@ export class StrategyCoordinator {
     // Store LIVE strategies (executable)
     const liveSetKey = `strategies:${this.connectionId}:${symbol}:live`
     await setSettings(liveSetKey, { strategies: liveStrategies, count: liveStrategies.length, created: new Date(), executable: true })
+
+    // Write live strategy count into progression hash for dashboard
+    try {
+      const client = getRedisClient()
+      const redisKey = `progression:${this.connectionId}`
+      if (liveStrategies.length > 0) {
+        await client.hincrby(redisKey, "strategies_real_total", liveStrategies.length)
+        await client.hincrby(redisKey, "strategy_evaluated_real", liveStrategies.length)
+        await client.expire(redisKey, 7 * 24 * 60 * 60)
+      }
+    } catch { /* non-critical */ }
+
+    // Create pseudo positions for each live strategy so the realtime processor can monitor them
+    if (liveStrategies.length > 0) {
+      try {
+        const posManager = new PseudoPositionManager(this.connectionId)
+        const connSettings = await getSettings(`connection:${this.connectionId}`)
+        const isLiveTradeEnabled = connSettings?.is_live_trade === true || connSettings?.is_live_trade === "1"
+
+        // Only create positions when live trade is enabled or in simulation mode
+        // Limit to top 5 live strategies per cycle to avoid position explosion
+        const toCreate = liveStrategies.slice(0, 5)
+
+        // Fetch entry price from Redis market data
+        let entryPrice = 0
+        try {
+          const client = getRedisClient()
+          const mdhash = await client.hgetall(`market_data:${symbol}`)
+          entryPrice = parseFloat(mdhash?.close || mdhash?.price || "0")
+          if (!entryPrice || isNaN(entryPrice)) {
+            const mdraw = await client.get(`market_data:${symbol}:1m`)
+            if (mdraw) {
+              const mdobj = JSON.parse(mdraw)
+              const candles = mdobj?.candles
+              if (Array.isArray(candles) && candles.length > 0) {
+                entryPrice = parseFloat(candles[candles.length - 1]?.close || "0")
+              }
+            }
+          }
+        } catch { /* fallback below */ }
+
+        // If we still have no price, skip position creation for this cycle
+        if (entryPrice <= 0) {
+          console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: No entry price available, skipping position creation`)
+        } else {
+          for (const strategy of toCreate) {
+            try {
+              const side: "long" | "short" = strategy.positionState === "reduce" || strategy.positionState === "close"
+                ? "short" : "long"
+
+              await posManager.createPosition({
+                symbol,
+                side,
+                indicationType: strategy.indication || "direction",
+                entryPrice,
+                takeprofitFactor: Math.max(0.5, (strategy.profitFactor - 1) * 100), // pf=1.5 → 50% TP
+                stoplossRatio: Math.min(5, 100 / Math.max(1, strategy.profitFactor) * 0.5), // inverse of PF
+                profitFactor: strategy.profitFactor,
+                trailingEnabled: strategy.confidence >= 0.85,
+              })
+            } catch (posErr) {
+              // Non-critical — don't let position creation stop strategy flow
+            }
+          }
+        }
+        console.log(`[v0] [StrategyFlow] ${symbol} LIVE: Created pseudo positions for ${Math.min(toCreate.length, liveStrategies.length)} live strategies`)
+      } catch (posCreateErr) {
+        console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: Position creation error:`, posCreateErr instanceof Error ? posCreateErr.message : String(posCreateErr))
+      }
+    }
 
     console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${liveStrategies.length}/${realStrategies.length} ready for trading (maxDDT=${metrics.maxDrawdownTime}min, minPF=${metrics.minProfitFactor}, confidence=${metrics.confidence})`)
 

@@ -26,9 +26,14 @@ const DEFAULT_LIMITS = {
 // Pre-cached client reference
 let cachedClient: any = null
 async function getCachedClient() {
+  // Always re-check if cachedClient is null/undefined
   if (!cachedClient) {
     await initRedis()
     cachedClient = getRedisClient()
+  }
+  // If still null after init, throw a clear error
+  if (!cachedClient) {
+    throw new Error("[IndicationSets] Redis client not available after initialization")
   }
   return cachedClient
 }
@@ -691,6 +696,16 @@ export class IndicationSetsProcessor {
   async getSetStats(symbol: string, type: string): Promise<any> {
     try {
       const client = await getCachedClient()
+      if (!client) {
+        return {
+          type,
+          totalConfigurations: 0,
+          currentEntries: 0,
+          avgProfitFactor: 0,
+          avgConfidence: 0,
+          error: "Redis client not available",
+        }
+      }
       const prefix = `indication_set:${this.connectionId}:${symbol}:${type}`
       const keys = await client.keys(`${prefix}*`)
       if (!keys || keys.length === 0) {

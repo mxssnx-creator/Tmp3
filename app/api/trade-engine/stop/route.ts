@@ -3,6 +3,23 @@ import { initRedis, getRedisClient } from "@/lib/redis-db"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { SystemLogger } from "@/lib/system-logger"
 
+// Clear ALL stale engine timers
+function clearAllEngineTimers() {
+  const engineGlobal = globalThis as unknown as {
+    __engine_timers?: Set<ReturnType<typeof setInterval>>
+  }
+  
+  if (engineGlobal.__engine_timers && engineGlobal.__engine_timers.size > 0) {
+    console.log(`[v0] [Trade Engine] Clearing ${engineGlobal.__engine_timers.size} engine timers...`)
+    for (const timer of engineGlobal.__engine_timers) {
+      try {
+        clearInterval(timer)
+      } catch {}
+    }
+    engineGlobal.__engine_timers.clear()
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     let connectionId: string | undefined
@@ -17,6 +34,9 @@ export async function POST(request: NextRequest) {
     }
 
     console.log("[v0] [Trade Engine] Stopping trade engine for connection:", connectionId || "all")
+    
+    // CRITICAL: Clear stale timers from previous code versions
+    clearAllEngineTimers()
 
     await initRedis()
     const client = getRedisClient()

@@ -10,6 +10,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import { Activity, BarChart2, Clock, Database, Play, RefreshCw, StopCircle, Zap } from "lucide-react"
+import { useExchange } from "@/lib/exchange-context"
 
 interface ProcessingLogEntry {
   timestamp: string
@@ -43,7 +44,9 @@ interface ProcessingStats {
   }
 }
 
-export function EngineProcessingLogDialog() {
+export function EngineProcessingLogDialog({ connectionId }: { connectionId?: string }) {
+  const { selectedConnectionId } = useExchange()
+  const activeConnectionId = connectionId || selectedConnectionId || "default-bingx-001"
   const [open, setOpen] = useState(false)
   const [logs, setLogs] = useState<ProcessingLogEntry[]>([])
   const [stats, setStats] = useState<ProcessingStats | null>(null)
@@ -63,7 +66,7 @@ export function EngineProcessingLogDialog() {
     try {
       const [monitorRes, connLogRes, engineRes] = await Promise.all([
         fetch('/api/system/monitoring', { cache: 'no-store' }),
-        fetch('/api/settings/connections/default-bingx-001/log', { cache: 'no-store' }),
+        fetch(`/api/settings/connections/${activeConnectionId}/log`, { cache: 'no-store' }),
         fetch('/api/engine/verify', { cache: 'no-store' })
       ])
 
@@ -167,7 +170,7 @@ export function EngineProcessingLogDialog() {
         </Button>
       </DialogTrigger>
 
-      <DialogContent className="max-w-4xl max-h-[90vh]">
+      <DialogContent className="max-w-4xl max-h-[82vh]">
         <DialogHeader>
           <DialogTitle className="flex items-center justify-between">
             <div className="flex items-center gap-2">

@@ -192,7 +192,7 @@ export function DetailedLoggingDialog() {
           Detailed Logs
         </Button>
       </DialogTrigger>
-      <DialogContent className="max-w-5xl max-h-[90vh] flex flex-col overflow-hidden">
+      <DialogContent className="max-w-4xl max-h-[82vh] flex flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle className="flex items-center justify-between">
             <span>Detailed Engine Processing Logs</span>

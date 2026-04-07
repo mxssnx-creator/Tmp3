@@ -65,7 +65,7 @@ export class MarketDataFetcher {
       // Get unique symbols from all active connections
       const symbols = new Set<string>()
       for (const conn of activeConnections) {
-        const connSymbols = conn.symbols || conn.active_symbols || ["BTCUSDT", "ETHUSDT"]
+        const connSymbols = conn.symbols || conn.active_symbols || ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         if (Array.isArray(connSymbols)) {
           connSymbols.forEach((s: string) => symbols.add(s))
         }

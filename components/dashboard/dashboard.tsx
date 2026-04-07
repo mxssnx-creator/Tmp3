@@ -2,12 +2,15 @@
 
 import React, { type ReactNode } from "react"
 import { PageHeader } from "@/components/page-header"
+import { QuickstartSection } from "./quickstart-section"
 import { SystemOverview } from "./system-overview"
 import { GlobalTradeEngineControls } from "./global-trade-engine-controls"
 import { DashboardActiveConnectionsManager } from "./dashboard-active-connections-manager"
 import { StatisticsOverviewV2 } from "./statistics-overview-v2"
 import { SystemMonitoringPanel } from "./system-monitoring-panel"
+import { VolatilityScreenerCard } from "./volatility-screener-card"
 import { Card } from "@/components/ui/card"
+import { useIndicationGenerator } from "@/components/indication-generator-hook"
 
 interface ErrorBoundaryProps { children: ReactNode; name: string }
 interface ErrorBoundaryState { hasError: boolean; error?: Error }
@@ -37,6 +40,10 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
 }
 
 export function Dashboard() {
+  // Auto-generate indications every 3 seconds using the simple generator
+  // This bypasses the stale webpack bundle issue with IndicationProcessor
+  useIndicationGenerator(true, 3000)
+  
   return (
     <div className="flex-1 flex flex-col min-h-0">
       <PageHeader
@@ -46,8 +53,16 @@ export function Dashboard() {
       />
 
       <div className="flex-1 space-y-4 px-3 md:px-4 py-4 pb-8">
+        <ErrorBoundary name="Quickstart">
+          <QuickstartSection />
+        </ErrorBoundary>
+
         <ErrorBoundary name="System Overview">
           <SystemOverview />
+        </ErrorBoundary>
+
+        <ErrorBoundary name="High Volatility Screener">
+          <VolatilityScreenerCard />
         </ErrorBoundary>
 
         <ErrorBoundary name="Trade Engine Controls">
@@ -59,7 +74,7 @@ export function Dashboard() {
         </ErrorBoundary>
 
         <ErrorBoundary name="Statistics">
-          <StatisticsOverviewV2 connections={[]} />
+          <StatisticsOverviewV2 />
         </ErrorBoundary>
 
         <ErrorBoundary name="System Monitoring">
