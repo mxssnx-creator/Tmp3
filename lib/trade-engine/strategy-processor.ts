@@ -38,6 +38,7 @@ export class StrategyProcessor {
       }
 
       if (indications.length === 0) {
+        console.warn(`[v0] [StrategyProcessor] No indications available for ${symbol} on ${this.connectionId}`)
         return { strategiesEvaluated: 0, liveReady: 0 }
       }
 
@@ -271,52 +272,14 @@ export class StrategyProcessor {
 
       // PRIMARY KEY: Main indication storage key where all indications are saved per connection
       // This is where IndicationProcessor now saves ALL 4 indication types for all symbols
-      const primaryKey = `indications:${this.connectionId}`
-      const allIndications = await getIndications(primaryKey)
+      const allIndications = await getIndications(this.connectionId, symbol)
 
       if (allIndications && Array.isArray(allIndications) && allIndications.length > 0) {
-        // Filter indications for this specific symbol
-        const symbolIndications = allIndications.filter((ind: any) => ind.symbol === symbol)
-        if (symbolIndications.length > 0) {
-          console.log(`[v0] [StrategyProcessor] Retrieved ${symbolIndications.length} indications for ${symbol} from main key`)
-          return symbolIndications
-        }
-        console.log(`[v0] [StrategyProcessor] Found ${allIndications.length} indications but none for symbol ${symbol}`)
-      } else {
-        console.log(`[v0] [StrategyProcessor] Primary key ${primaryKey} has no indications`)
+        console.log(`[v0] [StrategyProcessor] Retrieved ${allIndications.length} indications for ${symbol}/${this.connectionId}`)
+        return allIndications
       }
 
-      // FALLBACK 1: Old format - per-symbol real-time key
-      const realtimeKey = `${this.connectionId}:${symbol}:realtime`
-      const realtimeIndications = await getIndications(realtimeKey)
-      if (realtimeIndications && Array.isArray(realtimeIndications) && realtimeIndications.length > 0) {
-        console.log(`[v0] [StrategyProcessor] Retrieved ${realtimeIndications.length} indications for ${symbol} from realtime key (legacy)`)
-        return realtimeIndications
-      }
-
-      // FALLBACK 2: Older format without :realtime suffix
-      const legacyKey = `${this.connectionId}:${symbol}`
-      const legacyIndications = await getIndications(legacyKey)
-      if (legacyIndications && Array.isArray(legacyIndications) && legacyIndications.length > 0) {
-        console.log(`[v0] [StrategyProcessor] Retrieved ${legacyIndications.length} indications from legacy key=${legacyKey}`)
-        return legacyIndications
-      }
-
-      // FALLBACK 3: Broad search for any indications matching this symbol
-      const client = (await import("@/lib/redis-db")).getRedisClient()
-      const allKeys = await client.keys(`*${symbol}*`)
-      for (const key of allKeys) {
-        if (!key.includes("indications")) continue // Skip non-indication keys
-        try {
-          const altIndications = await getIndications(key)
-          if (altIndications && Array.isArray(altIndications) && altIndications.length > 0) {
-            console.log(`[v0] [StrategyProcessor] Retrieved ${altIndications.length} indications from discovered key=${key}`)
-            return altIndications
-          }
-        } catch {
-          // Continue searching
-        }
-      }
+      console.log(`[v0] [StrategyProcessor] No indications found for ${symbol} in connection ${this.connectionId}, checking fallbacks...`)
 
       // No indications found - generate them inline as a fallback
       // This bypasses the broken IndicationProcessor which has cache initialization issues

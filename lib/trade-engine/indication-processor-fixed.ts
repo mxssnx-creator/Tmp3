@@ -47,7 +47,7 @@ import { trackIndicationStats } from "@/lib/statistics-tracker"
 import { StepBasedIndicators } from "@/lib/step-based-indicators"
 
 // Pre-import modules at module load time (not per-call)
-import { initRedis, getRedisClient, getMarketData, saveIndication, getSettings } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getMarketData, saveIndication, getSettings, storeIndications } from "@/lib/redis-db"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 // Import standalone cache module to avoid this.marketDataCache issues
@@ -609,45 +609,9 @@ export class IndicationProcessor {
         const indicatorTypes = indications.map(i => i.type).join(", ")
         console.log(`[v0] [IndicationProcessor] ✓ ${symbol}: ${indications.length} indicators generated [${indicatorTypes}]`)
         
-        // Read existing indications
-        const existingRaw = await client.get(mainKey)
-        let existingIndications: any[] = []
-        if (existingRaw) {
-          try {
-            existingIndications = JSON.parse(typeof existingRaw === "string" ? existingRaw : JSON.stringify(existingRaw))
-            if (!Array.isArray(existingIndications)) {
-              existingIndications = []
-            }
-          } catch {
-            existingIndications = []
-          }
-        }
-        
-        console.log(`[v0] [IndicationProcessor] Found ${existingIndications.length} existing indications in Redis at ${mainKey}`)
-        
-        // Add new indications with symbol context
-        for (const ind of indications) {
-          existingIndications.push({
-            ...ind,
-            symbol,
-            timestamp: new Date().toISOString(),
-          })
-        }
-        
-        console.log(`[v0] [IndicationProcessor] Total indications after merge: ${existingIndications.length}`)
-        
-        // Keep only latest 1000 indications per connection to avoid memory bloat
-        if (existingIndications.length > 1000) {
-          existingIndications = existingIndications.slice(-1000)
-        }
-        
-        // Save back to Redis
-        await client.set(mainKey, JSON.stringify(existingIndications), { EX: 3600 })
-        console.log(`[v0] [IndicationProcessor] ✓ Saved ${indications.length} indications for ${symbol} to ${mainKey}, total now=${existingIndications.length}`)
-        
-        // Also save per-symbol for debugging
-        const symbolKey = `${this.connectionId}:${symbol}:realtime`
-        await saveIndication(symbolKey, indications[0])
+        // Save back to Redis using unified storage function (handles independent configuration sets)
+        await storeIndications(this.connectionId, symbol, indications)
+        console.log(`[v0] [IndicationProcessor] ✓ Stored ${indications.length} indications for ${symbol}`)
         
         // Track each indication to database for statistics and historical analysis
         for (const indication of indications) {
