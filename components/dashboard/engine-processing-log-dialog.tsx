@@ -66,7 +66,7 @@ export function EngineProcessingLogDialog({ connectionId }: { connectionId?: str
     try {
       const [monitorRes, connLogRes, engineRes] = await Promise.all([
         fetch('/api/system/monitoring', { cache: 'no-store' }),
-        fetch(`/api/settings/connections/${activeConnectionId}/log`, { cache: 'no-store' }),
+        fetch(`/api/connections/progression/${activeConnectionId}/logs`, { cache: 'no-store' }),
         fetch('/api/engine/verify', { cache: 'no-store' })
       ])
 
