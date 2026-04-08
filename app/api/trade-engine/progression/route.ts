@@ -151,19 +151,12 @@ export async function GET() {
       timestamp: new Date().toISOString(),
     }
     
-    // Cache the response for 5 seconds
+     // Cache the response for 5 seconds
     progressionCache.set(cacheKey, { data: response, timestamp: Date.now() })
     
     return NextResponse.json(response)
   } catch (error) {
     console.error("[v0] [ProgressionEngine] Critical error:", error)
-    return NextResponse.json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error",
-      connections: [],
-    }, { status: 500 })
-  }
-}
     await SystemLogger.logError(error, "api", "GET /api/trade-engine/progression").catch(() => {})
     return NextResponse.json({ 
       success: false,

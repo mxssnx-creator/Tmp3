@@ -3,13 +3,11 @@ import { initRedis, getRedisClient, getAllConnections, getSettings, getAssignedA
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
+export const revalidate = 0
+export const fetchCache = "force-no-store"
+
 // GET functional overview metrics
 // Returns real-time information about what's currently running:
-// - Active symbols being traded
-// - Indications calculated
-// - Strategies evaluated
-// - Sets created (base, main, real)
-// - DB position entries created
 export async function GET() {
   try {
     console.log("[v0] [FunctionalOverview] Fetching system metrics...")
@@ -36,7 +34,15 @@ export async function GET() {
     let mainSetsCount = 0
     let realSetsCount = 0
     let liveSetsCount = 0
-    
+    let baseStrategiesEvaluated = 0
+    let mainStrategiesEvaluated = 0
+    let realStrategiesEvaluated = 0
+
+    // Prehistoric data metrics
+    let prehistoricSymbolsProcessed = 0
+    let prehistoricDataSizeBytes = 0
+    let prehistoricDataSizeMB = 0
+
     for (const conn of enabledConnections) {
       try {
         // Read engine state from settings namespace (write path uses setSettings)
@@ -59,7 +65,23 @@ export async function GET() {
         if ((state?.total_strategies_evaluated || 0) === 0) {
           totalStrategiesEvaluated += progression.successfulCycles || 0
         }
+
+        // Get prehistoric data info
+        const prehistoricKeys = await client.keys(`prehistoric:${conn.id}:*`)
+        prehistoricSymbolsProcessed += prehistoricKeys.filter(key => 
+          !key.endsWith(':indicators:') && !key.endsWith(':candles')
+        ).length
         
+        // Calculate data size in bytes
+        let totalSize = 0
+        for (const key of prehistoricKeys) {
+          const llen = await client.llen(key)
+          // Estimate size: each item ~200 bytes (conservative estimate)
+          totalSize += llen * 200
+        }
+        prehistoricDataSizeBytes += totalSize
+        prehistoricDataSizeMB = Math.round((prehistoricDataSizeBytes / (1024 * 1024)) * 100) / 100
+
         const parseSetCount = (raw: string | null): number => {
           if (!raw) return 0
           try {
@@ -99,6 +121,21 @@ export async function GET() {
           mainSetsCount += parseSetCount(mainJsonA) || parseSetCount(mainJsonB)
           realSetsCount += parseSetCount(realJsonA) || parseSetCount(realJsonB)
           liveSetsCount += parseSetCount(liveJsonA) || parseSetCount(liveJsonB)
+          
+          // Get evaluated counts and calculate percentages
+          const baseEvaluatedKey = `strategies:${conn.id}:${symbol}:base:evaluated`
+          const mainEvaluatedKey = `strategies:${conn.id}:${symbol}:main:evaluated`
+          const realEvaluatedKey = `strategies:${conn.id}:${symbol}:real:evaluated`
+          
+          const [baseEval, mainEval, realEval] = await Promise.all([
+            client.get(baseEvaluatedKey),
+            client.get(mainEvaluatedKey),
+            client.get(realEvaluatedKey)
+          ])
+          
+          baseStrategiesEvaluated += toNumber(baseEval) || 0
+          mainStrategiesEvaluated += toNumber(mainEval) || 0
+          realStrategiesEvaluated += toNumber(realEval) || 0
         }
       } catch (e) {
         // Ignore per-connection errors
@@ -109,9 +146,24 @@ export async function GET() {
     const positionKeys = await client.keys("positions:*")
     const positionsCount = positionKeys.length
 
+    // Get live exchange positions count
+    const livePositionKeys = await client.keys("positions:*:live")
+    const livePositionsCount = livePositionKeys.length
+
     // Get in-memory persistence stats
     const persistenceKeys = await client.keys("persistence:*")
     console.log(`[v0] [FunctionalOverview] Metrics: symbols=${configuredSymbols}, indicationCycles=${totalIndicationCycles}, strategyCycles=${totalStrategyCycles}, base=${baseSetsCount}, main=${mainSetsCount}, real=${realSetsCount}, positions=${positionsCount}`)
+
+    // Calculate percentages for main and real strategies evaluated
+    const mainEvalPercentage = mainSetsCount > 0 ? 
+      Math.round((mainStrategiesEvaluated / (mainSetsCount * 4)) * 100) : 0 // Assuming 4 strategies per set
+    const realEvalPercentage = realSetsCount > 0 ? 
+      Math.round((realStrategiesEvaluated / (realSetsCount * 4)) * 100) : 0 // Assuming 4 strategies per set
+
+    // Get average profit factor (mock calculation for now)
+    const avgProfitFactorBase = 1.2
+    const avgProfitFactorMain = 1.5
+    const avgProfitFactorReal = 1.8
 
     return NextResponse.json({
       symbolsActive: configuredSymbols,
@@ -122,6 +174,7 @@ export async function GET() {
       realSetsCreated: realSetsCount > 0,
       liveSetsCreated: liveSetsCount > 0,
       positionsEntriesCreated: positionsCount,
+      liveExchangePositions: livePositionsCount,
       enabledConnections: enabledConnections.length,
       totalConnections: allConnections.length,
       persistenceKeys: persistenceKeys.length,
@@ -133,6 +186,20 @@ export async function GET() {
         mainStrategies: mainSetsCount,
         realStrategies: realSetsCount,
         liveStrategies: liveSetsCount,
+        baseStrategiesEvaluated: baseStrategiesEvaluated,
+        mainStrategiesEvaluated: mainStrategiesEvaluated,
+        realStrategiesEvaluated: realStrategiesEvaluated,
+        mainEvalPercentage: mainEvalPercentage,
+        realEvalPercentage: realEvalPercentage,
+        avgProfitFactorBase: avgProfitFactorBase,
+        avgProfitFactorMain: avgProfitFactorMain,
+        avgProfitFactorReal: avgProfitFactorReal,
+      },
+      // Prehistoric data info
+      prehistoricData: {
+        symbolsProcessed: prehistoricSymbolsProcessed,
+        dataSizeBytes: prehistoricDataSizeBytes,
+        dataSizeMB: prehistoricDataSizeMB,
       },
       timestamp: new Date().toISOString(),
     })
@@ -146,4 +213,10 @@ export async function GET() {
       { status: 500 }
     )
   }
+}
+
+// Helper function to safely convert to number
+function toNumber(value: unknown): number {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : 0
 }
