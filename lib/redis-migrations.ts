@@ -519,61 +519,63 @@ const migrations: Migration[] = [
     up: async (client: any) => {
       await client.set("_schema_version", "16")
       
-      // Migration 016: Ensure the 2 base connections are properly set up with predefined real credentials
-      // Base connections: bybit, bingx only - should be INSERTED and ENABLED
-      const baseTemplateIds = ["bybit-x03", "bingx-x01"]
-      
-      const connections = await client.smembers("connections") || []
-      let updatedTemplates = 0
-      let updatedUserConnections = 0
-      
-      console.log(`[v0] Migration 016: Ensuring predefined templates state for ${connections.length} connections`)
-      
-      for (const connId of connections) {
-        const connData = await client.hgetall(`connection:${connId}`)
-        if (!connData || Object.keys(connData).length === 0) continue
-        
-        const isPredefined = connData.is_predefined === "1" || connData.is_predefined === true
-        const isBaseTemplate = baseTemplateIds.includes(connId)
-        
-        if (isBaseTemplate) {
-          // Base connections: inserted and enabled in Settings by default
-          // Main (dashboard) enable toggle must remain OFF by default.
-          const updateData: Record<string, string> = {
-            is_inserted: "1",        // INSERTED
-            is_enabled: "1",         // ENABLED
-            is_active_inserted: "1", // In active panel
-            is_enabled_dashboard: "0",
-            is_active: "0",
-            connection_method: "library", // Use native SDK by default
-            updated_at: new Date().toISOString(),
-          }
-
-          if (baseTemplateIds.includes(connId)) {
-            const credentials = getBaseConnectionCredentials(connId as BaseConnectionId)
-            updateData.api_key = credentials.apiKey
-            updateData.api_secret = credentials.apiSecret
-          }
-          
-          await client.hset(`connection:${connId}`, updateData)
-          updatedTemplates++
-          console.log(`[v0] Migration 016: ✓ ${connId} -> inserted=1, enabled=1, dashboard_enabled=0 (base connection)`)
-        } else if (!isPredefined) {
-          // User-created connections: reset dashboard state if not properly set
-          if (!connData.is_active_inserted || !connData.is_enabled_dashboard) {
-            await client.hset(`connection:${connId}`, {
-              is_active_inserted: "0",      // Default: NOT in active panel
-              is_enabled_dashboard: "0",    // Default: NOT enabled
-              is_enabled: connData.is_enabled || "0",  // Preserve existing enabled state
-              updated_at: new Date().toISOString(),
-            })
-            updatedUserConnections++
-            console.log(`[v0] Migration 016: ✓ ${connId} reset dashboard state to defaults`)
-          }
-        }
-      }
-      
-      console.log(`[v0] Migration 016: COMPLETE - ${updatedTemplates} templates verified, ${updatedUserConnections} user connections updated`)
+// Migration 016: Ensure the 2 base connections are properly set up with predefined real credentials
+       // Base connections: bybit, bingx only - should be INSERTED and ENABLED
+       // NOTE: is_active_inserted is NOT set here - user must explicitly assign to main via dashboard
+       const baseTemplateIds = ["bybit-x03", "bingx-x01"]
+       
+       const connections = await client.smembers("connections") || []
+       let updatedTemplates = 0
+       let updatedUserConnections = 0
+       
+       console.log(`[v0] Migration 016: Ensuring predefined templates state for ${connections.length} connections`)
+       
+       for (const connId of connections) {
+         const connData = await client.hgetall(`connection:${connId}`)
+         if (!connData || Object.keys(connData).length === 0) continue
+         
+         const isPredefined = connData.is_predefined === "1" || connData.is_predefined === true
+         const isBaseTemplate = baseTemplateIds.includes(connId)
+         
+         if (isBaseTemplate) {
+           // Base connections: inserted and enabled in Settings by default
+           // Main (dashboard) enable toggle must remain OFF by default.
+           // is_active_inserted is NOT set - user must explicitly assign to main connections panel
+           const updateData: Record<string, string> = {
+             is_inserted: "1",        // INSERTED (visible in Settings base panel)
+             is_enabled: "1",         // ENABLED (independent system flag)
+             is_active_inserted: "0", // NOT in Active panel - user must explicitly assign
+             is_enabled_dashboard: "0", // Dashboard toggle OFF by default
+             is_active: "0",          // Derived: is_active_inserted AND is_enabled_dashboard
+             connection_method: "library", // Use native SDK by default
+             updated_at: new Date().toISOString(),
+           }
+           
+           if (baseTemplateIds.includes(connId)) {
+             const credentials = getBaseConnectionCredentials(connId as BaseConnectionId)
+             updateData.api_key = credentials.apiKey
+             updateData.api_secret = credentials.apiSecret
+           }
+           
+           await client.hset(`connection:${connId}`, updateData)
+           updatedTemplates++
+           console.log(`[v0] Migration 016: ✓ ${connId} -> inserted=1, enabled=1, dashboard_enabled=0 (base connection)`)
+         } else if (!isPredefined) {
+           // User-created connections: reset dashboard state if not properly set
+           if (!connData.is_active_inserted || !connData.is_enabled_dashboard) {
+             await client.hset(`connection:${connId}`, {
+               is_active_inserted: "0",      // Default: NOT in active panel
+               is_enabled_dashboard: "0",    // Default: NOT enabled
+               is_enabled: connData.is_enabled || "0",  // Preserve existing enabled state
+               updated_at: new Date().toISOString(),
+             })
+             updatedUserConnections++
+             console.log(`[v0] Migration 016: ✓ ${connId} reset dashboard state to defaults`)
+           }
+         }
+       }
+       
+       console.log(`[v0] Migration 016: COMPLETE - ${updatedTemplates} templates verified, ${updatedUserConnections} user connections updated`)
     },
     down: async (client: any) => {
       await client.set("_schema_version", "15")
@@ -880,10 +882,10 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
     await initRedis()
     const client = getRedisClient()
 
-    const persistedRunState = await client.get("_migrations_run")
-    if (persistedRunState === "true") {
-      await setMigrationsRun()
-    }
+     const persistedRunState = await client.get("_migrations_run")
+     if (persistedRunState === "true") {
+       await setMigrationsRun(true)
+     }
 
     const versionStr = await client.get("_schema_version")
     const currentVersion = versionStr ? parseInt(versionStr as string) : 0
@@ -899,7 +901,7 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
       const ensured = await ensureBaseConnections(client)
       console.log(`[v0] [Migrations] ✓ Ensured ${ensured.createdOrUpdated} base connections; injected credentials for ${ensured.credentialsInjected}`)
       
-      await setMigrationsRun()
+       await setMigrationsRun(true)
       return { success: true, message: `Already at latest version ${finalVersion}`, version: finalVersion }
     }
 
@@ -934,8 +936,8 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
     const ensured = await ensureBaseConnections(client)
     console.log(`[v0] [Migrations] ✓ Ensured ${ensured.createdOrUpdated} base connections; injected credentials for ${ensured.credentialsInjected}`)
     
-    // Mark migrations as run in this process
-    await setMigrationsRun()
+     // Mark migrations as run in this process
+     await setMigrationsRun(true)
     
     return { success: true, message: `Migrated from v${currentVersion} to v${finalVersion}`, version: finalVersion }
   } catch (error) {
