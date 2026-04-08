@@ -9,12 +9,8 @@
      · serverActions
 
  ✓ Starting...
-Attention: Next.js now collects completely anonymous telemetry regarding usage.
-This information is used to shape Next.js' roadmap and prioritize features.
-You can learn more, including how to opt-out if you'd not like to participate in this anonymous program, by visiting the following URL:
-https://nextjs.org/telemetry
-
- ✓ Compiled /instrumentation in 449ms (38 modules)
+ ○ Compiling /instrumentation ...
+ ✓ Compiled /instrumentation in 693ms (38 modules)
 [ERROR_HANDLER] Initializing production error handlers...
 [ERROR_HANDLER] Production error handlers initialized
 [METRICS] Registered metric: http_requests_total
@@ -52,4 +48,8 @@ https://nextjs.org/telemetry
 [METRICS] Registered metric: batch_operation_errors_total
 [METRICS] Registered metric: batch_item_errors_total
 [METRICS] Registered metric: retry_exhausted_total
- ✓ Ready in 1977ms
+ ✓ Ready in 2.8s
+ ○ Compiling / ...
+ ✓ Compiled / in 14.4s (1129 modules)
+ GET / 200 in 15821ms
+ ✓ Compiled in 2.1s (494 modules)
