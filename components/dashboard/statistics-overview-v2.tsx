@@ -18,8 +18,25 @@ export function StatisticsOverviewV2() {
 
   useEffect(() => {
     loadStats()
-    const interval = setInterval(loadStats, 45000) // Increased from 15s to 45s
-    return () => clearInterval(interval)
+    const interval = setInterval(loadStats, 5000) // Reduced to 5s for real-time updates
+    
+    // Listen for engine state changes to refresh immediately
+    const handleEngineStateChanged = () => loadStats()
+    
+    if (typeof window !== 'undefined') {
+      window.addEventListener('engine-state-changed', handleEngineStateChanged)
+      window.addEventListener('connection-toggled', handleEngineStateChanged)
+      window.addEventListener('live-trade-toggled', handleEngineStateChanged)
+    }
+    
+    return () => {
+      clearInterval(interval)
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('engine-state-changed', handleEngineStateChanged)
+        window.removeEventListener('connection-toggled', handleEngineStateChanged)
+        window.removeEventListener('live-trade-toggled', handleEngineStateChanged)
+      }
+    }
   }, [])
 
   const loadStats = async () => {
