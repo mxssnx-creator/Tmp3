@@ -85,8 +85,8 @@ export function EngineProcessingLogDialog({ connectionId }: { connectionId?: str
         },
         realtime: {
           intervalsProcessed: connLog.summary?.enginePerformance?.cyclesCompleted || 0,
-          indicationsGenerated: Object.values(connLog.summary?.indicationsCounts || {}).reduce((a: number, b: number) => a + b, 0),
-          strategiesEvaluated: Object.values(connLog.summary?.strategyCounts || {}).reduce((a: number, b: any) => a + (b?.evaluated || 0), 0),
+          indicationsGenerated: Object.values(connLog.summary?.indicationsCounts || {}).reduce((a: number, b: unknown) => a + Number(b || 0), 0),
+          strategiesEvaluated: Object.values(connLog.summary?.strategyCounts || {}).reduce((a: number, b: any) => a + Number(b?.evaluated || 0), 0),
           positionsCreated: connLog.summary?.enginePerformance?.totalTrades || 0,
           isActive: engine.components?.[0]?.phases?.realtime?.processing || false,
           lastCycleTime: connLog.summary?.enginePerformance?.cycleTimeMs || 0
