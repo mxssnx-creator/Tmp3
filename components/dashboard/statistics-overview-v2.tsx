@@ -18,7 +18,7 @@ export function StatisticsOverviewV2() {
 
   useEffect(() => {
     loadStats()
-    const interval = setInterval(loadStats, 45000) // Increased from 15s to 45s
+    const interval = setInterval(loadStats, 5000) // Real-time refresh every 5 seconds
     return () => clearInterval(interval)
   }, [])
 
