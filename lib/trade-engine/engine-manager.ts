@@ -221,7 +221,7 @@ export class TradeEngineManager {
       // Force an immediate indication cycle
       let immediateSymbols = await this.getSymbols()
       if (!immediateSymbols || immediateSymbols.length === 0) {
-        immediateSymbols = ["WIFUSDT", "SIRENUSDT", "DRIFTUSDT"]
+        immediateSymbols = ["DRIFTUSDT"]
       }
       const immediateResults = await Promise.all(immediateSymbols.map((symbol) => this.indicationProcessor.processIndication(symbol).catch(() => [])))
       const totalImmediateIndications = immediateResults.reduce((sum, arr) => sum + arr.length, 0)
@@ -391,7 +391,7 @@ export class TradeEngineManager {
         })
         // Fallback: load minimal market data
         try {
-          const fallbackSymbols = ["WIFUSDT", "SIRENUSDT", "DRIFTUSDT"]
+          const fallbackSymbols = ["DRIFTUSDT"]
           await loadMarketDataForEngine(fallbackSymbols)
         } catch (fallbackErr) {
           console.warn(`[v0] [Engine] Fallback market data failed:`, fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr))
@@ -1055,14 +1055,14 @@ export class TradeEngineManager {
         }
       }
 
-      // Default symbols - HIGH VOLATILITY ALTCOINS ONLY
-      // WIF, SIREN, DRIFT - specialized high-frequency altcoin trading
-      const defaultSymbols = ["WIFUSDT", "SIRENUSDT", "DRIFTUSDT"]
+      // Default symbols - SINGLE HIGH-VOLATILITY ALTCOIN FOR TESTING
+      // DRIFT - focused high-frequency trading test
+      const defaultSymbols = ["DRIFTUSDT"]
       return defaultSymbols
     } catch (error) {
       console.error("[v0] Failed to get symbols, using fallback:", error instanceof Error ? error.message : String(error))
-      // Fallback to high-volatility altcoin symbols only
-      return ["WIFUSDT", "SIRENUSDT", "DRIFTUSDT"]
+      // Fallback to test symbol only
+      return ["DRIFTUSDT"]
     }
   }
 
