@@ -1171,10 +1171,12 @@ export async function storeIndications(connectionId: string, symbol: string, ind
     await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
     
     // Also maintain per-type independent sets for high-frequency lookups
-    const typeKey = `indications:${connectionId}:${ind.type}`
-    const typeIndications = indications.filter(i => i.type === ind.type)
-    if (typeIndications.length > 0) {
-      await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
+    for (const ind of indications) {
+      const typeKey = `indications:${connectionId}:${ind.type}`
+      const typeIndications = indications.filter(i => i.type === ind.type)
+      if (typeIndications.length > 0) {
+        await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
+      }
     }
     
   } catch (error) {
