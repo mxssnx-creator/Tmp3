@@ -7,6 +7,7 @@ import { Play, FileText, Settings, Zap, RefreshCw, Loader2, TrendingUp, StopCirc
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { QuickstartComprehensiveLogDialog } from "./quickstart-comprehensive-log-dialog"
 
 interface VolatileSymbolState {
   symbol: string | null
@@ -375,10 +376,13 @@ export function QuickstartSection() {
           </Tabs>
         )}
 
-        {/* Log buttons — second row */}
+        {/* Log buttons — second row with comprehensive dialog */}
         <div className="flex flex-wrap gap-1.5 pt-1.5 border-t border-border/30">
+          {/* New comprehensive log dialog with Overall and Live Logs */}
+          <QuickstartComprehensiveLogDialog />
+          
+          {/* Legacy buttons - kept for backward compatibility */}
           {[
-            { label: "Logs", event: "open-logs-dialog" },
             { label: "Progression", event: "open-progression-logs" },
             { label: "Indications", event: "open-indications-logs" },
             { label: "Strategies", event: "open-strategies-logs" },

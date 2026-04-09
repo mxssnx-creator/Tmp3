@@ -141,8 +141,8 @@ export function SystemOverview() {
     }
 
     loadStats()
-    // Optimized: Increased polling from 5s to 45s to reduce API load
-    const interval = setInterval(loadStats, 45000)
+    // Real-time refresh every 5 seconds for active monitoring
+    const interval = setInterval(loadStats, 5000)
 
     // Listen for connection and live trade toggle events and refresh immediately
     const handleConnectionToggled = () => {

@@ -52,6 +52,32 @@ export async function GET(request: NextRequest) {
 
     const stats = await RedisMonitoring.getStatistics()
 
+    // Get real engine progression data from Redis
+    let totalCycles = 0
+    let totalIndications = 0
+    let totalStrategies = 0
+    
+    try {
+      const client = getRedisClient()
+      const progressionKeys = await client.keys("progression:*")
+      
+      for (const key of progressionKeys) {
+        try {
+          const data = await client.get(key)
+          if (data) {
+            const parsed = typeof data === "string" ? JSON.parse(data) : data
+            totalCycles += parseInt(parsed?.cyclesCompleted || parsed?.cycles || 0)
+            totalIndications += parseInt(parsed?.indications || 0)
+            totalStrategies += parseInt(parsed?.strategies || 0)
+          }
+        } catch (e) {
+          // Silently skip parse errors
+        }
+      }
+    } catch (e) {
+      console.warn(`[v0] Failed to fetch engine progression:`, e)
+    }
+
     return NextResponse.json({
       activeConnections: activeConnections.length,
       totalConnections: connections.length,
@@ -61,7 +87,17 @@ export async function GET(request: NextRequest) {
       dailyPnL: Number(dailyPnL.toFixed(2)),
       unrealizedPnL: Number(unrealizedPnL.toFixed(2)),
       totalBalance: Number((dailyPnL + unrealizedPnL).toFixed(2)),
-      statistics: stats,
+      statistics: {
+        ...stats,
+        totalCycles,
+        totalIndications,
+        totalStrategies,
+        avgCycleDuration: stats?.avgCycleDuration || 0,
+        winRate250: stats?.winRate250 || 0.5,
+        profitFactor250: stats?.profitFactor250 || 1.0,
+        winRate50: stats?.winRate50 || 0.5,
+        profitFactor50: stats?.profitFactor50 || 1.0,
+      },
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
