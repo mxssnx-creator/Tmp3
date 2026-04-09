@@ -103,6 +103,11 @@ const testingItems: Array<{
   icon: React.ComponentType<{ className?: string }>
 }> = [
   {
+    title: "Autotest & Debug",
+    href: "/autotest",
+    icon: FlaskConical,
+  },
+  {
     title: "Connection",
     href: "/testing/connection",
     icon: FlaskConical,
