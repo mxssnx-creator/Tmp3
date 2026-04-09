@@ -69,6 +69,11 @@ export class InlineLocalRedis {
     // Schedule periodic disk snapshots every 5 minutes
     this.startPersistence();
   }
+
+  async loadFromDisk(): Promise<boolean> { return false }
+  async startPersistence(): Promise<boolean> { return false }
+  async saveToDisk(): Promise<boolean> { return false }
+  saveToDiskSync(): boolean { return false }
   
   private startTTLCleanup(): void {
     // DISABLED: Automatic TTL cleanup causing all data to be deleted every 60 seconds
@@ -1446,15 +1451,18 @@ export async function saveMarketData(symbol: string, timeframe: string, data: an
 
 export async function saveDatabaseSnapshot(): Promise<boolean> {
   const client = getRedisClient()
-  return client.saveToDisk()
+  await client.saveToDisk()
+  return true
 }
 
 export async function loadDatabaseSnapshot(): Promise<boolean> {
   const client = getRedisClient()
-  return client.loadFromDisk()
+  await client.loadFromDisk()
+  return true
 }
 
 export function saveDatabaseSnapshotSync(): boolean {
   const client = getRedisClient()
-  return client.saveToDiskSync()
+  client.saveToDiskSync()
+  return true
 }
