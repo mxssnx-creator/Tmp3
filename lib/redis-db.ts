@@ -35,6 +35,7 @@ export class InlineLocalRedis {
   constructor() {
     // Use global storage for persistence across hot reloads
     if (!globalForRedis.__redis_data) {
+      // Initialize with defaults
       globalForRedis.__redis_data = {
         strings: new Map(),
         hashes: new Map(),
@@ -48,26 +49,38 @@ export class InlineLocalRedis {
           operationsPerSecond: 0,
         },
       }
+      
+      // Try to load from disk snapshot if available
+      this.loadFromDisk().catch(() => {
+        // Ignore load errors - start with empty database
+      });
     }
+    
     // Ensure ttl map exists for older data structures
     if (!globalForRedis.__redis_data.ttl) {
       globalForRedis.__redis_data.ttl = new Map()
     }
+    
     this.data = globalForRedis.__redis_data
     
     // Run cleanup every 60 seconds to remove expired keys
-    this.startTTLCleanup()
+    this.startTTLCleanup();
+    
+    // Schedule periodic disk snapshots every 5 minutes
+    this.startPersistence();
   }
   
   private startTTLCleanup(): void {
-    const globalCleanup = globalThis as unknown as { __redis_cleanup_started?: boolean }
-    if (globalCleanup.__redis_cleanup_started) return
-    globalCleanup.__redis_cleanup_started = true
+    // DISABLED: Automatic TTL cleanup causing all data to be deleted every 60 seconds
+    // Only run cleanup manually when explicitly requested
+    // const globalCleanup = globalThis as unknown as { __redis_cleanup_started?: boolean }
+    // if (globalCleanup.__redis_cleanup_started) return
+    // globalCleanup.__redis_cleanup_started = true
     
-    const ttlCleanupTimer = setInterval(() => {
-      this.cleanupExpiredKeys()
-    }, 60000)
-    ttlCleanupTimer.unref?.()
+    // const ttlCleanupTimer = setInterval(() => {
+    //   this.cleanupExpiredKeys()
+    // }, 60000)
+    // ttlCleanupTimer.unref?.()
   }
   
   private cleanupExpiredKeys(): number {
@@ -92,8 +105,10 @@ export class InlineLocalRedis {
     
     const expireAt = ttlMap.get(key)
     if (expireAt && Date.now() >= expireAt) {
-      this.deleteKey(key)
-      ttlMap.delete(key)
+      // Only delete expired keys during explicit cleanup operations
+      // Not on every read operation!
+      // this.deleteKey(key)
+      // ttlMap.delete(key)
       return true
     }
     return false
@@ -1423,4 +1438,23 @@ export async function saveMarketData(symbol: string, timeframe: string, data: an
   await client.set(key, JSON.stringify(data))
   // Set 24 hour TTL for market data
   await client.expire(key, 86400)
+}
+
+// ===========================================================================
+// EXPLICIT PERSISTENCE FUNCTIONS
+// ===========================================================================
+
+export async function saveDatabaseSnapshot(): Promise<boolean> {
+  const client = getRedisClient()
+  return client.saveToDisk()
+}
+
+export async function loadDatabaseSnapshot(): Promise<boolean> {
+  const client = getRedisClient()
+  return client.loadFromDisk()
+}
+
+export function saveDatabaseSnapshotSync(): boolean {
+  const client = getRedisClient()
+  return client.saveToDiskSync()
 }
