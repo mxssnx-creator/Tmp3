@@ -346,12 +346,13 @@ export class StrategyProcessor {
             ]
             
             // Save to Redis for future use
+            const redisClient = getRedisClient()
             const key = `indications:${this.connectionId}`
-            const existing = await client.get(key).catch(() => null)
-            const existingArr = existing ? JSON.parse(existing) : []
+            const existing = await redisClient.get(key).catch(() => null)
+            const existingArr = existing ? JSON.parse(String(existing || "[]")) : []
             existingArr.push(...generatedIndications)
             const trimmed = existingArr.slice(-1000)
-            await client.set(key, JSON.stringify(trimmed))
+            await redisClient.set(key, JSON.stringify(trimmed))
             
             return generatedIndications
           }
