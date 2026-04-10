@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server"
-import { initRedis, getActiveConnectionsForEngine, getAllConnections, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getAllConnections, getRedisClient } from "@/lib/redis-db"
 import { RedisMonitoring, RedisPositions, RedisTrades } from "@/lib/redis-operations"
 
 export const dynamic = "force-dynamic"
@@ -12,21 +12,19 @@ export async function GET(request: NextRequest) {
 
     await initRedis()
 
-    // Use getActiveConnectionsForEngine for position/trade queries (respects enabled flags)
-    // but also fall back to ALL connections so we don't miss progression data from any engine
-    let connections = await getActiveConnectionsForEngine()
-
-    // If no active connections found, fall back to all connections so progression data shows up
-    if (connections.length === 0) {
-      connections = await getAllConnections()
-    }
+    // Use all connections for position/trade queries; filter for active-inserted engines
+    const allConns = await getAllConnections()
+    let connections = allConns
 
     if (exchangeFilter) {
       connections = connections.filter((c: any) => c.exchange === exchangeFilter)
     }
 
+    // Active connections = those with a running engine (active-inserted or dashboard-enabled)
     const activeConnections = connections.filter(
       (c: any) =>
+        c.is_active_inserted === true || c.is_active_inserted === "1" ||
+        c.is_assigned === true || c.is_assigned === "1" ||
         c.is_active === true || c.is_active === "true" ||
         c.is_enabled_dashboard === true || c.is_enabled_dashboard === "1",
     )
