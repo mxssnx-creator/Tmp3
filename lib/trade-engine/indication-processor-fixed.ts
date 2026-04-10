@@ -8,8 +8,8 @@
  * @lastUpdate 2026-04-05T18:00:00Z - Restored original filename with fixed code
  */
 
-const _INDICATION_BUILD_VERSION = "5.0.0"
-const _BUILD_TIMESTAMP = 1712361600000 // Fixed timestamp to avoid constant rebuilds
+const _INDICATION_BUILD_VERSION = "5.0.1"
+const _BUILD_TIMESTAMP = 1712361660000 // Updated to force rebuild at 13:21
 
 // Log immediately on module load to confirm new code is running
 console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${_BUILD_TIMESTAMP}`)
