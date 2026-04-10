@@ -116,7 +116,16 @@ export class InlineLocalRedis {
   }
 
   private trackOperation(): void {
-    // Disabled for high performance - was causing event loop blocking at 80K+ ops/sec
+    // Lightweight: just increment the counter. Rate is computed lazily on read.
+    const stats = this.data.requestStats
+    const nowSec = Math.floor(Date.now() / 1000)
+    if (nowSec !== stats.lastSecond) {
+      // New second window: snapshot ops/sec from previous window and reset
+      stats.operationsPerSecond = stats.requestCount
+      stats.requestCount = 0
+      stats.lastSecond = nowSec
+    }
+    stats.requestCount++
   }
 
   async ping() {
@@ -129,11 +138,13 @@ export class InlineLocalRedis {
   }
 
   async get(key: string): Promise<string | null> {
+    this.trackOperation()
     if (this.isExpired(key)) return null
     return this.data.strings.get(key) ?? null
   }
 
   async set(key: string, value: string, options?: { EX?: number }): Promise<void> {
+    this.trackOperation()
     this.data.strings.set(key, value)
     if (options?.EX) {
       this.setKeyTTL(key, options.EX)
@@ -197,6 +208,7 @@ export class InlineLocalRedis {
   }
 
   async hmset(...args: string[]): Promise<void> {
+    this.trackOperation()
     if (args.length < 3) return
     const key = args[0]
     const obj: Record<string, string> = {}
@@ -207,6 +219,7 @@ export class InlineLocalRedis {
   }
 
   async hgetall(key: string): Promise<Record<string, string> | null> {
+    this.trackOperation()
     if (this.isExpired(key)) return null
     return this.data.hashes.get(key) ?? null
   }
@@ -257,6 +270,7 @@ export class InlineLocalRedis {
   }
 
   async sadd(key: string, ...members: string[]): Promise<number> {
+    this.trackOperation()
     const set = this.data.sets.get(key) || new Set()
     const sizeBefore = set.size
     for (const member of members) {
@@ -272,6 +286,7 @@ export class InlineLocalRedis {
   }
 
   async smembers(key: string): Promise<string[]> {
+    this.trackOperation()
     if (this.isExpired(key)) return []
     return Array.from(this.data.sets.get(key) || new Set())
   }
@@ -960,10 +975,16 @@ export async function closeRedis(): Promise<void> {
   isConnected = false
 }
 
-export async function getRedisRequestsPerSecond(): Promise<number> {
+export function getRedisRequestsPerSecond(): number {
   const data = globalForRedis.__redis_data
   if (!data || !data.requestStats) return 0
-  return data.requestStats.operationsPerSecond
+  const stats = data.requestStats
+  // If still within the current second, return running count; otherwise return last completed second
+  const nowSec = Math.floor(Date.now() / 1000)
+  if (nowSec === stats.lastSecond) {
+    return stats.requestCount
+  }
+  return stats.operationsPerSecond
 }
 
 export function getConnectionState(id: string): { isRunning: boolean } {
