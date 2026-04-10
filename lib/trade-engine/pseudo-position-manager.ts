@@ -93,9 +93,6 @@ export class PseudoPositionManager {
         params.symbol,
         params.indicationType,
         params.side,
-        params.takeprofitFactor,
-        params.stoplossRatio,
-        params.trailingEnabled,
       )
 
       if (!canCreate) {
@@ -373,38 +370,23 @@ export class PseudoPositionManager {
   }
 
   /**
-   * Check if can create new position for specific config+direction
+   * Check if can create a new position for a given Set (indication_type × direction).
+   * Enforces a hard limit of 1 active pseudo position per Set — meaning one open
+   * position per (symbol, indicationType, side) combination at any time.
    */
   private async canCreatePosition(
     symbol: string,
     indicationType: string,
     side: "long" | "short",
-    takeprofitFactor?: number,
-    stoplossRatio?: number,
-    trailingEnabled?: boolean,
   ): Promise<boolean> {
     try {
-      const maxSetting = await getSettings("maxPositionsPerConfigSet")
-      const maxPerConfig = maxSetting ? parseInt(String(maxSetting), 10) : 1
-
-      // Get active positions matching this config
+      // Exactly 1 active position per (symbol, indicationType, direction) Set
       const active = await this.listPositions({ status: "active", symbol, indicationType, side })
 
-      let matching: any[]
-      if (takeprofitFactor !== undefined && stoplossRatio !== undefined && trailingEnabled !== undefined) {
-        matching = active.filter(p =>
-          parseFloat(p.takeprofit_factor || "0") === takeprofitFactor &&
-          parseFloat(p.stoploss_ratio || "0") === stoplossRatio &&
-          (p.trailing_enabled === "1") === trailingEnabled
-        )
-      } else {
-        matching = active
-      }
-
-      const canCreate = matching.length < maxPerConfig
+      const canCreate = active.length < 1
 
       console.log(
-        `[v0] Position check: ${symbol} ${indicationType} ${side} | ${matching.length}/${maxPerConfig} (can create: ${canCreate})`,
+        `[v0] Position check (Set limit): ${symbol} ${indicationType} ${side} | ${active.length}/1 (can create: ${canCreate})`,
       )
 
       return canCreate

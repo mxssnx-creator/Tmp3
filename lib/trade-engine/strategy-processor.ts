@@ -58,15 +58,15 @@ export class StrategyProcessor {
         totalLiveReady += result.passedEvaluation
         
         stageSummary[result.type] = {
-          created: result.totalCreated,
-          passed: result.passedEvaluation,
-          failed: result.failedEvaluation,
+          setsEvaluated: result.totalCreated,
+          setsPassed: result.passedEvaluation,
+          setsFailed: result.failedEvaluation,
           avgProfitFactor: result.avgProfitFactor.toFixed(2),
           avgDrawdownTime: `${Math.round(result.avgDrawdownTime)}min`,
         }
 
         console.log(
-          `[v0] [StrategyFlow] ${symbol} ${result.type.toUpperCase()}: ${result.passedEvaluation}/${result.totalCreated} passed | ` +
+          `[v0] [StrategyFlow] ${symbol} ${result.type.toUpperCase()}: ${result.passedEvaluation}/${result.totalCreated} Sets passed | ` +
           `PF=${result.avgProfitFactor.toFixed(2)} | DDT=${Math.round(result.avgDrawdownTime)}min`
         )
         
@@ -89,7 +89,7 @@ export class StrategyProcessor {
       }
 
       if (totalLiveReady > 0) {
-        console.log(`[v0] [StrategyFlow] ${symbol}: ✅ READY FOR TRADING - ${totalLiveReady} live strategies created`)
+        console.log(`[v0] [StrategyFlow] ${symbol}: READY FOR TRADING - ${totalLiveReady} live Sets selected`)
         
         await logProgressionEvent(this.connectionId, `strategies_realtime`, "info", `Strategy flow completed for ${symbol}`, {
           stageSummary,
