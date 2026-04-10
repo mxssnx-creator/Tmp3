@@ -182,8 +182,15 @@ export class InlineLocalRedis {
     this.data.ttl?.clear()
   }
 
-  async hset(key: string, data: Record<string, string>): Promise<number> {
+  async hset(key: string, dataOrField: Record<string, string> | string, value?: string): Promise<number> {
+    this.trackOperation()
     const existing = this.data.hashes.get(key) || {}
+    // Support both hset(key, { field: value }) and hset(key, "field", "value")
+    if (typeof dataOrField === "string" && value !== undefined) {
+      this.data.hashes.set(key, { ...existing, [dataOrField]: value })
+      return 1
+    }
+    const data = dataOrField as Record<string, string>
     const updates = Object.keys(data).length
     this.data.hashes.set(key, { ...existing, ...data })
     return updates
