@@ -655,14 +655,42 @@ export class IndicationProcessor {
     
     // Fetch fresh data from Redis using dynamic import to avoid any stale references
     try {
-      const { getMarketData } = await import("@/lib/redis-db")
+      const { getMarketData, getClient, initRedis } = await import("@/lib/redis-db")
       // getMarketData requires both symbol and interval - use 1m as default for real-time trading
       const data = await getMarketData(symbol, "1m")
+      
+      // If no data from interval key, try direct Redis access as fallback
+      if (!data) {
+        await initRedis()
+        const client = getClient()
+        // Try the full MarketData object key
+        const rawData = await client.get(`market_data:${symbol}:1m`)
+        if (rawData) {
+          try {
+            const parsed = JSON.parse(rawData)
+            if (parsed && parsed.candles && parsed.candles.length > 0) {
+              cache.set(symbol, { data: parsed, timestamp: now })
+              return parsed
+            }
+          } catch (parseErr) {
+            console.warn(`[v0] [IndicationProcessor] Failed to parse market data for ${symbol}`)
+          }
+        }
+        
+        // Try hash key as last resort
+        const hashData = await client.hgetall(`market_data:${symbol}`)
+        if (hashData && Object.keys(hashData).length > 0) {
+          cache.set(symbol, { data: hashData, timestamp: now })
+          return hashData
+        }
+      }
+      
       if (data) {
         cache.set(symbol, { data, timestamp: now })
       }
       return data
     } catch (e) {
+      console.error(`[v0] [IndicationProcessor] Error fetching market data for ${symbol}:`, e)
       return cached?.data || null
     }
   }
