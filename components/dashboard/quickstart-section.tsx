@@ -114,21 +114,25 @@ export function QuickstartSection() {
 
     const fetchStats = async () => {
       try {
-        const res = await fetch("/api/connections/progression/default-bingx-001", { cache: "no-store" })
+        const res = await fetch(
+          `/api/trading/engine-stats?connection_id=${readiness.connectionId}`,
+          { cache: "no-store" }
+        )
         if (!res.ok) return
         const data = await res.json()
-
         setStats({
-          cycles: data.state?.cyclesCompleted || 0,
-          successRate: data.state?.cycleSuccessRate || 0,
-          indications: data.metrics?.indicationsCount || (data.state?.indicationEvaluatedDirection || 0),
-          strategies: data.metrics?.totalStrategiesEvaluated || (data.state?.strategyEvaluatedReal || 0),
-          positions: data.metrics?.intervalsProcessed || 0,
-          profit: data.state?.totalProfit || 0,
+          cycles: data.indicationCycleCount || data.strategyCycleCount || 0,
+          successRate: data.cycleSuccessRate || 0,
+          indications: data.totalIndicationsCount || data.indicationsByType?.total || 0,
+          strategies:
+            (data.baseStrategyCount || 0) +
+            (data.mainStrategyCount || 0) +
+            (data.realStrategyCount || 0),
+          positions: data.positionsCount || 0,
+          profit: data.totalProfit || 0,
         })
-      } catch (err) {
-        console.error("[v0] [Quickstart] Failed to fetch stats:", err)
-      }
+      } catch { /* non-critical */ }
+    }
     }
 
     fetchStats()
