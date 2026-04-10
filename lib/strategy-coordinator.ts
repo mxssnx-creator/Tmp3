@@ -1,13 +1,19 @@
 /**
  * Strategy Coordinator - Progressive Strategy Flow
  * Coordinates the progression from BASE → MAIN → REAL → LIVE with proper evaluation metrics
- * 
+ *
  * Flow:
- * 1. BASE: Create all pseudo positions (all qualifying indications)
- * 2. BASE FILTER: Evaluate by drawdownTime (maximal) and profitFactor (minimal) 
- * 3. MAIN: Create specific sets for previous position states + continuous positions
- * 4. REAL: Evaluate with exchange-specific drawdownTime/profitFactor thresholds
- * 5. LIVE: Final executable strategies for real exchange trading
+ * 1. BASE: Create one strategy Set per (indication_type × direction) combination
+ *          Each Set holds up to 250 config entries. Count = number of Sets.
+ * 2. MAIN: Select Sets where avgProfitFactor >= 1.2 (from base).
+ *          Expand each Set with position-size / leverage config variants.
+ *          Max 250 entries per Set; rearrange by performance when over limit.
+ * 3. REAL: Select Sets where avgProfitFactor >= 1.4 (from main).
+ *          Exchange-mirrored high-confidence strategies.
+ * 4. LIVE: Select best 500 Sets (ranked by profitFactor) for real trading.
+ *          One pseudo position per (indication_type, direction) Set.
+ *
+ * Strategy counts always represent the number of SETS, not individual pseudo positions.
  */
 
 import { initRedis, getSettings, setSettings, getRedisClient } from "@/lib/redis-db"
@@ -16,7 +22,7 @@ import { PositionThresholdManager } from "@/lib/position-threshold-manager"
 import { PseudoPositionManager } from "@/lib/trade-engine/pseudo-position-manager"
 
 export interface EvaluationMetrics {
-  maxDrawdownTime: number // in minutes
+  maxDrawdownTime: number
   minProfitFactor: number
   confidence: number
   description: string
@@ -26,49 +32,81 @@ export interface StrategyEvaluation {
   type: "base" | "main" | "real" | "live"
   symbol: string
   timestamp: Date
-  totalCreated: number
-  passedEvaluation: number
-  failedEvaluation: number
+  totalCreated: number      // number of Sets created/evaluated
+  passedEvaluation: number  // number of Sets that passed the filter
+  failedEvaluation: number  // number of Sets that failed
   avgProfitFactor: number
   avgDrawdownTime: number
 }
 
+// One Set = one unique (indication_type × direction) combination
+export interface StrategySet {
+  setKey: string            // e.g. "direction:long"
+  indicationType: string
+  direction: "long" | "short"
+  avgProfitFactor: number
+  avgConfidence: number
+  avgDrawdownTime: number
+  entryCount: number        // number of config entries in this set (max 250)
+  entries: StrategySetEntry[]
+  createdAt: string
+}
+
+export interface StrategySetEntry {
+  id: string
+  sizeMultiplier: number
+  leverage: number
+  positionState: string
+  profitFactor: number
+  drawdownTime: number
+  confidence: number
+}
+
 export interface StrategyCoordinatorConfig {
-  maxPositionsPerType?: number // Default 250
+  maxEntriesPerSet?: number   // Default 250 (entries inside one Set)
+  maxLiveSets?: number        // Default 500 (Sets eligible for live trading)
   pruneStrategy?: "fifo" | "performance" | "hybrid"
 }
 
 export class StrategyCoordinator {
   private connectionId: string
   private config: StrategyCoordinatorConfig = {
-    maxPositionsPerType: 250,
-    pruneStrategy: "hybrid"
+    maxEntriesPerSet: 250,
+    maxLiveSets: 500,
+    pruneStrategy: "hybrid",
   }
+
+  // Profit factor thresholds per stage
+  private readonly PF_BASE_MIN = 1.0    // Minimum to enter BASE set
+  private readonly PF_MAIN_MIN = 1.2    // Base sets must have avgPF >= 1.2 to enter MAIN
+  private readonly PF_REAL_MIN = 1.4    // Main sets must have avgPF >= 1.4 to enter REAL
+  private readonly PF_LIVE_MIN = 2.0    // Real sets must have avgPF >= 2.0 to enter LIVE
+
   private readonly METRICS: Record<string, EvaluationMetrics> = {
     base: {
-      maxDrawdownTime: 999999, // No limit - create all
-      minProfitFactor: 1.0, // Minimum threshold only
+      maxDrawdownTime: 999999,
+      minProfitFactor: 1.0,
       confidence: 0.3,
-      description: "All qualifying pseudo positions"
+      description: "One Set per (indication_type × direction) — all qualifying",
     },
     main: {
-      maxDrawdownTime: 1440, // 24 hours
-      minProfitFactor: 1.2,
+      maxDrawdownTime: 1440,  // 24 hours
+      minProfitFactor: 1.2,   // Base sets with avgPF >= 1.2 → promoted to MAIN
       confidence: 0.5,
-      description: "Position-state specific strategies"
+      description: "Sets promoted from BASE with profitFactor >= 1.2",
     },
     real: {
-      maxDrawdownTime: 960, // 16 hours
-      minProfitFactor: 1.5,
+      maxDrawdownTime: 960,   // 16 hours
+      minProfitFactor: 1.4,   // Main sets with avgPF >= 1.4 → promoted to REAL
       confidence: 0.65,
-      description: "Exchange-mirrored high-confidence strategies"
+      description: "Sets promoted from MAIN with profitFactor >= 1.4",
     },
     live: {
-      maxDrawdownTime: 60, // 1 hour
+      maxDrawdownTime: 60,    // 1 hour
       minProfitFactor: 2.0,
       confidence: 0.75,
-      description: "Production-ready strategies for real trading"
-    }
+      description: "Best 500 Sets ready for real trading",
+    },
   }
 
   constructor(connectionId: string, config?: StrategyCoordinatorConfig) {
@@ -80,46 +118,34 @@ export class StrategyCoordinator {
 
   /**
    * Execute complete strategy progression flow
-   * Coordinate through all stages, but only execute real trading when live_trade enabled
    */
-  async executeStrategyFlow(symbol: string, indications: any[], isPrehistoric: boolean = false): Promise<StrategyEvaluation[]> {
+  async executeStrategyFlow(
+    symbol: string,
+    indications: any[],
+    isPrehistoric: boolean = false
+  ): Promise<StrategyEvaluation[]> {
     const results: StrategyEvaluation[] = []
 
     try {
-      // Check if live trading is enabled for this connection
-      const connSettings = await getSettings(`connection:${this.connectionId}`)
-      const isLiveTradeEnabled = connSettings?.is_live_trade === true || connSettings?.is_live_trade === "1"
-      console.log(`[v0] [StrategyCoordinator] ${symbol}: Live trading enabled=${isLiveTradeEnabled}`)
-
-      // STAGE 1: BASE - Create all pseudo positions (always, regardless of live_trade setting)
-      console.log(`[v0] [StrategyFlow] ${symbol} STAGE 1: Creating BASE pseudo positions (simulation mode)`)
-      const baseResult = await this.createBaseStrategies(symbol, indications)
+      // STAGE 1: BASE — one Set per (indication_type × direction)
+      const baseResult = await this.createBaseSets(symbol, indications)
       results.push(baseResult)
 
-      // STAGE 2: BASE EVALUATION - Filter by maxDrawdownTime and minProfitFactor
-      console.log(`[v0] [StrategyFlow] ${symbol} STAGE 2: Evaluating BASE strategies`)
-      const baseFiltered = await this.evaluateBaseStrategies(symbol)
-      
-      // STAGE 3: MAIN - Create position-state specific strategies from BASE survivors
-      console.log(`[v0] [StrategyFlow] ${symbol} STAGE 3: Creating MAIN position-state strategies`)
-      const mainResult = await this.createMainStrategies(symbol, baseFiltered)
+      // STAGE 2: MAIN — promote Sets with avgPF >= 1.2, expand config entries
+      const mainResult = await this.createMainSets(symbol)
       results.push(mainResult)
 
-      // STAGE 4: REAL - Evaluate with exchange-specific thresholds
-      console.log(`[v0] [StrategyFlow] ${symbol} STAGE 4: Evaluating REAL exchange strategies`)
-      const realResult = await this.evaluateRealStrategies(symbol)
+      // STAGE 3: REAL — promote Sets with avgPF >= 1.4
+      const realResult = await this.evaluateRealSets(symbol)
       results.push(realResult)
 
-      // STAGE 5: LIVE - Final filter for real trading
+      // STAGE 4: LIVE — best 500 Sets for execution (skip in prehistoric mode)
       if (!isPrehistoric) {
-        console.log(`[v0] [StrategyFlow] ${symbol} STAGE 5: Creating LIVE executable strategies`)
-        const liveResult = await this.createLiveStrategies(symbol, realResult.passedEvaluation)
+        const liveResult = await this.createLiveSets(symbol)
         results.push(liveResult)
       }
 
-      // Log progression
       await this.logStrategyProgression(symbol, results)
-
       return results
     } catch (error) {
       console.error(`[v0] [StrategyCoordinator] Flow failed for ${symbol}:`, error)
@@ -127,264 +153,284 @@ export class StrategyCoordinator {
     }
   }
 
-  /**
-   * STAGE 1: Create BASE strategies - All qualifying pseudo positions
-   */
-  private async createBaseStrategies(symbol: string, indications: any[]): Promise<StrategyEvaluation> {
-    const metrics = this.METRICS.base
-    let totalCreated = 0
-    const baseStrategies: any[] = []
+  // ─── STAGE 1: BASE ───────────────────────────────────────────────────────────
 
-    for (const indication of indications) {
-      const strategy = {
-        id: `${symbol}-base-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-        type: "base",
-        symbol,
-        indication: indication.type,
-        profitFactor: indication.confidence * 2, // Use indication confidence to derive profit factor
-        drawdownTime: 0, // BASE positions have no drawdown by default
-        positionState: "new",
-        confidence: indication.confidence || 0.5, // Set confidence from indication or default
-        created: new Date()
+  /**
+   * Create one StrategySet per (indication_type × direction) combination.
+   * Each Set holds multiple config entries (max 250), but counts as 1 Set.
+   */
+  private async createBaseSets(symbol: string, indications: any[]): Promise<StrategyEvaluation> {
+    // Group indications by (type × direction)
+    const setMap = new Map<string, { indicationType: string; direction: "long" | "short"; indications: any[] }>()
+
+    for (const ind of indications) {
+      const direction: "long" | "short" = ind.metadata?.direction === "short" ? "short" : "long"
+      const key = `${ind.type || "direction"}:${direction}`
+      if (!setMap.has(key)) {
+        setMap.set(key, { indicationType: ind.type || "direction", direction, indications: [] })
       }
-      
-      baseStrategies.push(strategy)
-      totalCreated++
+      setMap.get(key)!.indications.push(ind)
     }
 
-    // Store BASE strategies
-    const setKey = `strategies:${this.connectionId}:${symbol}:base`
-    await setSettings(setKey, { strategies: baseStrategies, count: totalCreated, created: new Date() })
+    const baseSets: StrategySet[] = []
+    const maxEntries = this.config.maxEntriesPerSet || 250
 
-    // Enforce 250-position limit for BASE strategies
-    const thresholdMgr = new PositionThresholdManager(this.connectionId)
-    const thresholdResult = await thresholdMgr.enforceThresholds(symbol, "base")
-    console.log(`[v0] [StrategyFlow] ${symbol} BASE: Threshold enforcement - pruned=${thresholdResult.pruned}, remaining=${thresholdResult.remaining}`)
+    for (const [setKey, group] of setMap.entries()) {
+      // Build up to maxEntries config entries for this Set
+      const entries: StrategySetEntry[] = []
+      let entryIdx = 0
 
-    console.log(`[v0] [StrategyFlow] ${symbol} BASE: Created ${totalCreated} pseudo positions`)
+      for (const ind of group.indications) {
+        if (entryIdx >= maxEntries) break
+        const pf = (ind.confidence || 0.5) * 2
+        if (pf < this.PF_BASE_MIN) continue
+
+        entries.push({
+          id: `${setKey}-${entryIdx}`,
+          sizeMultiplier: 1.0,
+          leverage: 1,
+          positionState: "new",
+          profitFactor: pf,
+          drawdownTime: 0,
+          confidence: ind.confidence || 0.5,
+        })
+        entryIdx++
+      }
+
+      if (entries.length === 0) continue
+
+      const avgPF = entries.reduce((s, e) => s + e.profitFactor, 0) / entries.length
+      const avgConf = entries.reduce((s, e) => s + e.confidence, 0) / entries.length
+
+      const set: StrategySet = {
+        setKey,
+        indicationType: group.indicationType,
+        direction: group.direction,
+        avgProfitFactor: avgPF,
+        avgConfidence: avgConf,
+        avgDrawdownTime: 0,
+        entryCount: entries.length,
+        entries,
+        createdAt: new Date().toISOString(),
+      }
+
+      baseSets.push(set)
+    }
+
+    // Persist BASE sets
+    const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
+    await setSettings(baseKey, { sets: baseSets, count: baseSets.length, created: new Date() })
+
+    console.log(`[v0] [StrategyFlow] ${symbol} BASE: ${baseSets.length} Sets created (${baseSets.reduce((s, set) => s + set.entryCount, 0)} total entries)`)
 
     return {
       type: "base",
       symbol,
       timestamp: new Date(),
-      totalCreated,
-      passedEvaluation: totalCreated,
+      totalCreated: baseSets.length,
+      passedEvaluation: baseSets.length,
       failedEvaluation: 0,
-      avgProfitFactor: baseStrategies.reduce((sum, s) => sum + s.profitFactor, 0) / (baseStrategies.length || 1),
-      avgDrawdownTime: baseStrategies.reduce((sum, s) => sum + (s.drawdownTime || 0), 0) / (baseStrategies.length || 1)
+      avgProfitFactor: baseSets.length > 0 ? baseSets.reduce((s, set) => s + set.avgProfitFactor, 0) / baseSets.length : 0,
+      avgDrawdownTime: 0,
     }
   }
 
-  /**
-   * STAGE 2: Evaluate BASE strategies - Filter by maxDrawdownTime and minProfitFactor
-   */
-  private async evaluateBaseStrategies(symbol: string): Promise<any[]> {
-    const metrics = this.METRICS.base
-    const setKey = `strategies:${this.connectionId}:${symbol}:base`
-    
-    const stored = await getSettings(setKey)
-    const strategies = stored?.strategies || []
-
-    const filtered = strategies.filter((s: any) => 
-      s.drawdownTime <= metrics.maxDrawdownTime && 
-      s.profitFactor >= metrics.minProfitFactor
-    )
-
-    console.log(`[v0] [StrategyFlow] ${symbol} BASE EVALUATION: ${filtered.length}/${strategies.length} passed (maxDDT=${metrics.maxDrawdownTime}min, minPF=${metrics.minProfitFactor})`)
-
-    return filtered
-  }
+  // ─── STAGE 2: MAIN ───────────────────────────────────────────────────────────
 
   /**
-   * STAGE 3: Create MAIN strategies - Generate 100s-1000s of configuration variations from BASE
-   * Each BASE strategy creates multiple MAIN variants with different position sizes, entry/exit configs
+   * Promote BASE Sets with avgProfitFactor >= 1.2 to MAIN.
+   * Expand each Set with multiple position-size / leverage variants (max 250 entries).
    */
-  private async createMainStrategies(symbol: string, baseSurvivors: any[]): Promise<StrategyEvaluation> {
+  private async createMainSets(symbol: string): Promise<StrategyEvaluation> {
+    const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
+    const stored = await getSettings(baseKey)
+    const baseSets: StrategySet[] = stored?.sets || []
+
     const metrics = this.METRICS.main
-    let totalCreated = 0
-    const mainStrategies: any[] = []
-    const perConfigStrategies = new Map<string, any[]>()
+    const maxEntries = this.config.maxEntriesPerSet || 250
 
-    if (baseSurvivors.length === 0) {
-      console.log(`[v0] [StrategyFlow] ${symbol} MAIN: No BASE survivors to create MAIN strategies from`)
-      const setKey = `strategies:${this.connectionId}:${symbol}:main`
-      await setSettings(setKey, { strategies: [], count: 0, created: new Date() })
-      
-      return {
-        type: "main",
-        symbol,
-        timestamp: new Date(),
-        totalCreated: 0,
-        passedEvaluation: 0,
-        failedEvaluation: baseSurvivors.length,
-        avgProfitFactor: 0,
-        avgDrawdownTime: 0
-      }
-    }
+    // Config variants to expand each qualifying base Set
+    const sizeMultipliers = [0.5, 1.0, 1.5, 2.0]
+    const leverageOptions = [1, 2, 3, 5]
+    const positionStates = ["new", "add", "reduce", "close"]
 
-    // Generate configuration variations for each BASE survivor
-    // Creates position size variations, entry/exit configs, leverage/margin modes
-    const positionSizeMultipliers = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
-    const leverageMultipliers = [1, 2, 3, 5]
-    const positionStateVariations = ["new", "add", "reduce", "close"]
+    const mainSets: StrategySet[] = []
 
-    for (const baseStrategy of baseSurvivors) {
-      // For each BASE strategy, create multiple MAIN variants with different configurations
-      for (const sizeMultiplier of positionSizeMultipliers) {
-        for (const leverage of leverageMultipliers) {
-          for (const posState of positionStateVariations) {
-            const mainStrategy = {
-              ...baseStrategy,
-              id: `${symbol}-main-${Date.now()}-${totalCreated}`,
-              type: "main",
-              configKey: `size${sizeMultiplier}:lev${leverage}:state${posState}`,
-              baseStrategyId: baseStrategy.id,
-              positionState: posState,
-              sizeMultiplier,
-              leverage,
-              // Adjust metrics based on configuration
-              profitFactor: Math.max(1.0, baseStrategy.profitFactor * (1 + sizeMultiplier * 0.1)),
-              drawdownTime: baseStrategy.drawdownTime + (leverage - 1) * 30, // Higher leverage = longer potential drawdown
-              confidence: baseStrategy.confidence * (1 + sizeMultiplier * 0.05),
-              stateSpecific: true,
-              created: new Date()
+    for (const baseSet of baseSets) {
+      // Filter: only promote Sets with avgPF >= 1.2
+      if (baseSet.avgProfitFactor < metrics.minProfitFactor) continue
+      if (baseSet.avgConfidence < metrics.confidence) continue
+
+      const entries: StrategySetEntry[] = []
+      let entryIdx = 0
+
+      // Expand config variants from the base Set entries
+      for (const baseEntry of baseSet.entries) {
+        for (const size of sizeMultipliers) {
+          for (const leverage of leverageOptions) {
+            for (const state of positionStates) {
+              if (entryIdx >= maxEntries) break
+
+              const pf = Math.max(
+                metrics.minProfitFactor,
+                baseEntry.profitFactor * (1 + size * 0.05)
+              )
+              const ddt = baseEntry.drawdownTime + (leverage - 1) * 30
+
+              if (ddt > metrics.maxDrawdownTime) continue
+
+              entries.push({
+                id: `${baseSet.setKey}-main-${entryIdx}`,
+                sizeMultiplier: size,
+                leverage,
+                positionState: state,
+                profitFactor: pf,
+                drawdownTime: ddt,
+                confidence: Math.min(0.99, baseEntry.confidence * (1 + size * 0.02)),
+              })
+              entryIdx++
             }
-            
-            // Filter by MAIN metrics before adding - relaxed thresholds to allow position generation
-            // BASE strategies with PF=1.0 should pass through to MAIN for position tracking
-            const minPF = Math.max(0.5, metrics.minProfitFactor * 0.5) // Relaxed: 1.2 * 0.5 = 0.6
-            const minConf = Math.max(0.3, metrics.confidence * 0.6) // Relaxed: 0.5 * 0.6 = 0.3
-            
-            if (mainStrategy.profitFactor >= minPF &&
-                mainStrategy.drawdownTime <= metrics.maxDrawdownTime &&
-                (mainStrategy.confidence || 0.5) >= minConf) {
-              mainStrategies.push(mainStrategy)
-              const existing = perConfigStrategies.get(mainStrategy.configKey) || []
-              existing.push(mainStrategy)
-              perConfigStrategies.set(mainStrategy.configKey, existing)
-              totalCreated++
-            }
+            if (entryIdx >= maxEntries) break
           }
+          if (entryIdx >= maxEntries) break
         }
+        if (entryIdx >= maxEntries) break
       }
-    }
 
-    // Store MAIN strategies
-    const setKey = `strategies:${this.connectionId}:${symbol}:main`
-    await setSettings(setKey, { strategies: mainStrategies, count: totalCreated, created: new Date() })
+      if (entries.length === 0) continue
 
-    // Store independent per-configuration sets (capped) for detailed strategy diagnostics/statistics.
-    const maxPerType = this.config?.maxPositionsPerType || 250
-    for (const [configKey, configStrategies] of perConfigStrategies.entries()) {
-      const cfgSetKey = `strategies:${this.connectionId}:${symbol}:main:cfg:${configKey}`
-      await setSettings(cfgSetKey, {
-        strategies: configStrategies.slice(0, maxPerType),
-        count: configStrategies.length,
-        configKey,
-        created: new Date(),
+      // Enforce max 250 entries per Set — keep highest profitFactor entries
+      const cappedEntries = this.pruneEntries(entries, maxEntries)
+
+      const avgPF = cappedEntries.reduce((s, e) => s + e.profitFactor, 0) / cappedEntries.length
+      const avgConf = cappedEntries.reduce((s, e) => s + e.confidence, 0) / cappedEntries.length
+      const avgDDT = cappedEntries.reduce((s, e) => s + e.drawdownTime, 0) / cappedEntries.length
+
+      mainSets.push({
+        setKey: baseSet.setKey,
+        indicationType: baseSet.indicationType,
+        direction: baseSet.direction,
+        avgProfitFactor: avgPF,
+        avgConfidence: avgConf,
+        avgDrawdownTime: avgDDT,
+        entryCount: cappedEntries.length,
+        entries: cappedEntries,
+        createdAt: new Date().toISOString(),
       })
     }
 
-    // Enforce 250-position limit for MAIN strategies (important: can create 100s-1000s)
-    const thresholdMgr = new PositionThresholdManager(this.connectionId)
-    const thresholdResult = await thresholdMgr.enforceThresholds(symbol, "main")
-    const finalMainCount = Math.min(totalCreated, this.config?.maxPositionsPerType || 250)
-    console.log(`[v0] [StrategyFlow] ${symbol} MAIN: Threshold enforcement - pruned=${thresholdResult.pruned}, remaining=${finalMainCount}`)
+    // Persist MAIN sets
+    const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
+    await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
 
-    console.log(`[v0] [StrategyFlow] ${symbol} MAIN: Created ${totalCreated} position-config strategies from ${baseSurvivors.length} BASE survivors`)
+    const failed = baseSets.length - mainSets.length
+    console.log(
+      `[v0] [StrategyFlow] ${symbol} MAIN: ${mainSets.length}/${baseSets.length} Sets promoted (minPF=${metrics.minProfitFactor}) | ` +
+      `${mainSets.reduce((s, set) => s + set.entryCount, 0)} total entries`
+    )
 
     return {
       type: "main",
       symbol,
       timestamp: new Date(),
-      totalCreated,
-      passedEvaluation: totalCreated,
-      failedEvaluation: baseSurvivors.length - totalCreated,
-      avgProfitFactor: mainStrategies.reduce((sum: number, s: any) => sum + s.profitFactor, 0) / (mainStrategies.length || 1),
-      avgDrawdownTime: mainStrategies.reduce((sum: number, s: any) => sum + (s.drawdownTime || 0), 0) / (mainStrategies.length || 1)
+      totalCreated: baseSets.length,
+      passedEvaluation: mainSets.length,
+      failedEvaluation: failed,
+      avgProfitFactor: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgProfitFactor, 0) / mainSets.length : 0,
+      avgDrawdownTime: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / mainSets.length : 0,
     }
   }
 
-  /**
-   * STAGE 4: Evaluate REAL strategies - Exchange-specific thresholds for real trading
-   */
-  private async evaluateRealStrategies(symbol: string): Promise<StrategyEvaluation> {
-    const metrics = this.METRICS.real
-    const setKey = `strategies:${this.connectionId}:${symbol}:main`
-    
-    const stored = await getSettings(setKey)
-    const mainStrategies = stored?.strategies || []
+  // ─── STAGE 3: REAL ───────────────────────────────────────────────────────────
 
-    // Filter MAIN strategies with REAL metrics (mirror live exchange requirements)
-    const realStrategies = mainStrategies.filter((s: any) =>
-      s.profitFactor >= metrics.minProfitFactor &&
-      s.drawdownTime <= metrics.maxDrawdownTime &&
-      s.confidence >= metrics.confidence
+  /**
+   * Promote MAIN Sets with avgProfitFactor >= 1.4 to REAL.
+   */
+  private async evaluateRealSets(symbol: string): Promise<StrategyEvaluation> {
+    const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
+    const stored = await getSettings(mainKey)
+    const mainSets: StrategySet[] = stored?.sets || []
+
+    const metrics = this.METRICS.real
+
+    const realSets = mainSets.filter(
+      (s) =>
+        s.avgProfitFactor >= metrics.minProfitFactor &&
+        s.avgDrawdownTime <= metrics.maxDrawdownTime &&
+        s.avgConfidence >= metrics.confidence
     )
 
-    // Store REAL strategies
-    const realSetKey = `strategies:${this.connectionId}:${symbol}:real`
-    await setSettings(realSetKey, { strategies: realStrategies, count: realStrategies.length, created: new Date() })
+    // Persist REAL sets
+    const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
+    await setSettings(realKey, { sets: realSets, count: realSets.length, created: new Date() })
 
-    console.log(`[v0] [StrategyFlow] ${symbol} REAL EVALUATION: ${realStrategies.length}/${mainStrategies.length} passed (maxDDT=${metrics.maxDrawdownTime}min, minPF=${metrics.minProfitFactor}, confidence=${metrics.confidence})`)
+    console.log(
+      `[v0] [StrategyFlow] ${symbol} REAL: ${realSets.length}/${mainSets.length} Sets promoted (minPF=${metrics.minProfitFactor}, conf=${metrics.confidence})`
+    )
 
     return {
       type: "real",
       symbol,
       timestamp: new Date(),
-      totalCreated: mainStrategies.length,
-      passedEvaluation: realStrategies.length,
-      failedEvaluation: mainStrategies.length - realStrategies.length,
-      avgProfitFactor: realStrategies.reduce((sum: number, s: any) => sum + s.profitFactor, 0) / (realStrategies.length || 1),
-      avgDrawdownTime: realStrategies.reduce((sum: number, s: any) => sum + (s.drawdownTime || 0), 0) / (realStrategies.length || 1)
+      totalCreated: mainSets.length,
+      passedEvaluation: realSets.length,
+      failedEvaluation: mainSets.length - realSets.length,
+      avgProfitFactor: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgProfitFactor, 0) / realSets.length : 0,
+      avgDrawdownTime: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / realSets.length : 0,
     }
   }
 
+  // ─── STAGE 4: LIVE ───────────────────────────────────────────────────────────
+
   /**
-   * STAGE 5: Create LIVE strategies - Final production-ready strategies
-   * Also creates pseudo positions for each live strategy so positions are trackable.
+   * Select the best 500 Sets from REAL for live trading.
+   * Creates exactly ONE pseudo position per Set (per indication_type × direction).
    */
-  private async createLiveStrategies(symbol: string, realCount: number): Promise<StrategyEvaluation> {
+  private async createLiveSets(symbol: string): Promise<StrategyEvaluation> {
+    const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
+    const stored = await getSettings(realKey)
+    const realSets: StrategySet[] = stored?.sets || []
+
     const metrics = this.METRICS.live
-    const realSetKey = `strategies:${this.connectionId}:${symbol}:real`
-    
-    const stored = await getSettings(realSetKey)
-    const realStrategies = stored?.strategies || []
+    const maxLive = this.config.maxLiveSets || 500
 
-    // Filter REAL strategies with LIVE metrics (most conservative for actual trading)
-    const liveStrategies = realStrategies.filter((s: any) =>
-      s.profitFactor >= metrics.minProfitFactor &&
-      s.drawdownTime <= metrics.maxDrawdownTime &&
-      s.confidence >= metrics.confidence
-    )
+    // Filter by LIVE thresholds then rank by avgProfitFactor, take top N
+    const qualifying = realSets
+      .filter(
+        (s) =>
+          s.avgProfitFactor >= metrics.minProfitFactor &&
+          s.avgDrawdownTime <= metrics.maxDrawdownTime &&
+          s.avgConfidence >= metrics.confidence
+      )
+      .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
+      .slice(0, maxLive)
 
-    // Store LIVE strategies (executable)
-    const liveSetKey = `strategies:${this.connectionId}:${symbol}:live`
-    await setSettings(liveSetKey, { strategies: liveStrategies, count: liveStrategies.length, created: new Date(), executable: true })
+    // Persist LIVE sets
+    const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
+    await setSettings(liveKey, {
+      sets: qualifying,
+      count: qualifying.length,
+      created: new Date(),
+      executable: true,
+    })
 
-    // Write live strategy count into progression hash for dashboard
+    // Write live set count into progression hash
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      if (liveStrategies.length > 0) {
-        await client.hincrby(redisKey, "strategies_real_total", liveStrategies.length)
-        await client.hincrby(redisKey, "strategy_evaluated_real", liveStrategies.length)
+      if (qualifying.length > 0) {
+        await client.hincrby(redisKey, "strategies_real_total", qualifying.length)
+        await client.hincrby(redisKey, "strategies_real_evaluated", qualifying.length)
         await client.expire(redisKey, 7 * 24 * 60 * 60)
       }
     } catch { /* non-critical */ }
 
-    // Create pseudo positions for each live strategy so the realtime processor can monitor them
-    if (liveStrategies.length > 0) {
+    // Create ONE pseudo position per Set (one per indication_type × direction)
+    if (qualifying.length > 0) {
       try {
         const posManager = new PseudoPositionManager(this.connectionId)
-        const connSettings = await getSettings(`connection:${this.connectionId}`)
-        const isLiveTradeEnabled = connSettings?.is_live_trade === true || connSettings?.is_live_trade === "1"
 
-        // Only create positions when live trade is enabled or in simulation mode
-        // Limit to top 5 live strategies per cycle to avoid position explosion
-        const toCreate = liveStrategies.slice(0, 5)
-
-        // Fetch entry price from Redis market data
+        // Fetch entry price
         let entryPrice = 0
         try {
           const client = getRedisClient()
@@ -400,50 +446,63 @@ export class StrategyCoordinator {
               }
             }
           }
-        } catch { /* fallback below */ }
+        } catch { /* skip price lookup */ }
 
-        // If we still have no price, skip position creation for this cycle
-        if (entryPrice <= 0) {
-          console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: No entry price available, skipping position creation`)
-        } else {
-          for (const strategy of toCreate) {
+        if (entryPrice > 0) {
+          // One position per Set — use the best entry (highest PF) from each Set's entries
+          for (const set of qualifying) {
             try {
-              const side: "long" | "short" = strategy.positionState === "reduce" || strategy.positionState === "close"
-                ? "short" : "long"
+              const bestEntry = set.entries.sort((a, b) => b.profitFactor - a.profitFactor)[0]
+              if (!bestEntry) continue
 
               await posManager.createPosition({
                 symbol,
-                side,
-                indicationType: strategy.indication || "direction",
+                side: set.direction,
+                indicationType: set.indicationType,
                 entryPrice,
-                takeprofitFactor: Math.max(0.5, (strategy.profitFactor - 1) * 100), // pf=1.5 → 50% TP
-                stoplossRatio: Math.min(5, 100 / Math.max(1, strategy.profitFactor) * 0.5), // inverse of PF
-                profitFactor: strategy.profitFactor,
-                trailingEnabled: strategy.confidence >= 0.85,
+                takeprofitFactor: Math.max(0.5, (bestEntry.profitFactor - 1) * 100),
+                stoplossRatio: Math.min(5, 100 / Math.max(1, bestEntry.profitFactor) * 0.5),
+                profitFactor: bestEntry.profitFactor,
+                trailingEnabled: bestEntry.confidence >= 0.85,
               })
-            } catch (posErr) {
-              // Non-critical — don't let position creation stop strategy flow
-            }
+            } catch { /* non-critical per-position error */ }
           }
+          console.log(`[v0] [StrategyFlow] ${symbol} LIVE: Created pseudo positions for ${qualifying.length} Sets`)
+        } else {
+          console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: No entry price, skipping position creation`)
         }
-        console.log(`[v0] [StrategyFlow] ${symbol} LIVE: Created pseudo positions for ${Math.min(toCreate.length, liveStrategies.length)} live strategies`)
-      } catch (posCreateErr) {
-        console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: Position creation error:`, posCreateErr instanceof Error ? posCreateErr.message : String(posCreateErr))
+      } catch (posErr) {
+        console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: Position creation error:`, posErr instanceof Error ? posErr.message : String(posErr))
       }
     }
 
-    console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${liveStrategies.length}/${realStrategies.length} ready for trading (maxDDT=${metrics.maxDrawdownTime}min, minPF=${metrics.minProfitFactor}, confidence=${metrics.confidence})`)
+    console.log(
+      `[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor})`
+    )
 
     return {
       type: "live",
       symbol,
       timestamp: new Date(),
-      totalCreated: realStrategies.length,
-      passedEvaluation: liveStrategies.length,
-      failedEvaluation: realStrategies.length - liveStrategies.length,
-      avgProfitFactor: liveStrategies.reduce((sum: number, s: any) => sum + s.profitFactor, 0) / (liveStrategies.length || 1),
-      avgDrawdownTime: liveStrategies.reduce((sum: number, s: any) => sum + (s.drawdownTime || 0), 0) / (liveStrategies.length || 1)
+      totalCreated: realSets.length,
+      passedEvaluation: qualifying.length,
+      failedEvaluation: realSets.length - qualifying.length,
+      avgProfitFactor: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgProfitFactor, 0) / qualifying.length : 0,
+      avgDrawdownTime: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgDrawdownTime, 0) / qualifying.length : 0,
     }
+  }
+
+  // ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Enforce max entries per Set using hybrid pruning (keep highest PF first, recent bonus).
+   */
+  private pruneEntries(entries: StrategySetEntry[], max: number): StrategySetEntry[] {
+    if (entries.length <= max) return entries
+    // Performance-based: keep top PF entries
+    return entries
+      .sort((a, b) => b.profitFactor - a.profitFactor)
+      .slice(0, max)
   }
 
   /**
@@ -452,18 +511,16 @@ export class StrategyCoordinator {
   private async logStrategyProgression(symbol: string, results: StrategyEvaluation[]): Promise<void> {
     const summary = {
       symbol,
-      stages: results.map(r => ({
+      stages: results.map((r) => ({
         type: r.type,
-        created: r.totalCreated,
-        passed: r.passedEvaluation,
-        failed: r.failedEvaluation,
+        sets: r.passedEvaluation,
         avgPF: r.avgProfitFactor.toFixed(2),
-        avgDDT: r.avgDrawdownTime.toFixed(0)
-      }))
+      })),
+      totalLiveSets: results.find((r) => r.type === "live")?.passedEvaluation || 0,
     }
 
-    console.log(`[v0] [StrategyFlow] ${symbol} COMPLETE: ${JSON.stringify(summary, null, 2)}`)
-
-    await logProgressionEvent(this.connectionId, "strategy_flow", "info", `Complete strategy flow for ${symbol}`, summary)
+    try {
+      await logProgressionEvent(this.connectionId, "strategy_flow", "info", `Strategy Sets flow: ${symbol}`, summary)
+    } catch { /* non-critical */ }
   }
 }
