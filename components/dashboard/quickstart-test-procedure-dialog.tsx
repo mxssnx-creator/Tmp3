@@ -165,16 +165,32 @@ export function QuickstartTestProcedureDialog() {
 
     const poll = async () => {
       try {
-        const res = await fetch("/api/monitoring/stats", { cache: "no-store" })
+        // Use per-connection engine-stats when a connection is selected for accurate counts
+        const connId = selectedConnection?.id
+        const statsUrl = connId
+          ? `/api/trading/engine-stats?connection_id=${connId}`
+          : "/api/monitoring/stats"
+        const res = await fetch(statsUrl, { cache: "no-store" })
         if (!res.ok) return
         const data = await res.json()
-        setLiveMonitor({
-          cycles: data.statistics?.totalCycles || 0,
-          indications: data.statistics?.totalIndications || 0,
-          strategies: data.statistics?.totalStrategies || 0,
-          connections: data.activeConnections || 0,
-          symbols: data.statistics?.symbolsProcessed || 0,
-        })
+
+        if (connId) {
+          setLiveMonitor({
+            cycles: data.indicationCycleCount || data.strategyCycleCount || data.cyclesCompleted || 0,
+            indications: data.totalIndicationsCount || data.indications?.totalRecords || 0,
+            strategies: (data.baseStrategyCount || 0) + (data.mainStrategyCount || 0) + (data.realStrategyCount || 0) + (data.liveStrategyCount || 0),
+            connections: 1,
+            symbols: data.symbolsProcessed || 0,
+          })
+        } else {
+          setLiveMonitor({
+            cycles: data.statistics?.totalCycles || 0,
+            indications: data.statistics?.totalIndications || 0,
+            strategies: data.statistics?.totalStrategies || 0,
+            connections: data.activeConnections || 0,
+            symbols: data.statistics?.symbolsProcessed || 0,
+          })
+        }
       } catch { /* non-critical */ }
     }
 
@@ -183,7 +199,7 @@ export function QuickstartTestProcedureDialog() {
     return () => {
       if (liveMonitorRef.current) clearInterval(liveMonitorRef.current)
     }
-  }, [isRunning])
+  }, [isRunning, selectedConnection?.id])
 
   const resetTest = useCallback(() => {
     setSteps(
