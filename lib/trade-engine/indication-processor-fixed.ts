@@ -337,20 +337,54 @@ export class IndicationProcessor {
         // Try to load market data if not available
         const redis = await getRedisHelpers()
         await redis.initRedis()
+        const client = redis.getClient()
 
         // Force load market data for this symbol
         const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
         await loadMarketDataForEngine([symbol])
 
-        // Retry getting market data
-        const retryMarketData = await this.getLatestMarketDataCached(symbol)
-        if (!retryMarketData) {
+        // Clear cache entry and force direct Redis read after loading
+        SHARED_MARKET_DATA_CACHE.delete(symbol)
+        
+        // Try direct Redis read - bypass cache completely after load
+        // Key format from market-data-loader: market_data:${symbol}:1m
+        const directData = await client.get(`market_data:${symbol}:1m`)
+        if (directData) {
+          try {
+            const parsed = JSON.parse(directData)
+            if (parsed && parsed.candles && parsed.candles.length > 0) {
+              // Return the latest candle as market data
+              const latestCandle = parsed.candles[parsed.candles.length - 1]
+              marketData = {
+                symbol,
+                price: latestCandle.close,
+                open: latestCandle.open,
+                high: latestCandle.high,
+                low: latestCandle.low,
+                close: latestCandle.close,
+                volume: latestCandle.volume,
+                timestamp: new Date(latestCandle.timestamp).toISOString(),
+              }
+              SHARED_MARKET_DATA_CACHE.set(symbol, { data: marketData, timestamp: Date.now() })
+            }
+          } catch (e) {
+            console.warn(`[v0] [IndicationProcessor] Failed to parse direct market data for ${symbol}`)
+          }
+        }
+        
+        // If still no data, try hash key
+        if (!marketData) {
+          const hashData = await client.hgetall(`market_data:${symbol}`)
+          if (hashData && Object.keys(hashData).length > 0) {
+            marketData = hashData
+            SHARED_MARKET_DATA_CACHE.set(symbol, { data: marketData, timestamp: Date.now() })
+          }
+        }
+        
+        if (!marketData) {
           console.log(`[v0] [IndicationProcessor] No market data available for ${symbol} after loading attempt`)
           return []
         }
-        console.log(`[v0] [IndicationProcessor] Market data loaded on-demand for ${symbol}`)
-        // Continue with the loaded market data
-        marketData = retryMarketData
       }
 
       // Get historical candles for step-based calculations
