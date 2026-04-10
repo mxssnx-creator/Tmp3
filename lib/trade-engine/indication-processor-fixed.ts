@@ -552,7 +552,8 @@ export class IndicationProcessor {
       
       // ADVANCED INDICATIONS (8+ per symbol for comprehensive analysis):
       // 5. RSI-based Indication (Overbought/Oversold signals)
-      const avgRSI = Object.values(stepRSI).reduce((sum: number, item: any) => sum + (item.rsi || 50), 0) / Object.keys(stepRSI).length
+      const stepRSICount = Object.keys(stepRSI).length || 1
+      const avgRSI = Object.values(stepRSI).reduce((sum: number, item: any) => sum + (item.rsi || 50), 0) / stepRSICount
       indications.push({
         type: "rsi_signal",
         symbol,
@@ -562,8 +563,9 @@ export class IndicationProcessor {
       })
       
       // 6. MACD-based Indication
-      const avgMACD = Object.values(stepMACD).reduce((sum: number, item: any) => sum + (item.macd || 0), 0) / Object.keys(stepMACD).length
-      const avgSignal = Object.values(stepMACD).reduce((sum: number, item: any) => sum + (item.signal || 0), 0) / Object.keys(stepMACD).length
+      const stepMACDCount = Object.keys(stepMACD).length || 1
+      const avgMACD = Object.values(stepMACD).reduce((sum: number, item: any) => sum + (item.macd || 0), 0) / stepMACDCount
+      const avgSignal = Object.values(stepMACD).reduce((sum: number, item: any) => sum + (item.signal || 0), 0) / stepMACDCount
       indications.push({
         type: "macd_signal",
         symbol,
@@ -582,8 +584,9 @@ export class IndicationProcessor {
       })
       
       // 8. Trend Strength Indication
-      const avgMA = Object.values(stepDirections).reduce((sum: number, item: any) => sum + (item.ma || 0), 0) / Object.keys(stepDirections).length
-      const distanceFromMA = Math.abs(currentClose - avgMA) / avgMA * 100
+      const stepDirectionsCount = Object.keys(stepDirections).length || 1
+      const avgMA = Object.values(stepDirections).reduce((sum: number, item: any) => sum + (item.ma || 0), 0) / stepDirectionsCount
+      const distanceFromMA = avgMA > 0 ? Math.abs(currentClose - avgMA) / avgMA * 100 : 0
       indications.push({
         type: "trend_strength",
         symbol,
@@ -611,8 +614,9 @@ export class IndicationProcessor {
       })
       
       // 11. Support/Resistance from BB
-      const avgBBLower = Object.values(stepBB).reduce((sum: number, item: any) => sum + (item.lower || 0), 0) / Object.keys(stepBB).length
-      const avgBBUpper = Object.values(stepBB).reduce((sum: number, item: any) => sum + (item.upper || 0), 0) / Object.keys(stepBB).length
+      const stepBBCount = Object.keys(stepBB).length || 1
+      const avgBBLower = Object.values(stepBB).reduce((sum: number, item: any) => sum + (item.lower || 0), 0) / stepBBCount
+      const avgBBUpper = Object.values(stepBB).reduce((sum: number, item: any) => sum + (item.upper || 0), 0) / stepBBCount
       indications.push({
         type: "support_resistance",
         symbol,
