@@ -35,6 +35,7 @@ function normalizeApiTypeForExchange(apiType: string, exchangeSupported: string[
     // Find which perpetual variant the exchange supports
     for (const variant of PERPETUAL_EQUIVALENTS) {
       if (exchangeSupported.includes(variant)) {
+        console.log(`[v0] API type normalized: ${apiType} -> ${variant}`)
         return variant
       }
     }
