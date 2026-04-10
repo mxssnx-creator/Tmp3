@@ -329,7 +329,6 @@ export class IndicationProcessor {
    * Returns array of active indications for strategy processing
    */
   async processIndication(symbol: string): Promise<any[]> {
-    console.log(`[v0] [DEBUG-MARKER-2026-04-10] processIndication called for ${symbol}`)
     try {
       // Defensive initialization - ensure cache exists even if constructor failed
       if (!this.marketDataCache) {
@@ -337,26 +336,21 @@ export class IndicationProcessor {
       }
       
       let marketData = await this.getLatestMarketDataCached(symbol)
-      console.log(`[v0] [DEBUG-MARKER-2026-04-10] getLatestMarketDataCached returned: ${marketData ? 'DATA' : 'NULL'} for ${symbol}`)
       if (!marketData) {
         // Try to load market data if not available
         await initRedis()
         const client = getRedisClient()
-        console.log(`[v0] [DEBUG-MARKER-2026-04-10] Redis client ready, loading market data for ${symbol}`)
 
         // Force load market data for this symbol
         const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
-        const loadedCount = await loadMarketDataForEngine([symbol])
-        console.log(`[v0] [DEBUG-MARKER-2026-04-10] loadMarketDataForEngine returned: ${loadedCount} for ${symbol}`)
+        await loadMarketDataForEngine([symbol])
 
         // Clear cache entry and force direct Redis read after loading
         SHARED_MARKET_DATA_CACHE.delete(symbol)
         
         // Try direct Redis read - bypass cache completely after load
         // Key format from market-data-loader: market_data:${symbol}:1m
-        const directKey = `market_data:${symbol}:1m`
-        const directData = await client.get(directKey)
-        console.log(`[v0] [IndicationProcessor] Direct Redis read ${directKey}: ${directData ? 'FOUND (' + String(directData).length + ' chars)' : 'NOT FOUND'}`)
+        const directData = await client.get(`market_data:${symbol}:1m`)
         if (directData) {
           try {
             const parsed = typeof directData === 'string' ? JSON.parse(directData) : directData
@@ -374,7 +368,6 @@ export class IndicationProcessor {
                 timestamp: new Date(latestCandle.timestamp).toISOString(),
               }
               SHARED_MARKET_DATA_CACHE.set(symbol, { data: marketData, timestamp: Date.now() })
-              console.log(`[v0] [IndicationProcessor] ✓ Market data extracted from ${directKey}: price=${marketData.price}`)
             }
           } catch (e) {
             console.warn(`[v0] [IndicationProcessor] Failed to parse direct market data for ${symbol}:`, e)

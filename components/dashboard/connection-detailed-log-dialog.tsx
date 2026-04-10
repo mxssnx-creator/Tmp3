@@ -72,18 +72,19 @@ export function ConnectionDetailedLogDialog({ connection }: ConnectionDetailedLo
       const metricsData = await metricsRes.json().catch(() => ({}))
 
       setMetrics({
-        cyclesCompleted: metricsData.state?.cyclesCompleted || 0,
-        cycleSuccessRate: metricsData.state?.cycleSuccessRate || 0,
-        averageCycleTime: metricsData.metrics?.cycleTimeMs || 0,
-        indicationsTotal: Object.values(metricsData.state?.indicationEvaluatedDirection || {}).reduce((a: number, b: any) => a + Number(b || 0), 0) +
-                          Object.values(metricsData.state?.indicationEvaluatedMove || {}).reduce((a: number, b: any) => a + Number(b || 0), 0) +
-                          Object.values(metricsData.state?.indicationEvaluatedActive || {}).reduce((a: number, b: any) => a + Number(b || 0), 0),
-        strategiesEvaluated: metricsData.metrics?.totalStrategiesEvaluated || metricsData.state?.strategyEvaluatedBase + metricsData.state?.strategyEvaluatedMain + metricsData.state?.strategyEvaluatedReal || 0,
-        prehistoricCandles: metricsData.metrics?.prehistoricCandlesProcessed || 0,
-        symbolsLoaded: metricsData.metrics?.prehistoricSymbolsProcessed || 0,
+        cyclesCompleted: metricsData.state?.cyclesCompleted || metricsData.progressionState?.cyclesCompleted || 0,
+        cycleSuccessRate: metricsData.state?.cycleSuccessRate || metricsData.progressionState?.cycleSuccessRate || 0,
+        averageCycleTime: metricsData.metrics?.cycleTimeMs || metricsData.progressionState?.cycleTimeMs || 0,
+        indicationsTotal: metricsData.state?.indicationsCount || metricsData.progressionState?.indicationsCount || 
+                          metricsData.metrics?.indicationsCount || 0,
+        strategiesEvaluated: metricsData.metrics?.totalStrategiesEvaluated || metricsData.progressionState?.strategyEvaluatedBase + 
+                            (metricsData.progressionState?.strategyEvaluatedMain || 0) + 
+                            (metricsData.progressionState?.strategyEvaluatedReal || 0) || 0,
+        prehistoricCandles: metricsData.metrics?.prehistoricCandlesProcessed || metricsData.progressionState?.prehistoricCandlesProcessed || 0,
+        symbolsLoaded: metricsData.metrics?.prehistoricSymbolsProcessed || metricsData.progressionState?.prehistoricSymbolsProcessedCount || 0,
         cpuUsage: metricsData.monitoring?.cpu || 0,
         memoryUsage: metricsData.monitoring?.memory || 0,
-        positionsGenerated: metricsData.metrics?.intervalsProcessed || 0,
+        positionsGenerated: metricsData.metrics?.intervalsProcessed || metricsData.progressionState?.intervalsProcessed || 0,
       })
 
       setLogs(logsData.logs?.slice(-200) || [])
@@ -146,7 +147,7 @@ export function ConnectionDetailedLogDialog({ connection }: ConnectionDetailedLo
         </Button>
       </DialogTrigger>
 
-      <DialogContent className="max-w-4xl max-h-[84vh]">
+      <DialogContent className="max-w-4xl max-h-[80vh]">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Activity className="w-5 h-5" />
