@@ -9,14 +9,35 @@ import type { BaseExchangeConnector, ExchangeCredentials } from "./base-connecto
 import { EXCHANGE_API_TYPES } from "@/lib/connection-predefinitions"
 
 // Version marker for cache invalidation
-const _CONNECTOR_VERSION = "2.1.0"
+const _CONNECTOR_VERSION = "2.2.0"
 
-// API type aliases - normalize common variations
-const API_TYPE_ALIASES: Record<string, string> = {
-  perpetual_futures: "perpetual",
-  futures: "perpetual",
-  perp: "perpetual",
-  swap: "perpetual",
+// Perpetual-type equivalents that can be normalized between exchanges
+const PERPETUAL_EQUIVALENTS = ["perpetual", "perpetual_futures", "perp", "swap"]
+
+/**
+ * Normalize API type to what the specific exchange supports.
+ * Different exchanges use different names for the same thing:
+ * - bingx uses "perpetual_futures" 
+ * - pionex/orangex/gateio use "perpetual"
+ * This function converts between them based on what the exchange accepts.
+ */
+function normalizeApiTypeForExchange(apiType: string, exchangeSupported: string[]): string {
+  if (!exchangeSupported || !apiType) return apiType
+  
+  // If already supported, no change needed
+  if (exchangeSupported.includes(apiType)) return apiType
+  
+  // Check if this is a perpetual-type that needs conversion
+  if (PERPETUAL_EQUIVALENTS.includes(apiType)) {
+    // Find which perpetual variant the exchange supports
+    for (const variant of PERPETUAL_EQUIVALENTS) {
+      if (exchangeSupported.includes(variant)) {
+        return variant
+      }
+    }
+  }
+  
+  return apiType
 }
 
 export async function createExchangeConnector(
@@ -25,19 +46,19 @@ export async function createExchangeConnector(
 ): Promise<BaseExchangeConnector> {
   const normalizedExchange = exchange.toLowerCase().replace(/[^a-z]/g, "")
 
-  // Normalize API type using aliases
-  if (credentials.apiType && API_TYPE_ALIASES[credentials.apiType]) {
-    credentials.apiType = API_TYPE_ALIASES[credentials.apiType]
+  // Get supported types for this exchange
+  const supported = EXCHANGE_API_TYPES[normalizedExchange]
+  
+  // Normalize API type based on what this specific exchange supports
+  if (credentials.apiType && supported) {
+    credentials.apiType = normalizeApiTypeForExchange(credentials.apiType, supported)
   }
   
   // Validate API type is supported for the exchange
-  if (credentials.apiType) {
-    const supported = EXCHANGE_API_TYPES[normalizedExchange]
-    if (supported && !supported.includes(credentials.apiType)) {
-      throw new Error(
-        `Invalid API type '${credentials.apiType}' for ${exchange}. Supported: ${supported.join(", ")}`
-      )
-    }
+  if (credentials.apiType && supported && !supported.includes(credentials.apiType)) {
+    throw new Error(
+      `Invalid API type '${credentials.apiType}' for ${exchange}. Supported: ${supported.join(", ")}`
+    )
   }
 
   switch (normalizedExchange) {
