@@ -3,6 +3,7 @@
  * Creates appropriate connector based on exchange name
  * Falls back to CCXT for any supported exchange
  * NOTE: CCXT connector is server-only and loaded dynamically
+ * BUILD: 2026-04-10T13:56 - Added perpetual_futures normalization
  */
 
 import type { BaseExchangeConnector, ExchangeCredentials } from "./base-connector"
