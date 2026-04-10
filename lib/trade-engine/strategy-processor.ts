@@ -281,16 +281,18 @@ export class StrategyProcessor {
 
       console.log(`[v0] [StrategyProcessor] No indications found for ${symbol} in connection ${this.connectionId}, checking fallbacks...`)
 
-      // No indications found - generate them inline as a fallback
-      // This bypasses the broken IndicationProcessor which has cache initialization issues
+      // REBUILD FORCED: 2026-04-10 12:21 - Inline fallback indication generation
+      // Generates basic directional indications when no stored indications are available
       try {
-        const { getMarketData, getRedisClient } = await import("@/lib/redis-db")
+        const redisModule = await import("@/lib/redis-db")
+        const getMarketData = redisModule.getMarketData
+        const getRedisClientFunc = redisModule.getRedisClient
         // CRITICAL: getMarketData requires (symbol, interval) - use "1m" for trading
         let marketData = await getMarketData(symbol, "1m")
         
         // If getMarketData fails, try direct Redis access
         if (!marketData) {
-          const directClient = getRedisClient()
+          const directClient = getRedisClientFunc()
           // Try the full MarketData JSON key
           const rawJson = await directClient.get(`market_data:${symbol}:1m`)
           if (rawJson) {
@@ -346,14 +348,14 @@ export class StrategyProcessor {
             { type: "optimal", symbol, value: direction === "long" && rangePercent > 1.5 ? 1 : 0, profitFactor: 1.3, confidence: 0.75, timestamp: now },
           ]
           
-          // Save to Redis for future use
-          const fallbackClient = getRedisClient()
-          const key = `indications:${this.connectionId}`
-          const existing = await fallbackClient.get(key).catch(() => null)
-          const existingArr = existing ? JSON.parse(String(existing || "[]")) : []
+          // Save to Redis for future use - use renamed function to avoid any variable name conflicts
+          const saveClient = getRedisClientFunc()
+          const indicationKey = `indications:${this.connectionId}`
+          const existingData = await saveClient.get(indicationKey).catch(() => null)
+          const existingArr = existingData ? JSON.parse(String(existingData || "[]")) : []
           existingArr.push(...generatedIndications)
-          const trimmed = existingArr.slice(-1000)
-          await fallbackClient.set(key, JSON.stringify(trimmed))
+          const trimmedArr = existingArr.slice(-1000)
+          await saveClient.set(indicationKey, JSON.stringify(trimmedArr))
           
           return generatedIndications
         }
