@@ -449,23 +449,39 @@ export class StrategyCoordinator {
         } catch { /* skip price lookup */ }
 
         if (entryPrice > 0) {
-          // One position per Set — use the best entry (highest PF) from each Set's entries
+          // One position per Set entry (config combo) — each entry is an independent Set
           for (const set of qualifying) {
-            try {
-              const bestEntry = set.entries.sort((a, b) => b.profitFactor - a.profitFactor)[0]
-              if (!bestEntry) continue
+            for (const entry of set.entries) {
+              try {
+                const tp = Math.max(0.5, (entry.profitFactor - 1) * 100)
+                const sl = Math.min(5, 100 / Math.max(1, entry.profitFactor) * 0.5)
+                const trailing = entry.confidence >= 0.85
 
-              await posManager.createPosition({
-                symbol,
-                side: set.direction,
-                indicationType: set.indicationType,
-                entryPrice,
-                takeprofitFactor: Math.max(0.5, (bestEntry.profitFactor - 1) * 100),
-                stoplossRatio: Math.min(5, 100 / Math.max(1, bestEntry.profitFactor) * 0.5),
-                profitFactor: bestEntry.profitFactor,
-                trailingEnabled: bestEntry.confidence >= 0.85,
-              })
-            } catch { /* non-critical per-position error */ }
+                // Unique fingerprint for this config combination
+                const configSetKey = [
+                  set.indicationType,
+                  set.direction,
+                  tp.toFixed(4),
+                  sl.toFixed(4),
+                  trailing ? "1" : "0",
+                  entry.sizeMultiplier.toFixed(2),
+                  String(entry.leverage),
+                  entry.positionState,
+                ].join(":")
+
+                await posManager.createPosition({
+                  symbol,
+                  side: set.direction,
+                  indicationType: set.indicationType,
+                  entryPrice,
+                  takeprofitFactor: tp,
+                  stoplossRatio: sl,
+                  profitFactor: entry.profitFactor,
+                  trailingEnabled: trailing,
+                  configSetKey,
+                })
+              } catch { /* non-critical per-entry error */ }
+            }
           }
           console.log(`[v0] [StrategyFlow] ${symbol} LIVE: Created pseudo positions for ${qualifying.length} Sets`)
         } else {
