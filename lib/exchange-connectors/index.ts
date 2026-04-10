@@ -9,7 +9,10 @@ import type { BaseExchangeConnector, ExchangeCredentials } from "./base-connecto
 import { EXCHANGE_API_TYPES } from "@/lib/connection-predefinitions"
 
 // Version marker for cache invalidation
-const _CONNECTOR_VERSION = "2.2.0"
+const _CONNECTOR_VERSION = "2.3.0"
+
+// Log once to confirm new code is running
+console.log("[v0] Exchange connector factory v2.3.0 loaded")
 
 // Perpetual-type equivalents that can be normalized between exchanges
 const PERPETUAL_EQUIVALENTS = ["perpetual", "perpetual_futures", "perp", "swap"]
