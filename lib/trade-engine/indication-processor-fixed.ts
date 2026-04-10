@@ -341,14 +341,17 @@ export class IndicationProcessor {
 
         // Force load market data for this symbol
         const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
-        await loadMarketDataForEngine([symbol])
+        const loadedCount = await loadMarketDataForEngine([symbol])
+        console.log(`[v0] [IndicationProcessor] loadMarketDataForEngine returned: ${loadedCount} for ${symbol}`)
 
         // Clear cache entry and force direct Redis read after loading
         SHARED_MARKET_DATA_CACHE.delete(symbol)
         
         // Try direct Redis read - bypass cache completely after load
         // Key format from market-data-loader: market_data:${symbol}:1m
-        const directData = await client.get(`market_data:${symbol}:1m`)
+        const directKey = `market_data:${symbol}:1m`
+        const directData = await client.get(directKey)
+        console.log(`[v0] [IndicationProcessor] Direct Redis read ${directKey}: ${directData ? 'FOUND (' + directData.length + ' chars)' : 'NOT FOUND'}`)
         if (directData) {
           try {
             const parsed = JSON.parse(directData)
@@ -374,7 +377,9 @@ export class IndicationProcessor {
         
         // If still no data, try hash key
         if (!marketData) {
-          const hashData = await client.hgetall(`market_data:${symbol}`)
+          const hashKey = `market_data:${symbol}`
+          const hashData = await client.hgetall(hashKey)
+          console.log(`[v0] [IndicationProcessor] Hash Redis read ${hashKey}: ${hashData && Object.keys(hashData).length > 0 ? 'FOUND (' + Object.keys(hashData).length + ' fields)' : 'NOT FOUND'}`)
           if (hashData && Object.keys(hashData).length > 0) {
             marketData = hashData
             SHARED_MARKET_DATA_CACHE.set(symbol, { data: marketData, timestamp: Date.now() })
