@@ -57,7 +57,8 @@ import { getMarketDataCached, getSettingsCached } from "./market-data-cache"
 const redisHelpers = {
   initRedis,
   getRedisClient,
-  getMarketData: getMarketData ?? (async (_s: string) => null),
+  // getMarketData requires (symbol, interval) - default to "1m" for trading
+  getMarketData: getMarketData ?? (async (_s: string, _i?: string) => null),
   saveIndication: saveIndication ?? (async (_d: any) => ""),
   getSettings,
 }
@@ -91,7 +92,8 @@ async function getMarketDataCachedModule(symbol: string): Promise<any> {
 
   try {
     await initRedis()
-    const rawData = await getMarketData(symbol)
+    // CRITICAL: getMarketData requires (symbol, interval) - use "1m" for real-time trading
+    const rawData = await getMarketData(symbol, "1m")
 
     if (!rawData) {
       return null
@@ -192,7 +194,8 @@ export class IndicationProcessor {
       }
 
       // Priority 3: hash (single latest data point from redis-db.saveMarketData / getMarketData)
-      const rawData = await getMarketData(symbol)
+      // CRITICAL: getMarketData requires (symbol, interval) - use "1m" for trading
+      const rawData = await getMarketData(symbol, "1m")
       if (rawData) {
         const arr = Array.isArray(rawData) ? rawData : [rawData]
         console.log(`[v0] [PrehistoricIndication] Using hash fallback for ${symbol}: ${arr.length} data point(s)`)

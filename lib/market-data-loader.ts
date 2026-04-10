@@ -190,9 +190,13 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
 
         const key = `market_data:${symbol}:1m`
         const jsonData = JSON.stringify(marketData)
+        console.log(`[v0] [MarketData] STORING to key=${key}, dataLength=${jsonData.length}`)
         await client.set(key, jsonData)
         await client.expire(key, 86400) // 24 hour TTL
-        console.log(`[v0] [MarketData] ✓ Stored ${key} (${jsonData.length} chars)`)
+        
+        // Verify storage worked by reading back immediately
+        const verifyRead = await client.get(key)
+        console.log(`[v0] [MarketData] VERIFY READ: ${verifyRead ? 'SUCCESS (' + verifyRead.length + ' chars)' : 'FAILED - NULL'}`)
 
         // Store raw candles array for indication processor historical access
         const candlesKey = `market_data:${symbol}:candles`
