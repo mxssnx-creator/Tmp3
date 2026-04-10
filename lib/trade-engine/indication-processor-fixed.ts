@@ -448,7 +448,7 @@ export class IndicationProcessor {
       })
       
       // Store indications
-      await this.storeIndications(symbol, indications)
+      await storeIndications(this.connectionId, symbol, indications)
       
       return indications
     } catch (error) {
