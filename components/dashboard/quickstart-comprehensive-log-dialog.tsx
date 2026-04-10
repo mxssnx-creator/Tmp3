@@ -43,12 +43,32 @@ export function QuickstartComprehensiveLogDialog() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [overallData, setOverallData] = useState<OverallData | null>(null)
   const [isLoading, setIsLoading] = useState(false)
+  const [activeConnectionId, setActiveConnectionId] = useState<string>("default-bingx-001")
   const logsEndRef = useRef<HTMLDivElement>(null)
 
   // Auto-scroll logs to bottom
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
+
+  // Resolve which connection ID to use for logs
+  const resolveConnectionId = async () => {
+    try {
+      const res = await fetch("/api/settings/connections?t=" + Date.now(), { cache: "no-store" })
+      if (!res.ok) return
+      const data = await res.json()
+      const connections: any[] = Array.isArray(data) ? data : (data?.connections || [])
+      const active = connections.find(
+        (c) =>
+          c.is_enabled_dashboard === true || c.is_enabled_dashboard === "1" ||
+          c.is_active_inserted === true || c.is_active_inserted === "1" ||
+          c.is_active === true || c.is_active === "1"
+      ) || connections[0]
+      if (active?.id) setActiveConnectionId(active.id)
+    } catch {
+      // keep default
+    }
+  }
 
   // Fetch overall data
   const fetchOverallData = async () => {
@@ -80,7 +100,7 @@ export function QuickstartComprehensiveLogDialog() {
   // Fetch live logs
   const fetchLiveLogs = async () => {
     try {
-      const res = await fetch("/api/connections/progression/default-bingx-001/logs", { cache: "no-store" })
+      const res = await fetch(`/api/connections/progression/${activeConnectionId}/logs`, { cache: "no-store" })
       if (res.ok) {
         const data = await res.json()
         const newLogs: LogEntry[] = []
@@ -112,18 +132,28 @@ export function QuickstartComprehensiveLogDialog() {
     }
   }
 
-  // Refresh when dialog opens
+  // Refresh when dialog opens — first resolve the connection ID, then start polling
   useEffect(() => {
-    if (open) {
+    if (!open) return
+
+    resolveConnectionId().then(() => {
       fetchOverallData()
       fetchLiveLogs()
-      const interval = setInterval(() => {
-        fetchOverallData()
-        fetchLiveLogs()
-      }, 2000)
-      return () => clearInterval(interval)
-    }
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
+
+  // Re-fetch logs whenever the resolved connection ID changes
+  useEffect(() => {
+    if (!open) return
+    fetchLiveLogs()
+    const interval = setInterval(() => {
+      fetchOverallData()
+      fetchLiveLogs()
+    }, 2000)
+    return () => clearInterval(interval)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, activeConnectionId])
 
   const getLogColor = (level: string) => {
     switch (level) {

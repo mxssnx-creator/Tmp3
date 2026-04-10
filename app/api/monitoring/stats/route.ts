@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server"
-import { initRedis, getActiveConnectionsForEngine, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getActiveConnectionsForEngine, getAllConnections, getRedisClient } from "@/lib/redis-db"
 import { RedisMonitoring, RedisPositions, RedisTrades } from "@/lib/redis-operations"
 
 export const dynamic = "force-dynamic"
@@ -12,15 +12,23 @@ export async function GET(request: NextRequest) {
 
     await initRedis()
 
-    // Get ONLY active connections (is_enabled_dashboard = true) for monitoring
+    // Use getActiveConnectionsForEngine for position/trade queries (respects enabled flags)
+    // but also fall back to ALL connections so we don't miss progression data from any engine
     let connections = await getActiveConnectionsForEngine()
+
+    // If no active connections found, fall back to all connections so progression data shows up
+    if (connections.length === 0) {
+      connections = await getAllConnections()
+    }
 
     if (exchangeFilter) {
       connections = connections.filter((c: any) => c.exchange === exchangeFilter)
     }
 
     const activeConnections = connections.filter(
-      (c: any) => c.is_active === true || c.is_active === "true",
+      (c: any) =>
+        c.is_active === true || c.is_active === "true" ||
+        c.is_enabled_dashboard === true || c.is_enabled_dashboard === "1",
     )
 
     let totalPositions = 0
@@ -97,6 +105,7 @@ export async function GET(request: NextRequest) {
         profitFactor250: stats?.profitFactor250 || 1.0,
         winRate50: stats?.winRate50 || 0.5,
         profitFactor50: stats?.profitFactor50 || 1.0,
+        uptime: stats?.uptime || (totalCycles > 0 ? `${totalCycles} cycles` : "Starting..."),
       },
       timestamp: new Date().toISOString(),
     })

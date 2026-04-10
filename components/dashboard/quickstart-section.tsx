@@ -45,6 +45,8 @@ export function QuickstartSection() {
   const [isRunning, setIsRunning] = useState(false)
   const [showDetails, setShowDetails] = useState(false)
   const [logs, setLogs] = useState<LogEntry[]>([])
+  // The connection ID used for the running engine — set when start succeeds
+  const [activeConnectionId, setActiveConnectionId] = useState<string | null>(null)
   const [stats, setStats] = useState<EngineStats>({
     cycles: 0,
     successRate: 0,
@@ -108,14 +110,14 @@ export function QuickstartSection() {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
 
-  // Fetch live stats when running
+  // Fetch live stats when running — uses activeConnectionId resolved at start time
   useEffect(() => {
-    if (!isRunning) return
+    if (!isRunning || !activeConnectionId) return
 
     const fetchStats = async () => {
       try {
         const res = await fetch(
-          `/api/trading/engine-stats?connection_id=${readiness.connectionId}`,
+          `/api/trading/engine-stats?connection_id=${activeConnectionId}`,
           { cache: "no-store" }
         )
         if (!res.ok) return
@@ -123,11 +125,12 @@ export function QuickstartSection() {
         setStats({
           cycles: data.indicationCycleCount || data.strategyCycleCount || 0,
           successRate: data.cycleSuccessRate || 0,
-          indications: data.totalIndicationsCount || data.indicationsByType?.total || 0,
+          indications: data.totalIndicationsCount || data.indications?.totalRecords || 0,
           strategies:
             (data.baseStrategyCount || 0) +
             (data.mainStrategyCount || 0) +
-            (data.realStrategyCount || 0),
+            (data.realStrategyCount || 0) +
+            (data.liveStrategyCount || 0),
           positions: data.positionsCount || 0,
           profit: data.totalProfit || 0,
         })
@@ -140,7 +143,7 @@ export function QuickstartSection() {
     return () => {
       if (statsIntervalRef.current) clearInterval(statsIntervalRef.current)
     }
-  }, [isRunning])
+  }, [isRunning, activeConnectionId])
 
   const addLog = (message: string, type: "info" | "success" | "error" | "warning" = "info") => {
     const entry: LogEntry = {
@@ -175,19 +178,23 @@ export function QuickstartSection() {
         addLog(`✓ Market data loaded: ${symData.symbol || "BTCUSDT"}`, "success")
       }
 
+      const connId = active.id || "default-bingx-001"
+
       addLog("Step 3: Starting trade engine...", "info")
       const startRes = await fetch("/api/trade-engine/quick-start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ connectionId: active.id || "default-bingx-001" }),
+        body: JSON.stringify({ connectionId: connId }),
       })
 
       if (startRes.ok) {
         addLog("✓ Trade engine started", "success")
+        setActiveConnectionId(connId)
         setIsRunning(true)
         addLog("Engine is now running and processing live data", "info")
       } else {
         addLog("⚠ Engine already running or unavailable", "warning")
+        setActiveConnectionId(connId)
         setIsRunning(true)
       }
     } catch (err) {
@@ -202,6 +209,7 @@ export function QuickstartSection() {
     try {
       addLog("Stopping engine...", "info")
       setIsRunning(false)
+      setActiveConnectionId(null)
       setStats({
         cycles: 0,
         successRate: 0,
@@ -359,7 +367,7 @@ export function QuickstartSection() {
             <TabsContent value="stats" className="mt-2">
               <div className="grid grid-cols-3 gap-2">
                 {[
-                  { label: "Cycles", value: stats.cycles, icon: "🔄" },
+                  { label: "Cycles", value: stats.cycles, icon: "���" },
                   { label: "Indications", value: stats.indications, icon: "���" },
                   { label: "Strategies", value: stats.strategies, icon: "🎯" },
                   { label: "Positions", value: stats.positions, icon: "📈" },

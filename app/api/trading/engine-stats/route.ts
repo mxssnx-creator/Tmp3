@@ -50,28 +50,50 @@ export async function GET(req: Request) {
       console.warn("[v0] [EngineStats] Error reading strategy set keys:", e)
     }
 
-    // ── 3. Read strategy cycle count from settings:trade_engine_state ──────────
-    // This is updated every 100 indication cycles and every strategy cycle.
-    let strategyCycleCount = 0
+    // ── 3. Read strategy cycle count from progression hash (written every cycle) ─
+    // The engine-manager writes strategy_cycle_count to progression:{connId}
+    // every single cycle. settings:trade_engine_state is only persisted every 100 cycles.
+    let strategyCycleCount = parseInt(progHash.strategy_cycle_count || "0", 10)
     let realtimeCycleCount = 0
-    let cycleSuccessRate = 100
+    let cycleSuccessRate = parseFloat(progHash.cycle_success_rate || "100")
 
-    try {
-      const stateHash = await redis.hgetall(`settings:trade_engine_state:${connectionId}`) || {}
-      strategyCycleCount = parseInt(stateHash.strategy_cycle_count || "0", 10)
-      realtimeCycleCount = parseInt(stateHash.realtime_cycle_count || "0", 10)
-      cycleSuccessRate   = parseFloat(stateHash.cycle_success_rate || "100")
-    } catch (e) {
-      console.warn("[v0] [EngineStats] Error reading engine state:", e)
+    // Fallback: read from settings:trade_engine_state if progression hash is empty
+    if (strategyCycleCount === 0) {
+      try {
+        const stateHash = await redis.hgetall(`settings:trade_engine_state:${connectionId}`) || {}
+        strategyCycleCount = parseInt(stateHash.strategy_cycle_count || "0", 10)
+        realtimeCycleCount = parseInt(stateHash.realtime_cycle_count || "0", 10)
+        if (!cycleSuccessRate) {
+          cycleSuccessRate = parseFloat(stateHash.cycle_success_rate || "100")
+        }
+      } catch (e) {
+        console.warn("[v0] [EngineStats] Error reading engine state fallback:", e)
+      }
     }
 
+    // Also read cycles_completed from ProgressionStateManager field for the overall count
+    const cyclesCompleted = parseInt(progHash.cycles_completed || "0", 10)
+
     // ── 4. Read active pseudo positions count ────────────────────────────────────
+    // PseudoPositionManager stores positions at:
+    //   pseudo_positions:{connectionId}  → Redis set of IDs
+    //   pseudo_position:{connectionId}:{id}  → Redis hash per position
     let positionsCount = 0
     try {
-      const posKeys = await redis.keys(`settings:pseudo_positions:${connectionId}:*`)
-      for (const key of posKeys) {
-        const hash = await redis.hgetall(key) || {}
-        if (hash.status === "active") positionsCount++
+      const posIds = await redis.smembers(`pseudo_positions:${connectionId}`) || []
+      for (const posId of posIds) {
+        const hash = await redis.hgetall(`pseudo_position:${connectionId}:${posId}`) || {}
+        if ((hash.status || "active") === "active") positionsCount++
+      }
+      // Also check stage-specific position sets
+      if (positionsCount === 0) {
+        for (const stage of ["base", "main", "real", "live"]) {
+          const stageIds = await redis.smembers(`${stage}_pseudo_positions:${connectionId}`).catch(() => [] as string[])
+          for (const posId of stageIds) {
+            const hash = await redis.hgetall(`${stage}_pseudo_position:${connectionId}:${posId}`).catch(() => ({})) || {}
+            if ((hash.status || "active") === "active") positionsCount++
+          }
+        }
       }
     } catch (e) {
       // non-critical
@@ -94,6 +116,7 @@ export async function GET(req: Request) {
       indicationCycleCount,
       strategyCycleCount,
       realtimeCycleCount,
+      cyclesCompleted,
       cycleSuccessRate,
       totalIndicationsCount: indicationsCount,
       indicationsByType,
