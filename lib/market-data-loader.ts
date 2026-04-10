@@ -97,12 +97,16 @@ async function fetchRealMarketData(
     // Try each connection until we get data
     for (const conn of validConnections) {
       try {
+        // Normalize api_type: perpetual_futures -> perpetual (canonical form)
+        let apiType = conn.api_type || "perpetual"
+        if (apiType === "perpetual_futures") apiType = "perpetual"
+        
         const connector = await createExchangeConnector(
           conn.exchange,
           {
             apiKey: conn.api_key || conn.apiKey || "",
             apiSecret: conn.api_secret || conn.apiSecret || "",
-            apiType: (conn.api_type || "perpetual_futures") as "spot" | "perpetual_futures" | "unified",
+            apiType: apiType as "spot" | "perpetual" | "unified",
             isTestnet: conn.is_testnet === "1" || conn.is_testnet === true,
           }
         )
