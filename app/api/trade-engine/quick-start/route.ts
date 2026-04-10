@@ -41,8 +41,8 @@ export const dynamic = "force-dynamic"
 const API_VERSION = API_VERSIONS.tradeEngine
 const LOG_PREFIX = `[v0] [QuickStart] ${API_VERSION}`
 
-// Default trading symbol (single symbol for quickstart)
-const DEFAULT_SYMBOLS = ["BTCUSDT"]
+// Default trading symbol (single symbol for quickstart - DRIFTUSDT for live testing)
+const DEFAULT_SYMBOLS = ["DRIFTUSDT"]
 
 /**
  * POST /api/trade-engine/quick-start
