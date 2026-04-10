@@ -281,20 +281,18 @@ export class StrategyProcessor {
 
       console.log(`[v0] [StrategyProcessor] No indications found for ${symbol} in connection ${this.connectionId}, checking fallbacks...`)
 
-      // REBUILD FORCED: 2026-04-10 12:21 - Inline fallback indication generation
-      // Generates basic directional indications when no stored indications are available
+      // REBUILD 12:32 - Inline fallback indication generation v2
       try {
-        const redisModule = await import("@/lib/redis-db")
-        const getMarketData = redisModule.getMarketData
-        const getRedisClientFunc = redisModule.getRedisClient
-        // CRITICAL: getMarketData requires (symbol, interval) - use "1m" for trading
-        let marketData = await getMarketData(symbol, "1m")
+        console.log(`[v0] [StrategyProcessor] FALLBACK_V2: Starting for ${symbol}`)
+        const { getMarketData: fetchMarketData, getRedisClient: getClient } = await import("@/lib/redis-db")
+        // CRITICAL: fetchMarketData requires (symbol, interval) - use "1m" for trading
+        let marketData = await fetchMarketData(symbol, "1m")
         
-        // If getMarketData fails, try direct Redis access
+        // If fetchMarketData fails, try direct Redis access
         if (!marketData) {
-          const directClient = getRedisClientFunc()
+          const redisClient = getClient()
           // Try the full MarketData JSON key
-          const rawJson = await directClient.get(`market_data:${symbol}:1m`)
+          const rawJson = await redisClient.get(`market_data:${symbol}:1m`)
           if (rawJson) {
             try {
               const parsed = JSON.parse(rawJson)
@@ -313,7 +311,7 @@ export class StrategyProcessor {
           
           // Try hash key as last resort
           if (!marketData) {
-            const hashData = await directClient.hgetall(`market_data:${symbol}`)
+            const hashData = await redisClient.hgetall(`market_data:${symbol}`)
             if (hashData && Object.keys(hashData).length > 0) {
               marketData = hashData
             }
@@ -348,14 +346,15 @@ export class StrategyProcessor {
             { type: "optimal", symbol, value: direction === "long" && rangePercent > 1.5 ? 1 : 0, profitFactor: 1.3, confidence: 0.75, timestamp: now },
           ]
           
-          // Save to Redis for future use - use renamed function to avoid any variable name conflicts
-          const saveClient = getRedisClientFunc()
-          const indicationKey = `indications:${this.connectionId}`
-          const existingData = await saveClient.get(indicationKey).catch(() => null)
-          const existingArr = existingData ? JSON.parse(String(existingData || "[]")) : []
-          existingArr.push(...generatedIndications)
-          const trimmedArr = existingArr.slice(-1000)
-          await saveClient.set(indicationKey, JSON.stringify(trimmedArr))
+          // Save to Redis for future use
+          const storageClient = getClient()
+          const storageKey = `indications:${this.connectionId}`
+          const storedData = await storageClient.get(storageKey).catch(() => null)
+          const storedArr = storedData ? JSON.parse(String(storedData || "[]")) : []
+          storedArr.push(...generatedIndications)
+          const limitedArr = storedArr.slice(-1000)
+          await storageClient.set(storageKey, JSON.stringify(limitedArr))
+          console.log(`[v0] [StrategyProcessor] FALLBACK_V2: Generated ${generatedIndications.length} indications for ${symbol}`)
           
           return generatedIndications
         }
