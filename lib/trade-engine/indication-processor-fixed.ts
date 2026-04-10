@@ -335,9 +335,8 @@ export class IndicationProcessor {
       let marketData = await this.getLatestMarketDataCached(symbol)
       if (!marketData) {
         // Try to load market data if not available
-        const redis = await getRedisHelpers()
-        await redis.initRedis()
-        const client = redis.getClient()
+        await initRedis()
+        const client = getRedisClient()
 
         // Force load market data for this symbol
         const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
@@ -351,10 +350,10 @@ export class IndicationProcessor {
         // Key format from market-data-loader: market_data:${symbol}:1m
         const directKey = `market_data:${symbol}:1m`
         const directData = await client.get(directKey)
-        console.log(`[v0] [IndicationProcessor] Direct Redis read ${directKey}: ${directData ? 'FOUND (' + directData.length + ' chars)' : 'NOT FOUND'}`)
+        console.log(`[v0] [IndicationProcessor] Direct Redis read ${directKey}: ${directData ? 'FOUND (' + String(directData).length + ' chars)' : 'NOT FOUND'}`)
         if (directData) {
           try {
-            const parsed = JSON.parse(directData)
+            const parsed = typeof directData === 'string' ? JSON.parse(directData) : directData
             if (parsed && parsed.candles && parsed.candles.length > 0) {
               // Return the latest candle as market data
               const latestCandle = parsed.candles[parsed.candles.length - 1]
@@ -369,9 +368,10 @@ export class IndicationProcessor {
                 timestamp: new Date(latestCandle.timestamp).toISOString(),
               }
               SHARED_MARKET_DATA_CACHE.set(symbol, { data: marketData, timestamp: Date.now() })
+              console.log(`[v0] [IndicationProcessor] ✓ Market data extracted from ${directKey}: price=${marketData.price}`)
             }
           } catch (e) {
-            console.warn(`[v0] [IndicationProcessor] Failed to parse direct market data for ${symbol}`)
+            console.warn(`[v0] [IndicationProcessor] Failed to parse direct market data for ${symbol}:`, e)
           }
         }
         
