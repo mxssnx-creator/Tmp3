@@ -319,12 +319,22 @@ export class StrategyProcessor {
         }
         
         console.log(`[v0] [StrategyProcessor] Fallback generation for ${symbol}: marketData=${marketData ? 'found' : 'null'}`)
+        console.log(`[v0] [StrategyProcessor] marketData fields: close=${marketData?.close}, c=${marketData?.c}, price=${marketData?.price}, keys=${marketData ? Object.keys(marketData).join(',') : 'none'}`)
         
         if (marketData) {
-          const close = parseFloat(marketData?.close || marketData?.c || marketData?.price || "0")
-          const open = parseFloat(marketData?.open || marketData?.o || close.toString())
-          const high = parseFloat(marketData?.high || marketData?.h || close.toString())
-          const low = parseFloat(marketData?.low || marketData?.l || close.toString())
+          // Handle nested candles structure - extract latest candle if marketData contains candles array
+          let priceData = marketData
+          if (marketData.candles && Array.isArray(marketData.candles) && marketData.candles.length > 0) {
+            priceData = marketData.candles[marketData.candles.length - 1]
+            console.log(`[v0] [StrategyProcessor] Extracted latest candle: close=${priceData?.close}`)
+          }
+          
+          const close = parseFloat(priceData?.close || priceData?.c || priceData?.price || marketData?.lastPrice || "0")
+          const open = parseFloat(priceData?.open || priceData?.o || close.toString())
+          const high = parseFloat(priceData?.high || priceData?.h || close.toString())
+          const low = parseFloat(priceData?.low || priceData?.l || close.toString())
+          
+          console.log(`[v0] [StrategyProcessor] Parsed prices: close=${close}, open=${open}, high=${high}, low=${low}`)
           
           if (close > 0) {
             const direction = close >= open ? "long" : "short"
