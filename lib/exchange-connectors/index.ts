@@ -3,14 +3,21 @@
  * Creates appropriate connector based on exchange name
  * Falls back to CCXT for any supported exchange
  * NOTE: CCXT connector is server-only and loaded dynamically
- * BUILD: 2026-04-10T13:56 - Added perpetual_futures normalization
  */
 
 import type { BaseExchangeConnector, ExchangeCredentials } from "./base-connector"
 import { EXCHANGE_API_TYPES } from "@/lib/connection-predefinitions"
 
-// All primary exchanges use dedicated connectors (no CCXT dependency)
-// Connectors are dynamically imported to prevent them from being bundled into the client
+// Version marker for cache invalidation
+const _CONNECTOR_VERSION = "2.1.0"
+
+// API type aliases - normalize common variations
+const API_TYPE_ALIASES: Record<string, string> = {
+  perpetual_futures: "perpetual",
+  futures: "perpetual",
+  perp: "perpetual",
+  swap: "perpetual",
+}
 
 export async function createExchangeConnector(
   exchange: string,
@@ -18,9 +25,9 @@ export async function createExchangeConnector(
 ): Promise<BaseExchangeConnector> {
   const normalizedExchange = exchange.toLowerCase().replace(/[^a-z]/g, "")
 
-  // Normalize API type: perpetual_futures -> perpetual (common alias)
-  if (credentials.apiType === "perpetual_futures") {
-    credentials.apiType = "perpetual"
+  // Normalize API type using aliases
+  if (credentials.apiType && API_TYPE_ALIASES[credentials.apiType]) {
+    credentials.apiType = API_TYPE_ALIASES[credentials.apiType]
   }
   
   // Validate API type is supported for the exchange
@@ -28,7 +35,7 @@ export async function createExchangeConnector(
     const supported = EXCHANGE_API_TYPES[normalizedExchange]
     if (supported && !supported.includes(credentials.apiType)) {
       throw new Error(
-        `Invalid API type '${credentials.apiType}' for ${exchange}. Supported types: ${supported.join(", ")}`
+        `Invalid API type '${credentials.apiType}' for ${exchange}. Supported: ${supported.join(", ")}`
       )
     }
   }
