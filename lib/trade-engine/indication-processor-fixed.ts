@@ -656,7 +656,8 @@ export class IndicationProcessor {
     // Fetch fresh data from Redis using dynamic import to avoid any stale references
     try {
       const { getMarketData } = await import("@/lib/redis-db")
-      const data = await getMarketData(symbol)
+      // getMarketData requires both symbol and interval - use 1m as default for real-time trading
+      const data = await getMarketData(symbol, "1m")
       if (data) {
         cache.set(symbol, { data, timestamp: now })
       }
