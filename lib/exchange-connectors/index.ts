@@ -17,6 +17,11 @@ export async function createExchangeConnector(
 ): Promise<BaseExchangeConnector> {
   const normalizedExchange = exchange.toLowerCase().replace(/[^a-z]/g, "")
 
+  // Normalize API type: perpetual_futures -> perpetual (common alias)
+  if (credentials.apiType === "perpetual_futures") {
+    credentials.apiType = "perpetual"
+  }
+  
   // Validate API type is supported for the exchange
   if (credentials.apiType) {
     const supported = EXCHANGE_API_TYPES[normalizedExchange]
