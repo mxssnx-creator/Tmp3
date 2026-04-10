@@ -284,16 +284,47 @@ export class StrategyProcessor {
       // No indications found - generate them inline as a fallback
       // This bypasses the broken IndicationProcessor which has cache initialization issues
       try {
-        const { getMarketData } = await import("@/lib/redis-db")
-        const marketData = await getMarketData(symbol)
+        const { getMarketData, getRedisClient } = await import("@/lib/redis-db")
+        // CRITICAL: getMarketData requires (symbol, interval) - use "1m" for trading
+        let marketData = await getMarketData(symbol, "1m")
+        
+        // If getMarketData fails, try direct Redis access
+        if (!marketData) {
+          const directClient = getRedisClient()
+          // Try the full MarketData JSON key
+          const rawJson = await directClient.get(`market_data:${symbol}:1m`)
+          if (rawJson) {
+            try {
+              const parsed = JSON.parse(rawJson)
+              if (parsed && parsed.candles && parsed.candles.length > 0) {
+                const lastCandle = parsed.candles[parsed.candles.length - 1]
+                marketData = {
+                  close: String(lastCandle.close),
+                  open: String(lastCandle.open),
+                  high: String(lastCandle.high),
+                  low: String(lastCandle.low),
+                  volume: String(lastCandle.volume),
+                }
+              }
+            } catch (e) { /* ignore parse errors */ }
+          }
+          
+          // Try hash key as last resort
+          if (!marketData) {
+            const hashData = await directClient.hgetall(`market_data:${symbol}`)
+            if (hashData && Object.keys(hashData).length > 0) {
+              marketData = hashData
+            }
+          }
+        }
         
         console.log(`[v0] [StrategyProcessor] Fallback generation for ${symbol}: marketData=${marketData ? 'found' : 'null'}`)
         
         if (marketData) {
-          const close = parseFloat(marketData?.close || marketData?.c || "0")
-          const open = parseFloat(marketData?.open || marketData?.o || "0")
-          const high = parseFloat(marketData?.high || marketData?.h || "0")
-          const low = parseFloat(marketData?.low || marketData?.l || "0")
+          const close = parseFloat(marketData?.close || marketData?.c || marketData?.price || "0")
+          const open = parseFloat(marketData?.open || marketData?.o || close.toString())
+          const high = parseFloat(marketData?.high || marketData?.h || close.toString())
+          const low = parseFloat(marketData?.low || marketData?.l || close.toString())
           
           if (close > 0) {
             const direction = close >= open ? "long" : "short"
