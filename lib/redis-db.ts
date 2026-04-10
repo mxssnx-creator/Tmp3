@@ -1078,28 +1078,48 @@ export async function createPosition(data: any): Promise<any> {
 
 export async function getIndications(connectionId?: string, symbol?: string): Promise<any[]> {
   const client = getRedisClient()
-  let pattern: string
+  const indications: any[] = []
   
+  // First, try to get from the main key directly (storeIndications saves here)
+  if (connectionId) {
+    const mainKey = `indications:${connectionId}`
+    try {
+      const mainData = await client.get(mainKey)
+      if (mainData) {
+        const parsed = typeof mainData === "string" ? JSON.parse(mainData) : mainData
+        const arr = Array.isArray(parsed) ? parsed : [parsed]
+        
+        // Filter by symbol if provided
+        if (symbol) {
+          const filtered = arr.filter((ind: any) => ind.symbol === symbol)
+          if (filtered.length > 0) {
+            return filtered
+          }
+        } else {
+          return arr
+        }
+      }
+    } catch (e) {
+      console.warn(`[v0] Error reading main indication key ${mainKey}:`, e)
+    }
+  }
+  
+  // Fallback: search with pattern matching
+  let pattern: string
   if (connectionId && symbol) {
-    // Specific connection and symbol: look for both main key and per-type sets
     pattern = `indications:${connectionId}:${symbol}:*`
   } else if (connectionId) {
-    // All symbols for a connection
     pattern = `indications:${connectionId}:*`
   } else if (symbol) {
-    // All connections for a symbol (legacy support)
     pattern = `indication:${symbol}:*`
   } else {
-    // All indications
     pattern = `indications:*`
   }
   
   const keys = await client.keys(pattern)
-  const indications: any[] = []
   
   for (const key of keys) {
     try {
-      // Try to get as string first (indication-processor saves as JSON string)
       const stringData = await client.get(key)
       if (stringData) {
         try {
@@ -1112,7 +1132,6 @@ export async function getIndications(connectionId?: string, symbol?: string): Pr
         continue
       }
       
-      // Try as hash (fallback for legacy format)
       const hashData = await client.hgetall(key)
       if (hashData && Object.keys(hashData).length > 0) {
         indications.push({
