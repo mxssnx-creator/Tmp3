@@ -403,16 +403,19 @@ export class IndicationProcessor {
       const stepIndicators = StepBasedIndicators.calculateAll(candles, stepRange)
 
       console.log(`[v0] [IndicationProcessor] Step-based indicators calculated for ${symbol}: ${stepRange.length} steps analyzed`)
+      console.log(`[v0] [IndicationProcessor] DEBUG: marketData type=${typeof marketData}, keys=${marketData ? Object.keys(marketData).slice(0,5).join(',') : 'null'}`)
 
       // Market data is a single candle object with fields: price, open, high, low, close, volume, timestamp
       // Handle nested candles structure if present
       let priceSource = marketData
       if (marketData.candles && Array.isArray(marketData.candles) && marketData.candles.length > 0) {
         priceSource = marketData.candles[marketData.candles.length - 1]
+        console.log(`[v0] [IndicationProcessor] DEBUG: Extracted candle, close=${priceSource?.close}`)
       }
       
       // Extract price information with multiple fallbacks (handle string or number types)
       const currentClose = Number.parseFloat(String(priceSource.close || priceSource.c || priceSource.price || marketData.close || marketData.price || marketData.lastPrice || "0"))
+      console.log(`[v0] [IndicationProcessor] DEBUG: Parsed currentClose=${currentClose}`)
       const currentOpen = Number.parseFloat(String(priceSource.open || priceSource.o || marketData.open || currentClose))
       const currentHigh = Number.parseFloat(String(priceSource.high || priceSource.h || marketData.high || currentClose))
       const currentLow = Number.parseFloat(String(priceSource.low || priceSource.l || marketData.low || currentClose))
@@ -434,6 +437,7 @@ export class IndicationProcessor {
       
       // Calculate comprehensive indications from current candle OHLC
       const indications: any[] = []
+      console.log(`[v0] [IndicationProcessor] DEBUG: Starting indication generation for ${symbol}, close=${currentClose}`)
       
       // CORE INDICATIONS (4):
       // 1. DIRECTION Indication
