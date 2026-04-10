@@ -76,7 +76,9 @@ export class PseudoPositionManager {
   // ── public API ────────────────────────────────────────────────────────
 
   /**
-   * Create new pseudo position with proper volume calculation
+   * Create new pseudo position with proper volume calculation.
+   * configSetKey identifies the unique config combination (indType:dir:tp:sl:trailing:size:lev:state).
+   * Exactly one active position is allowed per configSetKey.
    */
   async createPosition(params: {
     symbol: string
@@ -87,19 +89,25 @@ export class PseudoPositionManager {
     stoplossRatio: number
     profitFactor: number
     trailingEnabled: boolean
+    configSetKey?: string  // unique fingerprint of the config combination
   }): Promise<string | null> {
     try {
-      const canCreate = await this.canCreatePosition(
-        params.symbol,
+      // Build a canonical config set key if not provided
+      const configSetKey = params.configSetKey || [
         params.indicationType,
         params.side,
+        params.takeprofitFactor.toFixed(4),
+        params.stoplossRatio.toFixed(4),
+        params.trailingEnabled ? "1" : "0",
+      ].join(":")
+
+      const canCreate = await this.canCreatePosition(
+        params.symbol,
+        configSetKey,
       )
 
       if (!canCreate) {
-        console.log(
-          `[v0] Cannot create ${params.side} position for ${params.symbol} (TP=${params.takeprofitFactor}, SL=${params.stoplossRatio}, trailing=${params.trailingEnabled}): max positions reached`,
-        )
-        return null
+        return null  // silent — one position per config set is expected
       }
 
       // Calculate volume for this position
@@ -141,6 +149,7 @@ export class PseudoPositionManager {
         symbol: params.symbol,
         indication_type: params.indicationType,
         side: params.side,
+        config_set_key: configSetKey,
         entry_price: String(params.entryPrice),
         current_price: String(params.entryPrice),
         quantity: String(volumeCalc.finalVolume),
@@ -370,28 +379,23 @@ export class PseudoPositionManager {
   }
 
   /**
-   * Check if can create a new position for a given Set (indication_type × direction).
-   * Enforces a hard limit of 1 active pseudo position per Set — meaning one open
-   * position per (symbol, indicationType, side) combination at any time.
+   * Check if a new position can be created for the given config set key.
+   * Each unique config combination (indType:dir:tp:sl:trailing:...) is an
+   * independent Set — exactly 1 active pseudo position is allowed per Set.
    */
   private async canCreatePosition(
     symbol: string,
-    indicationType: string,
-    side: "long" | "short",
+    configSetKey: string,
   ): Promise<boolean> {
     try {
-      // Exactly 1 active position per (symbol, indicationType, direction) Set
-      const active = await this.listPositions({ status: "active", symbol, indicationType, side })
-
-      const canCreate = active.length < 1
-
-      console.log(
-        `[v0] Position check (Set limit): ${symbol} ${indicationType} ${side} | ${active.length}/1 (can create: ${canCreate})`,
+      // Load all active positions for this symbol and check config_set_key
+      const active = await this.listPositions({ status: "active", symbol })
+      const existing = active.filter(
+        (p) => (p.config_set_key || "") === configSetKey
       )
-
-      return canCreate
+      return existing.length < 1
     } catch (error) {
-      console.error("[v0] Failed to check if can create position:", error)
+      console.error("[v0] Failed to check position limit for config set:", error)
       return false
     }
   }
