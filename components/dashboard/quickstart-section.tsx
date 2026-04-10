@@ -70,10 +70,19 @@ export function QuickstartSection() {
         const connData = await connRes.json()
         const connections: any[] = Array.isArray(connData) ? connData : (connData?.connections || [])
 
-        // Find first active/enabled connection
-        const active = connections.find(
-          c => c.is_active === "1" || c.is_active === true || c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
-        ) || connections[0]
+        // Find first active-inserted connection (shown in main panel = has a running engine).
+        // Prefer BingX/Bybit as they are the primary base exchanges.
+        const isInserted = (c: any) =>
+          c.is_active_inserted === "1" || c.is_active_inserted === true ||
+          c.is_assigned === "1" || c.is_assigned === true ||
+          c.is_active === "1" || c.is_active === true ||
+          c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
+
+        const preferredExchanges = ["bingx", "bybit"]
+        const active =
+          connections.find((c: any) => isInserted(c) && preferredExchanges.includes((c.exchange || "").toLowerCase())) ||
+          connections.find((c: any) => isInserted(c)) ||
+          connections[0]
 
         if (!active) {
           setVolatileSymbol(s => ({ ...s, loading: false, error: "No connections found" }))
@@ -123,14 +132,18 @@ export function QuickstartSection() {
         if (!res.ok) return
         const data = await res.json()
         setStats({
-          cycles: data.indicationCycleCount || data.strategyCycleCount || 0,
+          // indicationCycleCount is the primary flat field; fall back to nested
+          cycles: data.indicationCycleCount || data.indications?.cycleCount || data.strategyCycleCount || 0,
           successRate: data.cycleSuccessRate || 0,
+          // totalIndicationsCount is the flat field; fall back to nested totalRecords
           indications: data.totalIndicationsCount || data.indications?.totalRecords || 0,
+          // Flat per-type counts
           strategies:
             (data.baseStrategyCount || 0) +
             (data.mainStrategyCount || 0) +
             (data.realStrategyCount || 0) +
-            (data.liveStrategyCount || 0),
+            (data.liveStrategyCount || 0) ||
+            data.totalStrategyCount || 0,
           positions: data.positionsCount || 0,
           profit: data.totalProfit || 0,
         })
@@ -165,8 +178,18 @@ export function QuickstartSection() {
       addLog("Step 1: Initializing connection...", "info")
       const connRes = await fetch("/api/settings/connections?t=" + Date.now(), { cache: "no-store" })
       if (!connRes.ok) throw new Error("Failed to get connections")
-      const connections = await connRes.json()
-      const active = connections.find((c: any) => c.is_active === "1" || c.is_active === true) || connections[0]
+      const allConns: any[] = await connRes.json()
+      const connections = Array.isArray(allConns) ? allConns : (allConns as any)?.connections || []
+      const isInsertedConn = (c: any) =>
+        c.is_active_inserted === "1" || c.is_active_inserted === true ||
+        c.is_assigned === "1" || c.is_assigned === true ||
+        c.is_active === "1" || c.is_active === true ||
+        c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
+      const preferredExchanges = ["bingx", "bybit"]
+      const active =
+        connections.find((c: any) => isInsertedConn(c) && preferredExchanges.includes((c.exchange || "").toLowerCase())) ||
+        connections.find((c: any) => isInsertedConn(c)) ||
+        connections[0]
       if (!active) throw new Error("No active connections")
       addLog(`✓ Connected to ${active.exchange}`, "success")
 

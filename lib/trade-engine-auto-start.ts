@@ -10,7 +10,7 @@
 import { getGlobalTradeEngineCoordinator } from "./trade-engine"
 import { getAllConnections, getRedisClient, initRedis } from "./redis-db"
 import { loadSettingsAsync } from "./settings-storage"
-import { hasConnectionCredentials, isConnectionMainProcessing } from "./connection-state-utils"
+import { hasConnectionCredentials, isConnectionMainProcessing, isConnectionInActivePanel, isTruthyFlag } from "./connection-state-utils"
 
 let autoStartInitialized = false
 let autoStartTimer: NodeJS.Timeout | null = null
@@ -98,11 +98,19 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
           return
         }
 
-        // Filter for main-assigned + dashboard-enabled connections with valid API keys only.
+        // Filter for connections that should have a running engine.
+        // PRIMARY: active-inserted connections (shown in the main panel) with any credentials.
+        // These are connections the user has explicitly added to the dashboard — they should
+        // always run regardless of the is_enabled_dashboard toggle state.
+        // SECONDARY: fully main-processing connections (assigned + dashboard-enabled).
         const connectionsThatShouldBeRunning = connections.filter((c) => {
-          const isMainProcessing = isConnectionMainProcessing(c)
-          const hasValidCredentials = hasConnectionCredentials(c, 20, false)
-          return isMainProcessing && hasValidCredentials
+          const isActiveInserted = isConnectionInActivePanel(c)
+          const isFullyEnabled = isConnectionMainProcessing(c)
+          // Allow placeholder/predefined credentials — engine handles auth failures gracefully
+          const hasAnyCredentials = hasConnectionCredentials(c, 5, true)
+          const isPredefined = isTruthyFlag(c.is_predefined)
+          const isTestnet = isTruthyFlag(c.is_testnet) || isTruthyFlag(c.demo_mode)
+          return (isFullyEnabled || isActiveInserted) && (hasAnyCredentials || isPredefined || isTestnet)
         })
 
         // Load settings ONCE per interval, not per connection

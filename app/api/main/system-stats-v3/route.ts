@@ -125,7 +125,38 @@ export async function GET() {
       baseConnections.length > 0 ? "partial" : "down"
 
     const workflow = await getDashboardWorkflowSnapshot()
-    
+
+    // ── Aggregate cycle/indication/strategy stats from ALL active-inserted connections ──
+    // The focusConnection in dashboard-workflow only tracks one connection; read all
+    // progression hashes directly to get the real totals across all running engines.
+    let totalIndicationCycles = 0
+    let totalStrategyCycles   = 0
+    let totalIndicationsCount = 0
+    let totalStrategiesCount  = 0
+
+    try {
+      const progressionKeys = await client.keys("progression:*")
+      for (const key of progressionKeys) {
+        try {
+          const ph = await client.hgetall(key)
+          if (ph && typeof ph === "object") {
+            totalIndicationCycles += parseInt(ph.indication_cycle_count || "0", 10)
+            totalStrategyCycles   += parseInt(ph.strategy_cycle_count   || "0", 10)
+            totalIndicationsCount += parseInt(ph.indications_count       || "0", 10)
+            totalStrategiesCount  += parseInt(ph.strategies_count        || "0", 10)
+          }
+        } catch { /* skip per-key errors */ }
+      }
+    } catch (e) {
+      console.warn("[v0] [SystemStats] Error aggregating progression keys:", e)
+    }
+
+    // Fallback to focusConnection metrics if all progression hashes are empty
+    const focusCycles = workflow.connectionMetrics.engineCycles
+    const finalIndicationCycles = totalIndicationCycles || focusCycles?.indication || 0
+    const finalStrategyCycles   = totalStrategyCycles   || focusCycles?.strategy   || 0
+    const finalTotalCycles      = finalIndicationCycles + finalStrategyCycles
+
     console.log(`[v0] [SystemStats] Response: exchangeConnections.total=${insertedBaseConnections.length}, debug: base=${baseConnections.length}, enabled=${enabledBase.length}, inserted=${insertedBaseConnections.length}`)
     
     return NextResponse.json({
@@ -135,7 +166,7 @@ export async function GET() {
         mainStatus,
         mainCount: mainConnections.length,
         mainTotal: activeInsertedAll.length,
-        mainEnabled,  // Whether Main Engine is enabled
+        mainEnabled,
         liveTradeStatus,
         liveTradeCount: liveTradeConnections.length,
         liveTradeEnabled,
@@ -151,7 +182,6 @@ export async function GET() {
         totalKeys,
       },
       exchangeConnections: {
-        // Exchange connections = inserted base connections (independent of credentials)
         total: insertedBaseConnections.length,
         enabled: insertedBaseConnections.filter((c: any) => isTruthyFlag(c.is_enabled)).length,
         working: insertedBaseConnections.filter((c: any) => isConnectionWorking(c)).length,
@@ -159,34 +189,41 @@ export async function GET() {
         status: exchangeStatus,
       },
       activeConnections: {
-        // Active panel connections
-        total: workflow.overview.activePanelConnections,
-        active: workflow.overview.dashboardEnabledConnections,
+        // Count active-inserted connections — these are the ones with running engines
+        total: activeInsertedAll.length,
+        active: activeInsertedAll.length,
         liveTrade: workflow.overview.liveTradeConnections,
         presetTrade: workflow.overview.presetTradeConnections,
       },
-      // Available connections = enabled base connections NOT yet in Active panel
       availableConnections: enabledBase.filter((c: any) => !isConnectionInActivePanel(c)).length,
       liveTrades: {
         lastHour: 0,
         topConnections: [],
       },
       cycleStats: {
-        cycleCount: workflow.connectionMetrics.engineCycles?.total || workflow.connectionMetrics.progression?.cyclesCompleted || 0,
-        indicationCycles: workflow.connectionMetrics.engineCycles?.indication || 0,
-        strategyCycles: workflow.connectionMetrics.engineCycles?.strategy || 0,
+        cycleCount: finalTotalCycles,
+        indicationCycles: finalIndicationCycles,
+        strategyCycles: finalStrategyCycles,
+        indicationsCount: totalIndicationsCount,
+        strategiesCount: totalStrategiesCount,
         cycleDurationMs: workflow.connectionMetrics.engineDurations?.indicationAvgMs || 0,
       },
       totalPositions: workflow.connectionMetrics.positions,
       totalTrades: workflow.connectionMetrics.trades,
-      workflowOverview: workflow.overview,
+      workflowOverview: {
+        ...workflow.overview,
+        // Override with accurate active-inserted count
+        activePanelConnections: activeInsertedAll.length,
+        eligibleEngineConnections: Math.max(workflow.overview.eligibleEngineConnections, activeInsertedAll.length),
+      },
       workflowPhases: workflow.workflowPhases,
-      // DEBUG: Help understand what's being counted
       _debug: {
         baseConnectionsTotal: baseConnections.length,
         baseConnectionsEnabled: enabledBase.length,
         insertedBaseConnectionsCount: insertedBaseConnections.length,
         activeInsertedAllCount: activeInsertedAll.length,
+        totalIndicationCycles,
+        totalStrategyCycles,
       }
     })
   } catch (error) {

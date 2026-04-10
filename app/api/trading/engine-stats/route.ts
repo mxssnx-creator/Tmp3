@@ -28,26 +28,45 @@ export async function GET(req: Request) {
       }
     }
 
-    // ── 2. Read strategy Set counts from settings:strategies:{connId}:*:sets ──
-    // Strategy sets are stored via setSettings() which prefixes with "settings:".
-    // The value is a flattened hash; the "count" field holds the number of Sets.
-    let baseSetCount = 0
-    let mainSetCount = 0
-    let realSetCount = 0
+    // ── 2. Read strategy counts ──────────────────────────────────────────────────
+    // PRIMARY: progression hash fields written by statistics-tracker (hincrby every cycle)
+    let baseSetCount = parseInt(progHash.strategies_base_total || "0", 10)
+    let mainSetCount = parseInt(progHash.strategies_main_total || "0", 10)
+    let realSetCount = parseInt(progHash.strategies_real_total || "0", 10)
     let liveSetCount = 0
+    const totalFromProgression = baseSetCount + mainSetCount + realSetCount
 
+    // SECONDARY: direct counter keys strategies:{connId}:{type}:count (written by statistics-tracker via incrby)
+    // These are the most up-to-date values per strategy type.
     try {
-      const strategyKeys = await redis.keys(`settings:strategies:${connectionId}:*:sets`)
-      for (const key of strategyKeys) {
-        const hash = await redis.hgetall(key) || {}
-        const count = parseInt(hash.count || "0", 10)
-        if (key.includes(":base:"))  baseSetCount += count
-        else if (key.includes(":main:")) mainSetCount += count
-        else if (key.includes(":real:")) realSetCount += count
-        else if (key.includes(":live:")) liveSetCount += count
+      for (const type of ["base", "main", "real", "live"]) {
+        const raw = await redis.get(`strategies:${connectionId}:${type}:count`)
+        const count = parseInt(String(raw || "0"), 10)
+        if (type === "base") baseSetCount = Math.max(baseSetCount, count)
+        else if (type === "main") mainSetCount = Math.max(mainSetCount, count)
+        else if (type === "real") realSetCount = Math.max(realSetCount, count)
+        else if (type === "live") liveSetCount = Math.max(liveSetCount, count)
       }
     } catch (e) {
-      console.warn("[v0] [EngineStats] Error reading strategy set keys:", e)
+      console.warn("[v0] [EngineStats] Error reading strategy counter keys:", e)
+    }
+
+    // TERTIARY: settings:strategies:{connId}:*:sets hash keys (written by setSettings every 50-100 cycles)
+    // Only use if primary/secondary both return 0.
+    if (totalFromProgression === 0 && baseSetCount === 0) {
+      try {
+        const strategyKeys = await redis.keys(`settings:strategies:${connectionId}:*:sets`)
+        for (const key of strategyKeys) {
+          const hash = await redis.hgetall(key) || {}
+          const count = parseInt(hash.count || "0", 10)
+          if (key.includes(":base:"))      baseSetCount += count
+          else if (key.includes(":main:")) mainSetCount += count
+          else if (key.includes(":real:")) realSetCount += count
+          else if (key.includes(":live:")) liveSetCount += count
+        }
+      } catch (e) {
+        console.warn("[v0] [EngineStats] Error reading strategy set keys:", e)
+      }
     }
 
     // ── 3. Read strategy cycle count from progression hash (written every cycle) ─
