@@ -291,9 +291,6 @@ export class StrategyProcessor {
       ]
       console.log(`[v0] [StrategyProcessor] INLINE_V3: Generated ${inlineIndications.length} indications for ${symbol}`)
       return inlineIndications
-      
-      console.log(`[v0] [StrategyProcessor] No indications found for ${symbol} in connection ${this.connectionId}`)
-      return []
     } catch (error) {
       console.error(`[v0] [StrategyProcessor] Error retrieving indications for ${symbol}:`, error)
       return []
