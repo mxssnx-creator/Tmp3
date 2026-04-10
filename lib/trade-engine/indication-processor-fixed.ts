@@ -405,15 +405,21 @@ export class IndicationProcessor {
       console.log(`[v0] [IndicationProcessor] Step-based indicators calculated for ${symbol}: ${stepRange.length} steps analyzed`)
 
       // Market data is a single candle object with fields: price, open, high, low, close, volume, timestamp
-      // Extract price information from the single candle
-      const currentClose = Number.parseFloat(marketData.close || marketData.price || "0")
-      const currentOpen = Number.parseFloat(marketData.open || currentClose)
-      const currentHigh = Number.parseFloat(marketData.high || currentClose)
-      const currentLow = Number.parseFloat(marketData.low || currentClose)
-      const currentVolume = Number.parseFloat(marketData.volume || "0")
+      // Handle nested candles structure if present
+      let priceSource = marketData
+      if (marketData.candles && Array.isArray(marketData.candles) && marketData.candles.length > 0) {
+        priceSource = marketData.candles[marketData.candles.length - 1]
+      }
+      
+      // Extract price information with multiple fallbacks (handle string or number types)
+      const currentClose = Number.parseFloat(String(priceSource.close || priceSource.c || priceSource.price || marketData.close || marketData.price || marketData.lastPrice || "0"))
+      const currentOpen = Number.parseFloat(String(priceSource.open || priceSource.o || marketData.open || currentClose))
+      const currentHigh = Number.parseFloat(String(priceSource.high || priceSource.h || marketData.high || currentClose))
+      const currentLow = Number.parseFloat(String(priceSource.low || priceSource.l || marketData.low || currentClose))
+      const currentVolume = Number.parseFloat(String(priceSource.volume || priceSource.v || marketData.volume || "0"))
       
       if (currentClose === 0 || isNaN(currentClose)) {
-        // Disabled logging - runs per symbol per cycle
+        console.log(`[v0] [IndicationProcessor] REJECTED: Invalid price for ${symbol} - close=${currentClose}, marketData keys: ${Object.keys(marketData).slice(0,5).join(',')}`)
         return []
       }
 
