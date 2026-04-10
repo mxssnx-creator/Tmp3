@@ -342,7 +342,12 @@ export class GlobalTradeEngineCoordinator {
       
       await initRedis()
       const enabledIds = new Set(connections.map(c => c.id))
-      const runningIds = new Set(this.engineManagers.keys())
+      // Only count managers whose engine is actually running, not zombie Map entries from stale closures
+      const runningIds = new Set(
+        Array.from(this.engineManagers.entries())
+          .filter(([, mgr]) => mgr.isEngineRunning)
+          .map(([id]) => id),
+      )
       
       console.log(`[v0] [Coordinator] Missing engines check: shouldBeRunning=${enabledIds.size}, currentlyRunning=${runningIds.size}`)
       

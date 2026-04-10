@@ -609,6 +609,10 @@ export class TradeEngineManager {
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
+          // Always write indication_cycle_count every cycle so it is never capped by empty batches
+          await client.hset(redisKey, "indication_cycle_count", String(cycleCount))
+          await client.hset(redisKey, "symbols_processed", String(symbols.length))
+          await client.expire(redisKey, 7 * 24 * 60 * 60)
           if (Object.keys(indicationTypeCounts).length > 0) {
             // Atomically increment per-type fields in the progression hash
             for (const [type, count] of Object.entries(indicationTypeCounts)) {
@@ -616,9 +620,6 @@ export class TradeEngineManager {
               await client.hincrby(redisKey, field, count)
             }
             await client.hincrby(redisKey, "indications_count", totalIndications)
-            await client.hset(redisKey, "indication_cycle_count", String(cycleCount))
-            await client.hset(redisKey, "symbols_processed", String(symbols.length))
-            await client.expire(redisKey, 7 * 24 * 60 * 60)
           }
         } catch { /* non-critical */ }
 
@@ -766,14 +767,15 @@ export class TradeEngineManager {
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
+          // Always write strategy_cycle_count every cycle so stratCount is never capped
+          await client.hset(redisKey, "strategy_cycle_count", String(cycleCount))
+          await client.expire(redisKey, 7 * 24 * 60 * 60)
           if (evaluatedThisCycle > 0) {
             await client.hincrby(redisKey, "strategies_count", evaluatedThisCycle)
             await client.hincrby(redisKey, "strategies_real_total", liveReadyThisCycle)
             await client.hincrby(redisKey, "strategy_evaluated_real", liveReadyThisCycle)
-            await client.hset(redisKey, "strategy_cycle_count", String(cycleCount))
             await client.hset(redisKey, "total_strategies_evaluated", String(totalStrategiesEvaluated))
             await client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle))
-            await client.expire(redisKey, 7 * 24 * 60 * 60)
           }
         } catch { /* non-critical */ }
 
