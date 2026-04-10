@@ -157,12 +157,16 @@ export class InlineLocalRedis {
   }
 
   async incr(key: string): Promise<number> {
+    return this.incrby(key, 1)
+  }
+
+  async incrby(key: string, increment: number): Promise<number> {
     if (this.isExpired(key)) {
-      this.data.strings.set(key, "1")
-      return 1
+      this.data.strings.set(key, String(increment))
+      return increment
     }
     const current = parseInt(this.data.strings.get(key) || "0", 10)
-    const newValue = current + 1
+    const newValue = current + increment
     this.data.strings.set(key, String(newValue))
     return newValue
   }

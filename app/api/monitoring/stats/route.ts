@@ -59,19 +59,19 @@ export async function GET(request: NextRequest) {
     
     try {
       const client = getRedisClient()
+      // progression:* keys are Redis HASHES (written with hset/hincrby) — must use hgetall
       const progressionKeys = await client.keys("progression:*")
       
       for (const key of progressionKeys) {
         try {
-          const data = await client.get(key)
-          if (data) {
-            const parsed = typeof data === "string" ? JSON.parse(data) : data
-            totalCycles += parseInt(parsed?.cyclesCompleted || parsed?.cycles || 0)
-            totalIndications += parseInt(parsed?.indications || 0)
-            totalStrategies += parseInt(parsed?.strategies || 0)
+          const hash = await client.hgetall(key)
+          if (hash) {
+            totalCycles      += parseInt(hash.indication_cycle_count || "0", 10)
+            totalIndications += parseInt(hash.indications_count      || "0", 10)
+            totalStrategies  += parseInt(hash.strategies_count       || "0", 10)
           }
         } catch (e) {
-          // Silently skip parse errors
+          // Silently skip errors per key
         }
       }
     } catch (e) {

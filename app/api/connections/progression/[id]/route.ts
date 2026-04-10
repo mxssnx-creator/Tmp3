@@ -95,27 +95,31 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       return ProgressionStateManager.getDefaultState(connectionId)
     })
     
-    // Count indications processed for this connection
-    let indicationsCount = 0
-    let strategiesCount = 0
+    // Read live progression hash (written EVERY cycle) for real-time counts
+    // This is more current than engineState which persists only every 50-100 cycles
+    let progHash: Record<string, string> = {}
     try {
-      if (client) {
-        indicationsCount =
-          toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0)) ||
-          (await client.keys(`indications:${connectionId}:*`).catch(() => [])).length
+      progHash = (await client.hgetall(`progression:${connectionId}`)) || {}
+    } catch { /* non-critical */ }
 
-        strategiesCount =
-          toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0)) ||
-          (await client.keys(`strategies:${connectionId}:*`).catch(() => [])).length
-      }
-    } catch {
-      indicationsCount = 0
-      strategiesCount = 0
+    let indicationsCount = parseInt(progHash.indications_count || "0", 10)
+    let strategiesCount  = parseInt(progHash.strategies_count  || "0", 10)
+
+    // Fallback to string counter keys written by statistics-tracker
+    if (indicationsCount === 0) {
+      indicationsCount = toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0))
     }
-    
-    // Check for actual running evidence from cycle counts in engine state
-    const indicationCycleCount = toNumber(engineState?.indication_cycle_count)
-    const strategyCycleCount = toNumber(engineState?.strategy_cycle_count)
+    if (strategiesCount === 0) {
+      strategiesCount = toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0))
+    }
+
+    // Cycle counts: prefer live progression hash over engineState (more current)
+    const indicationCycleCount =
+      parseInt(progHash.indication_cycle_count || "0", 10) ||
+      toNumber(engineState?.indication_cycle_count)
+    const strategyCycleCount =
+      parseInt(progHash.strategy_cycle_count || "0", 10) ||
+      toNumber(engineState?.strategy_cycle_count)
     const hasRecentActivity = engineState?.last_indication_run 
       ? (Date.now() - new Date(engineState.last_indication_run).getTime()) < 60000 // Active in last 60s
       : false

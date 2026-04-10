@@ -133,7 +133,6 @@ export function QuickstartSection() {
         })
       } catch { /* non-critical */ }
     }
-    }
 
     fetchStats()
     statsIntervalRef.current = setInterval(fetchStats, 2000)
@@ -361,7 +360,7 @@ export function QuickstartSection() {
               <div className="grid grid-cols-3 gap-2">
                 {[
                   { label: "Cycles", value: stats.cycles, icon: "🔄" },
-                  { label: "Indications", value: stats.indications, icon: "📊" },
+                  { label: "Indications", value: stats.indications, icon: "���" },
                   { label: "Strategies", value: stats.strategies, icon: "🎯" },
                   { label: "Positions", value: stats.positions, icon: "📈" },
                   { label: "Success %", value: stats.successRate.toFixed(1), icon: "✓" },

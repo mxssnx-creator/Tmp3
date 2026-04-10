@@ -76,19 +76,20 @@ export async function trackStrategyStats(
     await initRedis()
     const client = getRedisClient()
 
-    await client.incr(`strategies:${connectionId}:${strategyType}:count`)
+    // Use incrby (single command) instead of looping incr (N commands)
+    await client.incrby(`strategies:${connectionId}:${strategyType}:count`, 1)
     await client.expire(`strategies:${connectionId}:${strategyType}:count`, 86400)
-    await client.incr(`strategies:${connectionId}:count`)
+    await client.incrby(`strategies:${connectionId}:count`, 1)
     await client.expire(`strategies:${connectionId}:count`, 86400)
 
-    for (let i = 0; i < totalCreated; i++) {
-      await client.incr(`strategies:${connectionId}:${strategyType}:evaluated`)
+    if (totalCreated > 0) {
+      await client.incrby(`strategies:${connectionId}:${strategyType}:evaluated`, totalCreated)
+      await client.expire(`strategies:${connectionId}:${strategyType}:evaluated`, 86400)
     }
-    await client.expire(`strategies:${connectionId}:${strategyType}:evaluated`, 86400)
-    for (let i = 0; i < passedCount; i++) {
-      await client.incr(`strategies:${connectionId}:${strategyType}:passed`)
+    if (passedCount > 0) {
+      await client.incrby(`strategies:${connectionId}:${strategyType}:passed`, passedCount)
+      await client.expire(`strategies:${connectionId}:${strategyType}:passed`, 86400)
     }
-    await client.expire(`strategies:${connectionId}:${strategyType}:passed`, 86400)
 
     await client.set(
       `strategies:${connectionId}:${strategyType}:latest`,
