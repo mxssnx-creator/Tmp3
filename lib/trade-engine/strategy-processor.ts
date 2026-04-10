@@ -327,35 +327,35 @@ export class StrategyProcessor {
             priceData = marketData.candles[marketData.candles.length - 1]
           }
           
-          const close = parseFloat(priceData?.close || priceData?.c || priceData?.price || marketData?.lastPrice || "0")
-          const open = parseFloat(priceData?.open || priceData?.o || close.toString())
-          const high = parseFloat(priceData?.high || priceData?.h || close.toString())
-          const low = parseFloat(priceData?.low || priceData?.l || close.toString())
+          const close = parseFloat(String(priceData?.close || priceData?.c || priceData?.price || marketData?.lastPrice || "0.01"))
+          const open = parseFloat(String(priceData?.open || priceData?.o || close))
+          const high = parseFloat(String(priceData?.high || priceData?.h || close))
+          const low = parseFloat(String(priceData?.low || priceData?.l || close))
           
-          if (close > 0) {
-            const direction = close >= open ? "long" : "short"
-            const range = high - low
-            const rangePercent = (range / close) * 100
-            const now = Date.now()
-            
-            const generatedIndications = [
-              { type: "direction", symbol, value: direction === "long" ? 1 : -1, profitFactor: 1.2, confidence: 0.7, timestamp: now },
-              { type: "move", symbol, value: rangePercent > 2 ? 1 : 0, profitFactor: 1.0 + rangePercent/100, confidence: 0.6, timestamp: now },
-              { type: "active", symbol, value: rangePercent > 1 ? 1 : 0, profitFactor: 1.1, confidence: 0.65, timestamp: now },
-              { type: "optimal", symbol, value: direction === "long" && rangePercent > 1.5 ? 1 : 0, profitFactor: 1.3, confidence: 0.75, timestamp: now },
-            ]
-            
-            // Save to Redis for future use
-            const redisClient = getRedisClient()
-            const key = `indications:${this.connectionId}`
-            const existing = await redisClient.get(key).catch(() => null)
-            const existingArr = existing ? JSON.parse(String(existing || "[]")) : []
-            existingArr.push(...generatedIndications)
-            const trimmed = existingArr.slice(-1000)
-            await redisClient.set(key, JSON.stringify(trimmed))
-            
-            return generatedIndications
-          }
+          // Always generate indications when market data is found (use safe defaults if price is invalid)
+          const safeClose = close > 0 ? close : 0.01
+          const direction = safeClose >= open ? "long" : "short"
+          const range = high - low
+          const rangePercent = safeClose > 0 ? (range / safeClose) * 100 : 1
+          const now = Date.now()
+          
+          const generatedIndications = [
+            { type: "direction", symbol, value: direction === "long" ? 1 : -1, profitFactor: 1.2, confidence: 0.7, timestamp: now },
+            { type: "move", symbol, value: rangePercent > 2 ? 1 : 0, profitFactor: 1.0 + rangePercent/100, confidence: 0.6, timestamp: now },
+            { type: "active", symbol, value: rangePercent > 1 ? 1 : 0, profitFactor: 1.1, confidence: 0.65, timestamp: now },
+            { type: "optimal", symbol, value: direction === "long" && rangePercent > 1.5 ? 1 : 0, profitFactor: 1.3, confidence: 0.75, timestamp: now },
+          ]
+          
+          // Save to Redis for future use
+          const fallbackClient = getRedisClient()
+          const key = `indications:${this.connectionId}`
+          const existing = await fallbackClient.get(key).catch(() => null)
+          const existingArr = existing ? JSON.parse(String(existing || "[]")) : []
+          existingArr.push(...generatedIndications)
+          const trimmed = existingArr.slice(-1000)
+          await fallbackClient.set(key, JSON.stringify(trimmed))
+          
+          return generatedIndications
         }
       } catch (genError) {
         // Fallback generation failed, log error
