@@ -329,6 +329,7 @@ export class IndicationProcessor {
    * Returns array of active indications for strategy processing
    */
   async processIndication(symbol: string): Promise<any[]> {
+    console.log(`[v0] [DEBUG-MARKER-2026-04-10] processIndication called for ${symbol}`)
     try {
       // Defensive initialization - ensure cache exists even if constructor failed
       if (!this.marketDataCache) {
@@ -336,15 +337,17 @@ export class IndicationProcessor {
       }
       
       let marketData = await this.getLatestMarketDataCached(symbol)
+      console.log(`[v0] [DEBUG-MARKER-2026-04-10] getLatestMarketDataCached returned: ${marketData ? 'DATA' : 'NULL'} for ${symbol}`)
       if (!marketData) {
         // Try to load market data if not available
         await initRedis()
         const client = getRedisClient()
+        console.log(`[v0] [DEBUG-MARKER-2026-04-10] Redis client ready, loading market data for ${symbol}`)
 
         // Force load market data for this symbol
         const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
         const loadedCount = await loadMarketDataForEngine([symbol])
-        console.log(`[v0] [IndicationProcessor] loadMarketDataForEngine returned: ${loadedCount} for ${symbol}`)
+        console.log(`[v0] [DEBUG-MARKER-2026-04-10] loadMarketDataForEngine returned: ${loadedCount} for ${symbol}`)
 
         // Clear cache entry and force direct Redis read after loading
         SHARED_MARKET_DATA_CACHE.delete(symbol)
