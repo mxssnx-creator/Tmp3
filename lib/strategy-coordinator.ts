@@ -221,6 +221,15 @@ export class StrategyCoordinator {
     const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
     await setSettings(baseKey, { sets: baseSets, count: baseSets.length, created: new Date() })
 
+    // Write Base counts to progression hash so stats API and dashboard read accurate per-stage counts
+    try {
+      const client = getRedisClient()
+      const redisKey = `progression:${this.connectionId}`
+      await client.hincrby(redisKey, "strategies_base_total", baseSets.length)
+      await client.hincrby(redisKey, "strategy_evaluated_base", baseSets.length)
+      await client.expire(redisKey, 7 * 24 * 60 * 60)
+    } catch { /* non-critical */ }
+
     console.log(`[v0] [StrategyFlow] ${symbol} BASE: ${baseSets.length} Sets created (${baseSets.reduce((s, set) => s + set.entryCount, 0)} total entries)`)
 
     return {
@@ -323,6 +332,15 @@ export class StrategyCoordinator {
     const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
     await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
 
+    // Write Main counts to progression hash (evaluated = sets promoted, total = base sets evaluated)
+    try {
+      const client = getRedisClient()
+      const redisKey = `progression:${this.connectionId}`
+      await client.hincrby(redisKey, "strategies_main_total", baseSets.length)   // how many Base sets were evaluated against Main threshold
+      await client.hincrby(redisKey, "strategy_evaluated_main", mainSets.length) // how many passed to Main
+      await client.expire(redisKey, 7 * 24 * 60 * 60)
+    } catch { /* non-critical */ }
+
     const failed = baseSets.length - mainSets.length
     console.log(
       `[v0] [StrategyFlow] ${symbol} MAIN: ${mainSets.length}/${baseSets.length} Sets promoted (minPF=${metrics.minProfitFactor}) | ` +
@@ -363,6 +381,15 @@ export class StrategyCoordinator {
     // Persist REAL sets
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
     await setSettings(realKey, { sets: realSets, count: realSets.length, created: new Date() })
+
+    // Write Real counts to progression hash
+    try {
+      const client = getRedisClient()
+      const redisKey = `progression:${this.connectionId}`
+      await client.hincrby(redisKey, "strategies_real_total", mainSets.length)    // how many Main sets were evaluated
+      await client.hincrby(redisKey, "strategy_evaluated_real", realSets.length)  // how many passed to Real
+      await client.expire(redisKey, 7 * 24 * 60 * 60)
+    } catch { /* non-critical */ }
 
     console.log(
       `[v0] [StrategyFlow] ${symbol} REAL: ${realSets.length}/${mainSets.length} Sets promoted (minPF=${metrics.minProfitFactor}, conf=${metrics.confidence})`
@@ -414,23 +441,26 @@ export class StrategyCoordinator {
       executable: true,
     })
 
-    // Write live set count into progression hash
+    // Write live set count into progression hash — track how many Real sets were promoted to Live
+    // NOTE: strategies_real_total and strategy_evaluated_real are already written by evaluateRealSets.
+    //       Here we only write the live-specific counter to avoid double-counting.
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
       if (qualifying.length > 0) {
-        await client.hincrby(redisKey, "strategies_real_total", qualifying.length)
-        await client.hincrby(redisKey, "strategies_real_evaluated", qualifying.length)
+        await client.hincrby(redisKey, "strategies_live_total", qualifying.length)
         await client.expire(redisKey, 7 * 24 * 60 * 60)
       }
     } catch { /* non-critical */ }
 
-    // Create ONE pseudo position per Set (one per indication_type × direction)
+    // Create EXACTLY ONE pseudo position per Set (one per indication_type × direction combination).
+    // Each Set represents a unique (indication_type × direction) coordinate.
+    // We pick the highest-profitFactor entry from the Set as the representative config for the position.
     if (qualifying.length > 0) {
       try {
         const posManager = new PseudoPositionManager(this.connectionId)
 
-        // Fetch entry price
+        // Fetch current market price for entry
         let entryPrice = 0
         try {
           const client = getRedisClient()
@@ -449,41 +479,40 @@ export class StrategyCoordinator {
         } catch { /* skip price lookup */ }
 
         if (entryPrice > 0) {
-          // One position per Set entry (config combo) — each entry is an independent Set
+          let positionsCreated = 0
           for (const set of qualifying) {
-            for (const entry of set.entries) {
-              try {
-                const tp = Math.max(0.5, (entry.profitFactor - 1) * 100)
-                const sl = Math.min(5, 100 / Math.max(1, entry.profitFactor) * 0.5)
-                const trailing = entry.confidence >= 0.85
+            try {
+              // Pick the best-performing entry from this Set as the representative config.
+              // "Best" = highest profitFactor (already sorted by pruneEntries).
+              const bestEntry = set.entries.reduce(
+                (best, e) => (e.profitFactor > best.profitFactor ? e : best),
+                set.entries[0]
+              )
+              if (!bestEntry) continue
 
-                // Unique fingerprint for this config combination
-                const configSetKey = [
-                  set.indicationType,
-                  set.direction,
-                  tp.toFixed(4),
-                  sl.toFixed(4),
-                  trailing ? "1" : "0",
-                  entry.sizeMultiplier.toFixed(2),
-                  String(entry.leverage),
-                  entry.positionState,
-                ].join(":")
+              const tp = Math.max(0.5, (bestEntry.profitFactor - 1) * 100)
+              const sl = Math.min(5, 100 / Math.max(1, bestEntry.profitFactor) * 0.5)
+              const trailing = bestEntry.confidence >= 0.85
 
-                await posManager.createPosition({
-                  symbol,
-                  side: set.direction,
-                  indicationType: set.indicationType,
-                  entryPrice,
-                  takeprofitFactor: tp,
-                  stoplossRatio: sl,
-                  profitFactor: entry.profitFactor,
-                  trailingEnabled: trailing,
-                  configSetKey,
-                })
-              } catch { /* non-critical per-entry error */ }
-            }
+              // configSetKey identifies this unique Set (indication_type × direction).
+              // One active pseudo position per Set is enforced inside createPosition.
+              const configSetKey = `${set.indicationType}:${set.direction}:${symbol}`
+
+              const posId = await posManager.createPosition({
+                symbol,
+                side: set.direction,
+                indicationType: set.indicationType,
+                entryPrice,
+                takeprofitFactor: tp,
+                stoplossRatio: sl,
+                profitFactor: bestEntry.profitFactor,
+                trailingEnabled: trailing,
+                configSetKey,
+              })
+              if (posId) positionsCreated++
+            } catch { /* non-critical per-Set error */ }
           }
-          console.log(`[v0] [StrategyFlow] ${symbol} LIVE: Created pseudo positions for ${qualifying.length} Sets`)
+          console.log(`[v0] [StrategyFlow] ${symbol} LIVE: Created/updated ${positionsCreated} pseudo positions for ${qualifying.length} Sets`)
         } else {
           console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: No entry price, skipping position creation`)
         }

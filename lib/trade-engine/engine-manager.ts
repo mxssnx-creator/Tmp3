@@ -763,20 +763,16 @@ export class TradeEngineManager {
         this.componentHealth.strategies.cycleCount = cycleCount
         this.componentHealth.strategies.successRate = cycleCount > 0 ? ((cycleCount - errorCount) / cycleCount) * 100 : 100
 
-        // Write strategy counts into progression hash for dashboard real-time display
+        // Write ONLY cycle-level metrics into the progression hash.
+        // Per-stage Set counts (strategies_base_total, strategies_main_total,
+        // strategies_real_total, strategy_evaluated_*) are written atomically inside
+        // StrategyCoordinator.executeStrategyFlow() to avoid double-counting.
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
-          // Always write strategy_cycle_count every cycle so stratCount is never capped
           await client.hset(redisKey, "strategy_cycle_count", String(cycleCount))
+          await client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle))
           await client.expire(redisKey, 7 * 24 * 60 * 60)
-          if (evaluatedThisCycle > 0) {
-            await client.hincrby(redisKey, "strategies_count", evaluatedThisCycle)
-            await client.hincrby(redisKey, "strategies_real_total", liveReadyThisCycle)
-            await client.hincrby(redisKey, "strategy_evaluated_real", liveReadyThisCycle)
-            await client.hset(redisKey, "total_strategies_evaluated", String(totalStrategiesEvaluated))
-            await client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle))
-          }
         } catch { /* non-critical */ }
 
         // Update progression cycle

@@ -32,6 +32,14 @@ export class PseudoPositionManager {
     return `pseudo_positions:${this.connectionId}`
   }
 
+  /**
+   * Redis set key that indexes all currently-active configSetKeys for O(1) duplicate detection.
+   * Each active position's configSetKey is added on creation and removed on close.
+   */
+  private activeConfigKeysSetKey(): string {
+    return `pseudo_positions:${this.connectionId}:active_config_keys`
+  }
+
   /** Redis hash key for one position */
   private positionKey(id: string): string {
     return `pseudo_position:${this.connectionId}:${id}`
@@ -168,6 +176,8 @@ export class PseudoPositionManager {
 
       await client.hset(this.positionKey(id), positionData)
       await client.sadd(this.positionsSetKey(), id)
+      // Register this configSetKey as active for O(1) duplicate detection on next creation
+      await client.sadd(this.activeConfigKeysSetKey(), configSetKey)
 
       console.log(`[v0] Created pseudo position ${id} for ${params.symbol} side=${params.side} vol=${volumeCalc.finalVolume}`)
 
@@ -289,8 +299,13 @@ export class PseudoPositionManager {
         realized_pnl: String(pnl),
       })
       
-      // Remove closed position from index set to prevent unbounded growth
+      // Remove closed position from the main index set
       await client.srem(this.positionsSetKey(), positionId)
+      // Remove from the O(1) active-configSetKey index so the slot can be reused
+      const configSetKey = position.config_set_key || ""
+      if (configSetKey) {
+        await client.srem(this.activeConfigKeysSetKey(), configSetKey)
+      }
       // Set TTL on the closed position hash so it auto-cleans (7 days)
       await client.expire(this.positionKey(positionId), 604800)
 
@@ -380,23 +395,25 @@ export class PseudoPositionManager {
 
   /**
    * Check if a new position can be created for the given config set key.
-   * Each unique config combination (indType:dir:tp:sl:trailing:...) is an
-   * independent Set — exactly 1 active pseudo position is allowed per Set.
+   * Each unique config combination (indType:dir:symbol) is an independent Set —
+   * exactly 1 active pseudo position is allowed per Set.
+   *
+   * Uses O(1) SISMEMBER on the activeConfigKeysSetKey index instead of scanning
+   * all positions, which is critical for high-frequency operation.
    */
   private async canCreatePosition(
     symbol: string,
     configSetKey: string,
   ): Promise<boolean> {
     try {
-      // Load all active positions for this symbol and check config_set_key
-      const active = await this.listPositions({ status: "active", symbol })
-      const existing = active.filter(
-        (p) => (p.config_set_key || "") === configSetKey
-      )
-      return existing.length < 1
+      const client = getRedisClient()
+      const isMember = await client.sismember(this.activeConfigKeysSetKey(), configSetKey)
+      // isMember is 1 (number) if already active, 0 or null if not
+      return !isMember
     } catch (error) {
       console.error("[v0] Failed to check position limit for config set:", error)
-      return false
+      // On Redis error fall through and allow creation (fail-open)
+      return true
     }
   }
 
