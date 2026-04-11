@@ -24,7 +24,6 @@ export async function GET() {
     }
 
     const symbolsArray = Array.from(allSymbols)
-    console.log(`[v0] [VolatilityScreen] Screening ${symbolsArray.length} symbols for high volatility...`)
 
     // Screen for high volatility (>2% range in last hour)
     const topVolatile = await getTopVolatileSymbols(symbolsArray, 3, 2.0)
@@ -33,8 +32,6 @@ export async function GET() {
     for (const metrics of topVolatile) {
       await cacheVolatilityMetrics(metrics)
     }
-
-    console.log(`[v0] [VolatilityScreen] Found ${topVolatile.length} high-volatility symbols`)
 
     return NextResponse.json({
       success: true,

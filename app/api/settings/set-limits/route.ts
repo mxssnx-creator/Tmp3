@@ -124,8 +124,6 @@ export async function POST(request: NextRequest) {
       updates.push("logs")
     }
     
-    console.log(`[v0] [SetLimits] Updated limits for: ${updates.join(", ")}`)
-    
     return NextResponse.json({
       success: true,
       updated: updates,

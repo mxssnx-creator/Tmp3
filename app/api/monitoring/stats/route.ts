@@ -81,7 +81,7 @@ export async function GET(request: NextRequest) {
         }
       }
     } catch (e) {
-      console.warn(`[v0] Failed to fetch engine progression:`, e)
+      // non-critical
     }
 
     return NextResponse.json({

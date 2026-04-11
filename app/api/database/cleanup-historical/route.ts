@@ -16,12 +16,8 @@ export async function POST(request: Request) {
     const cutoffTime = new Date(Date.now() - hoursToKeep * 60 * 60 * 1000)
     const cutoffTimeStr = cutoffTime.toISOString()
 
-    console.log(`[v0] [Cleanup] Starting historical data cleanup for connection: ${connectionId}`)
-    console.log(`[v0] [Cleanup] Keeping data from last ${hoursToKeep} hours (cutoff: ${cutoffTimeStr})`)
-
     // Get all market data keys for this connection
     const keys = await (client as any).keys(`market_data:${connectionId}:*`)
-    console.log(`[v0] [Cleanup] Found ${keys.length} market data records to check`)
 
     let deletedCount = 0
     let archivedCount = 0
@@ -31,7 +27,6 @@ export async function POST(request: Request) {
       const data = await (client as any).hgetall(key)
 
       if (!data || !data.timestamp) {
-        console.warn(`[v0] [Cleanup] Record missing timestamp: ${key}`)
         continue
       }
 
@@ -54,18 +49,13 @@ export async function POST(request: Request) {
           deletedCount++
           archivedCount++
 
-          if (deletedCount % 100 === 0) {
-            console.log(`[v0] [Cleanup] Processed ${deletedCount} records...`)
-          }
         } catch (error) {
-          console.error(`[v0] [Cleanup] Error archiving record ${key}:`, error)
+          console.error(`[Cleanup] Error archiving record ${key}:`, error)
         }
       } else {
         keptCount++
       }
     }
-
-    console.log(`[v0] [Cleanup] Cleanup complete: Deleted=${deletedCount}, Archived=${archivedCount}, Kept=${keptCount}`)
 
     return NextResponse.json({
       success: true,

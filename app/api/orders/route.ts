@@ -179,7 +179,7 @@ export async function POST(request: NextRequest) {
     // Order validation
     const validation = validateOrder({ quantity, price, order_type, side })
     if (!validation.valid) {
-      console.warn(`[v0] Order validation failed for user ${user.id}: ${validation.error}`)
+      console.warn(`Order validation failed for user ${user.id}: ${validation.error}`)
       return NextResponse.json(
         { success: false, error: validation.error, category: API_CATEGORY },
         { status: 400 }
