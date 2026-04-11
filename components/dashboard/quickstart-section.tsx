@@ -105,8 +105,7 @@ export function QuickstartSection() {
           loading: false,
           error: null,
         })
-      } catch (err) {
-        console.warn("[v0] [Quickstart] Failed to load volatile symbol:", err instanceof Error ? err.message : err)
+      } catch {
         setVolatileSymbol({ symbol: "BTCUSDT", exchange: null, priceChangePercent: null, loading: false, error: null })
       }
     }

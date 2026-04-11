@@ -76,8 +76,8 @@ export function QuickstartComprehensiveLogDialog() {
           lastUpdate: new Date().toLocaleTimeString(),
         })
       }
-    } catch (error) {
-      console.error("[v0] Failed to fetch overall data:", error)
+    } catch {
+      // non-critical
     } finally {
       setIsLoading(false)
     }
@@ -113,9 +113,7 @@ export function QuickstartComprehensiveLogDialog() {
 
         setLogs(newLogs.slice(-100)) // Keep last 100 logs
       }
-    } catch (error) {
-      console.error("[v0] Failed to fetch logs:", error)
-    }
+    } catch { /* non-critical */ }
   }
 
   // Poll when dialog is open; re-run whenever the selected connection changes

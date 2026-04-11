@@ -137,8 +137,8 @@ export function DetailedLoggingDialog() {
         setLogs(data.logs || [])
         setSummary(data.summary || null)
       }
-    } catch (error) {
-      console.error("[v0] Error fetching detailed logs:", error)
+    } catch {
+      // non-critical
     } finally {
       setLoading(false)
     }

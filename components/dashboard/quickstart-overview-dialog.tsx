@@ -77,8 +77,8 @@ export function QuickstartOverviewDialog() {
         setLogs(d.logs || d.recentLogs || [])
       }
       setLastRefresh(new Date())
-    } catch (err) {
-      console.error("[v0] [QuickstartOverview] load error:", err)
+    } catch {
+      // non-critical
     } finally {
       setLoading(false)
     }

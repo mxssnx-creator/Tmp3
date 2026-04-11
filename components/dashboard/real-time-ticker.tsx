@@ -37,8 +37,8 @@ export function RealTimeTicker() {
           setPrices(priceMap)
           setIsConnected(true)
         }
-      } catch (error) {
-        console.error("[v0] Failed to load real prices:", error)
+      } catch {
+        // silently ignore
       } finally {
         setIsLoading(false)
       }

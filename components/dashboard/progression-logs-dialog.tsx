@@ -104,8 +104,8 @@ export function ProgressionLogsDialog({
           setTradingState(logsData.progressionState)
         }
       }
-    } catch (error) {
-      console.error("[v0] Failed to load progression data:", error)
+    } catch {
+      // non-critical
     } finally {
       setIsLoading(false)
     }
