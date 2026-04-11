@@ -43,7 +43,6 @@ export function GlobalTradeEngineControls() {
     
     // Listen for engine state change events (from quick-start button, etc)
     const handleEngineStateChange = () => {
-      console.log("[v0] [Engine] Detected engine state change event, refreshing...")
       loadStatus()
     }
     
@@ -68,7 +67,6 @@ export function GlobalTradeEngineControls() {
       })
       if (response.ok) {
         const data = await response.json()
-        console.log(`[v0] [Engine] Status check: running=${data.running}, paused=${data.paused}, status=${data.status}`)
         const statusData: EngineStatus = {
           running: data.running === true || data.running === "true" || data.status === "running",
           paused: data.paused === true || data.paused === "true",
@@ -79,11 +77,10 @@ export function GlobalTradeEngineControls() {
           lastUpdate: new Date(data.lastUpdate || Date.now()),
           cycleStats: data.cycleStats,
         }
-        console.log(`[v0] [Engine] Parsed status: running=${statusData.running}, paused=${statusData.paused}`)
         setStatus(statusData)
       }
-    } catch (error) {
-      console.error("[v0] Failed to load engine status:", error)
+    } catch {
+      // silently ignore status load errors
     }
   }
 
@@ -106,8 +103,7 @@ export function GlobalTradeEngineControls() {
         // Even on error, refresh status to get accurate state
         await loadStatus()
       }
-    } catch (error) {
-      console.error("[v0] [Trade Engine] Start EXCEPTION:", error)
+    } catch {
       toast.error("Failed to start engine")
       // Refresh status even on exception to get accurate state
       await loadStatus()
@@ -130,9 +126,8 @@ export function GlobalTradeEngineControls() {
         toast.error(data.error || "Failed to pause engine")
         await loadStatus()
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to pause engine")
-      console.error("[v0] Error pausing engine:", error)
       await loadStatus()
     } finally {
       setIsPausing(false)
@@ -153,9 +148,8 @@ export function GlobalTradeEngineControls() {
         toast.error(data.error || "Failed to resume engine")
         await loadStatus()
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to resume engine")
-      console.error("[v0] Error resuming engine:", error)
       await loadStatus()
     } finally {
       setIsResuming(false)
@@ -176,9 +170,8 @@ export function GlobalTradeEngineControls() {
         toast.error(data.error || "Failed to stop engine")
         await loadStatus()
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to stop engine")
-      console.error("[v0] Error stopping engine:", error)
       await loadStatus()
     } finally {
       setIsStopping(false)
@@ -187,7 +180,6 @@ export function GlobalTradeEngineControls() {
 
   const handleSelectPreset = async (presetId: string) => {
     try {
-      console.log(`[v0] [PresetMode] Activating preset: ${presetId}`)
       const response = await fetch("/api/presets/activate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -207,7 +199,6 @@ export function GlobalTradeEngineControls() {
         throw new Error(data.error || "Failed to activate preset")
       }
     } catch (error) {
-      console.error("[v0] Failed to activate preset:", error)
       throw error
     }
   }

@@ -22,7 +22,7 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(false)
   const loadingRef = useRef(false)
   const lastLoadRef = useRef(0)
-  const LOAD_COOLDOWN = 60000 // 60 seconds between refreshes
+  const LOAD_COOLDOWN = 10000 // 10 seconds between refreshes
 
   const loadActiveConnections = useCallback(async (options?: { force?: boolean }) => {
     const force = options?.force === true
@@ -68,10 +68,26 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  // Only load on mount, remove interval to prevent loops
+  // Load on mount; also refresh when connections are toggled or added/removed
   useEffect(() => {
     loadActiveConnections()
-  }, []) // Empty dependency array - load once on mount only
+
+    const handleConnectionChange = () => {
+      loadActiveConnections({ force: true })
+    }
+
+    if (typeof window !== "undefined") {
+      window.addEventListener("connection-toggled", handleConnectionChange)
+      window.addEventListener("connection-removed", handleConnectionChange)
+    }
+
+    return () => {
+      if (typeof window !== "undefined") {
+        window.removeEventListener("connection-toggled", handleConnectionChange)
+        window.removeEventListener("connection-removed", handleConnectionChange)
+      }
+    }
+  }, [])
 
   const selectedConnection = activeConnections.find((connection: any) => connection.id === selectedConnectionId) || null
 

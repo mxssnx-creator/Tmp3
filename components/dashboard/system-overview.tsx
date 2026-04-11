@@ -132,11 +132,9 @@ export function SystemOverview() {
         if (response.ok) {
           const data = await response.json()
           setStats(normalizeSystemStats(data))
-        } else {
-          console.warn("[v0] [SystemOverview] Non-OK response while loading stats", response.status)
         }
-      } catch (error) {
-        console.error("[v0] Failed to load system stats:", error)
+      } catch {
+        // silently ignore stats load errors
       }
     }
 
@@ -145,15 +143,8 @@ export function SystemOverview() {
     const interval = setInterval(loadStats, 5000)
 
     // Listen for connection and live trade toggle events and refresh immediately
-    const handleConnectionToggled = () => {
-      console.log("[v0] [SystemOverview] Detected connection toggle event, refreshing stats...")
-      loadStats()
-    }
-    
-    const handleLiveTradeToggled = () => {
-      console.log("[v0] [SystemOverview] Detected live trade toggle event, refreshing stats...")
-      loadStats()
-    }
+    const handleConnectionToggled = () => { loadStats() }
+    const handleLiveTradeToggled = () => { loadStats() }
 
     if (typeof window !== 'undefined') {
       window.addEventListener('connection-toggled', handleConnectionToggled)

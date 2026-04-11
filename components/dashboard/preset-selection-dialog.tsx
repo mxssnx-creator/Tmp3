@@ -50,8 +50,7 @@ export function PresetSelectionDialog({ open, onOpenChange, onSelectPreset }: Pr
       })
       if (response.ok) {
         const data = await response.json()
-        console.log(`[v0] [PresetMode] Loaded ${data.length} presets`)
-        
+
         // Map database presets to the PresetOption format
         const presetOptions: PresetOption[] = (Array.isArray(data) ? data : []).map((p: any) => ({
           id: p.id,
@@ -67,15 +66,13 @@ export function PresetSelectionDialog({ open, onOpenChange, onSelectPreset }: Pr
         const activePreset = presetOptions.find((p) => p.is_active)
         if (activePreset) {
           setSelectedPreset(activePreset.id)
-          console.log(`[v0] [PresetMode] Auto-selected active preset: ${activePreset.name}`)
         } else if (presetOptions.length > 0) {
           setSelectedPreset(presetOptions[0].id)
         }
       }
-    } catch (error) {
-      console.error("[v0] Failed to load presets:", error)
-      toast.error("Failed to load presets")
-    } finally {
+      } catch (error) {
+        toast.error("Failed to load presets")
+      } finally {
       setIsLoading(false)
     }
   }
@@ -88,12 +85,10 @@ export function PresetSelectionDialog({ open, onOpenChange, onSelectPreset }: Pr
 
     try {
       setIsSaving(true)
-      console.log(`[v0] [PresetMode] Activating preset: ${selectedPreset}`)
       await onSelectPreset(selectedPreset)
       toast.success("Preset activated successfully")
       onOpenChange(false)
     } catch (error) {
-      console.error("[v0] Failed to activate preset:", error)
       toast.error("Failed to activate preset")
     } finally {
       setIsSaving(false)
