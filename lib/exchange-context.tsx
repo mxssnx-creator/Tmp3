@@ -22,6 +22,8 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(false)
   const loadingRef = useRef(false)
   const lastLoadRef = useRef(0)
+  // Use a ref to read selectedConnectionId inside the callback without stale closure
+  const selectedConnectionIdRef = useRef<string | null>(null)
   const LOAD_COOLDOWN = 10000 // 10 seconds between refreshes
 
   const loadActiveConnections = useCallback(async (options?: { force?: boolean }) => {
@@ -53,10 +55,16 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
         
         setActiveConnections(mainConnections)
         
-        if (mainConnections.length > 0 && !selectedConnectionId) {
-          const firstConnection = mainConnections[0]
-          setSelectedConnectionId(firstConnection.id)
-          setSelectedExchange(firstConnection.exchange || null)
+        // Auto-select only when no connection is currently selected.
+        // Read from ref to avoid stale closure (state is always null inside useCallback).
+        if (mainConnections.length > 0 && !selectedConnectionIdRef.current) {
+          // Prefer BingX, then fall back to first available connection
+          const preferred =
+            mainConnections.find((c: any) => (c.exchange || "").toLowerCase() === "bingx") ||
+            mainConnections[0]
+          setSelectedConnectionId(preferred.id)
+          setSelectedExchange(preferred.exchange || null)
+          selectedConnectionIdRef.current = preferred.id
         }
       }
     } catch (error) {
@@ -103,6 +111,7 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
         selectedConnectionId,
         setSelectedConnectionId: (connectionId) => {
           setSelectedConnectionId(connectionId)
+          selectedConnectionIdRef.current = connectionId
           const matching = activeConnections.find((connection: any) => connection.id === connectionId)
           setSelectedExchange(matching?.exchange || null)
         },
