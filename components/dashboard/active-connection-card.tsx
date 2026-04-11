@@ -164,10 +164,11 @@ export function ActiveConnectionCard({
 
   useEffect(() => {
     fetchProgression()
+    // Poll faster during active phases (2s), slower when idle/live (5s)
     const interval = setInterval(
       fetchProgression,
       progression?.phase && progression.phase !== "idle" && progression.phase !== "stopped" && progression.phase !== "live_trading"
-        ? 1000
+        ? 2000
         : 5000
     )
     
@@ -199,9 +200,9 @@ export function ActiveConnectionCard({
     }
   }, [fetchProgression, progression?.phase])
 
-  // Fetch live engine-stats every 3s when engine is running
+  // Fetch live engine-stats every 3s when connection is active
   useEffect(() => {
-    if (!globalEngineRunning) return
+    if (!connection.isActive && !globalEngineRunning) return
 
     const fetchLiveStats = async () => {
       try {
@@ -234,15 +235,10 @@ export function ActiveConnectionCard({
     const connName = connection.exchangeName
     console.log(`[v0] [Card] Live Trade toggle clicked: ${connName}, current=${liveTrade}, new=${newState}`)
     
-    // Validation
-    if (newState && !globalEngineRunning) {
-      console.log(`[v0] [Card] ✗ Cannot enable live trade - global engine not running`)
-      toast.error("Global Trade Engine must be running first")
-      return
-    }
+    // Validation — connection must be enabled first (engine starts automatically with connection)
     if (newState && !connection.isActive) {
-      console.log(`[v0] [Card] ✗ Cannot enable live trade - connection not active on dashboard`)
-      toast.error("Enable the connection first")
+      console.log(`[v0] [Card] ✗ Cannot enable live trade - connection not enabled on dashboard`)
+      toast.error("Enable the connection toggle first")
       return
     }
     
@@ -287,12 +283,8 @@ export function ActiveConnectionCard({
 
   // Handle Preset Mode toggle
   const handlePresetModeToggle = async (newState: boolean) => {
-    if (newState && !globalEngineRunning) {
-      toast.error("Global Trade Engine must be running first")
-      return
-    }
     if (newState && !connection.isActive) {
-      toast.error("Enable the connection first")
+      toast.error("Enable the connection toggle first")
       return
     }
     setPresetModeLoading(true)
@@ -459,7 +451,7 @@ export function ActiveConnectionCard({
 
             {/* Row 3: Three toggle switches */}
             <div className="flex items-center gap-4 mt-2.5 pt-2 border-t border-border/50">
-              {/* Enable toggle */}
+              {/* Enable toggle — no pre-condition on global engine; toggle-dashboard API starts the engine */}
               <div className="flex items-center gap-2">
                 <Switch
                   id={`enable-${connection.connectionId}`}
@@ -468,7 +460,7 @@ export function ActiveConnectionCard({
                     console.log(`[v0] [Card] Toggle clicked for ${connName}: ${connection.isActive} → ${!connection.isActive}`)
                     onToggle(connection.connectionId, connection.isActive)
                   }}
-                  disabled={isToggling || (!globalEngineRunning && !connection.isActive)}
+                  disabled={isToggling}
                   className="scale-[0.8]"
                 />
                 <Label
@@ -493,7 +485,7 @@ export function ActiveConnectionCard({
                   id={`live-${connection.connectionId}`}
                   checked={liveTrade}
                   onCheckedChange={handleLiveTradeToggle}
-                  disabled={liveTradeLoading || !connection.isActive || !globalEngineRunning}
+                  disabled={liveTradeLoading || !connection.isActive}
                   className="scale-[0.8]"
                 />
                 <Label
@@ -522,7 +514,7 @@ export function ActiveConnectionCard({
                   id={`preset-${connection.connectionId}`}
                   checked={presetMode}
                   onCheckedChange={handlePresetModeToggle}
-                  disabled={presetModeLoading || !connection.isActive || !globalEngineRunning}
+                  disabled={presetModeLoading || !connection.isActive}
                   className="scale-[0.8]"
                 />
                 <Label
@@ -587,8 +579,8 @@ export function ActiveConnectionCard({
             </div>
           </CardHeader>
 
-          {/* Progress bar when engine is active AND connection is enabled */}
-          {connection.isActive && globalEngineRunning && phase !== "idle" && phase !== "stopped" && (
+          {/* Progress bar when engine has active progression data */}
+          {(connection.isActive || phase === "live_trading") && phase !== "idle" && phase !== "stopped" && phase !== "disabled" && (
             <CardContent className="pt-0 pb-3 px-4">
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
