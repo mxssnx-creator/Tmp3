@@ -56,21 +56,21 @@ export function AddActiveConnectionDialog({
         return
       }
 
-      // Filter to show base exchange connections that are:
-      // 1. Base exchange (bybit, bingx, binance, okx only)
-      // 2. Enabled in Settings (is_enabled=1)
-      // 3. Not yet added to Active panel (is_active_inserted=0)
-      // Note: Both predefined templates AND user-created connections can be added
-      const BASE_EXCHANGES = ["bybit", "bingx", "pionex", "orangex"]
+      // Filter to show connections that are:
+      // 1. Enabled in Settings (is_enabled=1) — any exchange including user-created
+      // 2. Not yet added to Active panel (is_active_inserted=0 AND is_dashboard_inserted=0)
+      // This includes base exchange predefined templates AND user-created connections
+      const KNOWN_BASE_EXCHANGES = ["bybit", "bingx", "binance", "okx", "pionex", "orangex", "gateio", "kucoin", "mexc", "bitget", "huobi"]
       const availableForAdd = allConnections.filter((c: any) => {
         const exchange = (c.exchange || "").toLowerCase().trim()
-        const isBase = BASE_EXCHANGES.includes(exchange)
+        const isKnownExchange = KNOWN_BASE_EXCHANGES.includes(exchange)
+        const isUserCreated = c.is_predefined === false || c.is_predefined === "0" || c.is_predefined === "false"
         const isEnabled = c.is_enabled === true || c.is_enabled === "1" || c.is_enabled === "true"
         const alreadyInActivePanel = c.is_active_inserted === true || c.is_active_inserted === "1" ||
                                       c.is_dashboard_inserted === true || c.is_dashboard_inserted === "1"
         
-        // Show base connections that are enabled but NOT yet in Active panel
-        return isBase && isEnabled && !alreadyInActivePanel
+        // Show connections that are enabled, not yet in Active panel, and either known exchange or user-created
+        return (isKnownExchange || isUserCreated) && isEnabled && !alreadyInActivePanel
       })
 
       setAvailableConnections(availableForAdd)
@@ -100,17 +100,15 @@ export function AddActiveConnectionDialog({
 
     setAdding(true)
     try {
-      // Use API to set is_dashboard_inserted=1 (adds to dashboard) and is_enabled_dashboard=0 (disabled by default)
-      const res = await fetch(`/api/settings/connections/${selectedConnection}/toggle-dashboard`, {
+      // Add connection to Active panel (disabled by default — user must toggle Enable)
+      // The /active POST route sets is_active_inserted=1, is_dashboard_inserted=1, is_enabled_dashboard=0
+      const assignRes = await fetch(`/api/settings/connections/${selectedConnection}/active`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          is_dashboard_inserted: "1",  // Mark as inserted on dashboard
-          is_enabled_dashboard: "0",    // Disabled by default - user must enable
-        }),
       })
-      if (!res.ok) {
-        throw new Error("Failed to add connection to dashboard")
+      if (!assignRes.ok) {
+        const errData = await assignRes.json().catch(() => ({}))
+        throw new Error(errData.error || "Failed to add connection to active panel")
       }
 
       toast.success(`${connection.name} added to active list`)

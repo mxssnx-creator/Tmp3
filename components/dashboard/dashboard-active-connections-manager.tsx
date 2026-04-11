@@ -82,13 +82,12 @@ export function DashboardActiveConnectionsManager() {
         const exchange = (conn.exchange || "").toLowerCase().trim()
         const isBase = BASE_EXCHANGES.includes(exchange)
 
-        // is_active_inserted = "1" means this connection is in Active panel
-        // is_inserted = "1" means this connection is visible (predefined template)
-        // This applies to BOTH predefined templates (when enabled) AND user-created connections
+        // is_active_inserted = "1" means this connection was explicitly added to the Active panel
+        // is_dashboard_inserted = "1" also means it was added to dashboard
+        // NOTE: is_inserted alone (Settings-level visibility) does NOT qualify — only explicit panel assignment
         const isActiveInserted =
           toBoolean(conn.is_active_inserted) ||
-          toBoolean(conn.is_dashboard_inserted) ||
-          toBoolean(conn.is_inserted)  // Also show if simply inserted/visible
+          toBoolean(conn.is_dashboard_inserted)
 
         // isEnabledDashboard = connection's dashboard toggle is ON (processing enabled)
         const isEnabledDashboard =
@@ -128,7 +127,7 @@ export function DashboardActiveConnectionsManager() {
       if (res.ok) {
         const data = await res.json()
         const wasRunning = globalEngineRef.current
-        const nowRunning = data.running === true
+        const nowRunning = data.running === true || data.running === "true" || data.status === "running"
         globalEngineRef.current = nowRunning
         setGlobalEngineRunning(nowRunning)
         if (!wasRunning && nowRunning) {
@@ -146,8 +145,8 @@ export function DashboardActiveConnectionsManager() {
     console.log(`[v0] [Manager] Initializing active connections manager (version: ${COMPONENT_VERSIONS.dashboardManager})`)
     loadConnections()
     checkGlobalEngine()
-    const connInterval = setInterval(loadConnections, 60000) // Increased from 5s to 60s
-    const engineInterval = setInterval(checkGlobalEngine, 60000) // Increased from 3s to 60s
+    const connInterval = setInterval(loadConnections, 8000) // Poll every 8s for responsive UI
+    const engineInterval = setInterval(checkGlobalEngine, 5000) // Poll every 5s for engine status
     
     // Listen for relevant events and refresh
     const handleEngineStateChange = () => {
@@ -173,14 +172,8 @@ export function DashboardActiveConnectionsManager() {
     
     console.log(`[v0] [Manager] Toggle requested: ${connectionId}, current=${currentState}, new=${newState}`)
     
-    // Block enabling if global engine is not running
-    if (newState && !globalEngineRunning) {
-      console.log(`[v0] [Manager] ✗ Cannot enable - global engine not running`)
-      toast.error("Cannot activate connection", {
-        description: "Global Trade Engine must be running first. Start it from the Trade Engine controls.",
-      })
-      return
-    }
+    // NOTE: Enabling a connection STARTS the engine for that connection (no pre-requirement).
+    // The toggle-dashboard API directly invokes coordinator.startEngine().
     
     setTogglingIds(prev => new Set(prev).add(connectionId))
     
@@ -239,21 +232,25 @@ export function DashboardActiveConnectionsManager() {
         })
       }
 
-      // Dispatch event for other components
+      // Dispatch events for other components to refresh
       if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("connection-toggled", {
           detail: { connectionId, newState }
         }))
-        console.log(`[v0] [Manager] → Dispatched connection-toggled event`)
+        window.dispatchEvent(new CustomEvent("engine-state-changed", {
+          detail: { connectionId, newState }
+        }))
+        console.log(`[v0] [Manager] → Dispatched connection-toggled + engine-state-changed events`)
       }
       
       console.log(`[v0] [Manager] ✓ Toggle complete: ${connName} → ${newState ? "ACTIVE" : "INACTIVE"}`)
       
-      // Refresh after toggle
-      console.log(`[v0] [Manager] → Refreshing connections...`)
+      // Refresh engine status and connections after toggle
+      console.log(`[v0] [Manager] → Refreshing connections and engine status...`)
       setTimeout(() => {
         loadConnections()
-      }, 500)
+        checkGlobalEngine()
+      }, 800)
     } catch (error) {
       console.error(`[v0] [Manager] ✗ Toggle error for ${connName}:`, error)
       // Revert local state on error
@@ -407,15 +404,15 @@ export function DashboardActiveConnectionsManager() {
         onConnectionAdded={() => loadConnections()}
       />
 
-      {!globalEngineLoading && !globalEngineRunning && (
+      {!globalEngineLoading && !globalEngineRunning && activeConnections.some(c => c.isActive) && (
         <div className="flex items-center gap-3 p-3 rounded-lg border border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30">
           <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium text-amber-800 dark:text-amber-300">
-              Global Trade Engine is not running
+              Engine starting up
             </p>
             <p className="text-xs text-amber-600 dark:text-amber-400">
-              Start the Global Trade Engine first before activating individual connections.
+              Engine is initializing for enabled connections. Status will update shortly.
             </p>
           </div>
         </div>
@@ -424,8 +421,10 @@ export function DashboardActiveConnectionsManager() {
       {activeConnections.length === 0 ? (
         <Card>
           <CardContent className="pt-6 text-center text-muted-foreground">
-            <p className="mb-3">No base connections found</p>
-            <p className="text-sm text-muted-foreground">Configure connections in Settings first.</p>
+            <p className="mb-3">No active connections</p>
+            <p className="text-sm text-muted-foreground">
+              Use the &ldquo;Add Connection&rdquo; button to add a connection, or configure connections in Settings first.
+            </p>
           </CardContent>
         </Card>
       ) : (

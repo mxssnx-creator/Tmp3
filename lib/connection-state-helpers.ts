@@ -58,18 +58,20 @@ export function buildMainConnectionDisableUpdate(conn: any): Record<string, any>
 }
 
 /**
- * Build update object to REMOVE a connection from Main Connections completely
- * - Unassign and uninsert
- * - Set all active flags to 0
+ * Build update object to REMOVE a connection from Main Connections panel
+ * - Unassign from Active panel (is_active_inserted=0, is_assigned=0)
+ * - Disable processing (is_enabled_dashboard=0, is_active=0)
+ * - KEEP is_inserted stable so the connection remains visible in Settings
  */
 export function buildMainConnectionRemoveUpdate(conn: any): Record<string, any> {
   return {
     ...conn,
     is_assigned: "0",
     is_active_inserted: "0",
-    is_inserted: "0",
+    is_dashboard_inserted: "0",
     is_enabled_dashboard: "0",
     is_active: "0",
+    // NOTE: is_inserted is intentionally NOT set to 0 — connection remains in Settings
     updated_at: new Date().toISOString(),
   }
 }
