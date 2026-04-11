@@ -12,15 +12,6 @@ export async function GET() {
       return isDashboardEnabled
     })
     
-    // Log which connections are active
-    if (activeConnections.length > 0) {
-      const activeIds = activeConnections.map((c: any) => `${c.name}(${c.id})`).join(", ")
-      console.log(`[v0] [API/ActiveConnections] GET: ${activeConnections.length}/${allConnections.length} active | Active: [${activeIds}]`)
-    } else {
-      const availableIds = allConnections.map((c: any) => `${c.name}(${c.id})`).join(", ")
-      console.log(`[v0] [API/ActiveConnections] GET: 0 active out of ${allConnections.length} | Available: [${availableIds}]`)
-    }
-    
     return NextResponse.json({
       success: true,
       connections: activeConnections,

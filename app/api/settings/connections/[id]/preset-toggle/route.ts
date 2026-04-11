@@ -41,7 +41,6 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         }, { status: 400 })
       }
       
-      console.log(`[v0] [Preset] Prerequisites met - starting independent preset engine`)
     }
 
     // Update connection with is_preset_trade flag
