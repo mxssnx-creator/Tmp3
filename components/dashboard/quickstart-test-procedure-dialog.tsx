@@ -9,6 +9,7 @@ import { Card } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { AlertCircle, CheckCircle2, Clock, Play, RefreshCw, Terminal, Zap, Activity } from "lucide-react"
+import { useExchange } from "@/lib/exchange-context"
 
 interface TestStep {
   id: string
@@ -148,6 +149,7 @@ function extractCycleSummary(stepId: string, data: any): string | null {
 }
 
 export function QuickstartTestProcedureDialog() {
+  const { selectedConnection } = useExchange()
   const [open, setOpen] = useState(false)
   const [steps, setSteps] = useState<TestStep[]>(TEST_STEPS)
   const [report, setReport] = useState<TestReport | null>(null)
