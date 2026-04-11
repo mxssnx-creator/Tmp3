@@ -121,13 +121,6 @@ export async function GET(req: Request) {
     // ── 5. Build response ────────────────────────────────────────────────────────
     const totalStrategySets = baseSetCount + mainSetCount + realSetCount + liveSetCount
 
-    console.log(
-      `[v0] [EngineStats] ${connectionId}: ` +
-      `indicationCycles=${indicationCycleCount} strategyCycles=${strategyCycleCount} ` +
-      `base=${baseSetCount} main=${mainSetCount} real=${realSetCount} live=${liveSetCount} ` +
-      `positions=${positionsCount} totalIndications=${indicationsCount}`
-    )
-
     return NextResponse.json({
       success: true,
       connectionId,

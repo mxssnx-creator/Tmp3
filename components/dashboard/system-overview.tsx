@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { Settings, Zap, Database, Network, Activity, TrendingUp } from "lucide-react"
+import { Settings, Zap, Database, Network, Activity, TrendingUp, Wifi, WifiOff } from "lucide-react"
 
 interface SystemStats {
   tradeEngines: {
@@ -44,7 +44,19 @@ interface SystemStats {
   }
 }
 
+interface PerConnectionInfo {
+  id: string
+  name: string
+  exchange: string
+  isEnabled: boolean
+  isLiveTrade: boolean
+  isPresetTrade: boolean
+  phase: string
+  progress: number
+}
+
 export function SystemOverview() {
+  const [perConnectionList, setPerConnectionList] = useState<PerConnectionInfo[]>([])
   const [stats, setStats] = useState<SystemStats>({
     tradeEngines: {
       globalStatus: "idle",
@@ -123,12 +135,38 @@ export function SystemOverview() {
   })
 
   useEffect(() => {
+    const loadPerConnectionInfo = async () => {
+      try {
+        const res = await fetch("/api/settings/connections?t=" + Date.now(), {
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache, no-store, must-revalidate" },
+        })
+        if (!res.ok) return
+        const data = await res.json()
+        const allConns = Array.isArray(data) ? data : (data?.connections || [])
+        const toB = (v: unknown) => v === true || v === "1" || v === "true"
+        const activeConns: PerConnectionInfo[] = allConns
+          .filter((c: any) => toB(c.is_active_inserted) || toB(c.is_dashboard_inserted) || toB(c.is_enabled_dashboard))
+          .map((c: any) => ({
+            id: c.id,
+            name: c.name || c.id,
+            exchange: c.exchange || "",
+            isEnabled: toB(c.is_enabled_dashboard),
+            isLiveTrade: toB(c.is_live_trade),
+            isPresetTrade: toB(c.is_preset_trade),
+            phase: "idle",
+            progress: 0,
+          }))
+        setPerConnectionList(activeConns)
+      } catch { /* non-critical */ }
+    }
+
     const loadStats = async () => {
       try {
-    const response = await fetch("/api/main/system-stats-v3", {
-      cache: "no-store",
-      headers: { "Cache-Control": "no-cache" },
-    })
+        const response = await fetch("/api/main/system-stats-v3", {
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" },
+        })
         if (response.ok) {
           const data = await response.json()
           setStats(normalizeSystemStats(data))
@@ -139,12 +177,13 @@ export function SystemOverview() {
     }
 
     loadStats()
+    loadPerConnectionInfo()
     // Real-time refresh every 5 seconds for active monitoring
-    const interval = setInterval(loadStats, 5000)
+    const interval = setInterval(() => { loadStats(); loadPerConnectionInfo() }, 5000)
 
     // Listen for connection and live trade toggle events and refresh immediately
-    const handleConnectionToggled = () => { loadStats() }
-    const handleLiveTradeToggled = () => { loadStats() }
+    const handleConnectionToggled = () => { loadStats(); loadPerConnectionInfo() }
+    const handleLiveTradeToggled = () => { loadStats(); loadPerConnectionInfo() }
 
     if (typeof window !== 'undefined') {
       window.addEventListener('connection-toggled', handleConnectionToggled)
@@ -348,36 +387,51 @@ export function SystemOverview() {
             </div>
           </div>
 
-          {/* Main Connections */}
+          {/* Main Connections — per-connection breakdown */}
           <div className={`p-3 rounded-lg border-l-4 ${stats.activeConnections.active > 0 ? "border-l-green-500" : stats.activeConnections.total > 0 ? "border-l-blue-400" : "border-l-gray-400"} bg-muted/30`}>
-            <div className="flex items-center gap-2 mb-2">
-              <Activity className="h-4 w-4 text-muted-foreground" />
-              <span className="text-xs font-semibold text-muted-foreground">Main Connections (Active)</span>
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <div className="flex items-center gap-2">
+                <Activity className="h-4 w-4 text-muted-foreground" />
+                <span className="text-xs font-semibold text-muted-foreground">Main Connections</span>
+              </div>
+              <span className="text-[10px] text-muted-foreground tabular-nums">
+                {stats.activeConnections.active}/{stats.activeConnections.total} enabled
+              </span>
             </div>
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground" title="Connections established in the Active panel">Established</span>
-                <span className="font-semibold">{stats.activeConnections.total}</span>
+            {perConnectionList.length === 0 ? (
+              <p className="text-[10px] text-muted-foreground italic">No active connections</p>
+            ) : (
+              <div className="space-y-1.5">
+                {perConnectionList.map((conn) => (
+                  <div key={conn.id} className="flex items-center justify-between gap-1">
+                    <div className="flex items-center gap-1 min-w-0">
+                      {conn.isEnabled ? (
+                        <Wifi className="h-3 w-3 text-green-500 shrink-0" />
+                      ) : (
+                        <WifiOff className="h-3 w-3 text-muted-foreground shrink-0" />
+                      )}
+                      <span className="text-[11px] font-medium truncate" title={conn.name}>
+                        {conn.name}
+                      </span>
+                      <span className="text-[10px] text-muted-foreground shrink-0 capitalize">
+                        ({conn.exchange})
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      {conn.isEnabled && (
+                        <Badge className="text-[9px] h-4 px-1 bg-green-100 text-green-800 border-green-200">On</Badge>
+                      )}
+                      {conn.isLiveTrade && (
+                        <Badge className="text-[9px] h-4 px-1 bg-blue-100 text-blue-800 border-blue-200">Live</Badge>
+                      )}
+                      {conn.isPresetTrade && (
+                        <Badge className="text-[9px] h-4 px-1 bg-purple-100 text-purple-800 border-purple-200">Preset</Badge>
+                      )}
+                    </div>
+                  </div>
+                ))}
               </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground" title="Enabled via the Enable toggle">Enabled</span>
-                <span className={`font-semibold ${stats.activeConnections.active > 0 ? "text-green-600" : "text-muted-foreground"}`}>
-                  {stats.activeConnections.active}
-                </span>
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground">Live Trade</span>
-                <span className={`font-semibold ${stats.activeConnections.liveTrade > 0 ? "text-blue-600" : "text-muted-foreground"}`}>
-                  {stats.activeConnections.liveTrade}
-                </span>
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground">Preset Mode</span>
-                <span className={`font-semibold ${stats.activeConnections.presetTrade > 0 ? "text-purple-600" : "text-muted-foreground"}`}>
-                  {stats.activeConnections.presetTrade}
-                </span>
-              </div>
-            </div>
+            )}
           </div>
 
           {/* Live Trades */}
