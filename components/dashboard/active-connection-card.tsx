@@ -204,9 +204,12 @@ export function ActiveConnectionCard({
     }
   }, [fetchProgression, connection.connectionId])
 
-  // Fetch live engine-stats every 3s when connection is active
+  // Fetch live engine-stats every 3s when connection is active (or globally running)
   useEffect(() => {
-    if (!connection.isActive && !globalEngineRunning) return
+    if (!connection.isActive && !globalEngineRunning) {
+      setLiveStats(null)
+      return
+    }
 
     const fetchLiveStats = async () => {
       try {
@@ -216,16 +219,13 @@ export function ActiveConnectionCard({
         )
         if (!res.ok) return
         const data = await res.json()
-        const indicationCycles = data.indicationCycleCount || 0
-        if (indicationCycles > 0 || (data.totalStrategyCount || 0) > 0) {
-          setLiveStats({
-            indicationCycles,
-            strategyCycles:  data.strategyCycleCount  || 0,
-            indications:     data.totalIndicationsCount || 0,
-            strategies:      data.totalStrategyCount   || 0,
-            positions:       data.positionsCount       || 0,
-          })
-        }
+        setLiveStats({
+          indicationCycles: data.indicationCycleCount  || 0,
+          strategyCycles:   data.strategyCycleCount    || 0,
+          indications:      data.totalIndicationsCount || 0,
+          strategies:       data.totalStrategyCount    || 0,
+          positions:        data.positionsCount        || 0,
+        })
       } catch { /* non-critical */ }
     }
 
@@ -569,6 +569,27 @@ export function ActiveConnectionCard({
             </div>
           </CardHeader>
 
+          {/* Per-connection stats row — shown whenever active with data, even in idle/stopped phases */}
+          {connection.isActive && liveStats && (phase === "idle" || phase === "stopped" || phase === "disabled") && (
+            <CardContent className="pt-0 pb-2 px-4">
+              <div className="flex items-center gap-3 flex-wrap pt-1 border-t border-border/40">
+                {[
+                  { label: "Cycles",    value: liveStats.indicationCycles },
+                  { label: "Ind.",      value: liveStats.indications },
+                  { label: "Strat.",    value: liveStats.strategies },
+                  { label: "Positions", value: liveStats.positions },
+                ].map(({ label, value }) => (
+                  <div key={label} className="flex items-center gap-1 text-[10px]">
+                    <span className="text-muted-foreground">{label}</span>
+                    <span className="font-semibold tabular-nums">
+                      {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          )}
+
           {/* Progress bar when engine has active progression data */}
           {(connection.isActive || phase === "live_trading") && phase !== "idle" && phase !== "stopped" && phase !== "disabled" && (
             <CardContent className="pt-0 pb-3 px-4">
@@ -587,14 +608,14 @@ export function ActiveConnectionCard({
                   </p>
                 )}
                 
-                {/* Live engine stats mini row — shown when engine has processed at least 1 cycle */}
-                {liveStats && liveStats.indicationCycles > 0 && phase !== "idle" && phase !== "prehistoric_data" && (
+                {/* Per-connection engine stats — always shown when connection is active */}
+                {liveStats && phase !== "prehistoric_data" && (
                   <div className="flex items-center gap-3 mt-1.5 flex-wrap">
                     {[
-                      { label: "Cycles",     value: liveStats.indicationCycles },
-                      { label: "Ind.",       value: liveStats.indications },
-                      { label: "Strat.",     value: liveStats.strategies },
-                      { label: "Positions",  value: liveStats.positions },
+                      { label: "Cycles",    value: liveStats.indicationCycles },
+                      { label: "Ind.",      value: liveStats.indications },
+                      { label: "Strat.",    value: liveStats.strategies },
+                      { label: "Positions", value: liveStats.positions },
                     ].map(({ label, value }) => (
                       <div key={label} className="flex items-center gap-1 text-[10px]">
                         <span className="text-muted-foreground">{label}</span>

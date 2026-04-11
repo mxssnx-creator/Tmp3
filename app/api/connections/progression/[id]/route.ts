@@ -75,7 +75,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
        const coordinator = getGlobalTradeEngineCoordinator()
        if (coordinator) {
          isEngineRunning = coordinator.isEngineRunning(connectionId)
-         console.log(`[v0] [ProgressionAPI] ${connectionId}: Coordinator reports engine running = ${isEngineRunning}`)
        }
      } catch (e) {
        console.warn(`[v0] [ProgressionAPI] ${connectionId}: Failed to check coordinator state, falling back to Redis flag`)
@@ -124,9 +123,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       ? (Date.now() - new Date(engineState.last_indication_run).getTime()) < 60000 // Active in last 60s
       : false
     
-    // DEBUG: Log what we're reading (production safe)
-    console.log(`[v0] [ProgressionAPI] ${connectionId}: cycleCount=${indicationCycleCount}, stratCount=${strategyCycleCount}, recent=${hasRecentActivity}, engineState.status=${engineState?.status}, running=${isEngineRunning}`)
-    
     // Engine is running only when there is current runtime evidence
     const engineRunning = isEngineRunning || 
       (isGloballyRunning && (isActiveInserted || isInserted) && isEnabled) ||
@@ -143,18 +139,15 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       phase = "live_trading"
       progress = 100
       detail = `Live trading active - ${Math.max(indicationCycleCount, progressionState.cyclesCompleted)} cycles`
-      console.log(`[v0] [Phase] ${connectionId}: Strong cycles evidence → live_trading`)
     } else if (indicationCycleCount > 20 || progressionState.cyclesCompleted > 20 || indicationsCount > 50) {
       phase = "live_trading"
       progress = 90 + Math.min(10, indicationCycleCount / 100)
       detail = `Live trading - ${Math.max(indicationCycleCount, progressionState.cyclesCompleted)} cycles`
-      console.log(`[v0] [Phase] ${connectionId}: Moderate cycles (${indicationCycleCount}) OR indications (${indicationsCount}) → live_trading`)
     } else if (indicationCycleCount > 0 || indicationsCount > 0 || progressionState.cyclesCompleted > 0) {
       const totalCycles = Math.max(progressionState.cyclesCompleted, indicationCycleCount)
       phase = "realtime"
       progress = 80 + Math.min(20, totalCycles / 10)
       detail = `Processing - ${totalCycles} cycles`
-      console.log(`[v0] [Phase] ${connectionId}: Initial cycles (${indicationCycleCount}) OR keys (${indicationsCount}) → realtime`)
     } else if (progression?.phase && !["ready", "idle", "initializing"].includes(progression.phase)) {
       phase = progression.phase
       progress = Number(progression.progress) || 50
@@ -246,14 +239,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // Derive detailed step flags from phase progression
     const phaseOrder = ["idle", "initializing", "prehistoric_data", "indications", "strategies", "realtime", "live_trading"]
     const currentIdx = phaseOrder.indexOf(phase)
-
-    console.log(`[v0] [Progression] Phase analysis for ${connName}:`, {
-      phase,
-      progress,
-      message,
-      phaseIndex: currentIdx,
-      running: engineRunning,
-    })
 
     // Get recent logs for this connection
     const recentLogs = await getProgressionLogs(connectionId)
