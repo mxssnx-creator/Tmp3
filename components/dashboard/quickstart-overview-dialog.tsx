@@ -1,51 +1,153 @@
 "use client"
 
-import React, { useState, useEffect, useCallback } from "react"
+import React, { useState, useEffect, useCallback, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Progress } from "@/components/ui/progress"
-import { BarChart3, RefreshCw, Database, Activity, Zap, TrendingUp, ChevronRight } from "lucide-react"
+import {
+  BarChart3, RefreshCw, Database, Activity, Zap, TrendingUp,
+  ChevronDown, ChevronUp, CheckCircle2, Circle, Clock,
+} from "lucide-react"
 import { useExchange } from "@/lib/exchange-context"
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
+interface StratDetail {
+  avgPosPerSet: number
+  createdSets: number
+  avgProfitFactor: number
+  avgProcessingTimeMs: number
+  evalPct: number
+}
+
 interface StatsResponse {
   historic: {
-    symbolsProcessed: number
-    symbolsTotal: number
-    candlesLoaded: number
-    indicatorsCalculated: number
-    cyclesCompleted: number
-    isComplete: boolean
-    progressPercent: number
+    symbolsProcessed: number; symbolsTotal: number; candlesLoaded: number
+    indicatorsCalculated: number; cyclesCompleted: number; isComplete: boolean; progressPercent: number
   }
   realtime: {
-    indicationCycles: number
-    strategyCycles: number
-    realtimeCycles: number
-    indicationsTotal: number
-    strategiesTotal: number
-    positionsOpen: number
-    isActive: boolean
-    successRate: number
-    avgCycleTimeMs: number
+    indicationCycles: number; strategyCycles: number; realtimeCycles: number
+    indicationsTotal: number; strategiesTotal: number; positionsOpen: number
+    isActive: boolean; successRate: number; avgCycleTimeMs: number
   }
   breakdown: {
     indications: { direction: number; move: number; active: number; optimal: number; auto: number; total: number }
-    strategies: { base: number; main: number; real: number; live: number; total: number }
+    strategies: { base: number; main: number; real: number; live: number; total: number
+                  baseEvaluated: number; mainEvaluated: number; realEvaluated: number }
   }
+  strategyDetail: { base: StratDetail; main: StratDetail; real: StratDetail }
+  windows: { indications: { last5m: number; last60m: number }; strategies: { last5m: number; last60m: number } }
   metadata: { engineRunning: boolean; phase: string; progress: number; message: string; lastUpdate: string }
 }
 
 interface LogEntry {
-  timestamp: string
-  level: string
-  phase: string
-  message: string
-  details?: any
+  timestamp: string; level: string; phase: string; message: string; details?: any
+}
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+function fmt(n: number) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}K`
+  return String(n)
+}
+
+function pct(a: number, b: number) {
+  if (!b) return "0%"
+  return `${Math.round((a / b) * 100)}%`
+}
+
+function StatCell({ label, value, sub, accent }: { label: string; value: string; sub?: string; accent?: string }) {
+  return (
+    <div className="rounded bg-muted/50 p-2 text-center min-w-0">
+      <div className={`text-base font-bold tabular-nums truncate ${accent || "text-foreground"}`}>{value}</div>
+      {sub && <div className="text-[9px] text-muted-foreground leading-none mt-0.5">{sub}</div>}
+      <div className="text-[10px] text-muted-foreground leading-none mt-0.5">{label}</div>
+    </div>
+  )
+}
+
+// ─── StratSection ─────────────────────────────────────────────────────────────
+
+function StratSection({
+  label, count, evaluated, evaluatedOf, detail, accentCls, bgCls,
+}: {
+  label: string; count: number; evaluated: number; evaluatedOf: number
+  detail: StratDetail | undefined; accentCls: string; bgCls: string
+}) {
+  const evalPct = evaluatedOf > 0 ? Math.round((evaluated / evaluatedOf) * 1000) / 10 : (detail?.evalPct ?? 0)
+
+  return (
+    <div className={`rounded-md border p-2.5 space-y-2 ${bgCls}`}>
+      {/* header */}
+      <div className="flex items-center justify-between">
+        <span className={`text-xs font-semibold ${accentCls}`}>{label}</span>
+        <span className={`text-lg font-bold tabular-nums ${accentCls}`}>{fmt(count)}</span>
+      </div>
+
+      {/* eval bar — only for Main and Real */}
+      {evaluatedOf > 0 && (
+        <div className="space-y-0.5">
+          <div className="flex justify-between text-[10px] text-muted-foreground">
+            <span>Evaluated of {label === "Main" ? "Base" : "Main"}</span>
+            <span className="font-medium tabular-nums">{evalPct.toFixed(1)}%</span>
+          </div>
+          <Progress value={Math.min(100, evalPct)} className="h-1" />
+          <div className="text-[9px] text-muted-foreground text-right">
+            {fmt(evaluated)} / {fmt(evaluatedOf)} sets
+          </div>
+        </div>
+      )}
+
+      {/* detail metrics */}
+      {detail && (
+        <div className="grid grid-cols-2 gap-1 text-[10px]">
+          {detail.createdSets > 0 && (
+            <div className="flex justify-between col-span-2">
+              <span className="text-muted-foreground">Created Sets</span>
+              <span className="font-medium tabular-nums">{fmt(detail.createdSets)}</span>
+            </div>
+          )}
+          {detail.avgPosPerSet > 0 && (
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Avg Pos/Set</span>
+              <span className="font-medium tabular-nums">{detail.avgPosPerSet.toFixed(2)}</span>
+            </div>
+          )}
+          {detail.avgProfitFactor > 0 && (
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Avg PF</span>
+              <span className="font-medium tabular-nums">{detail.avgProfitFactor.toFixed(3)}</span>
+            </div>
+          )}
+          {detail.avgProcessingTimeMs > 0 && (
+            <div className="flex justify-between col-span-2">
+              <span className="text-muted-foreground">Avg Proc Time</span>
+              <span className="font-medium tabular-nums">{detail.avgProcessingTimeMs.toFixed(1)}ms</span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── IndWindow ────────────────────────────────────────────────────────────────
+
+function IndWindow({ label, count, total }: { label: string; count: number; total: number }) {
+  const p = total > 0 ? Math.min(100, (count / total) * 100) : 0
+  return (
+    <div className="flex items-center gap-2 text-[11px]">
+      <span className="w-14 text-muted-foreground shrink-0">{label}</span>
+      <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+        <div className="h-full bg-violet-500/70 rounded-full transition-all" style={{ width: `${p}%` }} />
+      </div>
+      <span className="w-12 text-right tabular-nums font-medium">{fmt(count)}</span>
+    </div>
+  )
 }
 
 // ─── component ────────────────────────────────────────────────────────────────
@@ -60,13 +162,13 @@ export function QuickstartOverviewDialog() {
   const [stats, setStats] = useState<StatsResponse | null>(null)
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null)
+  const [expandedLog, setExpandedLog] = useState<number | null>(null)
+  const pollRef = useRef<NodeJS.Timeout>()
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (silent = false) => {
     if (!connectionId) return
-    setLoading(true)
+    if (!silent) setLoading(true)
     try {
-      // Single canonical /stats call covers historic + realtime + breakdown in one response.
-      // Logs are fetched separately — they are large and only rendered in the Logs tab.
       const [statsRes, logsRes] = await Promise.all([
         fetch(`/api/connections/progression/${connectionId}/stats`, { cache: "no-store" }),
         fetch(`/api/connections/progression/${connectionId}/logs?t=${Date.now()}`, { cache: "no-store" }),
@@ -74,172 +176,173 @@ export function QuickstartOverviewDialog() {
       if (statsRes.ok) setStats(await statsRes.json())
       if (logsRes.ok) {
         const d = await logsRes.json()
-        setLogs(d.logs || d.recentLogs || [])
+        setLogs((d.logs || d.recentLogs || []).slice(0, 200))
       }
       setLastRefresh(new Date())
-    } catch {
-      // non-critical
-    } finally {
-      setLoading(false)
-    }
+    } catch { /* non-critical */ }
+    finally { if (!silent) setLoading(false) }
   }, [connectionId])
 
-  // Load on open, then poll every 3s while open
   useEffect(() => {
+    clearInterval(pollRef.current)
     if (!isOpen) return
     load()
-    const interval = setInterval(load, 3000)
-    return () => clearInterval(interval)
+    pollRef.current = setInterval(() => load(true), 3000)
+    return () => clearInterval(pollRef.current)
   }, [isOpen, load])
 
-  const fmt = (n: number) =>
-    n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M`
-    : n >= 1_000   ? `${(n / 1_000).toFixed(1)}K`
-    : String(n)
+  const h   = stats?.historic
+  const rt  = stats?.realtime
+  const bd  = stats?.breakdown
+  const sd  = stats?.strategyDetail
+  const win = stats?.windows
 
-  const h  = stats?.historic
-  const rt = stats?.realtime
-  const bd = stats?.breakdown
-
-  const indTypeRows = [
-    { label: "Direction", value: bd?.indications.direction || 0, color: "bg-blue-500" },
-    { label: "Move",      value: bd?.indications.move      || 0, color: "bg-violet-500" },
-    { label: "Active",    value: bd?.indications.active    || 0, color: "bg-green-500" },
-    { label: "Optimal",   value: bd?.indications.optimal   || 0, color: "bg-amber-500" },
-    { label: "Auto",      value: bd?.indications.auto      || 0, color: "bg-rose-500" },
+  const indTypes = [
+    { label: "Direction", value: bd?.indications.direction || 0 },
+    { label: "Move",      value: bd?.indications.move      || 0 },
+    { label: "Active",    value: bd?.indications.active    || 0 },
+    { label: "Optimal",   value: bd?.indications.optimal   || 0 },
+    { label: "Auto",      value: bd?.indications.auto      || 0 },
   ]
-  const totalIndByType = indTypeRows.reduce((s, r) => s + r.value, 0) || 1
+  const totalIndByType = indTypes.reduce((s, r) => s + r.value, 0) || 1
+  const evalMain5m  = win?.indications.last5m  || 0
+  const evalMain60m = win?.indications.last60m || 0
+  const totalIndAll = rt?.indicationsTotal || bd?.indications.total || 0
 
   return (
     <Dialog open={isOpen} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button variant="outline" size="icon" title="Engine overview">
-          <BarChart3 className="h-4 w-4" />
+        <Button variant="outline" size="sm" className="h-7 text-xs px-2.5 gap-1" title="Engine overview">
+          <BarChart3 className="h-3.5 w-3.5" />
+          Overview
         </Button>
       </DialogTrigger>
 
-      <DialogContent className="max-w-3xl max-h-[88vh] flex flex-col overflow-hidden">
-        <DialogHeader className="shrink-0">
-          <DialogTitle className="flex items-center gap-2">
-            <BarChart3 className="w-5 h-5" />
+      <DialogContent className="max-w-3xl max-h-[90vh] flex flex-col overflow-hidden p-0">
+        {/* header */}
+        <DialogHeader className="px-4 pt-4 pb-2 shrink-0 border-b">
+          <DialogTitle className="flex items-center gap-2 text-sm">
+            <BarChart3 className="w-4 h-4" />
             Engine Overview
             {connectionLabel && (
-              <Badge variant="secondary" className="text-xs font-normal">{connectionLabel}</Badge>
+              <Badge variant="secondary" className="text-[10px] font-normal">{connectionLabel}</Badge>
+            )}
+            {stats?.metadata?.engineRunning && (
+              <Badge className="bg-green-600 text-[10px] h-4 px-1.5">Running</Badge>
             )}
             <Button
-              size="icon"
-              variant="ghost"
-              className="ml-auto h-7 w-7"
-              onClick={load}
-              disabled={loading}
-              title="Refresh"
+              size="icon" variant="ghost" className="ml-auto h-6 w-6"
+              onClick={() => load()} disabled={loading} title="Refresh"
             >
-              <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
+              <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
             </Button>
           </DialogTitle>
           {lastRefresh && (
-            <p className="text-[11px] text-muted-foreground">
+            <p className="text-[10px] text-muted-foreground mt-0.5">
               Updated {lastRefresh.toLocaleTimeString()}
-              {stats?.metadata?.phase && (
-                <> &bull; Phase: <span className="font-medium">{stats.metadata.phase}</span></>
+              {stats?.metadata?.phase && stats.metadata.phase !== "—" && (
+                <> &bull; <span className="capitalize">{stats.metadata.phase.replace(/_/g, " ")}</span></>
               )}
             </p>
           )}
         </DialogHeader>
 
         <Tabs defaultValue="overview" className="flex-1 flex flex-col min-h-0">
-          <TabsList className="shrink-0 grid grid-cols-4">
-            <TabsTrigger value="overview"    className="text-xs">Overview</TabsTrigger>
-            <TabsTrigger value="historic"    className="text-xs">Historic</TabsTrigger>
-            <TabsTrigger value="realtime"    className="text-xs">Realtime</TabsTrigger>
-            <TabsTrigger value="logs"        className="text-xs">Logs</TabsTrigger>
+          <TabsList className="shrink-0 grid grid-cols-5 h-8 rounded-none border-b bg-transparent px-4">
+            {["overview","prehistoric","indications","strategies","logs"].map(tab => (
+              <TabsTrigger key={tab} value={tab} className="text-[11px] capitalize h-7 data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none">
+                {tab}
+              </TabsTrigger>
+            ))}
           </TabsList>
 
-          {/* ── Overview ── */}
-          <TabsContent value="overview" className="flex-1 overflow-y-auto space-y-3 mt-3">
+          {/* ── Overview ─────────────────────────────────────────────────── */}
+          <TabsContent value="overview" className="flex-1 overflow-y-auto p-4 space-y-3">
+            {/* top counters */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              {[
-                { label: "Indication Cycles", value: fmt(rt?.indicationCycles || 0), accent: "text-blue-600 dark:text-blue-400" },
-                { label: "Strategy Cycles",   value: fmt(rt?.strategyCycles   || 0), accent: "text-violet-600 dark:text-violet-400" },
-                { label: "Total Indications", value: fmt(rt?.indicationsTotal || 0), accent: "text-green-600 dark:text-green-400" },
-                { label: "Open Positions",    value: fmt(rt?.positionsOpen    || 0), accent: "text-amber-600 dark:text-amber-400" },
-              ].map(({ label, value, accent }) => (
-                <div key={label} className="rounded-lg border bg-card p-3 text-center">
-                  <div className={`text-2xl font-bold tabular-nums ${accent}`}>{value}</div>
-                  <div className="text-[11px] text-muted-foreground mt-0.5">{label}</div>
+              <StatCell label="Ind Cycles"   value={fmt(rt?.indicationCycles || 0)}  accent="text-blue-600 dark:text-blue-400" />
+              <StatCell label="Strat Cycles" value={fmt(rt?.strategyCycles   || 0)}  accent="text-violet-600 dark:text-violet-400" />
+              <StatCell label="Indications"  value={fmt(rt?.indicationsTotal || 0)}  accent="text-green-600 dark:text-green-400" />
+              <StatCell label="Positions"    value={fmt(rt?.positionsOpen    || 0)}  accent="text-amber-600 dark:text-amber-400" />
+            </div>
+
+            {/* time windows */}
+            {(evalMain5m > 0 || evalMain60m > 0) && (
+              <div className="rounded-md border p-3 space-y-1.5">
+                <div className="text-xs font-semibold flex items-center gap-1.5">
+                  <Clock className="w-3.5 h-3.5 text-muted-foreground" />
+                  Activity Windows
                 </div>
-              ))}
-            </div>
-
-            {/* Strategies */}
-            <div className="rounded-lg border bg-card p-3 space-y-2">
-              <div className="flex items-center gap-2 text-sm font-medium">
-                <Zap className="w-4 h-4 text-amber-500" />
-                Strategies
-              </div>
-              <div className="grid grid-cols-4 gap-2 text-center text-xs">
-                {[
-                  { label: "Base",  value: bd?.strategies.base  || 0 },
-                  { label: "Main",  value: bd?.strategies.main  || 0 },
-                  { label: "Real",  value: bd?.strategies.real  || 0 },
-                  { label: "Total", value: bd?.strategies.total || 0 },
-                ].map(({ label, value }) => (
-                  <div key={label} className="rounded bg-muted/50 p-2">
-                    <div className="font-semibold tabular-nums">{fmt(value)}</div>
-                    <div className="text-muted-foreground">{label}</div>
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Last 5 min</span>
+                    <span className="font-medium tabular-nums">{fmt(evalMain5m)} ind</span>
                   </div>
-                ))}
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Last 60 min</span>
+                    <span className="font-medium tabular-nums">{fmt(evalMain60m)} ind</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* strategies compact overview */}
+            <div className="rounded-md border p-3 space-y-2">
+              <div className="flex items-center gap-1.5 text-xs font-semibold">
+                <Zap className="w-3.5 h-3.5 text-amber-500" />
+                Strategies Summary
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <StatCell label="Base" value={fmt(bd?.strategies.base || 0)} accent="text-orange-600 dark:text-orange-400" />
+                <StatCell label="Main" value={fmt(bd?.strategies.main || 0)} accent="text-yellow-600 dark:text-yellow-400"
+                  sub={bd?.strategies.base ? `${pct(bd.strategies.main, bd.strategies.base)} of Base` : undefined}
+                />
+                <StatCell label="Real" value={fmt(bd?.strategies.real || 0)} accent="text-green-600 dark:text-green-400"
+                  sub={bd?.strategies.main ? `${pct(bd.strategies.real, bd.strategies.main)} of Main` : undefined}
+                />
               </div>
             </div>
 
-            {/* Processing status */}
-            <div className="rounded-lg border bg-card p-3 space-y-2">
-              <div className="flex items-center gap-2 text-sm font-medium">
-                <Activity className="w-4 h-4 text-green-500" />
-                Processing Status
+            {/* success rate + cycle time */}
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-md border p-3 space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="flex items-center gap-1 font-medium"><TrendingUp className="w-3 h-3" />Success Rate</span>
+                  <span className="font-bold tabular-nums">{(rt?.successRate || 0).toFixed(1)}%</span>
+                </div>
+                <Progress value={rt?.successRate || 0} className="h-1.5" />
               </div>
-              <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-xs">
-                {[
-                  { label: "Historical Data", done: h?.isComplete },
-                  { label: "Indications",     done: (rt?.indicationCycles || 0) > 0 },
-                  { label: "Strategies",      done: (rt?.strategyCycles   || 0) > 0 },
-                  { label: "Realtime",        done: rt?.isActive },
-                ].map(({ label, done }) => (
-                  <div key={label} className="flex items-center justify-between gap-2">
-                    <span className="text-muted-foreground">{label}</span>
-                    <Badge variant={done ? "default" : "secondary"} className="text-[10px] h-5 px-1.5">
-                      {done ? "Active" : "Pending"}
+              <div className="rounded-md border p-3 space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="flex items-center gap-1 font-medium"><Clock className="w-3 h-3" />Avg Cycle</span>
+                  <span className="font-bold tabular-nums">{rt?.avgCycleTimeMs || 0}ms</span>
+                </div>
+                <div className="flex flex-wrap gap-1 mt-0.5">
+                  {[
+                    { label: "Historic",    done: h?.isComplete },
+                    { label: "Indications", done: (rt?.indicationCycles || 0) > 0 },
+                    { label: "Strategies",  done: (rt?.strategyCycles   || 0) > 0 },
+                    { label: "Realtime",    done: rt?.isActive },
+                  ].map(({ label, done }) => (
+                    <Badge key={label} variant={done ? "default" : "secondary"} className="text-[9px] h-4 px-1">
+                      {label}
                     </Badge>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
-            </div>
-
-            {/* Cycle success */}
-            <div className="rounded-lg border bg-card p-3 space-y-1.5">
-              <div className="flex items-center justify-between text-sm font-medium">
-                <span className="flex items-center gap-2">
-                  <TrendingUp className="w-4 h-4 text-blue-500" />
-                  Cycle Success Rate
-                </span>
-                <span className="tabular-nums font-bold">{(rt?.successRate || 0).toFixed(1)}%</span>
-              </div>
-              <Progress value={rt?.successRate || 0} className="h-1.5" />
             </div>
           </TabsContent>
 
-          {/* ── Historic ── */}
-          <TabsContent value="historic" className="flex-1 overflow-y-auto space-y-3 mt-3">
-            <div className="rounded-lg border bg-card p-3 space-y-3">
-              <div className="flex items-center gap-2 text-sm font-medium">
+          {/* ── Prehistoric ───────────────────────────────────────────────── */}
+          <TabsContent value="prehistoric" className="flex-1 overflow-y-auto p-4 space-y-3">
+            <div className="rounded-md border p-3 space-y-3">
+              <div className="flex items-center gap-2">
                 <Database className="w-4 h-4 text-blue-500" />
-                Historical Data Processing
-                <Badge
-                  variant={h?.isComplete ? "default" : "secondary"}
-                  className="ml-auto text-[10px]"
-                >
-                  {h?.isComplete ? "Loaded" : "Pending"}
-                </Badge>
+                <span className="text-sm font-semibold">Prehistoric Processing</span>
+                {h?.isComplete
+                  ? <Badge className="bg-green-600 text-[10px] ml-auto">Loaded</Badge>
+                  : <Badge variant="secondary" className="text-[10px] ml-auto">Processing…</Badge>
+                }
               </div>
 
               <div className="space-y-1">
@@ -250,49 +353,80 @@ export function QuickstartOverviewDialog() {
                 <Progress value={h?.progressPercent || 0} className="h-2" />
               </div>
 
-              <div className="grid grid-cols-3 gap-2 text-center text-xs">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <StatCell label="Symbols"      value={fmt(h?.symbolsProcessed    || 0)} accent="text-blue-600 dark:text-blue-400" />
+                <StatCell label="Candles"      value={fmt(h?.candlesLoaded       || 0)} accent="text-sky-600 dark:text-sky-400" />
+                <StatCell label="Indicators"   value={fmt(h?.indicatorsCalculated|| 0)} accent="text-teal-600 dark:text-teal-400" />
+                <StatCell label="Preh Cycles"  value={fmt(h?.cyclesCompleted     || 0)} accent="text-indigo-600 dark:text-indigo-400" />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 text-[11px] pt-1">
                 {[
-                  { label: "Symbols",       value: fmt(h?.symbolsProcessed      || 0), bg: "bg-blue-50 dark:bg-blue-950/30", txt: "text-blue-700 dark:text-blue-400" },
-                  { label: "Candles",       value: fmt(h?.candlesLoaded          || 0), bg: "bg-sky-50 dark:bg-sky-950/30",   txt: "text-sky-700 dark:text-sky-400" },
-                  { label: "Preh. Cycles",  value: fmt(h?.cyclesCompleted        || 0), bg: "bg-indigo-50 dark:bg-indigo-950/30", txt: "text-indigo-700 dark:text-indigo-400" },
-                ].map(({ label, value, bg, txt }) => (
-                  <div key={label} className={`rounded ${bg} p-2.5`}>
-                    <div className={`text-lg font-bold tabular-nums ${txt}`}>{value}</div>
-                    <div className="text-muted-foreground mt-0.5">{label}</div>
+                  { label: "Data Loaded",   done: h?.isComplete },
+                  { label: "Ind Running",   done: (rt?.indicationCycles || 0) > 0 },
+                  { label: "Strat Running", done: (rt?.strategyCycles   || 0) > 0 },
+                  { label: "Live Active",   done: rt?.isActive },
+                ].map(({ label, done }) => (
+                  <div key={label} className="flex items-center gap-1.5">
+                    {done ? <CheckCircle2 className="w-3 h-3 text-green-500 shrink-0" /> : <Circle className="w-3 h-3 text-muted-foreground/30 shrink-0" />}
+                    <span className={done ? "text-foreground" : "text-muted-foreground"}>{label}</span>
                   </div>
                 ))}
               </div>
             </div>
           </TabsContent>
 
-          {/* ── Realtime ── */}
-          <TabsContent value="realtime" className="flex-1 overflow-y-auto space-y-3 mt-3">
-            {/* Indication breakdown */}
-            <div className="rounded-lg border bg-card p-3 space-y-3">
-              <div className="flex items-center gap-2 text-sm font-medium">
-                <Activity className="w-4 h-4 text-violet-500" />
-                Indication Breakdown
-                <span className="ml-auto text-xs text-muted-foreground">
-                  Total: {fmt(bd?.indications.total || 0)}
+          {/* ── Indications ───────────────────────────────────────────────── */}
+          <TabsContent value="indications" className="flex-1 overflow-y-auto p-4 space-y-3">
+            {/* time window summary */}
+            <div className="grid grid-cols-3 gap-2">
+              <StatCell label="Total" value={fmt(totalIndAll)} accent="text-violet-600 dark:text-violet-400" />
+              <StatCell label="Last 5min"  value={fmt(evalMain5m)}  sub="rolling window" />
+              <StatCell label="Last 60min" value={fmt(evalMain60m)} sub="rolling window" />
+            </div>
+
+            {/* per-type bars */}
+            <div className="rounded-md border p-3 space-y-2.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold flex items-center gap-1.5">
+                  <Activity className="w-3.5 h-3.5 text-violet-500" />
+                  Indication Types
                 </span>
+                <span className="text-muted-foreground">{fmt(rt?.indicationCycles || 0)} cycles</span>
               </div>
               <div className="space-y-2">
-                {indTypeRows.map(({ label, value, color }) => (
-                  <div key={label} className="space-y-1">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-muted-foreground">{label}</span>
-                      <span className="font-medium tabular-nums">{fmt(value)}</span>
-                    </div>
-                    <div className="h-1.5 bg-muted rounded-full overflow-hidden">
-                      <div
-                        className={`h-full ${color} rounded-full transition-all`}
-                        style={{ width: `${Math.min(100, (value / totalIndByType) * 100)}%` }}
-                      />
-                    </div>
-                  </div>
+                {indTypes.map(({ label, value }) => (
+                  <IndWindow key={label} label={label} count={value} total={totalIndByType} />
                 ))}
               </div>
-              <div className="border-t pt-2 grid grid-cols-2 gap-2 text-xs">
+            </div>
+
+            {/* last 5 evaluated (simulated from ratio if not available) */}
+            <div className="rounded-md border p-3 space-y-2">
+              <div className="text-xs font-semibold">Eval Counts — Last Periods</div>
+              <div className="grid grid-cols-2 gap-2 text-[11px]">
+                {indTypes.map(({ label, value }) => {
+                  const ratio5m  = totalIndAll > 0 && evalMain5m  > 0 ? (value / totalIndAll) * evalMain5m  : 0
+                  const ratio60m = totalIndAll > 0 && evalMain60m > 0 ? (value / totalIndAll) * evalMain60m : 0
+                  return (
+                    <React.Fragment key={label}>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">{label} 5m</span>
+                        <span className="font-medium tabular-nums">{fmt(Math.round(ratio5m))}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">{label} 60m</span>
+                        <span className="font-medium tabular-nums">{fmt(Math.round(ratio60m))}</span>
+                      </div>
+                    </React.Fragment>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="rounded-md border p-3 space-y-1.5">
+              <div className="text-xs font-semibold">Realtime Metrics</div>
+              <div className="grid grid-cols-2 gap-1.5 text-[11px]">
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Indication Cycles</span>
                   <span className="font-medium tabular-nums">{fmt(rt?.indicationCycles || 0)}</span>
@@ -301,68 +435,122 @@ export function QuickstartOverviewDialog() {
                   <span className="text-muted-foreground">Realtime Cycles</span>
                   <span className="font-medium tabular-nums">{fmt(rt?.realtimeCycles || 0)}</span>
                 </div>
-              </div>
-            </div>
-
-            {/* Strategy hierarchy */}
-            <div className="rounded-lg border bg-card p-3 space-y-2">
-              <div className="text-sm font-medium">Strategy Hierarchy</div>
-              <div className="space-y-2 text-xs">
-                {[
-                  { label: "Base Strategies", value: bd?.strategies.base || 0, desc: "All initial strategy sets" },
-                  { label: "Main Strategies", value: bd?.strategies.main || 0, desc: "Filtered top performers" },
-                  { label: "Real Strategies", value: bd?.strategies.real || 0, desc: "Highest confidence only" },
-                ].map(({ label, value, desc }) => (
-                  <div key={label} className="flex items-center gap-2 p-2 rounded bg-muted/40">
-                    <ChevronRight className="w-3 h-3 text-muted-foreground shrink-0" />
-                    <div className="flex-1">
-                      <div className="font-medium">{label}</div>
-                      <div className="text-muted-foreground">{desc}</div>
-                    </div>
-                    <div className="font-bold tabular-nums">{fmt(value)}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Perf row */}
-            <div className="rounded-lg border bg-card p-3 grid grid-cols-3 gap-2 text-center text-xs">
-              {[
-                { label: "Success Rate", value: `${(rt?.successRate || 0).toFixed(1)}%` },
-                { label: "Avg Cycle",    value: `${rt?.avgCycleTimeMs || 0}ms` },
-                { label: "Positions",    value: fmt(rt?.positionsOpen || 0) },
-              ].map(({ label, value }) => (
-                <div key={label} className="rounded bg-muted/50 p-2">
-                  <div className="font-semibold tabular-nums">{value}</div>
-                  <div className="text-muted-foreground">{label}</div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Open Positions</span>
+                  <span className="font-medium tabular-nums">{fmt(rt?.positionsOpen || 0)}</span>
                 </div>
-              ))}
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Avg Cycle Time</span>
+                  <span className="font-medium tabular-nums">{rt?.avgCycleTimeMs || 0}ms</span>
+                </div>
+              </div>
             </div>
           </TabsContent>
 
-          {/* ── Logs ── */}
-          <TabsContent value="logs" className="flex-1 flex flex-col min-h-0 mt-3">
+          {/* ── Strategies ────────────────────────────────────────────────── */}
+          <TabsContent value="strategies" className="flex-1 overflow-y-auto p-4 space-y-3">
+            <p className="text-[11px] text-muted-foreground leading-relaxed">
+              Main strategies are formed from evaluated Base pseudo-position sets, coordinated via pis-count and
+              continuous-count factors plus additional strategies — not always new sets but coordinated variable
+              mappings for high-frequency evaluation. Real strategies filter Main by highest-confidence coordination.
+            </p>
+
+            <StratSection
+              label="Base"
+              count={bd?.strategies.base || 0}
+              evaluated={bd?.strategies.baseEvaluated || 0}
+              evaluatedOf={0}
+              detail={sd?.base}
+              accentCls="text-orange-600 dark:text-orange-400"
+              bgCls="bg-orange-50/50 dark:bg-orange-950/20 border-orange-200/50 dark:border-orange-800/30"
+            />
+
+            <StratSection
+              label="Main"
+              count={bd?.strategies.main || 0}
+              evaluated={bd?.strategies.mainEvaluated || 0}
+              evaluatedOf={bd?.strategies.base || 0}
+              detail={sd?.main}
+              accentCls="text-yellow-600 dark:text-yellow-400"
+              bgCls="bg-yellow-50/50 dark:bg-yellow-950/20 border-yellow-200/50 dark:border-yellow-800/30"
+            />
+
+            <StratSection
+              label="Real"
+              count={bd?.strategies.real || 0}
+              evaluated={bd?.strategies.realEvaluated || 0}
+              evaluatedOf={bd?.strategies.main || 0}
+              detail={sd?.real}
+              accentCls="text-green-600 dark:text-green-400"
+              bgCls="bg-green-50/50 dark:bg-green-950/20 border-green-200/50 dark:border-green-800/30"
+            />
+
+            <div className="rounded-md border p-2.5">
+              <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Strategy Cycles</span>
+                  <span className="font-medium tabular-nums">{fmt(rt?.strategyCycles || 0)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Total Strategies</span>
+                  <span className="font-medium tabular-nums">{fmt(bd?.strategies.total || 0)}</span>
+                </div>
+                {(bd?.strategies.live || 0) > 0 && (
+                  <div className="flex justify-between col-span-2">
+                    <span className="text-muted-foreground">Live Strategies</span>
+                    <span className="font-medium tabular-nums">{fmt(bd!.strategies.live)}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </TabsContent>
+
+          {/* ── Logs ──────────────────────────────────────────────────────── */}
+          <TabsContent value="logs" className="flex-1 flex flex-col min-h-0 p-4">
+            <div className="flex items-center justify-between pb-2 shrink-0">
+              <span className="text-xs text-muted-foreground">{logs.length} entries</span>
+              <Button size="sm" variant="outline" onClick={() => load()} disabled={loading} className="h-7 gap-1.5 text-xs">
+                <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
+                Refresh
+              </Button>
+            </div>
             <ScrollArea className="flex-1 rounded border">
-              <div className="p-2 space-y-1">
+              <div className="p-2 space-y-px">
                 {logs.length === 0 ? (
                   <p className="text-center text-xs text-muted-foreground py-8">No logs available yet.</p>
                 ) : (
-                  logs.slice(0, 150).map((log, idx) => (
-                    <div key={idx} className="flex items-start gap-2 text-xs py-1 px-1.5 rounded hover:bg-muted/40">
-                      <span className="text-muted-foreground shrink-0 tabular-nums">
-                        {new Date(log.timestamp).toLocaleTimeString()}
-                      </span>
-                      <Badge
-                        variant="outline"
-                        className={`text-[10px] h-4 px-1 shrink-0 ${
-                          log.level === "error"   ? "border-red-400 text-red-600" :
-                          log.level === "warning" ? "border-amber-400 text-amber-600" :
-                          "border-border text-muted-foreground"
-                        }`}
+                  logs.map((log, idx) => (
+                    <div key={idx}>
+                      <button
+                        type="button"
+                        onClick={() => setExpandedLog(expandedLog === idx ? null : idx)}
+                        className="w-full flex items-start gap-2 text-xs py-1 px-1.5 rounded hover:bg-muted/40 text-left"
                       >
-                        {log.phase}
-                      </Badge>
-                      <span className="flex-1 text-foreground break-words">{log.message}</span>
+                        <span className="text-muted-foreground shrink-0 tabular-nums font-mono text-[10px] pt-px">
+                          {new Date(log.timestamp).toLocaleTimeString()}
+                        </span>
+                        <Badge
+                          variant="outline"
+                          className={`text-[9px] h-4 px-1 shrink-0 ${
+                            log.level === "error"   ? "border-red-400 text-red-600 dark:text-red-400" :
+                            log.level === "warning" ? "border-amber-400 text-amber-600 dark:text-amber-400" :
+                            "border-border text-muted-foreground"
+                          }`}
+                        >
+                          {log.phase}
+                        </Badge>
+                        <span className="flex-1 text-foreground break-words">{log.message}</span>
+                        {log.details && (
+                          expandedLog === idx
+                            ? <ChevronUp className="w-3 h-3 text-muted-foreground shrink-0 mt-0.5" />
+                            : <ChevronDown className="w-3 h-3 text-muted-foreground shrink-0 mt-0.5" />
+                        )}
+                      </button>
+                      {expandedLog === idx && log.details && (
+                        <div className="ml-[90px] mb-1 p-1.5 rounded bg-muted/40 font-mono text-[10px] text-muted-foreground overflow-auto max-h-32">
+                          <pre>{JSON.stringify(log.details, null, 2)}</pre>
+                        </div>
+                      )}
                     </div>
                   ))
                 )}

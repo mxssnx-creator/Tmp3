@@ -209,6 +209,76 @@ export async function GET(
     )
     const stratTotal = Object.values(stratCounts).reduce((s, v) => s + v, 0) || strategiesTotal
 
+    // ── STRATEGY DETAIL fields ───────────────────────────────────────────────
+    // Per-stage avg positions per set, created sets, avg profit factor, avg processing time
+    // Written by strategy-processor as HSET strategy_detail:{connId}:{stage} ...
+    const stratDetailKeys = ["base", "main", "real"] as const
+    const stratDetail: Record<string, {
+      avgPosPerSet: number; createdSets: number; avgProfitFactor: number; avgProcessingTimeMs: number
+      evalPct: number
+    }> = {}
+
+    await Promise.all(
+      stratDetailKeys.map(async (stage) => {
+        const dh = await client.hgetall(`strategy_detail:${connectionId}:${stage}`).catch(() => ({})) as Record<string, string>
+        const createdSets       = n(dh.created_sets      || progHash[`strategy_${stage}_created_sets`])
+        const avgPosPerSet      = parseFloat(dh.avg_pos_per_set      || progHash[`strategy_${stage}_avg_pos_per_set`]      || "0")
+        const avgProfitFactor   = parseFloat(dh.avg_profit_factor    || progHash[`strategy_${stage}_avg_profit_factor`]    || "0")
+        const avgProcessingMs   = parseFloat(dh.avg_processing_ms    || progHash[`strategy_${stage}_avg_processing_ms`]    || "0")
+
+        // Eval percentage: main = evaluated/base, real = evaluated/main
+        let evalPct = 0
+        if (stage === "main") {
+          const base = stratCounts.base || 1
+          evalPct = base > 0 ? Math.round((stratEvaluated.main / base) * 1000) / 10 : 0
+        } else if (stage === "real") {
+          const main = stratCounts.main || 1
+          evalPct = main > 0 ? Math.round((stratEvaluated.real / main) * 1000) / 10 : 0
+        }
+
+        stratDetail[stage] = {
+          avgPosPerSet:      isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100    : 0,
+          createdSets:       createdSets,
+          avgProfitFactor:   isFinite(avgProfitFactor) ? Math.round(avgProfitFactor * 1000) / 1000 : 0,
+          avgProcessingTimeMs: isFinite(avgProcessingMs) ? Math.round(avgProcessingMs * 10) / 10 : 0,
+          evalPct,
+        }
+      })
+    )
+
+    // ── WINDOW DATA (last 5min / 60min) ──────────────────────────────────────
+    // Stored in sorted sets: indications:{connId}:window  scored by unix ms timestamp
+    // If not present fall back to estimating from cycle counts using elapsed time
+    const nowMs = Date.now()
+    const ago5m  = nowMs - 5  * 60 * 1000
+    const ago60m = nowMs - 60 * 60 * 1000
+
+    let indWindow5m  = 0
+    let indWindow60m = 0
+    let stratWindow5m  = 0
+    let stratWindow60m = 0
+
+    try {
+      // ZRANGEBYSCORE on indications window zset (score = timestamp ms, value = count increment)
+      const ind5m  = await client.zrangebyscore(`indications:${connectionId}:window`,  ago5m,  "+inf").catch(() => [])
+      const ind60m = await client.zrangebyscore(`indications:${connectionId}:window`,  ago60m, "+inf").catch(() => [])
+      const str5m  = await client.zrangebyscore(`strategies:${connectionId}:window`,   ago5m,  "+inf").catch(() => [])
+      const str60m = await client.zrangebyscore(`strategies:${connectionId}:window`,   ago60m, "+inf").catch(() => [])
+      indWindow5m  = ind5m.length
+      indWindow60m = ind60m.length
+      stratWindow5m  = str5m.length
+      stratWindow60m = str60m.length
+    } catch { /* non-critical; fall back to zero */ }
+
+    // If window sets are empty, estimate from rate: total / elapsed_minutes * window
+    if (indWindow5m === 0 && indTotal > 0) {
+      const startedAtMs = n(progHash.started_at) || (nowMs - 3600_000)
+      const elapsedMin = (nowMs - startedAtMs) / 60_000 || 1
+      const ratePerMin = indTotal / elapsedMin
+      indWindow5m  = Math.round(ratePerMin * 5)
+      indWindow60m = Math.round(ratePerMin * Math.min(60, elapsedMin))
+    }
+
     // ── METADATA section ─────────────────────────────────────────────────────
     const phase    = ep?.phase || "unknown"
     const progress = n(ep?.progress)
@@ -264,6 +334,19 @@ export async function GET(
           mainEvaluated: stratEvaluated.main || 0,
           realEvaluated: stratEvaluated.real || 0,
         },
+      },
+
+      // Per-stage strategy detail — avg positions per set, created sets, avg profit factor, avg processing time
+      strategyDetail: {
+        base: stratDetail.base,
+        main: stratDetail.main,
+        real: stratDetail.real,
+      },
+
+      // Rolling time-window indication and strategy counts
+      windows: {
+        indications: { last5m: indWindow5m, last60m: indWindow60m },
+        strategies:  { last5m: stratWindow5m, last60m: stratWindow60m },
       },
 
       metadata: {
