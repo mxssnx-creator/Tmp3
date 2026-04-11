@@ -28,43 +28,44 @@ interface ProgressionLog {
   details?: any
 }
 
-interface ProgressionState {
-  // Cycle counts — from /logs endpoint (progressionState) AND /[id] endpoint (metrics)
-  cyclesCompleted: number
-  successfulCycles: number
-  failedCycles: number
-  cycleSuccessRate: number
-  realtimeCycleCount: number
-  indicationCycleCount: number   // from /[id] metrics
-  strategyCycleCount: number     // from /[id] metrics
-  // Trading
-  totalTrades: number
-  successfulTrades: number
-  tradeSuccessRate: number
-  totalProfit: number
-  // Processing
-  indicationsCount: number
-  strategiesCount: number
-  // Prehistoric
-  prehistoricCyclesCompleted: number
-  prehistoricSymbolsProcessed: number
-  prehistoricCandlesProcessed: number
-  // By type — indications
-  indicationEvaluatedDirection: number
-  indicationEvaluatedMove: number
-  indicationEvaluatedActive: number
-  indicationEvaluatedOptimal: number
-  // By stage — strategies
-  setsBaseCount: number
-  setsMainCount: number
-  setsRealCount: number
-  // Processing status flags
-  processingCompleteness: {
-    prehistoricLoaded: boolean
-    indicationsRunning: boolean
-    strategiesRunning: boolean
-    realtimeRunning: boolean
-    hasErrors: boolean
+// Stats shape from /stats endpoint
+interface StatsShape {
+  historic: {
+    symbolsProcessed: number
+    symbolsTotal: number
+    candlesLoaded: number
+    cyclesCompleted: number
+    isComplete: boolean
+    progressPercent: number
+  }
+  realtime: {
+    indicationCycles: number
+    strategyCycles: number
+    realtimeCycles: number
+    indicationsTotal: number
+    strategiesTotal: number
+    positionsOpen: number
+    isActive: boolean
+    successRate: number
+    avgCycleTimeMs: number
+  }
+  breakdown: {
+    indications: { direction: number; move: number; active: number; optimal: number; auto: number; total: number }
+    strategies: { base: number; main: number; real: number; live: number; total: number; baseEvaluated: number; mainEvaluated: number; realEvaluated: number }
+  }
+  metadata: { engineRunning: boolean; phase: string; progress: number; message: string }
+  // Legacy fields from /logs for trading activity
+  progressionState?: {
+    totalTrades?: number
+    successfulTrades?: number
+    tradeSuccessRate?: number
+    totalProfit?: number
+    processingCompleteness?: {
+      prehistoricLoaded?: boolean
+      indicationsRunning?: boolean
+      strategiesRunning?: boolean
+      realtimeRunning?: boolean
+    }
   }
 }
 
@@ -77,77 +78,32 @@ export function ProgressionLogsDialog({
   connectionName,
 }: ProgressionLogsDialogProps) {
   const [logs, setLogs] = useState<ProgressionLog[]>([])
-  const [progressionState, setProgressionState] = useState<Partial<ProgressionState> | null>(null)
+  const [stats, setStats] = useState<StatsShape | null>(null)
+  const [tradingState, setTradingState] = useState<StatsShape["progressionState"] | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [activeTab, setActiveTab] = useState<"log" | "info" | "breakdown">("log")
 
   const loadData = useCallback(async () => {
     setIsLoading(true)
     try {
-      // Fetch both endpoints in parallel:
-      // - /logs  → progressionState (cycle counts, type breakdowns, prehistoric)
-      // - /[id]  → metrics (indicationCycleCount, strategyCycleCount, current phase)
-      const [logsRes, progressionRes] = await Promise.all([
+      // Primary: /stats endpoint (canonical historic + realtime + breakdown)
+      // Secondary: /logs endpoint (for actual log entries + trading activity from progressionState)
+      const [statsRes, logsRes] = await Promise.all([
+        fetch(`/api/connections/progression/${connectionId}/stats`, { cache: "no-store" }),
         fetch(`/api/connections/progression/${connectionId}/logs?t=${Date.now()}`, { cache: "no-store" }),
-        fetch(`/api/connections/progression/${connectionId}?t=${Date.now()}`, { cache: "no-store" }),
       ])
 
-      let logsData: any = {}
-      let progData: any = {}
+      if (statsRes.ok) setStats(await statsRes.json())
 
-      if (logsRes.ok) logsData = await logsRes.json()
-      if (progressionRes.ok) progData = await progressionRes.json()
-
-      // Merge logs from both sources
-      const logsArr: ProgressionLog[] = (
-        logsData.logs || logsData.recentLogs || progData.recentLogs || []
-      ).slice(0, 150)
-      setLogs(logsArr)
-
-      // Merge state from both sources — /[id] metrics take priority for live cycle counts
-      const ps  = logsData.progressionState || {}
-      const pm  = progData.metrics          || {}
-      const pst = progData.state            || {}
-
-      setProgressionState({
-        // Cycle counts — prefer live metrics from /[id] (more current than /logs)
-        cyclesCompleted:     pm.indicationCycleCount || parseInt(ps.cyclesCompleted    || "0"),
-        successfulCycles:    pm.strategyCycleCount   || parseInt(ps.successfulCycles   || "0"),
-        failedCycles:                                   parseInt(ps.failedCycles        || "0"),
-        cycleSuccessRate:    parseFloat(String(pm.cycleSuccessRate    || ps.cycleSuccessRate    || "0")),
-        realtimeCycleCount:  pm.realtimeCycleCount   || parseInt(ps.realtimeCycleCount  || "0"),
-        indicationCycleCount: pm.indicationCycleCount || 0,
-        strategyCycleCount:   pm.strategyCycleCount   || 0,
-        // Trading
-        totalTrades:       pst.totalTrades       || parseInt(ps.totalTrades       || "0"),
-        successfulTrades:  pst.successfulTrades  || parseInt(ps.successfulTrades  || "0"),
-        tradeSuccessRate:  parseFloat(String(pst.tradeSuccessRate  || ps.tradeSuccessRate  || "0")),
-        totalProfit:       parseFloat(String(pst.totalProfit       || ps.totalProfit       || "0")),
-        // Processing
-        indicationsCount: pm.totalIndicationsEvaluated || parseInt(ps.indicationsCount || "0"),
-        strategiesCount:  pm.totalStrategiesEvaluated  || parseInt(ps.strategiesCount  || "0"),
-        // Prehistoric
-        prehistoricCyclesCompleted: pst.prehistoricCyclesCompleted || parseInt(ps.prehistoricCyclesCompleted || "0"),
-        prehistoricSymbolsProcessed: pm.prehistoricSymbolsProcessed || parseInt(ps.prehistoricSymbolsProcessedCount || ps.prehistoricSymbolsProcessed || "0"),
-        prehistoricCandlesProcessed: pm.prehistoricCandlesProcessed || parseInt(ps.prehistoricCandlesProcessed || "0"),
-        // Indication types
-        indicationEvaluatedDirection: parseInt(ps.indicationEvaluatedDirection || "0"),
-        indicationEvaluatedMove:      parseInt(ps.indicationEvaluatedMove      || "0"),
-        indicationEvaluatedActive:    parseInt(ps.indicationEvaluatedActive    || "0"),
-        indicationEvaluatedOptimal:   parseInt(ps.indicationEvaluatedOptimal   || "0"),
-        // Strategy stages
-        setsBaseCount: parseInt(ps.setsBaseCount || ps.strategyEvaluatedBase || "0"),
-        setsMainCount: parseInt(ps.setsMainCount || ps.strategyEvaluatedMain || "0"),
-        setsRealCount: parseInt(ps.setsRealCount || ps.strategyEvaluatedReal || "0"),
-        // Completeness
-        processingCompleteness: ps.processingCompleteness || {
-          prehistoricLoaded:  false,
-          indicationsRunning: (pm.indicationCycleCount || 0) > 0,
-          strategiesRunning:  (pm.strategyCycleCount   || 0) > 0,
-          realtimeRunning:    (pm.realtimeCycleCount   || 0) > 0,
-          hasErrors:          false,
-        },
-      })
+      if (logsRes.ok) {
+        const logsData = await logsRes.json()
+        const logsArr: ProgressionLog[] = (logsData.logs || logsData.recentLogs || []).slice(0, 150)
+        setLogs(logsArr)
+        // Trading activity fields come from /logs progressionState
+        if (logsData.progressionState) {
+          setTradingState(logsData.progressionState)
+        }
+      }
     } catch (error) {
       console.error("[v0] Failed to load progression data:", error)
     } finally {
@@ -191,13 +147,16 @@ export function ProgressionLogsDialog({
     }
   }
 
-  const ps = progressionState
+  const rt = stats?.realtime
+  const h  = stats?.historic
+  const bd = stats?.breakdown
 
   const indTypes = [
-    { label: "Direction", value: ps?.indicationEvaluatedDirection || 0 },
-    { label: "Move",      value: ps?.indicationEvaluatedMove      || 0 },
-    { label: "Active",    value: ps?.indicationEvaluatedActive    || 0 },
-    { label: "Optimal",   value: ps?.indicationEvaluatedOptimal   || 0 },
+    { label: "Direction", value: bd?.indications.direction || 0 },
+    { label: "Move",      value: bd?.indications.move      || 0 },
+    { label: "Active",    value: bd?.indications.active    || 0 },
+    { label: "Optimal",   value: bd?.indications.optimal   || 0 },
+    { label: "Auto",      value: bd?.indications.auto      || 0 },
   ]
   const totalIndByType = indTypes.reduce((s, r) => s + r.value, 0) || 1
 
@@ -208,9 +167,9 @@ export function ProgressionLogsDialog({
           <DialogTitle className="flex items-center gap-2">
             <Zap className="w-5 h-5" />
             {connectionName} — Engine Progression
-            {(ps?.indicationCycleCount || 0) > 0 && (
+            {(rt?.indicationCycles || 0) > 0 && (
               <Badge variant="default" className="bg-green-600 text-[11px]">
-                ● {fmt(ps?.indicationCycleCount || 0)} cycles
+                {fmt(rt?.indicationCycles || 0)} cycles
               </Badge>
             )}
           </DialogTitle>
@@ -285,7 +244,7 @@ export function ProgressionLogsDialog({
           <TabsContent value="info" className="flex-1 overflow-hidden">
             <ScrollArea className="h-full">
               <div className="space-y-4 p-4">
-                {/* Cycles */}
+                {/* Engine Cycles — from realtime section of /stats */}
                 <div className="rounded-lg border p-4 space-y-3">
                   <div className="flex items-center gap-2">
                     <Clock className="w-4 h-4" />
@@ -293,10 +252,10 @@ export function ProgressionLogsDialog({
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     {[
-                      { label: "Indication Cycles", value: fmt(ps?.indicationCycleCount || ps?.cyclesCompleted || 0), cls: "text-blue-700 dark:text-blue-400", bg: "bg-blue-50 dark:bg-blue-950" },
-                      { label: "Strategy Cycles",   value: fmt(ps?.strategyCycleCount   || ps?.successfulCycles  || 0), cls: "text-green-700 dark:text-green-400", bg: "bg-green-50 dark:bg-green-950" },
-                      { label: "Realtime Cycles",   value: fmt(ps?.realtimeCycleCount   || 0),                         cls: "text-violet-700 dark:text-violet-400", bg: "bg-violet-50 dark:bg-violet-950" },
-                      { label: "Success Rate",      value: `${(ps?.cycleSuccessRate || 0).toFixed(1)}%`,               cls: "text-amber-700 dark:text-amber-400",  bg: "bg-amber-50 dark:bg-amber-950" },
+                      { label: "Indication Cycles", value: fmt(rt?.indicationCycles || 0), cls: "text-blue-700 dark:text-blue-400",    bg: "bg-blue-50 dark:bg-blue-950" },
+                      { label: "Strategy Cycles",   value: fmt(rt?.strategyCycles   || 0), cls: "text-green-700 dark:text-green-400",   bg: "bg-green-50 dark:bg-green-950" },
+                      { label: "Realtime Cycles",   value: fmt(rt?.realtimeCycles   || 0), cls: "text-violet-700 dark:text-violet-400", bg: "bg-violet-50 dark:bg-violet-950" },
+                      { label: "Success Rate",      value: `${(rt?.successRate || 0).toFixed(1)}%`, cls: "text-amber-700 dark:text-amber-400", bg: "bg-amber-50 dark:bg-amber-950" },
                     ].map(({ label, value, cls, bg }) => (
                       <div key={label} className={`p-3 rounded-lg ${bg}`}>
                         <div className={`text-2xl font-bold tabular-nums ${cls}`}>{value}</div>
@@ -306,23 +265,30 @@ export function ProgressionLogsDialog({
                   </div>
                 </div>
 
-                {/* Prehistoric */}
+                {/* Historic Data — from historic section of /stats */}
                 <div className="rounded-lg border p-4 space-y-3">
                   <div className="flex items-center gap-2">
                     <Database className="w-4 h-4" />
                     <h3 className="font-semibold">Historical Data</h3>
                     <Badge
-                      variant={ps?.processingCompleteness?.prehistoricLoaded ? "default" : "secondary"}
+                      variant={h?.isComplete ? "default" : "secondary"}
                       className="ml-auto text-[11px]"
                     >
-                      {ps?.processingCompleteness?.prehistoricLoaded ? "Loaded" : "Pending"}
+                      {h?.isComplete ? "Loaded" : "Pending"}
                     </Badge>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs text-muted-foreground">
+                      <span>{h?.symbolsProcessed || 0} / {h?.symbolsTotal || 0} symbols</span>
+                      <span>{h?.progressPercent || 0}%</span>
+                    </div>
+                    <Progress value={h?.progressPercent || 0} className="h-1.5" />
                   </div>
                   <div className="grid grid-cols-3 gap-3">
                     {[
-                      { label: "Symbols",         value: fmt(ps?.prehistoricSymbolsProcessed || 0), cls: "text-sky-700 dark:text-sky-400", bg: "bg-sky-50 dark:bg-sky-950" },
-                      { label: "Candles Loaded",  value: fmt(ps?.prehistoricCandlesProcessed  || 0), cls: "text-teal-700 dark:text-teal-400", bg: "bg-teal-50 dark:bg-teal-950" },
-                      { label: "Preh. Cycles",    value: fmt(ps?.prehistoricCyclesCompleted   || 0), cls: "text-indigo-700 dark:text-indigo-400", bg: "bg-indigo-50 dark:bg-indigo-950" },
+                      { label: "Symbols",        value: fmt(h?.symbolsProcessed || 0), cls: "text-sky-700 dark:text-sky-400",     bg: "bg-sky-50 dark:bg-sky-950" },
+                      { label: "Candles",        value: fmt(h?.candlesLoaded    || 0), cls: "text-teal-700 dark:text-teal-400",   bg: "bg-teal-50 dark:bg-teal-950" },
+                      { label: "Preh. Cycles",   value: fmt(h?.cyclesCompleted  || 0), cls: "text-indigo-700 dark:text-indigo-400", bg: "bg-indigo-50 dark:bg-indigo-950" },
                     ].map(({ label, value, cls, bg }) => (
                       <div key={label} className={`p-3 rounded-lg ${bg} text-center`}>
                         <div className={`text-xl font-bold tabular-nums ${cls}`}>{value}</div>
@@ -332,7 +298,7 @@ export function ProgressionLogsDialog({
                   </div>
                 </div>
 
-                {/* Trading Activity */}
+                {/* Trading Activity — from /logs progressionState */}
                 <div className="rounded-lg border p-4 space-y-3">
                   <div className="flex items-center gap-2">
                     <TrendingUp className="w-4 h-4" />
@@ -340,10 +306,10 @@ export function ProgressionLogsDialog({
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     {[
-                      { label: "Total Trades",     value: fmt(ps?.totalTrades     || 0), cls: "text-slate-700 dark:text-slate-400",   bg: "bg-slate-50 dark:bg-slate-900" },
-                      { label: "Profitable",        value: fmt(ps?.successfulTrades || 0), cls: "text-emerald-700 dark:text-emerald-400", bg: "bg-emerald-50 dark:bg-emerald-950" },
-                      { label: "Win Rate",          value: `${(ps?.tradeSuccessRate || 0).toFixed(1)}%`, cls: "text-amber-700 dark:text-amber-400", bg: "bg-amber-50 dark:bg-amber-950" },
-                      { label: "Total Profit",      value: `$${(ps?.totalProfit || 0).toFixed(2)}`, cls: "text-cyan-700 dark:text-cyan-400", bg: "bg-cyan-50 dark:bg-cyan-950" },
+                      { label: "Total Trades",  value: fmt(tradingState?.totalTrades     || 0), cls: "text-slate-700 dark:text-slate-400",   bg: "bg-slate-50 dark:bg-slate-900" },
+                      { label: "Profitable",    value: fmt(tradingState?.successfulTrades || 0), cls: "text-emerald-700 dark:text-emerald-400", bg: "bg-emerald-50 dark:bg-emerald-950" },
+                      { label: "Win Rate",      value: `${(tradingState?.tradeSuccessRate || 0).toFixed(1)}%`, cls: "text-amber-700 dark:text-amber-400", bg: "bg-amber-50 dark:bg-amber-950" },
+                      { label: "Total Profit",  value: `$${(tradingState?.totalProfit || 0).toFixed(2)}`, cls: "text-cyan-700 dark:text-cyan-400", bg: "bg-cyan-50 dark:bg-cyan-950" },
                     ].map(({ label, value, cls, bg }) => (
                       <div key={label} className={`p-3 rounded-lg ${bg}`}>
                         <div className={`text-2xl font-bold tabular-nums ${cls}`}>{value}</div>
@@ -364,13 +330,13 @@ export function ProgressionLogsDialog({
           <TabsContent value="breakdown" className="flex-1 overflow-hidden">
             <ScrollArea className="h-full">
               <div className="space-y-4 p-4">
-                {/* Indications by type */}
+                {/* Indications by type — from /stats breakdown.indications */}
                 <div className="rounded-lg border p-4 space-y-3">
                   <div className="flex items-center gap-2">
                     <Activity className="w-4 h-4 text-violet-500" />
                     <h3 className="font-semibold">Indications by Type</h3>
                     <span className="ml-auto text-xs text-muted-foreground">
-                      Total: {fmt(ps?.indicationsCount || 0)}
+                      Total: {fmt(bd?.indications.total || rt?.indicationsTotal || 0)}
                     </span>
                   </div>
                   <div className="space-y-2.5">
@@ -391,56 +357,60 @@ export function ProgressionLogsDialog({
                   </div>
                 </div>
 
-                {/* Strategies by stage */}
+                {/* Strategies by stage — from /stats breakdown.strategies */}
                 <div className="rounded-lg border p-4 space-y-3">
                   <div className="flex items-center gap-2">
                     <Zap className="w-4 h-4 text-amber-500" />
                     <h3 className="font-semibold">Strategies by Stage</h3>
                     <span className="ml-auto text-xs text-muted-foreground">
-                      Total: {fmt((ps?.setsBaseCount || 0) + (ps?.setsMainCount || 0) + (ps?.setsRealCount || 0))}
+                      Total: {fmt(bd?.strategies.total || rt?.strategiesTotal || 0)}
                     </span>
                   </div>
                   <div className="grid grid-cols-3 gap-3 text-center text-xs">
                     {[
-                      { label: "Base",  value: ps?.setsBaseCount || 0, cls: "text-orange-700 dark:text-orange-400", bg: "bg-orange-50 dark:bg-orange-950" },
-                      { label: "Main",  value: ps?.setsMainCount || 0, cls: "text-amber-700 dark:text-amber-400",  bg: "bg-amber-50 dark:bg-amber-950" },
-                      { label: "Real",  value: ps?.setsRealCount || 0, cls: "text-yellow-700 dark:text-yellow-400", bg: "bg-yellow-50 dark:bg-yellow-950" },
-                    ].map(({ label, value, cls, bg }) => (
-                      <div key={label} className={`p-3 rounded-lg ${bg}`}>
+                      { label: "Base", value: bd?.strategies.base || 0, eval: bd?.strategies.baseEvaluated || 0, cls: "text-orange-700 dark:text-orange-400", bg: "bg-orange-50 dark:bg-orange-950" },
+                      { label: "Main", value: bd?.strategies.main || 0, eval: bd?.strategies.mainEvaluated || 0, cls: "text-yellow-700 dark:text-yellow-400", bg: "bg-yellow-50 dark:bg-yellow-950" },
+                      { label: "Real", value: bd?.strategies.real || 0, eval: bd?.strategies.realEvaluated || 0, cls: "text-green-700 dark:text-green-400",  bg: "bg-green-50 dark:bg-green-950" },
+                    ].map(({ label, value, eval: evaluated, cls, bg }) => (
+                      <div key={label} className={`rounded-lg ${bg} p-3`}>
                         <div className={`text-xl font-bold tabular-nums ${cls}`}>{fmt(value)}</div>
-                        <div className="text-muted-foreground mt-1">{label}</div>
+                        <div className="text-muted-foreground">{label}</div>
+                        {evaluated > 0 && (
+                          <div className="text-[10px] text-muted-foreground mt-0.5">{fmt(evaluated)} passed</div>
+                        )}
                       </div>
                     ))}
                   </div>
                 </div>
 
-                {/* Processing flags */}
+                {/* Processing completeness */}
                 <div className="rounded-lg border p-4 space-y-2">
-                  <h3 className="font-semibold text-sm">Processing Status</h3>
-                  <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs">
+                  <div className="text-sm font-semibold">Processing Status</div>
+                  <div className="space-y-1.5 text-xs">
                     {[
-                      { label: "Historical Data", flag: ps?.processingCompleteness?.prehistoricLoaded },
-                      { label: "Indications",     flag: ps?.processingCompleteness?.indicationsRunning },
-                      { label: "Strategies",      flag: ps?.processingCompleteness?.strategiesRunning },
-                      { label: "Realtime",        flag: ps?.processingCompleteness?.realtimeRunning },
-                    ].map(({ label, flag }) => (
+                      { label: "Historic Data Loaded",  done: h?.isComplete },
+                      { label: "Indications Running",    done: (rt?.indicationCycles || 0) > 0 },
+                      { label: "Strategies Running",     done: (rt?.strategyCycles   || 0) > 0 },
+                      { label: "Realtime Active",        done: rt?.isActive },
+                    ].map(({ label, done }) => (
                       <div key={label} className="flex items-center justify-between">
                         <span className="text-muted-foreground">{label}</span>
-                        <Badge variant={flag ? "default" : "secondary"} className="text-[10px] h-5">
-                          {flag ? "Active" : "Pending"}
+                        <Badge variant={done ? "default" : "secondary"} className="text-[10px] h-5 px-1.5">
+                          {done ? "Yes" : "No"}
                         </Badge>
                       </div>
                     ))}
                   </div>
 
-                  {/* Success rate bar */}
-                  <div className="pt-2 space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-muted-foreground">Cycle Success Rate</span>
-                      <span className="font-medium">{(ps?.cycleSuccessRate || 0).toFixed(1)}%</span>
+                  {(rt?.successRate || 0) > 0 && (
+                    <div className="pt-2 space-y-1">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-muted-foreground">Cycle Success Rate</span>
+                        <span className="font-medium">{(rt?.successRate || 0).toFixed(1)}%</span>
+                      </div>
+                      <Progress value={rt?.successRate || 0} className="h-1.5" />
                     </div>
-                    <Progress value={ps?.cycleSuccessRate || 0} className="h-1.5" />
-                  </div>
+                  )}
                 </div>
               </div>
             </ScrollArea>
