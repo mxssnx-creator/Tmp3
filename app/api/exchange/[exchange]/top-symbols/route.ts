@@ -92,7 +92,7 @@ async function fetchMostVolatileSymbol(exchange: string): Promise<{ symbol: stri
             }))
         }
       } catch (bybitErr) {
-        console.warn(`[v0] [TopSymbols] Bybit API error, using default:`, bybitErr instanceof Error ? bybitErr.message : bybitErr)
+        console.warn(`[TopSymbols] Bybit API error, using default:`, bybitErr instanceof Error ? bybitErr.message : bybitErr)
       }
 
     } else if (exchange === "bingx") {
