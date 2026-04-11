@@ -122,6 +122,14 @@ export function ActiveConnectionCard({
   const [volumeType, setVolumeType] = useState<"usdt" | "contract">("usdt")
   const [mainTradeStatus, setMainTradeStatus] = useState<"idle" | "active" | "paused" | "stopped">("idle")
   const [presetTradeStatus, setPresetTradeStatus] = useState<"idle" | "active" | "paused" | "stopped">("idle")
+  // Live engine-stats counters displayed under the progress bar
+  const [liveStats, setLiveStats] = useState<{
+    indicationCycles: number
+    strategyCycles: number
+    indications: number
+    strategies: number
+    positions: number
+  } | null>(null)
   const details = connection.details
 
   // Sync local toggle states from connection details
@@ -190,6 +198,36 @@ export function ActiveConnectionCard({
       }
     }
   }, [fetchProgression, progression?.phase])
+
+  // Fetch live engine-stats every 3s when engine is running
+  useEffect(() => {
+    if (!globalEngineRunning) return
+
+    const fetchLiveStats = async () => {
+      try {
+        const res = await fetch(
+          `/api/trading/engine-stats?connection_id=${connection.connectionId}`,
+          { cache: "no-store" }
+        )
+        if (!res.ok) return
+        const data = await res.json()
+        const indicationCycles = data.indicationCycleCount || 0
+        if (indicationCycles > 0 || (data.totalStrategyCount || 0) > 0) {
+          setLiveStats({
+            indicationCycles,
+            strategyCycles:  data.strategyCycleCount  || 0,
+            indications:     data.totalIndicationsCount || 0,
+            strategies:      data.totalStrategyCount   || 0,
+            positions:       data.positionsCount       || 0,
+          })
+        }
+      } catch { /* non-critical */ }
+    }
+
+    fetchLiveStats()
+    const interval = setInterval(fetchLiveStats, 3000)
+    return () => clearInterval(interval)
+  }, [globalEngineRunning, connection.connectionId])
 
   // Handle Live Trade toggle
   const handleLiveTradeToggle = async (newState: boolean) => {
@@ -567,6 +605,25 @@ export function ActiveConnectionCard({
                   </p>
                 )}
                 
+                {/* Live engine stats mini row — shown when engine has processed at least 1 cycle */}
+                {liveStats && liveStats.indicationCycles > 0 && phase !== "idle" && phase !== "prehistoric_data" && (
+                  <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+                    {[
+                      { label: "Cycles",     value: liveStats.indicationCycles },
+                      { label: "Ind.",       value: liveStats.indications },
+                      { label: "Strat.",     value: liveStats.strategies },
+                      { label: "Positions",  value: liveStats.positions },
+                    ].map(({ label, value }) => (
+                      <div key={label} className="flex items-center gap-1 text-[10px]">
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="font-semibold tabular-nums">
+                          {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 {/* Detailed prehistoric progress display */}
                 {phase === "prehistoric_data" && progression?.prehistoricProgress && (
                   <div className="mt-2 p-2 bg-amber-50/50 dark:bg-amber-950/20 rounded border border-amber-200/50 dark:border-amber-800/30 space-y-1">
