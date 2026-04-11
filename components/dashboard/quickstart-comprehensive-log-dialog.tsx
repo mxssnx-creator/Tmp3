@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Button } from "@/components/ui/button"
 import { FileText, Activity, BarChart3, RefreshCw } from "lucide-react"
+import { useExchange } from "@/lib/exchange-context"
 
 interface LogEntry {
   timestamp: Date
@@ -39,36 +40,21 @@ interface OverallData {
 }
 
 export function QuickstartComprehensiveLogDialog() {
+  // Use the global exchange context — driven by the top-page exchange selector
+  const { selectedConnectionId, selectedConnection, selectedExchange } = useExchange()
+  const activeConnectionId = selectedConnectionId || "default-bingx-001"
+  const connectionLabel = selectedConnection?.name || (selectedExchange || "").toUpperCase() || activeConnectionId
+
   const [open, setOpen] = useState(false)
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [overallData, setOverallData] = useState<OverallData | null>(null)
   const [isLoading, setIsLoading] = useState(false)
-  const [activeConnectionId, setActiveConnectionId] = useState<string>("default-bingx-001")
   const logsEndRef = useRef<HTMLDivElement>(null)
 
   // Auto-scroll logs to bottom
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
-
-  // Resolve which connection ID to use for logs
-  const resolveConnectionId = async () => {
-    try {
-      const res = await fetch("/api/settings/connections?t=" + Date.now(), { cache: "no-store" })
-      if (!res.ok) return
-      const data = await res.json()
-      const connections: any[] = Array.isArray(data) ? data : (data?.connections || [])
-      const active = connections.find(
-        (c) =>
-          c.is_enabled_dashboard === true || c.is_enabled_dashboard === "1" ||
-          c.is_active_inserted === true || c.is_active_inserted === "1" ||
-          c.is_active === true || c.is_active === "1"
-      ) || connections[0]
-      if (active?.id) setActiveConnectionId(active.id)
-    } catch {
-      // keep default
-    }
-  }
 
   // Fetch overall data
   const fetchOverallData = async () => {
@@ -132,20 +118,10 @@ export function QuickstartComprehensiveLogDialog() {
     }
   }
 
-  // Refresh when dialog opens — first resolve the connection ID, then start polling
+  // Poll when dialog is open; re-run whenever the selected connection changes
   useEffect(() => {
     if (!open) return
-
-    resolveConnectionId().then(() => {
-      fetchOverallData()
-      fetchLiveLogs()
-    })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
-
-  // Re-fetch logs whenever the resolved connection ID changes
-  useEffect(() => {
-    if (!open) return
+    fetchOverallData()
     fetchLiveLogs()
     const interval = setInterval(() => {
       fetchOverallData()
@@ -181,6 +157,11 @@ export function QuickstartComprehensiveLogDialog() {
           <DialogTitle className="flex items-center gap-2">
             <Activity className="w-5 h-5" />
             Engine Processing Data & Logs
+            {connectionLabel && (
+              <Badge variant="secondary" className="text-xs font-normal">
+                {connectionLabel}
+              </Badge>
+            )}
           </DialogTitle>
         </DialogHeader>
 

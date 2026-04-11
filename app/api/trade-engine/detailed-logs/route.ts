@@ -191,6 +191,14 @@ export async function GET(request: Request) {
       activeConnections.map(async (conn: any, index: number) => {
         const state = (await getSettings(`trade_engine_state:${conn.id}`)) || {}
         const progression = progressionStates[index] || {}
+
+        // Read the live progression hash — written every indication cycle.
+        // This is more current than trade_engine_state (persisted every 50-100 cycles).
+        let progHash: Record<string, string> = {}
+        try {
+          progHash = (await client.hgetall(`progression:${conn.id}`)) || {}
+        } catch { /* non-critical */ }
+
         const symbols = Array.isArray((state as any).symbols)
           ? (state as any).symbols
           : Array.isArray((state as any).active_symbols)
@@ -221,9 +229,18 @@ export async function GET(request: Request) {
         return {
           id: conn.id,
           symbols,
-          indicationCycles: toNumber((state as any).indication_cycle_count) || toNumber((progression as any).cyclesCompleted),
-          strategyCycles: toNumber((state as any).strategy_cycle_count) || toNumber((progression as any).successfulCycles),
-          realtimeCycles: toNumber((state as any).realtime_cycle_count),
+          // Prefer live progression hash (updated every cycle) over engineState (every 50-100 cycles)
+          indicationCycles:
+            parseInt(progHash.indication_cycle_count || "0", 10) ||
+            toNumber((state as any).indication_cycle_count) ||
+            toNumber((progression as any).cyclesCompleted),
+          strategyCycles:
+            parseInt(progHash.strategy_cycle_count || "0", 10) ||
+            toNumber((state as any).strategy_cycle_count) ||
+            toNumber((progression as any).successfulCycles),
+          realtimeCycles:
+            parseInt(progHash.realtime_cycle_count || "0", 10) ||
+            toNumber((state as any).realtime_cycle_count),
           strategiesEvaluated: toNumber((state as any).total_strategies_evaluated),
           durations: {
             indication: toNumber((state as any).indication_avg_duration_ms),
