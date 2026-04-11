@@ -79,7 +79,7 @@ export function AddActiveConnectionDialog({
         setSelectedConnection(availableForAdd[0].id || "")
       }
     } catch (error) {
-      console.error("[v0] Error loading connections:", error)
+      console.error("[AddDialog] Error loading connections:", error)
       toast.error("Failed to load connections")
     } finally {
       setLoading(false)
@@ -115,23 +115,14 @@ export function AddActiveConnectionDialog({
       
       // Wait a moment for backend to update
       await new Promise(resolve => setTimeout(resolve, 500))
-      
-      console.log("[v0] [AddDialog] Connection added, triggering refresh...")
-      
-      if (onConnectionAdded) {
-        console.log("[v0] [AddDialog] Calling onConnectionAdded callback")
-        await onConnectionAdded(selectedConnection)
-      }
-      if (onSuccess) {
-        console.log("[v0] [AddDialog] Calling onSuccess callback")
-        onSuccess(selectedConnection)
-      }
 
-      console.log("[v0] [AddDialog] Closing dialog")
+      if (onConnectionAdded) await onConnectionAdded(selectedConnection)
+      if (onSuccess) onSuccess(selectedConnection)
+
       onOpenChange(false)
       setSelectedConnection("")
     } catch (error: any) {
-      console.error("[v0] Error adding connection:", error)
+      console.error("[AddDialog] Error adding connection:", error)
       toast.error(error.message || "Failed to add connection")
     } finally {
       setAdding(false)

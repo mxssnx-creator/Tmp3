@@ -35,9 +35,7 @@ export function DashboardActiveConnectionsManager() {
   const globalEngineRef = React.useRef(false)
   const activeConnectionsRef = React.useRef<ActiveConnectionWithDetails[]>([])
 
-  useEffect(() => {
-    console.log(`[v0] [Manager] Component loaded - ${VERSION}`)
-  }, [])
+
 
   const updateActiveConnections = (updater: ActiveConnectionWithDetails[] | ((prev: ActiveConnectionWithDetails[]) => ActiveConnectionWithDetails[])) => {
     if (typeof updater === "function") {
@@ -55,7 +53,6 @@ export function DashboardActiveConnectionsManager() {
   const loadConnections = async () => {
     try {
       const timestamp = new Date().getTime()
-      console.log(`[v0] [Manager] Loading connections with cache bust: t=${timestamp}`)
       const response = await fetch(`/api/settings/connections?v=${VERSION}&t=${timestamp}`, {
         cache: "no-store",
         headers: {
@@ -64,16 +61,14 @@ export function DashboardActiveConnectionsManager() {
           "X-Component-Version": VERSION,
         },
       })
-      
+
       if (!response.ok) {
-        console.error(`[v0] [Manager] API returned ${response.status}`)
         setLoading(false)
         return
       }
-      
+
       const data = await response.json()
       const allConnections: Connection[] = Array.isArray(data) ? data : (data?.connections || [])
-      console.log(`[v0] [Manager] Loaded ${allConnections.length} total connections from API`)
       
       const activeConns: ActiveConnectionWithDetails[] = []
       const seenIds = new Set<string>()
@@ -94,28 +89,23 @@ export function DashboardActiveConnectionsManager() {
           toBoolean(conn.is_enabled_dashboard)
 
         if (isBase || isActiveInserted || isEnabledDashboard) {
-          if (seenIds.has(conn.id)) {
-            console.warn(`[v0] [Manager] Duplicate connection skipped: ${conn.id}`)
-            continue
-          }
+          if (seenIds.has(conn.id)) continue
           seenIds.add(conn.id)
           activeConns.push({
             id: `active-${conn.id}`,
             connectionId: conn.id,
             exchangeName: conn.exchange ? conn.exchange.charAt(0).toUpperCase() + conn.exchange.slice(1) : "Unknown",
-            isActive: isEnabledDashboard, // Dashboard toggle state
+            isActive: isEnabledDashboard,
             isBaseEnabled: isBase,
             addedAt: conn.created_at || new Date().toISOString(),
             details: conn,
           })
-          console.log(`[v0] [Manager]   ${conn.id} (${conn.name}): base=${isBase}, inserted=${isActiveInserted}, enabled=${isEnabledDashboard}`)
         }
       }
-      
-      console.log(`[v0] [Manager] Filtered to ${activeConns.length} active connections (bybit=${activeConns.filter(c => c.connectionId.includes('bybit')).length}, bingx=${activeConns.filter(c => c.connectionId.includes('bingx')).length})`)
+
       updateActiveConnections(activeConns)
     } catch (error) {
-      console.error("[v0] Error loading connections:", error)
+      console.error("[Manager] Error loading connections:", error)
     } finally {
       setLoading(false)
     }
@@ -142,15 +132,13 @@ export function DashboardActiveConnectionsManager() {
   }
 
   useEffect(() => {
-    console.log(`[v0] [Manager] Initializing active connections manager (version: ${COMPONENT_VERSIONS.dashboardManager})`)
-    loadConnections()
-    checkGlobalEngine()
-    const connInterval = setInterval(loadConnections, 8000) // Poll every 8s for responsive UI
-    const engineInterval = setInterval(checkGlobalEngine, 5000) // Poll every 5s for engine status
+  loadConnections()
+  checkGlobalEngine()
+  const connInterval = setInterval(loadConnections, 8000)
+  const engineInterval = setInterval(checkGlobalEngine, 5000)
     
     // Listen for relevant events and refresh
     const handleEngineStateChange = () => {
-      console.log(`[v0] [Manager] Detected engine state change, refreshing...`)
       checkGlobalEngine()
     }
     
@@ -169,91 +157,55 @@ export function DashboardActiveConnectionsManager() {
 
   const handleToggle = async (connectionId: string, currentState: boolean) => {
     const newState = !currentState
-    
-    console.log(`[v0] [Manager] Toggle requested: ${connectionId}, current=${currentState}, new=${newState}`)
-    
-    // NOTE: Enabling a connection STARTS the engine for that connection (no pre-requirement).
-    // The toggle-dashboard API directly invokes coordinator.startEngine().
-    
+
     setTogglingIds(prev => new Set(prev).add(connectionId))
-    
+
     const connInfo = activeConnections.find(ac => ac.connectionId === connectionId)
     const connName = connInfo?.exchangeName ? `${connInfo.exchangeName} (${connectionId})` : connectionId
-    
+
     try {
-      console.log(`[v0] [Manager] ${newState ? "ENABLING" : "DISABLING"} ${connName}...`)
-      
-      // 1. Toggle active state via API while keeping insertion state stable
-      console.log(`[v0] [Manager] → Calling toggle-dashboard API...`)
       const toggleRes = await fetch(`/api/settings/connections/${connectionId}/toggle-dashboard`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          is_enabled_dashboard: newState,
-        }),
+        body: JSON.stringify({ is_enabled_dashboard: newState }),
         cache: "no-store"
       })
-      
+
       if (!toggleRes.ok) {
         const errorData = await toggleRes.json().catch(() => ({ error: "Unknown error" }))
         throw new Error(`Toggle API failed: ${errorData.error}`)
       }
-      console.log(`[v0] [Manager] ✓ Toggle API succeeded`)
-      
-      // 2. Update local state immediately
-      console.log(`[v0] [Manager] → Updating local state...`)
+
       updateActiveConnections(prev => prev.map(ac =>
         ac.connectionId === connectionId ? { ...ac, isActive: newState } : ac
       ))
-      console.log(`[v0] [Manager] ✓ Local state updated`)
 
-      // Live trade is now MANUAL ONLY - do not auto-enable
-      // User must manually enable via the Live Trade slider on the connection card
       if (!newState) {
-        // Only auto-disable live trade when connection is disabled
-        console.log(`[v0] [Manager] → Stopping engine for ${connName} (connection disabled)...`)
-        const stopRes = await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
+        // Auto-disable live trade when connection is disabled
+        await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ is_live_trade: false }),
           cache: "no-store"
-        })
-        
-        if (stopRes.ok) {
-          console.log(`[v0] [Manager] ✓ Engine stopped for ${connName}`)
-        }
-        toast.success("Connection deactivated", {
-          description: "Engine stopped",
-        })
+        }).catch(() => { /* non-critical */ })
+        toast.success("Connection deactivated", { description: "Engine stopped" })
       } else {
-        // When enabling, just show that live trade must be enabled manually
         toast.success("Connection added to Main Connections", {
           description: "Use the Live Trade slider to enable real exchange trading",
         })
       }
 
-      // Dispatch events for other components to refresh
       if (typeof window !== "undefined") {
-        window.dispatchEvent(new CustomEvent("connection-toggled", {
-          detail: { connectionId, newState }
-        }))
-        window.dispatchEvent(new CustomEvent("engine-state-changed", {
-          detail: { connectionId, newState }
-        }))
-        console.log(`[v0] [Manager] → Dispatched connection-toggled + engine-state-changed events`)
+        window.dispatchEvent(new CustomEvent("connection-toggled", { detail: { connectionId, newState } }))
+        window.dispatchEvent(new CustomEvent("engine-state-changed", { detail: { connectionId, newState } }))
       }
-      
-      console.log(`[v0] [Manager] ✓ Toggle complete: ${connName} → ${newState ? "ACTIVE" : "INACTIVE"}`)
-      
-      // Refresh engine status and connections after toggle
-      console.log(`[v0] [Manager] → Refreshing connections and engine status...`)
+
       setTimeout(() => {
         loadConnections()
         checkGlobalEngine()
       }, 800)
     } catch (error) {
-      console.error(`[v0] [Manager] ✗ Toggle error for ${connName}:`, error)
-      // Revert local state on error
+      console.error(`[Manager] Toggle error for ${connName}:`, error)
       updateActiveConnections(prev => prev.map(ac =>
         ac.connectionId === connectionId ? { ...ac, isActive: currentState } : ac
       ))
@@ -268,64 +220,44 @@ export function DashboardActiveConnectionsManager() {
   }
 
   const handleRemove = async (connectionId: string, connectionName: string) => {
-    console.log(`[v0] [Manager] Remove requested: ${connectionId} (${connectionName})`)
     try {
       setRemovingIds(prev => new Set(prev).add(connectionId))
-      
-      // Step 1: Stop engine if running
-      console.log(`[v0] [Manager] → Stopping engine for ${connectionName}...`)
-      try {
-        await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ is_live_trade: false }),
-          cache: "no-store"
-        })
-        console.log(`[v0] [Manager] ✓ Engine stopped`)
-      } catch (engineErr) {
-        console.warn(`[v0] [Manager] ⚠ Engine stop failed (non-critical):`, engineErr)
-      }
-      
-      // Step 2: Remove from main panel via DELETE API
-      console.log(`[v0] [Manager] → Calling DELETE /api/settings/connections/${connectionId}/active...`)
+
+      // Stop engine first (non-critical)
+      await fetch(`/api/settings/connections/${connectionId}/live-trade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ is_live_trade: false }),
+        cache: "no-store"
+      }).catch(() => { /* non-critical */ })
+
+      // Remove from active panel
       const removeRes = await fetch(`/api/settings/connections/${connectionId}/active`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
         cache: "no-store"
       })
-      
+
       if (!removeRes.ok) {
         const errorData = await removeRes.json().catch(() => ({ error: "Unknown error" }))
-        throw new Error(`Remove API failed: ${errorData.error || removeRes.statusText}`)
+        throw new Error(errorData.error || removeRes.statusText)
       }
-      
-      const removeResult = await removeRes.json()
-      console.log(`[v0] [Manager] ✓ DELETE API succeeded:`, removeResult)
-      
-      // Step 3: Update local state
-      console.log(`[v0] [Manager] → Updating local state...`)
+
       updateActiveConnections(prev => prev.filter(ac => ac.connectionId !== connectionId))
-      
-      // Step 4: Dispatch event
+
       if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("connection-removed", {
           detail: { connectionId, name: connectionName }
         }))
       }
-      
+
       toast.success("Connection removed", {
         description: `${connectionName} has been removed from active connections`
       })
-      
-      console.log(`[v0] [Manager] ✓ Remove complete: ${connectionName}`)
-      
-      // Refresh connections list
-      setTimeout(() => {
-        console.log(`[v0] [Manager] → Refreshing connections list...`)
-        loadConnections()
-      }, 500)
+
+      setTimeout(() => loadConnections(), 500)
     } catch (error) {
-      console.error(`[v0] [Manager] ✗ Remove error for ${connectionName}:`, error)
+      console.error(`[Manager] Remove error for ${connectionName}:`, error)
       toast.error("Failed to remove connection", {
         description: error instanceof Error ? error.message : "Unknown error"
       })

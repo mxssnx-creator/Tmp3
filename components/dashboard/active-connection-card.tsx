@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -123,6 +123,8 @@ export function ActiveConnectionCard({
   const [mainTradeStatus, setMainTradeStatus] = useState<"idle" | "active" | "paused" | "stopped">("idle")
   const [presetTradeStatus, setPresetTradeStatus] = useState<"idle" | "active" | "paused" | "stopped">("idle")
   // Live engine-stats counters displayed under the progress bar
+  // Ref to current phase — used inside stable interval callback to avoid recreating on every phase change
+  const phaseRef = useRef<string>("idle")
   const [liveStats, setLiveStats] = useState<{
     indicationCycles: number
     strategyCycles: number
@@ -143,7 +145,6 @@ export function ActiveConnectionCard({
   // Poll progression
   const fetchProgression = useCallback(async () => {
     try {
-      console.log(`[v0] [Card] Fetching progression for: ${connection.exchangeName} (${connection.connectionId})`)
       const res = await fetch(`/api/connections/progression/${connection.connectionId}`, {
         cache: "no-store",
         headers: { "Cache-Control": "no-cache, no-store, must-revalidate" },
@@ -151,54 +152,57 @@ export function ActiveConnectionCard({
       if (res.ok) {
         const data = await res.json()
         if (data.success && data.progression) {
-          console.log(`[v0] [Card] ✓ Progression received: phase=${data.progression.phase}, progress=${data.progression.progress}%, message="${data.progression.message}"`)
           setProgression(data.progression)
         }
-      } else {
-        console.warn(`[v0] [Card] ⚠ Progression API returned ${res.status}`)
       }
-    } catch (error) {
-      console.error("[v0] [Card] Failed to fetch progression:", error)
+    } catch {
+      // Non-critical polling — swallow silently
     }
-  }, [connection.connectionId, connection.exchangeName])
+  }, [connection.connectionId])
+
+  // Keep phaseRef current so the stable interval can read it without recreating
+  useEffect(() => {
+    phaseRef.current = progression?.phase || "idle"
+  }, [progression?.phase])
 
   useEffect(() => {
     fetchProgression()
-    // Poll faster during active phases (2s), slower when idle/live (5s)
-    const interval = setInterval(
-      fetchProgression,
-      progression?.phase && progression.phase !== "idle" && progression.phase !== "stopped" && progression.phase !== "live_trading"
-        ? 2000
-        : 5000
-    )
-    
-    // Listen for connection toggle events to refresh progression immediately
-    const handleConnectionToggled = () => {
-      console.log(`[v0] [Card] Detected connection toggle event, refreshing progression...`)
-      fetchProgression()
+
+    // Single stable interval — reads phaseRef.current on each tick to decide the next delay.
+    // Using a self-scheduling timeout so interval length adapts without recreating the effect.
+    let timeoutId: ReturnType<typeof setTimeout>
+    const scheduleNext = () => {
+      const phase = phaseRef.current
+      const isActivePhase = phase && phase !== "idle" && phase !== "stopped" && phase !== "live_trading" && phase !== "disabled"
+      const delay = isActivePhase ? 2000 : 5000
+      timeoutId = setTimeout(async () => {
+        await fetchProgression()
+        scheduleNext()
+      }, delay)
     }
-    
+    scheduleNext()
+
+    const handleConnectionToggled = () => { fetchProgression() }
     const handleLiveTradeToggled = (event: Event) => {
       const customEvent = event as CustomEvent
       if (customEvent.detail?.connectionId === connection.connectionId) {
-        console.log(`[v0] [Card] Detected live trade toggle for this connection, refreshing progression...`)
         fetchProgression()
       }
     }
-    
-    if (typeof window !== 'undefined') {
-      window.addEventListener('connection-toggled', handleConnectionToggled)
-      window.addEventListener('live-trade-toggled', handleLiveTradeToggled)
+
+    if (typeof window !== "undefined") {
+      window.addEventListener("connection-toggled", handleConnectionToggled)
+      window.addEventListener("live-trade-toggled", handleLiveTradeToggled)
     }
-    
+
     return () => {
-      clearInterval(interval)
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('connection-toggled', handleConnectionToggled)
-        window.removeEventListener('live-trade-toggled', handleLiveTradeToggled)
+      clearTimeout(timeoutId)
+      if (typeof window !== "undefined") {
+        window.removeEventListener("connection-toggled", handleConnectionToggled)
+        window.removeEventListener("live-trade-toggled", handleLiveTradeToggled)
       }
     }
-  }, [fetchProgression, progression?.phase])
+  }, [fetchProgression, connection.connectionId])
 
   // Fetch live engine-stats every 3s when connection is active
   useEffect(() => {
@@ -228,21 +232,17 @@ export function ActiveConnectionCard({
     fetchLiveStats()
     const interval = setInterval(fetchLiveStats, 3000)
     return () => clearInterval(interval)
-  }, [globalEngineRunning, connection.connectionId])
+  }, [globalEngineRunning, connection.connectionId, connection.isActive])
 
   // Handle Live Trade toggle
   const handleLiveTradeToggle = async (newState: boolean) => {
     const connName = connection.exchangeName
-    console.log(`[v0] [Card] Live Trade toggle clicked: ${connName}, current=${liveTrade}, new=${newState}`)
-    
-    // Validation — connection must be enabled first (engine starts automatically with connection)
+    // Validation — connection must be enabled first
     if (newState && !connection.isActive) {
-      console.log(`[v0] [Card] ✗ Cannot enable live trade - connection not enabled on dashboard`)
       toast.error("Enable the connection toggle first")
       return
     }
-    
-    console.log(`[v0] [Card] → Calling live-trade API for ${connName}...`)
+
     setLiveTradeLoading(true)
     try {
       const res = await fetch(`/api/settings/connections/${connection.connectionId}/live-trade`, {
@@ -251,30 +251,21 @@ export function ActiveConnectionCard({
         body: JSON.stringify({ is_live_trade: newState }),
         cache: "no-store"
       })
-      
+
       const data = await res.json().catch(() => ({ error: "Failed to parse response" }))
-      console.log(`[v0] [Card] API Response for ${connName}:`, data)
-      
+
       if (res.ok && data.success) {
-        console.log(`[v0] [Card] ✓ Live trade ${newState ? "enabled" : "disabled"} for ${connName}`)
         setLiveTrade(newState)
         toast.success(newState ? `Live Trading starting on ${connName}...` : `Live Trading stopped on ${connName}`)
-        
-        // Dispatch event for system-wide refresh
         if (typeof window !== "undefined") {
-          window.dispatchEvent(new CustomEvent("live-trade-toggled", { 
-            detail: { connectionId: connection.connectionId, newState } 
+          window.dispatchEvent(new CustomEvent("live-trade-toggled", {
+            detail: { connectionId: connection.connectionId, newState }
           }))
         }
       } else {
-        console.log(`[v0] [Card] ✗ API error for ${connName}:`, data.error || data.details)
         toast.error(`Failed to toggle Live Trade: ${data.error || "Unknown error"}`)
-        if (data.details) {
-          console.log(`[v0] [Card] Error details:`, data.details)
-        }
       }
-    } catch (error) {
-      console.error(`[v0] [Card] Exception toggling live trade for ${connName}:`, error)
+    } catch {
       toast.error("Failed to toggle Live Trade")
     } finally {
       setLiveTradeLoading(false)
@@ -457,7 +448,6 @@ export function ActiveConnectionCard({
                   id={`enable-${connection.connectionId}`}
                   checked={connection.isActive}
                   onCheckedChange={() => {
-                    console.log(`[v0] [Card] Toggle clicked for ${connName}: ${connection.isActive} → ${!connection.isActive}`)
                     onToggle(connection.connectionId, connection.isActive)
                   }}
                   disabled={isToggling}

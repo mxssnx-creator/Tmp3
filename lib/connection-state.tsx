@@ -112,7 +112,7 @@ export function ConnectionStateProvider({ children }: { children: ReactNode }) {
         }
       }
     } catch (error) {
-      console.error("[v0] [ConnectionState] Failed to load base connections:", error)
+      console.error("[ConnectionState] Failed to load base connections:", error)
     } finally {
       loadingRef.current.base = false
       setIsBaseLoading(false)
@@ -166,7 +166,7 @@ export function ConnectionStateProvider({ children }: { children: ReactNode }) {
         setExchangeConnectionsActiveStatus(newStatusMap)
       }
     } catch (error) {
-      console.error("[v0] [ConnectionState] Failed to load Active Connections:", error)
+      console.error("[ConnectionState] Failed to load active connections:", error)
     } finally {
       loadingRef.current.active = false
       setIsExchangeConnectionsActiveLoading(false)
@@ -212,11 +212,6 @@ export function ConnectionStateProvider({ children }: { children: ReactNode }) {
       const newStatus = !currentStatus
       next.set(id, newStatus)
       activeStatusRef.current = next
-      
-      // Find the connection to log its name
-      const conn = exchangeConnectionsActive.find(c => c.id === `active-${id}`) || exchangeConnectionsActive.find(c => c.id === id)
-      const connName = conn?.name || conn?.id || id
-      console.log(`[v0] [ConnectionStateToggle] ${newStatus ? "✓ ENABLED" : "✗ DISABLED"}: ${connName} (${id})`)
       
       return next
     })
