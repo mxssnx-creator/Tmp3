@@ -103,16 +103,10 @@ export async function trackStrategyStats(
       }),
     )
     await client.expire(`strategies:${connectionId}:${strategyType}:latest`, 3600)
-
-    // Also increment strategy counts in the progression hash for dashboard real-time display
-    const baseField = strategyType === "base" ? "strategies_base_total"
-      : strategyType === "main" ? "strategies_main_total" : "strategies_real_total"
-    const evaluatedField = strategyType === "base" ? "strategy_evaluated_base"
-      : strategyType === "main" ? "strategy_evaluated_main" : "strategy_evaluated_real"
-    await client.hincrby(`progression:${connectionId}`, baseField, totalCreated)
-    await client.hincrby(`progression:${connectionId}`, evaluatedField, passedCount)
-    await client.hincrby(`progression:${connectionId}`, "strategies_count", totalCreated)
-    await client.expire(`progression:${connectionId}`, 7 * 24 * 60 * 60)
+    // NOTE: Per-stage progression hash fields (strategies_base_total, strategies_main_total,
+    // strategies_real_total, strategy_evaluated_*) are written exclusively by StrategyCoordinator
+    // to avoid double-counting. trackStrategyStats only writes to the flat counter keys above
+    // and to the SQL strategies_real table for historical analytics.
   } catch (e) {
     console.error(`[v0] [Stats] Failed to track strategy in Redis:`, e instanceof Error ? e.message : String(e))
   }

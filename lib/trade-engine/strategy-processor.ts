@@ -70,21 +70,20 @@ export class StrategyProcessor {
           `PF=${result.avgProfitFactor.toFixed(2)} | DDT=${Math.round(result.avgDrawdownTime)}min`
         )
         
-        // REAL-TIME: Save strategies immediately after calculation, no batching
-        if (result.passedEvaluation > 0) {
-          try {
-            await trackStrategyStats(
-              this.connectionId,
-              symbol,
-              result.type,
-              result.totalCreated,
-              result.passedEvaluation,
-              result.avgProfitFactor,
-              result.avgDrawdownTime
-            )
-          } catch (e) {
-            // Ignore DB errors - processing continues
-          }
+        // REAL-TIME: Always track stats for every stage (even zero-pass cycles)
+        // so that the DB accurately reflects all evaluation attempts, not just successes.
+        try {
+          await trackStrategyStats(
+            this.connectionId,
+            symbol,
+            result.type,
+            result.totalCreated,
+            result.passedEvaluation,
+            result.avgProfitFactor,
+            result.avgDrawdownTime
+          )
+        } catch (e) {
+          // Ignore DB errors - processing continues
         }
       }
 
