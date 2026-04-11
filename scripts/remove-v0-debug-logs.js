@@ -15,7 +15,7 @@
 import { readFileSync, writeFileSync, readdirSync, statSync } from "fs"
 import { join, extname } from "path"
 
-const ROOT = process.cwd()
+const ROOT = "/vercel/share/v0-project"
 
 // Directories to skip entirely
 const SKIP_DIRS = new Set([
@@ -28,17 +28,16 @@ const SKIP_DIRS = new Set([
   "public",
 ])
 
-// Patterns for lines that should be REMOVED outright
-// These are standalone console.log/warn with [v0] that add no value
+// Lines that are solely a console.log or console.warn with [v0] prefix — remove entirely.
+// Matches backtick, single-quote, and double-quote string starts.
 const REMOVE_LINE_PATTERNS = [
-  /^\s*console\.log\([`'"]\[v0\]/,
-  /^\s*console\.warn\([`'"]\[v0\]/,
+  /^\s*console\.log\([\`'"]\[v0\]/,
+  /^\s*console\.warn\([\`'"]\[v0\]/,
 ]
 
-// Patterns for console.error with [v0] where the catch variable is ONLY used in the log
-// We replace the whole catch block body with a comment
-const SOLO_ERROR_LOG = /^\s*console\.error\([`'"]\[v0\][^)]*,\s*(error|err|e)\s*\)\s*$/
-const SOLO_ERROR_LOG_NO_VAR = /^\s*console\.error\([`'"]\[v0\][^)]*\)\s*$/
+// console.error with [v0] where the error variable is ONLY used in the log line
+const SOLO_ERROR_LOG = /^\s*console\.error\([\`'"]\[v0\][^)]*,\s*(error|err|e)\s*\)\s*$/
+const SOLO_ERROR_LOG_NO_VAR = /^\s*console\.error\([\`'"]\[v0\][^)]*\)\s*$/
 
 let filesModified = 0
 let linesRemoved = 0
