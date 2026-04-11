@@ -18,8 +18,6 @@ export async function GET(request: NextRequest) {
     const limit = Number.parseInt(searchParams.get("limit") || "100")
     const engine = searchParams.get("engine") // Filter by engine type
 
-    console.log(`[v0] [StructuredLogs] Retrieving logs: connectionId=${connectionId}, limit=${limit}, engine=${engine}`)
-
     if (!connectionId) {
       return NextResponse.json({ error: "connectionId required" }, { status: 400 })
     }
@@ -27,9 +25,6 @@ export async function GET(request: NextRequest) {
     // Retrieve logs from Redis
     const logKey = `engine:logs:${connectionId}`
     const rawLogs = await client.lrange(logKey, 0, limit - 1)
-
-    console.log(`[v0] [StructuredLogs] Retrieved ${rawLogs.length} logs from Redis`)
-
     const logs = rawLogs.map((log) => JSON.parse(log))
 
     // Filter by engine if specified
@@ -50,8 +45,6 @@ export async function GET(request: NextRequest) {
       if (log.status === "error") stats.errorCount++
     }
 
-    console.log(`[v0] [StructuredLogs] Stats: ${stats.totalLogs} logs, ${stats.errorCount} errors`)
-
     return NextResponse.json({
       success: true,
       connectionId,
@@ -60,7 +53,7 @@ export async function GET(request: NextRequest) {
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
-    console.error("[v0] Error retrieving structured logs:", error)
+    console.error("Error retrieving structured logs:", error)
     return NextResponse.json(
       {
         success: false,
@@ -84,7 +77,6 @@ export async function POST(request: NextRequest) {
     const { action, connectionId } = body
 
     if (action === "clear") {
-      console.log(`[v0] [StructuredLogs] Clearing logs for connection: ${connectionId}`)
       const logKey = `engine:logs:${connectionId}`
       await client.del(logKey)
 

@@ -53,7 +53,6 @@ export async function POST(request: NextRequest) {
 
     await updateConnection(connectionId, activeConnection)
 
-    console.log(`[v0] [Add to Active] ${connectionId} inserted into Active panel (disabled by default)`)
     await SystemLogger.logConnection(
       `Inserted into Active panel. Toggle to enable.`,
       connectionId,
