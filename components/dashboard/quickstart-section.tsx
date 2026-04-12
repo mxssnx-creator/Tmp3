@@ -31,9 +31,12 @@ interface LiveStats {
   historicCycles: number
   historicComplete: boolean
   historicProgress: number
+  historicCandles: number
+  historicIndicators: number
   // realtime
   indicationCycles: number
   strategyCycles: number
+  realtimeCycles: number
   indicationsTotal: number
   strategiesTotal: number
   positionsOpen: number
@@ -49,6 +52,7 @@ interface LiveStats {
   stratBase: number
   stratMain: number
   stratReal: number
+  stratLive: number
   // windows
   indLast5m: number
   indLast60m: number
@@ -59,11 +63,11 @@ interface LiveStats {
 
 const EMPTY_STATS: LiveStats = {
   historicSymbols: 0, historicSymbolsTotal: 0, historicCycles: 0,
-  historicComplete: false, historicProgress: 0,
-  indicationCycles: 0, strategyCycles: 0, indicationsTotal: 0,
+  historicComplete: false, historicProgress: 0, historicCandles: 0, historicIndicators: 0,
+  indicationCycles: 0, strategyCycles: 0, realtimeCycles: 0, indicationsTotal: 0,
   strategiesTotal: 0, positionsOpen: 0, successRate: 0, avgCycleMs: 0, isActive: false,
   indDirection: 0, indMove: 0, indActive: 0, indOptimal: 0, indAuto: 0,
-  stratBase: 0, stratMain: 0, stratReal: 0,
+  stratBase: 0, stratMain: 0, stratReal: 0, stratLive: 0,
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
 }
 
@@ -163,8 +167,11 @@ export function QuickstartSection() {
         historicCycles:        s.historic?.cyclesCompleted     || 0,
         historicComplete:      s.historic?.isComplete          || false,
         historicProgress:      s.historic?.progressPercent     || 0,
+        historicCandles:       s.historic?.candlesLoaded       || 0,
+        historicIndicators:    s.historic?.indicatorsCalculated || 0,
         indicationCycles:      indCycles,
         strategyCycles:        stratCycles,
+        realtimeCycles:        s.realtime?.realtimeCycles      || 0,
         indicationsTotal:      indTotal,
         strategiesTotal:       stratTotal,
         positionsOpen:         s.realtime?.positionsOpen       || 0,
@@ -179,59 +186,65 @@ export function QuickstartSection() {
         stratBase:             stratBase,
         stratMain:             stratMain,
         stratReal:             stratReal,
+        stratLive:             s.breakdown?.strategies?.live   || 0,
         indLast5m:             s.windows?.indications?.last5m     || 0,
         indLast60m:            s.windows?.indications?.last60m    || 0,
         phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
         engineRunning:         s.metadata?.engineRunning || indCycles > 0,
       })
-      if (indCycles > 0 && !isRunning) setIsRunning(true)
+      // NOTE: do NOT auto-set isRunning here — isRunning tracks user-initiated sessions only.
+      // engineRunning in stats reflects the server state independently.
     } catch { /* non-critical */ }
     finally { if (!silent) setLoadingStats(false) }
-  }, [connectionId, isRunning])
+  }, [connectionId])
 
   // ── fetch volatile symbol ──────────────────────────────────────────────────
-  useEffect(() => {
-    async function loadSymbol() {
-      setVolatileSymbol(s => ({ ...s, loading: true }))
-      try {
-        const connRes = await fetch("/api/settings/connections?t=" + Date.now(), { cache: "no-store" })
-        if (!connRes.ok) throw new Error("no connections")
-        const data = await connRes.json()
-        const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
+  const loadSymbol = useCallback(async (showSpinner = true) => {
+    if (showSpinner) setVolatileSymbol(s => ({ ...s, loading: true }))
+    try {
+      const connRes = await fetch("/api/settings/connections?t=" + Date.now(), { cache: "no-store" })
+      if (!connRes.ok) throw new Error("no connections")
+      const data = await connRes.json()
+      const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
 
-        const isActive = (c: any) =>
-          c.is_active_inserted === "1" || c.is_active_inserted === true ||
-          c.is_assigned === "1" || c.is_assigned === true ||
-          c.is_active === "1" || c.is_active === true ||
-          c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
+      const isActive = (c: any) =>
+        c.is_active_inserted === "1" || c.is_active_inserted === true ||
+        c.is_assigned === "1" || c.is_assigned === true ||
+        c.is_active === "1" || c.is_active === true ||
+        c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
 
-        // 1st: exact match on selectedConnectionId
-        // 2nd: any active connection matching the selectedExchange name
-        // 3rd: any active connection
-        // 4th: first connection
-        const conn =
-          conns.find(c => c.id === selectedConnectionId) ||
-          conns.find(c => isActive(c) && (c.exchange || "").toLowerCase() === (selectedExchange || "").toLowerCase()) ||
-          conns.find(c => isActive(c)) ||
-          conns[0]
+      // 1st: exact match on selectedConnectionId
+      // 2nd: any active connection matching the selectedExchange name
+      // 3rd: any active connection
+      // 4th: first connection
+      const conn =
+        conns.find(c => c.id === selectedConnectionId) ||
+        conns.find(c => isActive(c) && (c.exchange || "").toLowerCase() === (selectedExchange || "").toLowerCase()) ||
+        conns.find(c => isActive(c)) ||
+        conns[0]
 
-        if (!conn) {
-          setVolatileSymbol(s => ({ ...s, loading: false }))
-          return
-        }
-
-        const ex = (conn.exchange || "bingx").toLowerCase()
-        const symRes = await fetch(`/api/exchange/${ex}/top-symbols?t=` + Date.now(), { cache: "no-store" })
-        if (!symRes.ok) throw new Error("no symbols")
-        const sym = await symRes.json()
-        setVolatileSymbol({ symbol: sym.symbol || "BTCUSDT", exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
-      } catch {
-        setVolatileSymbol({ symbol: "BTCUSDT", exchange: (selectedExchange || "bingx").toLowerCase(), pct: null, loading: false })
+      if (!conn) {
+        setVolatileSymbol(s => ({ ...s, loading: false }))
+        return
       }
+
+      const ex = (conn.exchange || "bingx").toLowerCase()
+      const symRes = await fetch(`/api/exchange/${ex}/top-symbols?t=` + Date.now(), { cache: "no-store" })
+      if (!symRes.ok) throw new Error("no symbols")
+      const sym = await symRes.json()
+      setVolatileSymbol({ symbol: sym.symbol || "BTCUSDT", exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
+    } catch {
+      setVolatileSymbol(s => ({ ...s, loading: false }))
     }
-    // Run immediately and whenever exchange selection changes
-    loadSymbol()
   }, [selectedConnectionId, selectedExchange])
+
+  useEffect(() => {
+    // Run immediately and whenever exchange selection changes
+    loadSymbol(true)
+    // Also refresh the volatile symbol every 60 seconds so it stays current
+    const symbolInterval = setInterval(() => loadSymbol(false), 60_000)
+    return () => clearInterval(symbolInterval)
+  }, [loadSymbol])
 
   // ── auto-scroll logs ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -319,19 +332,8 @@ export function QuickstartSection() {
   }
 
   const handleRefresh = async () => {
-    setVolatileSymbol(s => ({ ...s, loading: true }))
-    try {
-      if (volatileSymbol.exchange) {
-        const res = await fetch(`/api/exchange/${volatileSymbol.exchange}/top-symbols?t=` + Date.now(), { cache: "no-store" })
-        if (res.ok) {
-          const sym = await res.json()
-          setVolatileSymbol(s => ({ ...s, symbol: sym.symbol || s.symbol, pct: sym.priceChangePercent ?? s.pct, loading: false }))
-          return
-        }
-      }
-    } catch { /* non-critical */ }
-    setVolatileSymbol(s => ({ ...s, loading: false }))
-    await fetchStats()
+    await loadSymbol(true)
+    await fetchStats(true)
   }
 
   const logColor = (type: string) => {
@@ -490,6 +492,34 @@ export function QuickstartSection() {
               <div className="flex flex-wrap gap-1.5">
                 <MiniStat label="Symbols"    value={`${stats.historicSymbols}/${stats.historicSymbolsTotal}`} />
                 <MiniStat label="Preh Cycles" value={fmt(stats.historicCycles)} />
+                {stats.historicCandles > 0 && (
+                  <MiniStat label="Candles" value={fmt(stats.historicCandles)} />
+                )}
+                {stats.historicIndicators > 0 && (
+                  <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
+                )}
+              </div>
+            </div>
+
+            {/* processing cycles overview */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <Activity className="w-3.5 h-3.5 text-blue-500" />
+                Processing Cycles
+                {stats.realtimeCycles > 0 && (
+                  <span className="ml-auto text-[10px] text-muted-foreground font-normal">
+                    Realtime {fmt(stats.realtimeCycles)}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                <MiniStat label="Ind Cycles"  value={fmt(stats.indicationCycles)} sub={stats.realtimeCycles > 0 ? `${((stats.indicationCycles / Math.max(stats.realtimeCycles, 1)) * 100).toFixed(0)}% rt` : undefined} />
+                <MiniStat label="Strat Cycles" value={fmt(stats.strategyCycles)}  sub={stats.indicationCycles > 0 ? `${((stats.strategyCycles / Math.max(stats.indicationCycles, 1)) * 100).toFixed(0)}% of ind` : undefined} />
+                {stats.realtimeCycles > 0 && (
+                  <MiniStat label="RT Cycles" value={fmt(stats.realtimeCycles)} />
+                )}
+                <MiniStat label="Indications" value={fmt(stats.indicationsTotal)} sub={stats.indicationCycles > 0 ? `${(stats.indicationsTotal / Math.max(stats.indicationCycles, 1)).toFixed(1)}/cyc` : undefined} />
+                <MiniStat label="Strategies"  value={fmt(stats.strategiesTotal)}  sub={stats.strategyCycles > 0 ? `${(stats.strategiesTotal / Math.max(stats.strategyCycles, 1)).toFixed(1)}/cyc` : undefined} />
               </div>
             </div>
 
@@ -516,6 +546,7 @@ export function QuickstartSection() {
                         <div className="h-full bg-violet-500/70 rounded-full" style={{ width: `${pct}%` }} />
                       </div>
                       <span className="w-10 text-right tabular-nums font-medium">{fmt(value)}</span>
+                      <span className="w-8 text-right tabular-nums text-muted-foreground">{pct.toFixed(0)}%</span>
                     </div>
                   )
                 })}
@@ -528,18 +559,20 @@ export function QuickstartSection() {
                 <BarChart3 className="w-3.5 h-3.5 text-amber-500" />
                 Strategies
                 <span className="ml-auto text-[10px] text-muted-foreground font-normal">
-                  Total {fmt(stats.stratBase + stats.stratMain + stats.stratReal)}
+                  Total {fmt(stats.stratBase + stats.stratMain + stats.stratReal + stats.stratLive)}
                 </span>
               </div>
-              <div className="grid grid-cols-3 gap-1.5 text-center text-[10px]">
+              <div className="grid grid-cols-4 gap-1.5 text-center text-[10px]">
                 {[
-                  { label: "Base", value: stats.stratBase, color: "text-orange-600 dark:text-orange-400" },
-                  { label: "Main", value: stats.stratMain, color: "text-yellow-600 dark:text-yellow-400" },
-                  { label: "Real", value: stats.stratReal, color: "text-green-600 dark:text-green-400"   },
-                ].map(({ label, value, color }) => (
+                  { label: "Base", value: stats.stratBase, color: "text-orange-600 dark:text-orange-400", ratio: null },
+                  { label: "Main", value: stats.stratMain, color: "text-yellow-600 dark:text-yellow-400", ratio: stats.stratBase > 0 ? `${((stats.stratMain / stats.stratBase) * 100).toFixed(0)}%` : null },
+                  { label: "Real", value: stats.stratReal, color: "text-green-600 dark:text-green-400",   ratio: stats.stratMain > 0 ? `${((stats.stratReal / stats.stratMain) * 100).toFixed(0)}%` : null },
+                  { label: "Live", value: stats.stratLive, color: "text-blue-600 dark:text-blue-400",     ratio: stats.stratReal > 0 ? `${((stats.stratLive / stats.stratReal) * 100).toFixed(0)}%` : null },
+                ].map(({ label, value, color, ratio }) => (
                   <div key={label} className="rounded bg-muted/60 py-1.5 px-1">
                     <div className={`text-sm font-bold tabular-nums ${color}`}>{fmt(value)}</div>
                     <div className="text-muted-foreground">{label}</div>
+                    {ratio && <div className="text-[9px] text-muted-foreground/70">{ratio}</div>}
                   </div>
                 ))}
               </div>
@@ -548,10 +581,10 @@ export function QuickstartSection() {
             {/* processing status pills */}
             <div className="flex flex-wrap gap-1.5 text-[10px]">
               {[
-                { label: "Historic",   done: stats.historicComplete },
-                { label: "Indications", done: stats.indicationCycles > 0 },
-                { label: "Strategies",  done: stats.strategyCycles > 0 },
-                { label: "Realtime",    done: stats.isActive },
+                { label: "Prehistoric",  done: stats.historicComplete },
+                { label: "Indications",  done: stats.indicationCycles > 0 },
+                { label: "Strategies",   done: stats.strategyCycles > 0 },
+                { label: "Realtime",     done: stats.isActive },
               ].map(({ label, done }) => (
                 <div key={label} className={`flex items-center gap-1 px-2 py-0.5 rounded-full border ${done ? "border-green-500/30 bg-green-500/10 text-green-700 dark:text-green-400" : "border-border bg-muted/30 text-muted-foreground"}`}>
                   {done ? <CheckCircle2 className="w-2.5 h-2.5" /> : <AlertCircle className="w-2.5 h-2.5 opacity-40" />}

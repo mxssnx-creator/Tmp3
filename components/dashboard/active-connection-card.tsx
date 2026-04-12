@@ -204,7 +204,7 @@ export function ActiveConnectionCard({
     }
   }, [fetchProgression, connection.connectionId])
 
-  // Fetch live engine-stats every 3s when connection is active (or globally running)
+  // Fetch live stats every 4s from the canonical /stats endpoint (per-connection, cumulative)
   useEffect(() => {
     if (!connection.isActive && !globalEngineRunning) {
       setLiveStats(null)
@@ -213,24 +213,25 @@ export function ActiveConnectionCard({
 
     const fetchLiveStats = async () => {
       try {
+        // Use canonical stats endpoint — same source as progression info, per-connection
         const res = await fetch(
-          `/api/trading/engine-stats?connection_id=${connection.connectionId}`,
+          `/api/connections/progression/${connection.connectionId}/stats`,
           { cache: "no-store" }
         )
         if (!res.ok) return
         const data = await res.json()
         setLiveStats({
-          indicationCycles: data.indicationCycleCount  || 0,
-          strategyCycles:   data.strategyCycleCount    || 0,
-          indications:      data.totalIndicationsCount || 0,
-          strategies:       data.totalStrategyCount    || 0,
-          positions:        data.positionsCount        || 0,
+          indicationCycles: data.realtime?.indicationCycles  || data.indicationCycleCount  || 0,
+          strategyCycles:   data.realtime?.strategyCycles    || data.strategyCycleCount    || 0,
+          indications:      data.realtime?.indicationsTotal  || data.totalIndicationsCount || 0,
+          strategies:       data.realtime?.strategiesTotal   || data.totalStrategyCount    || 0,
+          positions:        data.realtime?.positionsOpen     || data.positionsCount        || 0,
         })
       } catch { /* non-critical */ }
     }
 
     fetchLiveStats()
-    const interval = setInterval(fetchLiveStats, 3000)
+    const interval = setInterval(fetchLiveStats, 4000)
     return () => clearInterval(interval)
   }, [globalEngineRunning, connection.connectionId, connection.isActive])
 
