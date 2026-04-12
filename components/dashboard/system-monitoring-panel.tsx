@@ -29,7 +29,8 @@ export function SystemMonitoringPanel() {
       if (res.ok) {
         const mon = await res.json()
         setData({
-          engineCycles: mon.engines?.strategies?.cycleCount || 0,
+          // Primary: indication cycles (live hash); fallback: strategy cycles
+          engineCycles: mon.engines?.indications?.cycleCount || mon.engines?.strategies?.cycleCount || 0,
           activePositions: mon.database?.positions1h || 0,
           cpu: mon.cpu || 0,
           memory: mon.memory || 0,
