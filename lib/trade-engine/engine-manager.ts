@@ -401,24 +401,43 @@ export class TradeEngineManager {
 
   /**
    * Load prehistoric data (historical data before real-time processing)
+   * Default range: last 1 day, processed at 1-second timeframe intervals
    * Runs in background - does not block engine startup
    * Error handling: failures don't stop subsequent processing steps
    */
   private async loadPrehistoricData(): Promise<void> {
+    // Default: 1-day look-back, 1-second timeframe interval
+    const DEFAULT_RANGE_DAYS = 1
+    const DEFAULT_TIMEFRAME_SECONDS = 1
+
     try {
       const engineState = await getSettings(`trade_engine_state:${this.connectionId}`)
-      if (engineState?.prehistoric_data_loaded) {
-        return
-      }
+
+      // Read persisted settings for range/timeframe (allow override from stored state)
+      const storedRangeDays: number = Number(engineState?.prehistoric_range_days) || DEFAULT_RANGE_DAYS
+      const storedTimeframeSec: number = Number(engineState?.prehistoric_timeframe_seconds) || DEFAULT_TIMEFRAME_SECONDS
 
       const symbols = await this.getSymbols()
       await logProgressionEvent(this.connectionId, "prehistoric_data_scan", "info", "Scanning symbols for prehistoric processing", {
         symbols,
         symbolsCount: symbols.length,
+        rangeDays: storedRangeDays,
+        timeframeSeconds: storedTimeframeSec,
       })
 
       const prehistoricEnd = new Date()
-      const prehistoricStart = new Date(prehistoricEnd.getTime() - 30 * 24 * 60 * 60 * 1000)
+      const prehistoricStart = new Date(prehistoricEnd.getTime() - storedRangeDays * 24 * 60 * 60 * 1000)
+
+      // Store canonical range metadata so dashboard can display timeframe details
+      const redisClient = getRedisClient()
+      await redisClient.hset(`prehistoric:${this.connectionId}`, {
+        range_start: prehistoricStart.toISOString(),
+        range_end: prehistoricEnd.toISOString(),
+        range_days: String(storedRangeDays),
+        timeframe_seconds: String(storedTimeframeSec),
+        is_complete: "0",
+        updated_at: new Date().toISOString(),
+      })
 
       // Initialize config sets and process prehistoric data through them
       const configProcessor = new ConfigSetProcessor(this.connectionId)
@@ -428,8 +447,13 @@ export class TradeEngineManager {
         strategyConfigs: configInitResult.strategies,
       })
       
-      // Process prehistoric data through config sets
-      const processingResult = await configProcessor.processPrehistoricData(symbols)
+      // Process prehistoric data: only missing ranges, step by timeframe interval
+      const processingResult = await configProcessor.processPrehistoricData(
+        symbols,
+        prehistoricStart,
+        prehistoricEnd,
+        storedTimeframeSec
+      )
       await logProgressionEvent(this.connectionId, "prehistoric_processed", processingResult.errors > 0 ? "warning" : "info", `Prehistoric complete: ${processingResult.indicationResults} indications, ${processingResult.strategyPositions} strategies`, {
         symbolsTotal: processingResult.symbolsTotal,
         symbolsProcessed: processingResult.symbolsProcessed,
@@ -438,13 +462,29 @@ export class TradeEngineManager {
         strategyPositions: processingResult.strategyPositions,
         errors: processingResult.errors,
         durationMs: processingResult.duration,
+        timeframeSeconds: storedTimeframeSec,
+        rangeDays: storedRangeDays,
+        intervalsProcessed: processingResult.intervalsProcessed || 0,
+        missingIntervalsLoaded: processingResult.missingIntervalsLoaded || 0,
       })
+
+      // Mark prehistoric hash as complete
+      await redisClient.hset(`prehistoric:${this.connectionId}`, {
+        is_complete: "1",
+        symbols_processed: String(processingResult.symbolsProcessed),
+        candles_loaded: String(processingResult.candlesProcessed),
+        indicators_calculated: String(processingResult.indicationResults),
+        updated_at: new Date().toISOString(),
+      })
+      await redisClient.expire(`prehistoric:${this.connectionId}`, 86400)
 
       // Update state to mark prehistoric phase complete
       await setSettings(`trade_engine_state:${this.connectionId}`, {
         prehistoric_data_loaded: true,
         prehistoric_data_start: prehistoricStart.toISOString(),
         prehistoric_data_end: prehistoricEnd.toISOString(),
+        prehistoric_range_days: storedRangeDays,
+        prehistoric_timeframe_seconds: storedTimeframeSec,
         prehistoric_symbols: symbols,
         config_sets_initialized: true,
         config_set_indication_results: processingResult.indicationResults,
