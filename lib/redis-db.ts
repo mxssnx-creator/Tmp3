@@ -1166,10 +1166,14 @@ export async function getIndications(connectionId?: string, symbol?: string): Pr
       
       const hashData = await client.hgetall(key)
       if (hashData && Object.keys(hashData).length > 0) {
-        indications.push({
-          id: key.replace(/^indications?:/, ""),
-          ...hashData,
-        })
+        // Parse numeric fields from string — hgetall always returns strings
+        const parsed: Record<string, any> = { id: key.replace(/^indications?:/, ""), ...hashData }
+        if (typeof parsed.confidence === "string")    parsed.confidence    = parseFloat(parsed.confidence)
+        if (typeof parsed.profitFactor === "string")  parsed.profitFactor  = parseFloat(parsed.profitFactor)
+        if (typeof parsed.profit_factor === "string") parsed.profit_factor = parseFloat(parsed.profit_factor)
+        if (typeof parsed.value === "string")         parsed.value         = parseFloat(parsed.value)
+        if (typeof parsed.timestamp === "string")     parsed.timestamp     = parseInt(parsed.timestamp, 10)
+        indications.push(parsed)
       }
     } catch (e) {
       console.warn(`[v0] Error reading indication key ${key}:`, e)

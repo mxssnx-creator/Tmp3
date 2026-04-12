@@ -182,7 +182,12 @@ export class StrategyCoordinator {
 
       for (const ind of group.indications) {
         if (entryIdx >= maxEntries) break
-        const pf = (ind.confidence || 0.5) * 2
+        // Always parse as numbers — indication fields may arrive as strings from Redis hgetall
+        const rawConf = parseFloat(String(ind.confidence ?? 0.5))
+        const conf = Number.isFinite(rawConf) ? rawConf : 0.5
+        const rawPF = parseFloat(String(ind.profitFactor ?? ind.profit_factor ?? 0))
+        const pfFromPF = Number.isFinite(rawPF) && rawPF > 0 ? rawPF : conf * 2
+        const pf = pfFromPF
         if (pf < this.PF_BASE_MIN) continue
 
         entries.push({
@@ -192,7 +197,7 @@ export class StrategyCoordinator {
           positionState: "new",
           profitFactor: pf,
           drawdownTime: 0,
-          confidence: ind.confidence || 0.5,
+          confidence: conf,
         })
         entryIdx++
       }
@@ -312,9 +317,9 @@ export class StrategyCoordinator {
       // Enforce max 250 entries per Set — keep highest profitFactor entries
       const cappedEntries = this.pruneEntries(entries, maxEntries)
 
-      const avgPF = cappedEntries.reduce((s, e) => s + e.profitFactor, 0) / cappedEntries.length
-      const avgConf = cappedEntries.reduce((s, e) => s + e.confidence, 0) / cappedEntries.length
-      const avgDDT = cappedEntries.reduce((s, e) => s + e.drawdownTime, 0) / cappedEntries.length
+      const avgPF   = cappedEntries.reduce((s, e) => s + Number(e.profitFactor  || 0), 0) / cappedEntries.length
+      const avgConf = cappedEntries.reduce((s, e) => s + Number(e.confidence    || 0), 0) / cappedEntries.length
+      const avgDDT  = cappedEntries.reduce((s, e) => s + Number(e.drawdownTime  || 0), 0) / cappedEntries.length
 
       mainSets.push({
         setKey: baseSet.setKey,
@@ -343,10 +348,12 @@ export class StrategyCoordinator {
     } catch { /* non-critical */ }
 
     const failed = baseSets.length - mainSets.length
-    console.log(
-      `[v0] [StrategyFlow] ${symbol} MAIN: ${mainSets.length}/${baseSets.length} Sets promoted (minPF=${metrics.minProfitFactor}) | ` +
-      `${mainSets.reduce((s, set) => s + set.entryCount, 0)} total entries`
-    )
+    if (baseSets.length > 0) {
+      const sample = baseSets[0]
+      console.log(`[v0] [StrategyFlow] ${symbol} MAIN: ${mainSets.length}/${baseSets.length} promoted (minPF=${metrics.minProfitFactor}) | sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}}`)
+    } else {
+      console.log(`[v0] [StrategyFlow] ${symbol} MAIN: 0 base sets available`)
+    }
 
     return {
       type: "main",
@@ -378,6 +385,12 @@ export class StrategyCoordinator {
         s.avgDrawdownTime <= metrics.maxDrawdownTime &&
         s.avgConfidence >= metrics.confidence
     )
+
+    // Debug: show why sets failed REAL filter
+    if (mainSets.length > 0 && realSets.length === 0) {
+      const sample = mainSets[0]
+      console.log(`[v0] [StrategyFlow] ${symbol} REAL filter rejected all: sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}} threshold={minPF=${metrics.minProfitFactor}, conf=${metrics.confidence}, maxDDT=${metrics.maxDrawdownTime}}`)
+    }
 
     // Persist REAL sets
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
@@ -433,6 +446,12 @@ export class StrategyCoordinator {
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
 
+    console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor}, minConf=${metrics.confidence}, maxDDT=${metrics.maxDrawdownTime})`)
+    if (realSets.length > 0 && qualifying.length === 0) {
+      const sample = realSets[0]
+      console.log(`[v0] [StrategyFlow] ${symbol} LIVE filter rejected all real sets: sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}}`)
+    }
+
     // Persist LIVE sets
     const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
     await setSettings(liveKey, {
@@ -459,13 +478,9 @@ export class StrategyCoordinator {
         // which handles boolean/string coercion. Raw hgetall may miss "true" vs "1" vs boolean true.
         const { getConnection: getConn } = await import("@/lib/redis-db")
         const connData = await getConn(this.connectionId)
-        const isLiveTrade =
-          connData?.is_live_trade === true ||
-          connData?.is_live_trade === "1" ||
-          connData?.is_live_trade === "true" ||
-          connData?.live_trade_enabled === true ||
-          connData?.live_trade_enabled === "1"
-        console.log(`[v0] [StrategyFlow] ${symbol} LIVE gate: is_live_trade=${isLiveTrade} (raw=${connData?.is_live_trade})`)
+        const { isTruthyFlag } = await import("@/lib/connection-state-utils")
+        const isLiveTrade = isTruthyFlag(connData?.is_live_trade) || isTruthyFlag(connData?.live_trade_enabled)
+        console.log(`[v0] [StrategyFlow] ${symbol} LIVE gate: is_live_trade=${isLiveTrade} (raw=${JSON.stringify(connData?.is_live_trade)}, conn=${this.connectionId})`)
         if (isLiveTrade) {
           const { executeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
           const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
