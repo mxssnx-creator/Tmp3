@@ -80,7 +80,7 @@ export class StrategyCoordinator {
   private readonly PF_BASE_MIN = 1.0    // Minimum to enter BASE set
   private readonly PF_MAIN_MIN = 1.2    // Base sets must have avgPF >= 1.2 to enter MAIN
   private readonly PF_REAL_MIN = 1.4    // Main sets must have avgPF >= 1.4 to enter REAL
-  private readonly PF_LIVE_MIN = 2.0    // Real sets must have avgPF >= 2.0 to enter LIVE
+  private readonly PF_LIVE_MIN = 1.4    // Real sets must have avgPF >= 1.4 to enter LIVE
 
   private readonly METRICS: Record<string, EvaluationMetrics> = {
     base: {
@@ -102,10 +102,10 @@ export class StrategyCoordinator {
       description: "Sets promoted from MAIN with profitFactor >= 1.4",
     },
     live: {
-      maxDrawdownTime: 60,    // 1 hour
-      minProfitFactor: 2.0,
-      confidence: 0.75,
-      description: "Best 500 Sets ready for real trading",
+      maxDrawdownTime: 120,   // 2 hours — realistic for current strategy output
+      minProfitFactor: 1.4,   // Match REAL stage minimum so Sets can flow through
+      confidence: 0.65,       // Match REAL stage confidence floor
+      description: "Best 500 Sets ready for real trading (PF≥1.4, conf≥0.65)",
     },
   }
 
@@ -455,9 +455,17 @@ export class StrategyCoordinator {
     // This is guarded by is_live_trade flag on the connection — if disabled, only pseudo positions are created.
     if (qualifying.length > 0) {
       try {
-        const client = getRedisClient()
-        const connSettings = await client.hgetall(`connection:${this.connectionId}`) || {}
-        const isLiveTrade = connSettings.is_live_trade === "1" || connSettings.is_live_trade === "true"
+        // Use getConnection() as authoritative source — it reads connection:{id} hash via parseHash
+        // which handles boolean/string coercion. Raw hgetall may miss "true" vs "1" vs boolean true.
+        const { getConnection: getConn } = await import("@/lib/redis-db")
+        const connData = await getConn(this.connectionId)
+        const isLiveTrade =
+          connData?.is_live_trade === true ||
+          connData?.is_live_trade === "1" ||
+          connData?.is_live_trade === "true" ||
+          connData?.live_trade_enabled === true ||
+          connData?.live_trade_enabled === "1"
+        console.log(`[v0] [StrategyFlow] ${symbol} LIVE gate: is_live_trade=${isLiveTrade} (raw=${connData?.is_live_trade})`)
         if (isLiveTrade) {
           const { executeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
           const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")

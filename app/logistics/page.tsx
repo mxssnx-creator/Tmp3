@@ -32,6 +32,22 @@ interface EngineStats {
   cycleSuccessRate: number
   cyclesCompleted: number
 }
+
+interface LivePosition {
+  id: string
+  symbol: string
+  direction: "long" | "short"
+  status: "pending" | "open" | "partially_filled" | "filled" | "closed" | "error" | "simulated"
+  quantity: number
+  executedQuantity: number
+  entryPrice: number
+  averageExecutionPrice: number
+  takeProfit: number
+  stopLoss: number
+  orderId?: string
+  exchangeData?: { unrealizedPnl?: number; roi?: number; markPrice?: number }
+  createdAt: number
+}
 interface QueueData {
   queueSize: number; processingRate: number; successRate: number
   avgLatency: number; completedOrders: number; failedOrders: number
@@ -301,7 +317,19 @@ function MainSystemTab({ stats }: { stats: EngineStats | null }) {
             <Row label="Sets this cycle" value={`${s?.realStrategyCount || 0}`} />
             <Row label="PF threshold" value="≥ 1.4" />
             <Row label="Confidence" value="≥ 0.65" />
+            <Row label="Max drawdown time" value="≤ 960 min (16 h)" />
             <Row label="Live gate" value="is_live_trade=1 + valid credentials" />
+          </Block>
+
+          <Block icon={TrendingUp} title="Live Stage" sub="exchange orders · PF ≥ 1.4 + conf ≥ 0.65 + DDT ≤ 2h" accent="green"
+            right={<Tag color={s && s.liveStrategyCount > 0 ? "green" : "default"}>{s?.liveStrategyCount || 0} sets</Tag>}>
+            <Row label="Sets this cycle" value={<span className={cn("font-bold", (s?.liveStrategyCount || 0) > 0 ? "text-emerald-400" : "text-muted-foreground")}>{s?.liveStrategyCount || 0}</span>} />
+            <Row label="PF threshold" value="≥ 1.4 (same as REAL)" />
+            <Row label="Confidence" value="≥ 0.65" />
+            <Row label="Max drawdown time" value="≤ 120 min (2 h)" />
+            <Row label="Max live sets" value="500 (ranked by PF)" />
+            <Row label="Execution" value="Market order via exchange connector" />
+            <Row label="Guard" value="is_live_trade flag on connection" />
           </Block>
 
           <Block icon={LineChart} title="Pseudo Positions" sub="virtual tracking — no real capital" accent="green">
@@ -500,6 +528,79 @@ function BotsTab() {
   )
 }
 
+// ─── Live Positions Section ───────────────────────────────────────────────────
+
+function LivePositionsSection({ positions }: { positions: LivePosition[] }) {
+  const active = positions.filter(p => p.status === "open" || p.status === "pending" || p.status === "partially_filled")
+  const simulated = positions.filter(p => p.status === "simulated")
+  const all = positions
+
+  if (all.length === 0) return null
+
+  const statusColor = (s: LivePosition["status"]) => {
+    if (s === "open" || s === "filled") return "green"
+    if (s === "pending" || s === "partially_filled") return "orange"
+    if (s === "simulated") return "blue"
+    if (s === "error") return "red"
+    return "default"
+  }
+
+  return (
+    <div className="rounded-md border bg-card">
+      <div className="flex items-center justify-between border-b px-3 py-1.5">
+        <div className="flex items-center gap-1.5">
+          <Activity className="h-3 w-3 text-emerald-400" />
+          <span className="text-[11px] font-semibold uppercase tracking-wider">Live Exchange Positions</span>
+          {active.length > 0 && (
+            <span className="relative flex h-1.5 w-1.5">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-1.5">
+          {active.length > 0 && <Tag color="green">{active.length} active</Tag>}
+          {simulated.length > 0 && <Tag color="blue">{simulated.length} sim</Tag>}
+          <Tag color="default">{all.length} total</Tag>
+        </div>
+      </div>
+      <div className="px-3 py-2 space-y-1">
+        {all.slice(0, 10).map(pos => (
+          <div key={pos.id} className="flex items-center gap-2 rounded border px-2 py-1">
+            <Tag color={pos.direction === "long" ? "green" : "red"}>{pos.direction.toUpperCase()}</Tag>
+            <span className="text-[10px] font-medium tabular-nums w-24 truncate">{pos.symbol}</span>
+            <Tag color={statusColor(pos.status) as any}>{pos.status}</Tag>
+            {pos.orderId && (
+              <span className="text-[9px] font-mono text-muted-foreground hidden sm:inline truncate max-w-[80px]" title={pos.orderId}>
+                #{pos.orderId.slice(0, 8)}
+              </span>
+            )}
+            <span className="text-[10px] text-muted-foreground ml-auto tabular-nums">
+              qty {pos.executedQuantity > 0 ? pos.executedQuantity.toFixed(4) : pos.quantity.toFixed(4)}
+            </span>
+            {pos.exchangeData?.unrealizedPnl !== undefined && (
+              <span className={cn("text-[10px] font-mono tabular-nums", (pos.exchangeData.unrealizedPnl || 0) >= 0 ? "text-emerald-400" : "text-red-400")}>
+                {pos.exchangeData.unrealizedPnl >= 0 ? "+" : ""}{pos.exchangeData.unrealizedPnl.toFixed(2)}
+              </span>
+            )}
+            {pos.exchangeData?.roi !== undefined && (
+              <span className={cn("text-[9px] tabular-nums", (pos.exchangeData.roi || 0) >= 0 ? "text-emerald-400/70" : "text-red-400/70")}>
+                {pos.exchangeData.roi.toFixed(1)}%
+              </span>
+            )}
+            <span className="text-[9px] text-muted-foreground/50 tabular-nums">
+              {new Date(pos.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            </span>
+          </div>
+        ))}
+        {all.length > 10 && (
+          <p className="text-[10px] text-muted-foreground text-center pt-1">+{all.length - 10} more positions</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── Queue Card ───────────────────────────────────────────────────────────────
 
 function QueueSection({ queueData }: { queueData: QueueData | null }) {
@@ -617,6 +718,7 @@ function LogisticsContent() {
   const [tab,          setTab]          = useState<Tab>("main")
   const [stats,        setStats]        = useState<EngineStats | null>(null)
   const [queueData,    setQueueData]    = useState<QueueData | null>(null)
+  const [livePos,      setLivePos]      = useState<LivePosition[]>([])
   const [lastRefresh,  setLastRefresh]  = useState<Date | null>(null)
   const [refreshing,   setRefreshing]   = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval>>()
@@ -624,14 +726,19 @@ function LogisticsContent() {
   const loadAll = useCallback(async (silent = false) => {
     if (!silent) setRefreshing(true)
     try {
-      const [statsRes, queueRes] = await Promise.allSettled([
+      const [statsRes, queueRes, livePosRes] = await Promise.allSettled([
         fetch(`/api/trading/engine-stats?connection_id=${connId}`, { cache: "no-store" }),
         fetch("/api/logistics/queue", { cache: "no-store" }),
+        fetch(`/api/trading/live-positions?connection_id=${connId}`, { cache: "no-store" }),
       ])
       if (statsRes.status === "fulfilled" && statsRes.value.ok)
         setStats(await statsRes.value.json())
       if (queueRes.status === "fulfilled" && queueRes.value.ok)
         setQueueData(await queueRes.value.json())
+      if (livePosRes.status === "fulfilled" && livePosRes.value.ok) {
+        const d = await livePosRes.value.json()
+        setLivePos(Array.isArray(d) ? d : (d?.positions || []))
+      }
       setLastRefresh(new Date())
     } catch { /* non-critical */ }
     finally { if (!silent) setRefreshing(false) }
@@ -672,6 +779,9 @@ function LogisticsContent() {
 
         {/* Queue section — always visible */}
         <QueueSection queueData={queueData} />
+
+        {/* Live exchange positions — always visible when data exists */}
+        <LivePositionsSection positions={livePos} />
 
         {/* Tab content */}
         {tab === "main"   && <MainSystemTab stats={stats} />}
