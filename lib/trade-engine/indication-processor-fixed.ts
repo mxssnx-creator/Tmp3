@@ -406,47 +406,70 @@ export class IndicationProcessor {
         return []
       }
 
-      // Generate indications - ALWAYS generate even if prices look invalid
+      // Determine direction from real price data:
+      // Use close vs open to set bullish/bearish direction for this candle.
+      // Also generate the opposite direction as a hedge indication.
+      const isBullish = currentClose >= currentOpen
+      const primaryDir = isBullish ? "long" : "short"
+      const secondaryDir = isBullish ? "short" : "long"
+
+      // Derive confidence from candle body vs wick ratio (stronger body = higher confidence)
+      const range = currentHigh - currentLow
+      const body = Math.abs(currentClose - currentOpen)
+      const bodyRatio = range > 0 ? Math.min(0.99, body / range) : 0.5
+      const primaryConf = 0.5 + bodyRatio * 0.4  // 0.5 – 0.9
+      const secondaryConf = 0.5 + (1 - bodyRatio) * 0.25 // 0.5 – 0.75 (weaker)
+
+      // Profit factor proportional to confidence
+      const primaryPF = 1.0 + primaryConf * 0.5
+      const secondaryPF = 1.0 + secondaryConf * 0.3
+
+      // Generate indications - 4 types × 2 directions = 8 indications per cycle
       const indications: any[] = []
       const now = Date.now()
-      
-      // Always create basic indications
-      indications.push({
-        type: "direction",
-        symbol,
-        value: 1,
-        profitFactor: 1.2,
-        confidence: 0.7,
-        timestamp: now,
-      })
-      
-      indications.push({
-        type: "move",
-        symbol,
-        value: 1,
-        profitFactor: 1.15,
-        confidence: 0.6,
-        timestamp: now,
-      })
-      
-      indications.push({
-        type: "active",
-        symbol,
-        value: 1,
-        profitFactor: 1.1,
-        confidence: 0.65,
-        timestamp: now,
-      })
-      
-      indications.push({
-        type: "optimal",
-        symbol,
-        value: 1,
-        profitFactor: 1.3,
-        confidence: 0.75,
-        timestamp: now,
-      })
-      
+
+      for (const [dir, conf, pf] of [
+        [primaryDir, primaryConf, primaryPF],
+        [secondaryDir, secondaryConf, secondaryPF],
+      ] as Array<["long" | "short", number, number]>) {
+        indications.push({
+          type: "direction",
+          symbol,
+          value: currentClose,
+          profitFactor: pf,
+          confidence: conf,
+          timestamp: now,
+          metadata: { direction: dir },
+        })
+        indications.push({
+          type: "move",
+          symbol,
+          value: currentClose,
+          profitFactor: pf * 0.95,
+          confidence: conf * 0.95,
+          timestamp: now,
+          metadata: { direction: dir },
+        })
+        indications.push({
+          type: "active",
+          symbol,
+          value: currentClose,
+          profitFactor: pf * 0.9,
+          confidence: conf * 0.9,
+          timestamp: now,
+          metadata: { direction: dir },
+        })
+        indications.push({
+          type: "optimal",
+          symbol,
+          value: currentClose,
+          profitFactor: Math.min(2.5, pf * 1.1),
+          confidence: Math.min(0.95, conf * 1.05),
+          timestamp: now,
+          metadata: { direction: dir },
+        })
+      }
+
       // Store indications
       await storeIndications(this.connectionId, symbol, indications)
       

@@ -221,12 +221,13 @@ export class StrategyCoordinator {
     const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
     await setSettings(baseKey, { sets: baseSets, count: baseSets.length, created: new Date() })
 
-    // Write Base counts to progression hash so stats API and dashboard read accurate per-stage counts
+    // Write Base counts to progression hash so stats API and dashboard read accurate per-stage counts.
+    // Use hset (not hincrby) so the count reflects actual current Sets, not accumulation across cycles.
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      await client.hincrby(redisKey, "strategies_base_total", baseSets.length)
-      await client.hincrby(redisKey, "strategy_evaluated_base", baseSets.length)
+      await client.hset(redisKey, "strategies_base_total", String(baseSets.length))
+      await client.hset(redisKey, "strategy_evaluated_base", String(baseSets.length))
       await client.expire(redisKey, 7 * 24 * 60 * 60)
     } catch { /* non-critical */ }
 
@@ -332,12 +333,12 @@ export class StrategyCoordinator {
     const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
     await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
 
-    // Write Main counts to progression hash (evaluated = sets promoted, total = base sets evaluated)
+    // Write Main counts to progression hash — use hset so value reflects current cycle, not accumulation.
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      await client.hincrby(redisKey, "strategies_main_total", baseSets.length)   // how many Base sets were evaluated against Main threshold
-      await client.hincrby(redisKey, "strategy_evaluated_main", mainSets.length) // how many passed to Main
+      await client.hset(redisKey, "strategies_main_total", String(baseSets.length))   // base sets evaluated against Main threshold this cycle
+      await client.hset(redisKey, "strategy_evaluated_main", String(mainSets.length)) // sets that passed to Main this cycle
       await client.expire(redisKey, 7 * 24 * 60 * 60)
     } catch { /* non-critical */ }
 
@@ -382,12 +383,12 @@ export class StrategyCoordinator {
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
     await setSettings(realKey, { sets: realSets, count: realSets.length, created: new Date() })
 
-    // Write Real counts to progression hash
+    // Write Real counts to progression hash — use hset so value reflects current cycle, not accumulation.
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      await client.hincrby(redisKey, "strategies_real_total", mainSets.length)    // how many Main sets were evaluated
-      await client.hincrby(redisKey, "strategy_evaluated_real", realSets.length)  // how many passed to Real
+      await client.hset(redisKey, "strategies_real_total", String(mainSets.length))    // main sets evaluated this cycle
+      await client.hset(redisKey, "strategy_evaluated_real", String(realSets.length))  // sets that passed to Real this cycle
       await client.expire(redisKey, 7 * 24 * 60 * 60)
     } catch { /* non-critical */ }
 
@@ -407,7 +408,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ───────────────────────────────────────────────────────────
+  // ─── STAGE 4: LIVE ───────────────────────────��───────────────────────────────
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -441,17 +442,75 @@ export class StrategyCoordinator {
       executable: true,
     })
 
-    // Write live set count into progression hash — track how many Real sets were promoted to Live
+    // Write live set count into progression hash — use hset so count reflects current cycle snapshot.
     // NOTE: strategies_real_total and strategy_evaluated_real are already written by evaluateRealSets.
-    //       Here we only write the live-specific counter to avoid double-counting.
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      if (qualifying.length > 0) {
-        await client.hincrby(redisKey, "strategies_live_total", qualifying.length)
-        await client.expire(redisKey, 7 * 24 * 60 * 60)
-      }
+      await client.hset(redisKey, "strategies_live_total", String(qualifying.length))
+      await client.expire(redisKey, 7 * 24 * 60 * 60)
     } catch { /* non-critical */ }
+
+    // Attempt real exchange trading for qualifying LIVE sets when the connection has live trading enabled.
+    // This is guarded by is_live_trade flag on the connection — if disabled, only pseudo positions are created.
+    if (qualifying.length > 0) {
+      try {
+        const client = getRedisClient()
+        const connSettings = await client.hgetall(`connection:${this.connectionId}`) || {}
+        const isLiveTrade = connSettings.is_live_trade === "1" || connSettings.is_live_trade === "true"
+        if (isLiveTrade) {
+          const { executeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
+          const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
+          const connector = await exchangeConnectorFactory.getOrCreateConnector(this.connectionId)
+          if (connector) {
+            let liveExecutions = 0
+            for (const set of qualifying) {
+              try {
+                const bestEntry = set.entries.reduce(
+                  (best, e) => (e.profitFactor > best.profitFactor ? e : best),
+                  set.entries[0]
+                )
+                if (!bestEntry) continue
+                const tp = Math.max(0.5, (bestEntry.profitFactor - 1) * 100)
+                const sl = Math.min(5, 100 / Math.max(1, bestEntry.profitFactor) * 0.5)
+                const liveResult = await executeLivePosition(this.connectionId, {
+                  id: `real:${this.connectionId}:${set.setKey}:${symbol}`,
+                  connectionId: this.connectionId,
+                  symbol,
+                  direction: set.direction,
+                  quantity: 0.001, // minimal — risk management is at exchange level
+                  entryPrice: 0,   // market order, price determined at fill
+                  leverage: bestEntry.leverage || 1,
+                  riskAmount: 0.001 * sl / 100,
+                  rewardTarget: 0.001 * tp / 100,
+                  stopLoss: sl,
+                  takeProfit: tp,
+                  mainPositionCount: set.entryCount,
+                  evaluationScore: bestEntry.confidence,
+                  ratioMet: bestEntry.confidence >= 0.65,
+                  timestamp: Date.now(),
+                  ratios: {
+                    profitabilityRatio: bestEntry.profitFactor,
+                    accountRiskRatio: sl / 100,
+                    successRateRatio: bestEntry.confidence,
+                    consistencyRatio: set.avgConfidence,
+                  },
+                  status: "pending",
+                }, connector)
+                if (liveResult && liveResult.status !== "error") liveExecutions++
+              } catch { /* per-set non-critical */ }
+            }
+            if (liveExecutions > 0) {
+              console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${liveExecutions} REAL exchange orders placed`)
+            }
+          } else {
+            console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: live_trade=true but connector not available`)
+          }
+        }
+      } catch (liveErr) {
+        console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: Real exchange execution error:`, liveErr instanceof Error ? liveErr.message : String(liveErr))
+      }
+    }
 
     // Create EXACTLY ONE pseudo position per Set (one per indication_type × direction combination).
     // Each Set represents a unique (indication_type × direction) coordinate.

@@ -599,7 +599,12 @@ export class TradeEngineManager {
         }
 
         const totalIndications = indicationResults.reduce((sum, arr) => sum + (arr?.length || 0), 0)
-        
+
+        // Increment cycle count BEFORE writing to Redis so the stored value is accurate
+        cycleCount++
+        const duration = Date.now() - startTime
+        totalDuration += duration
+
         // Log detailed breakdown
         console.log(`[v0] [IndicationProcessor CYCLE ${cycleCount}] Symbols: ${symbols.length} | Total Indications: ${totalIndications}`)
         console.log(`[v0] [IndicationProcessor] Per-symbol: ${JSON.stringify(symbolIndicationCounts)}`)
@@ -609,8 +614,9 @@ export class TradeEngineManager {
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
-          // Always write indication_cycle_count every cycle so it is never capped by empty batches
-          await client.hset(redisKey, "indication_cycle_count", String(cycleCount))
+          // Use hincrby for cycle count so it survives server restarts and accumulates across
+          // all engines running for this connection (not reset to local scope on reload)
+          await client.hincrby(redisKey, "indication_cycle_count", 1)
           await client.hset(redisKey, "symbols_processed", String(symbols.length))
           await client.expire(redisKey, 7 * 24 * 60 * 60)
           if (Object.keys(indicationTypeCounts).length > 0) {
@@ -622,10 +628,6 @@ export class TradeEngineManager {
             await client.hincrby(redisKey, "indications_count", totalIndications)
           }
         } catch { /* non-critical */ }
-
-        const duration = Date.now() - startTime
-        cycleCount++
-        totalDuration += duration
 
         const processedThisCycle = indicationResults.reduce((sum, arr) => sum + (arr?.length || 0), 0)
 
@@ -770,7 +772,8 @@ export class TradeEngineManager {
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
-          await client.hset(redisKey, "strategy_cycle_count", String(cycleCount))
+          // Use hincrby for cycle count so it survives restarts and accumulates correctly
+          await client.hincrby(redisKey, "strategy_cycle_count", 1)
           await client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle))
           await client.expire(redisKey, 7 * 24 * 60 * 60)
         } catch { /* non-critical */ }
