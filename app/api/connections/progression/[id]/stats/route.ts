@@ -179,7 +179,7 @@ export async function GET(
       ep?.phase === "realtime" ||
       es.status === "running"
 
-    // ── BREAKDOWN section ────────────────────────────────────────────────────
+    // ── BREAKDOWN section ────────────────────────────────��───────────────────
     // Indication per-type counts live in two places:
     //   1. progression hash: indications_{type}_count  (written by statistics-tracker hincrby)
     //   2. standalone key:   indications:{connId}:{type}:count  (also by statistics-tracker incr)
@@ -230,6 +230,10 @@ export async function GET(
         const avgPosPerSet      = parseFloat(dh.avg_pos_per_set      || progHash[`strategy_${stage}_avg_pos_per_set`]      || "0")
         const avgProfitFactor   = parseFloat(dh.avg_profit_factor    || progHash[`strategy_${stage}_avg_profit_factor`]    || "0")
         const avgProcessingMs   = parseFloat(dh.avg_processing_ms    || progHash[`strategy_${stage}_avg_processing_ms`]    || "0")
+        // Average position evaluation score for Real stage (stored by strategy-coordinator)
+        const avgPosEvalReal    = parseFloat(dh.avg_pos_eval_real    || progHash[`strategy_${stage}_avg_pos_eval_real`]    || "0")
+        // Drawdown time (avg minutes from strategy sets)
+        const avgDrawdownTime   = parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
 
         // Eval percentage: main = evaluated/base, real = evaluated/main
         let evalPct = 0
@@ -241,15 +245,38 @@ export async function GET(
           evalPct = main > 0 ? Math.round((stratEvaluated.real / main) * 1000) / 10 : 0
         }
 
+        // Pass ratio = passed/evaluated for this stage
+        const stageEvaluated = stratEvaluated[stage] || 0
+        const stagePassed    = n(dh.passed_sets || progHash[`strategy_${stage}_passed`])
+        const passRatio      = stageEvaluated > 0 ? Math.round((stagePassed / stageEvaluated) * 1000) / 10 : 0
+
         stratDetail[stage] = {
-          avgPosPerSet:      isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100    : 0,
-          createdSets:       createdSets,
-          avgProfitFactor:   isFinite(avgProfitFactor) ? Math.round(avgProfitFactor * 1000) / 1000 : 0,
-          avgProcessingTimeMs: isFinite(avgProcessingMs) ? Math.round(avgProcessingMs * 10) / 10 : 0,
+          avgPosPerSet:        isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100      : 0,
+          createdSets,
+          avgProfitFactor:     isFinite(avgProfitFactor) ? Math.round(avgProfitFactor * 1000) / 1000 : 0,
+          avgProcessingTimeMs: isFinite(avgProcessingMs) ? Math.round(avgProcessingMs * 10) / 10     : 0,
+          avgPosEvalReal:      isFinite(avgPosEvalReal)  ? Math.round(avgPosEvalReal * 1000) / 1000  : 0,
+          avgDrawdownTime:     isFinite(avgDrawdownTime) ? Math.round(avgDrawdownTime * 10) / 10     : 0,
           evalPct,
+          passRatio,
+          evaluated: stageEvaluated,
+          passed: stagePassed,
+          failed: Math.max(0, stageEvaluated - stagePassed),
         }
       })
     )
+
+    // --- Prehistoric metadata (range, timeframe, interval progress) ---
+    const prehistoricMeta = {
+      rangeStart:              prehistoricHash.range_start          || null,
+      rangeEnd:                prehistoricHash.range_end            || null,
+      rangeDays:               n(prehistoricHash.range_days)        || 1,
+      timeframeSeconds:        n(prehistoricHash.timeframe_seconds) || 1,
+      intervalsProcessed:      n(prehistoricHash.intervals_processed) || n(progHash.prehistoric_intervals_processed),
+      missingIntervalsLoaded:  n(prehistoricHash.missing_intervals)   || n(progHash.prehistoric_missing_loaded),
+      currentSymbol:           prehistoricHash.current_symbol         || progHash.prehistoric_current_symbol || "",
+      isComplete:              prehistoricHash.is_complete === "1",
+    }
 
     // ── WINDOW DATA (last 5min / 60min) ──────────────────────────────────────
     // Stored in sorted sets: indications:{connId}:window  scored by unix ms timestamp
@@ -341,12 +368,16 @@ export async function GET(
         },
       },
 
-      // Per-stage strategy detail — avg positions per set, created sets, avg profit factor, avg processing time
+      // Per-stage strategy detail — avg positions per set, created sets, avg profit factor, avg processing time,
+      // avg pos eval for Real, pass ratios, drawdown time
       strategyDetail: {
         base: stratDetail.base,
         main: stratDetail.main,
         real: stratDetail.real,
       },
+
+      // Prehistoric processing metadata — range, timeframe, interval progress
+      prehistoricMeta,
 
       // Rolling time-window indication and strategy counts
       windows: {

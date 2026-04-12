@@ -22,6 +22,12 @@ export interface ProcessingResult {
   candlesProcessed: number
   errors: number
   duration: number
+  // Interval-stepping metrics
+  intervalsProcessed: number
+  missingIntervalsLoaded: number
+  timeframeSeconds: number
+  rangeStartMs: number
+  rangeEndMs: number
 }
 
 export class ConfigSetProcessor {
@@ -73,12 +79,31 @@ export class ConfigSetProcessor {
   }
 
   /**
-   * Process prehistoric data through all config sets
-   * Main entry point for Phase 6 processing
+   * Process prehistoric data through all config sets.
+   * Processes ONLY missing time intervals (skips already-loaded ranges).
+   * Steps through the full time range one timeframe interval at a time.
+   *
+   * @param symbols       - Symbols to process
+   * @param rangeStart    - Start of the historical range (default: now - 1 day)
+   * @param rangeEnd      - End of the historical range (default: now)
+   * @param timeframeSec  - Timeframe interval in seconds (default: 1 = 1-second bars)
    */
-  async processPrehistoricData(symbols: string[]): Promise<ProcessingResult> {
+  async processPrehistoricData(
+    symbols: string[],
+    rangeStart?: Date,
+    rangeEnd?: Date,
+    timeframeSec: number = 1
+  ): Promise<ProcessingResult> {
     const startTime = Date.now()
-    console.log(`[v0] [ConfigSetProcessor] Starting prehistoric processing for ${symbols.length} symbols`)
+    const now = new Date()
+    const effectiveEnd = rangeEnd ?? now
+    const effectiveStart = rangeStart ?? new Date(now.getTime() - 1 * 24 * 60 * 60 * 1000)
+    const intervalMs = timeframeSec * 1000
+
+    console.log(
+      `[v0] [ConfigSetProcessor] Starting prehistoric processing for ${symbols.length} symbols | ` +
+      `range=${effectiveStart.toISOString()} → ${effectiveEnd.toISOString()} | timeframe=${timeframeSec}s`
+    )
 
     await initRedis()
     const client = getRedisClient()
@@ -89,6 +114,8 @@ export class ConfigSetProcessor {
     let symbolsWithoutData = 0
     let candlesProcessed = 0
     let errors = 0
+    let totalIntervalsProcessed = 0
+    let missingIntervalsLoaded = 0
 
     const indicationConfigs = await this.indicationManager.getEnabledConfigs()
     const strategyConfigs = await this.strategyManager.getEnabledConfigs()
@@ -98,17 +125,33 @@ export class ConfigSetProcessor {
       `${strategyConfigs.length} strategy configs`
     )
 
+    // Store range metadata for dashboard
+    try {
+      await client.hset(`prehistoric:${this.connectionId}`, {
+        range_start: effectiveStart.toISOString(),
+        range_end: effectiveEnd.toISOString(),
+        timeframe_seconds: String(timeframeSec),
+        symbols_total: String(symbols.length),
+        updated_at: new Date().toISOString(),
+      })
+    } catch { /* non-critical */ }
+
     for (const symbol of symbols) {
       try {
+        // --- Load all available candles for this symbol ---
+        let candles: any[] = []
+
         const candlesRaw = await client.get(`market_data:${symbol}:candles`)
-        const candles = candlesRaw ? JSON.parse(candlesRaw) : []
+        if (candlesRaw) {
+          candles = JSON.parse(candlesRaw)
+        }
 
         if (!candles || candles.length === 0) {
           const marketDataRaw = await client.get(`market_data:${symbol}:1m`)
           if (marketDataRaw) {
             const marketDataObj = JSON.parse(marketDataRaw)
             if (marketDataObj?.candles) {
-              candles.push(...marketDataObj.candles)
+              candles = marketDataObj.candles
             }
           }
         }
@@ -123,33 +166,105 @@ export class ConfigSetProcessor {
           continue
         }
 
-        console.log(`[v0] [ConfigSetProcessor] Processing ${candles.length} candles for ${symbol}`)
-        candlesProcessed += candles.length
-        symbolsProcessed++
-
-        // Write intermediate prehistoric progress to progression hash so dashboard shows live tracking
+        // --- Determine which time intervals are already processed ---
+        const processedKey = `prehistoric:${this.connectionId}:${symbol}:processed_intervals`
+        let processedIntervals: Set<number> = new Set()
         try {
-          await client.hincrby(`progression:${this.connectionId}`, "prehistoric_candles_processed", candles.length)
-          await client.hincrby(`progression:${this.connectionId}`, "prehistoric_symbols_processed_count", 1)
-          await client.expire(`progression:${this.connectionId}`, 7 * 24 * 60 * 60)
+          const processedRaw = await client.get(processedKey)
+          if (processedRaw) {
+            const arr: number[] = JSON.parse(processedRaw)
+            processedIntervals = new Set(arr)
+          }
         } catch { /* non-critical */ }
 
-        const indicationResults = await this.processIndicationConfigs(symbol, candles, indicationConfigs)
+        // --- Step through time range interval by interval, processing only missing ones ---
+        let currentTs = effectiveStart.getTime()
+        const endTs = effectiveEnd.getTime()
+
+        const intervalCandles: any[] = []
+        let symbolIntervalCount = 0
+        let symbolMissingCount = 0
+
+        while (currentTs < endTs) {
+          const bucketTs = Math.floor(currentTs / intervalMs) * intervalMs
+          totalIntervalsProcessed++
+          symbolIntervalCount++
+
+          if (!processedIntervals.has(bucketTs)) {
+            // Find candles that fall within this interval bucket
+            const bucketCandles = candles.filter((c: any) => {
+              const cTs = typeof c.timestamp === "number" ? c.timestamp : new Date(c.timestamp || c.time).getTime()
+              return cTs >= bucketTs && cTs < bucketTs + intervalMs
+            })
+
+            if (bucketCandles.length > 0) {
+              intervalCandles.push(...bucketCandles)
+              missingIntervalsLoaded++
+              symbolMissingCount++
+              processedIntervals.add(bucketTs)
+            }
+          }
+
+          currentTs += intervalMs
+        }
+
+        // Persist the updated processed-intervals set for this symbol (TTL = 25h)
+        try {
+          await client.set(processedKey, JSON.stringify([...processedIntervals]), { EX: 90000 })
+        } catch { /* non-critical */ }
+
+        // Merge interval candles with full candle array for processing
+        const combinedCandles = intervalCandles.length > 0 ? intervalCandles : candles
+        candlesProcessed += combinedCandles.length
+        symbolsProcessed++
+
+        console.log(
+          `[v0] [ConfigSetProcessor] ${symbol}: ${combinedCandles.length} candles | ` +
+          `intervals=${symbolIntervalCount} | missing=${symbolMissingCount}`
+        )
+
+        // --- Write live progress to Redis hash ---
+        try {
+          const progressKey = `progression:${this.connectionId}`
+          await client.hincrby(progressKey, "prehistoric_candles_processed", combinedCandles.length)
+          await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+          await client.hset(progressKey, {
+            prehistoric_current_symbol: symbol,
+            prehistoric_intervals_processed: String(totalIntervalsProcessed),
+            prehistoric_missing_loaded: String(missingIntervalsLoaded),
+            prehistoric_timeframe_seconds: String(timeframeSec),
+          })
+          await client.expire(progressKey, 7 * 24 * 60 * 60)
+        } catch { /* non-critical */ }
+
+        // --- Process indications ---
+        const indicationResults = await this.processIndicationConfigs(symbol, combinedCandles, indicationConfigs)
         totalIndicationResults += indicationResults
 
-        // Write indication result counts into progression hash
         try {
           await client.hincrby(`progression:${this.connectionId}`, "indications_count", indicationResults)
           await client.expire(`progression:${this.connectionId}`, 7 * 24 * 60 * 60)
         } catch { /* non-critical */ }
 
-        const strategyPositions = await this.processStrategyConfigs(symbol, candles, strategyConfigs)
+        // --- Process strategies ---
+        const strategyPositions = await this.processStrategyConfigs(symbol, combinedCandles, strategyConfigs)
         totalStrategyPositions += strategyPositions
 
-        // Write strategy position counts into progression hash
         try {
           await client.hincrby(`progression:${this.connectionId}`, "strategies_base_total", strategyPositions)
           await client.expire(`progression:${this.connectionId}`, 7 * 24 * 60 * 60)
+        } catch { /* non-critical */ }
+
+        // Mark symbol as completed in prehistoric hash
+        try {
+          await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+          await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
+          await client.hset(`prehistoric:${this.connectionId}`, {
+            candles_loaded: String(candlesProcessed),
+            symbols_processed: String(symbolsProcessed),
+            intervals_processed: String(totalIntervalsProcessed),
+            missing_intervals: String(missingIntervalsLoaded),
+          })
         } catch { /* non-critical */ }
 
       } catch (error) {
@@ -174,6 +289,11 @@ export class ConfigSetProcessor {
       candlesProcessed,
       errors,
       duration,
+      intervalsProcessed: totalIntervalsProcessed,
+      missingIntervalsLoaded,
+      timeframeSeconds: timeframeSec,
+      rangeStartMs: effectiveStart.getTime(),
+      rangeEndMs: effectiveEnd.getTime(),
     }
 
     console.log(

@@ -132,6 +132,38 @@ export function ActiveConnectionCard({
     strategies: number
     positions: number
   } | null>(null)
+  const [prehistoricStats, setPrehistoricStats] = useState<{
+    // Indication breakdown
+    indicationsDirection: number
+    indicationsMove: number
+    indicationsActive: number
+    indicationsOptimal: number
+    indicationsAuto: number
+    indicationsTotal: number
+    // Strategy stages
+    stratBase: number
+    stratMain: number
+    stratReal: number
+    stratLive: number
+    // Stage ratios and metrics
+    basePassRatio: number
+    mainPassRatio: number
+    realPassRatio: number
+    avgProfitFactorBase: number
+    avgProfitFactorMain: number
+    avgProfitFactorReal: number
+    avgDrawdownTimeBase: number
+    avgDrawdownTimeMain: number
+    avgDrawdownTimeReal: number
+    avgPosEvalReal: number
+    // Prehistoric metadata
+    rangeDays: number
+    timeframeSeconds: number
+    intervalsProcessed: number
+    missingIntervalsLoaded: number
+    currentSymbol: string
+    isComplete: boolean
+  } | null>(null)
   const details = connection.details
 
   // Sync local toggle states from connection details
@@ -226,6 +258,41 @@ export function ActiveConnectionCard({
           indications:      data.realtime?.indicationsTotal  || data.totalIndicationsCount || 0,
           strategies:       data.realtime?.strategiesTotal   || data.totalStrategyCount    || 0,
           positions:        data.realtime?.positionsOpen     || data.positionsCount        || 0,
+        })
+
+        // Also populate prehistoric stats from the same response
+        const bd = data.breakdown || {}
+        const sd = data.strategyDetail || {}
+        const pm = data.prehistoricMeta || {}
+        const ind = bd.indications || {}
+        const strat = bd.strategies || {}
+        setPrehistoricStats({
+          indicationsDirection: ind.direction || 0,
+          indicationsMove:      ind.move      || 0,
+          indicationsActive:    ind.active    || 0,
+          indicationsOptimal:   ind.optimal   || 0,
+          indicationsAuto:      ind.auto      || 0,
+          indicationsTotal:     ind.total     || 0,
+          stratBase:  strat.base || 0,
+          stratMain:  strat.main || 0,
+          stratReal:  strat.real || 0,
+          stratLive:  strat.live || 0,
+          basePassRatio:      sd.base?.passRatio      || 0,
+          mainPassRatio:      sd.main?.passRatio      || 0,
+          realPassRatio:      sd.real?.passRatio      || 0,
+          avgProfitFactorBase: sd.base?.avgProfitFactor || 0,
+          avgProfitFactorMain: sd.main?.avgProfitFactor || 0,
+          avgProfitFactorReal: sd.real?.avgProfitFactor || 0,
+          avgDrawdownTimeBase: sd.base?.avgDrawdownTime || 0,
+          avgDrawdownTimeMain: sd.main?.avgDrawdownTime || 0,
+          avgDrawdownTimeReal: sd.real?.avgDrawdownTime || 0,
+          avgPosEvalReal:      sd.real?.avgPosEvalReal  || 0,
+          rangeDays:               pm.rangeDays              || 1,
+          timeframeSeconds:        pm.timeframeSeconds        || 1,
+          intervalsProcessed:      pm.intervalsProcessed      || 0,
+          missingIntervalsLoaded:  pm.missingIntervalsLoaded  || 0,
+          currentSymbol:           pm.currentSymbol           || "",
+          isComplete:              pm.isComplete              || false,
         })
       } catch { /* non-critical */ }
     }
@@ -628,51 +695,163 @@ export function ActiveConnectionCard({
                   </div>
                 )}
 
-                {/* Detailed prehistoric progress display */}
-                {phase === "prehistoric_data" && progression?.prehistoricProgress && (
-                  <div className="mt-2 p-2 bg-amber-50/50 dark:bg-amber-950/20 rounded border border-amber-200/50 dark:border-amber-800/30 space-y-1">
-                    <div className="text-[10px] font-medium text-amber-700 dark:text-amber-400">Historical Data Loading</div>
-                    
-                    {/* Symbols progress */}
-                    <div className="flex items-center justify-between text-[10px]">
-                      <span className="text-muted-foreground">Symbols</span>
-                      <span className="font-medium">
-                        {progression.prehistoricProgress.symbolsProcessed}/{progression.prehistoricProgress.symbolsTotal}
-                      </span>
+                {/* Rich prehistoric progress display */}
+                {(phase === "prehistoric_data" || (prehistoricStats && (prehistoricStats.indicationsTotal > 0 || prehistoricStats.stratBase > 0))) && (
+                  <div className="mt-2 p-2 bg-amber-50/50 dark:bg-amber-950/20 rounded border border-amber-200/50 dark:border-amber-800/30 space-y-2">
+                    {/* Header row */}
+                    <div className="flex items-center justify-between">
+                      <div className="text-[10px] font-semibold text-amber-700 dark:text-amber-400">
+                        Historical Processing
+                      </div>
+                      <div className="flex items-center gap-1.5 text-[9px]">
+                        {prehistoricStats && (
+                          <>
+                            <span className="text-muted-foreground">
+                              {prehistoricStats.rangeDays}d range
+                            </span>
+                            <span className="text-muted-foreground/50">|</span>
+                            <span className="text-muted-foreground font-mono">
+                              {prehistoricStats.timeframeSeconds === 1 ? "1s" : `${prehistoricStats.timeframeSeconds}s`}
+                            </span>
+                            {prehistoricStats.isComplete && (
+                              <>
+                                <span className="text-muted-foreground/50">|</span>
+                                <span className="text-green-600 dark:text-green-400 font-medium">complete</span>
+                              </>
+                            )}
+                          </>
+                        )}
+                      </div>
                     </div>
-                    {progression.prehistoricProgress.currentSymbol && (
-                      <div className="text-[10px] text-muted-foreground">
-                        Processing: <span className="font-mono font-medium">{progression.prehistoricProgress.currentSymbol}</span>
+
+                    {/* Symbols & candles row */}
+                    {progression?.prehistoricProgress && (
+                      <div className="flex items-center gap-3 text-[10px]">
+                        <div className="flex items-center gap-1">
+                          <span className="text-muted-foreground">Symbols</span>
+                          <span className="font-medium tabular-nums">
+                            {progression.prehistoricProgress.symbolsProcessed}/{progression.prehistoricProgress.symbolsTotal}
+                          </span>
+                        </div>
+                        {progression.prehistoricProgress.candlesLoaded > 0 && (
+                          <div className="flex items-center gap-1">
+                            <span className="text-muted-foreground">Candles</span>
+                            <span className="font-medium tabular-nums">
+                              {progression.prehistoricProgress.candlesLoaded >= 1000
+                                ? `${(progression.prehistoricProgress.candlesLoaded / 1000).toFixed(1)}K`
+                                : progression.prehistoricProgress.candlesLoaded}
+                            </span>
+                          </div>
+                        )}
+                        {prehistoricStats && prehistoricStats.intervalsProcessed > 0 && (
+                          <div className="flex items-center gap-1">
+                            <span className="text-muted-foreground">Intervals</span>
+                            <span className="font-medium tabular-nums">
+                              {prehistoricStats.intervalsProcessed >= 1000
+                                ? `${(prehistoricStats.intervalsProcessed / 1000).toFixed(1)}K`
+                                : prehistoricStats.intervalsProcessed}
+                            </span>
+                          </div>
+                        )}
+                        {prehistoricStats && prehistoricStats.currentSymbol && phase === "prehistoric_data" && (
+                          <div className="flex items-center gap-1 ml-auto">
+                            <span className="text-muted-foreground">Now:</span>
+                            <span className="font-mono font-medium text-[9px]">{prehistoricStats.currentSymbol}</span>
+                          </div>
+                        )}
                       </div>
                     )}
-                    
-                    {/* Candles progress */}
-                    {progression.prehistoricProgress.candlesTotal > 0 && (
-                      <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-muted-foreground">Candles</span>
-                        <span className="font-medium">
-                          {progression.prehistoricProgress.candlesLoaded}/{progression.prehistoricProgress.candlesTotal}
-                        </span>
+
+                    {/* Indications breakdown */}
+                    {prehistoricStats && prehistoricStats.indicationsTotal > 0 && (
+                      <div className="space-y-0.5">
+                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Indications ({prehistoricStats.indicationsTotal.toLocaleString()})</div>
+                        <div className="grid grid-cols-5 gap-1">
+                          {[
+                            { label: "Dir", value: prehistoricStats.indicationsDirection },
+                            { label: "Move", value: prehistoricStats.indicationsMove },
+                            { label: "Act", value: prehistoricStats.indicationsActive },
+                            { label: "Opt", value: prehistoricStats.indicationsOptimal },
+                            { label: "Auto", value: prehistoricStats.indicationsAuto },
+                          ].map(({ label, value }) => (
+                            <div key={label} className="text-center">
+                              <div className="text-[8px] text-muted-foreground">{label}</div>
+                              <div className="text-[10px] font-semibold tabular-nums">
+                                {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     )}
-                    
-                    {/* Indicators calculated */}
-                    {progression.prehistoricProgress.indicatorsCalculated > 0 && (
-                      <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-muted-foreground">Indicators</span>
-                        <span className="font-medium">
-                          {progression.prehistoricProgress.indicatorsCalculated}
-                        </span>
+
+                    {/* Strategy stages breakdown */}
+                    {prehistoricStats && (prehistoricStats.stratBase > 0 || prehistoricStats.stratMain > 0 || prehistoricStats.stratReal > 0) && (
+                      <div className="space-y-1">
+                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Strategy Sets</div>
+                        {/* Stage rows: Base → Main → Real */}
+                        {[
+                          {
+                            label: "Base", count: prehistoricStats.stratBase,
+                            passRatio: prehistoricStats.basePassRatio,
+                            avgPF: prehistoricStats.avgProfitFactorBase,
+                            avgDDT: prehistoricStats.avgDrawdownTimeBase,
+                            avgPosEval: null,
+                            color: "text-blue-600 dark:text-blue-400",
+                          },
+                          {
+                            label: "Main", count: prehistoricStats.stratMain,
+                            passRatio: prehistoricStats.mainPassRatio,
+                            avgPF: prehistoricStats.avgProfitFactorMain,
+                            avgDDT: prehistoricStats.avgDrawdownTimeMain,
+                            avgPosEval: null,
+                            color: "text-purple-600 dark:text-purple-400",
+                          },
+                          {
+                            label: "Real", count: prehistoricStats.stratReal,
+                            passRatio: prehistoricStats.realPassRatio,
+                            avgPF: prehistoricStats.avgProfitFactorReal,
+                            avgDDT: prehistoricStats.avgDrawdownTimeReal,
+                            avgPosEval: prehistoricStats.avgPosEvalReal,
+                            color: "text-green-600 dark:text-green-400",
+                          },
+                        ].map(({ label, count, passRatio, avgPF, avgDDT, avgPosEval, color }) => (
+                          count > 0 && (
+                            <div key={label} className="grid grid-cols-[28px_40px_auto_auto_auto_auto] gap-x-2 items-center text-[10px]">
+                              <span className={`font-semibold ${color}`}>{label}</span>
+                              <span className="font-semibold tabular-nums">
+                                {count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count}
+                              </span>
+                              <span className="text-muted-foreground">
+                                ratio <span className="text-foreground font-medium">{passRatio > 0 ? `${passRatio.toFixed(1)}%` : "—"}</span>
+                              </span>
+                              <span className="text-muted-foreground">
+                                PF <span className={`font-medium ${avgPF >= 1.4 ? "text-green-600 dark:text-green-400" : avgPF >= 1.0 ? "text-foreground" : "text-red-500"}`}>
+                                  {avgPF > 0 ? avgPF.toFixed(2) : "—"}
+                                </span>
+                              </span>
+                              <span className="text-muted-foreground">
+                                DDT <span className="text-foreground font-medium">
+                                  {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "—"}
+                                </span>
+                              </span>
+                              {avgPosEval !== null && (
+                                <span className="text-muted-foreground">
+                                  PosEval <span className={`font-medium ${avgPosEval >= 0.7 ? "text-green-600 dark:text-green-400" : avgPosEval >= 0.4 ? "text-amber-600 dark:text-amber-400" : "text-foreground"}`}>
+                                    {avgPosEval > 0 ? avgPosEval.toFixed(3) : "—"}
+                                  </span>
+                                </span>
+                              )}
+                            </div>
+                          )
+                        ))}
                       </div>
                     )}
-                    
-                    {/* Duration */}
-                    {progression.prehistoricProgress.duration > 0 && (
-                      <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-muted-foreground">Duration</span>
-                        <span className="font-medium">
-                          {(progression.prehistoricProgress.duration / 1000).toFixed(1)}s
-                        </span>
+
+                    {/* Missing intervals info */}
+                    {prehistoricStats && prehistoricStats.missingIntervalsLoaded > 0 && (
+                      <div className="text-[9px] text-muted-foreground">
+                        Loaded {prehistoricStats.missingIntervalsLoaded.toLocaleString()} missing intervals
                       </div>
                     )}
                   </div>
