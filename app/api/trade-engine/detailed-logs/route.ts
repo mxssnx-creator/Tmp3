@@ -80,22 +80,46 @@ async function countIndicationsByType(client: ReturnType<typeof getRedisClient>,
 }
 
 async function countStrategiesByType(client: ReturnType<typeof getRedisClient>, connectionId: string, symbols: string[]) {
+  // PRIMARY: read from per-stage counter keys written by statistics-tracker (most current)
+  const [baseFromCounter, mainFromCounter, realFromCounter] = await Promise.all([
+    client.get(`strategies:${connectionId}:base:count`).then(v => toNumber(v)).catch(() => 0),
+    client.get(`strategies:${connectionId}:main:count`).then(v => toNumber(v)).catch(() => 0),
+    client.get(`strategies:${connectionId}:real:count`).then(v => toNumber(v)).catch(() => 0),
+  ])
+
+  if (baseFromCounter > 0 || mainFromCounter > 0 || realFromCounter > 0) {
+    return { base: baseFromCounter, main: mainFromCounter, real: realFromCounter }
+  }
+
+  // SECONDARY: read from progression hash written by StrategyCoordinator (hincrby every cycle)
+  try {
+    const progHash = await client.hgetall(`progression:${connectionId}`) || {}
+    const baseFromHash = parseInt(progHash.strategies_base_total || "0", 10)
+    const mainFromHash = parseInt(progHash.strategies_main_total || "0", 10)
+    const realFromHash = parseInt(progHash.strategies_real_total || "0", 10)
+    if (baseFromHash > 0 || mainFromHash > 0 || realFromHash > 0) {
+      return { base: baseFromHash, main: mainFromHash, real: realFromHash }
+    }
+  } catch { /* non-critical */ }
+
+  // TERTIARY: fall back to settings hash keys written by setSettings in StrategyCoordinator
+  // Key pattern: settings:strategies:{connId}:{symbol}:{stage}:sets (hash with .count field)
   const uniqueSymbols = Array.from(new Set(symbols.filter(Boolean)))
   if (uniqueSymbols.length === 0) {
-    uniqueSymbols.push("BTCUSDT", "ETHUSDT")
+    uniqueSymbols.push("BTCUSDT", "ETHUSDT", "SOLUSDT")
   }
 
   const totals = { base: 0, main: 0, real: 0 }
 
   for (const symbol of uniqueSymbols) {
-    const [baseCount, mainCount, realCount] = await Promise.all([
-      countArrayEntries(client, `strategies:${connectionId}:${symbol}:base`),
-      countArrayEntries(client, `strategies:${connectionId}:${symbol}:main`),
-      countArrayEntries(client, `strategies:${connectionId}:${symbol}:real`),
-    ])
-    totals.base += baseCount
-    totals.main += mainCount
-    totals.real += realCount
+    for (const stage of ["base", "main", "real"] as const) {
+      try {
+        const settingsHash = await client.hgetall(`settings:strategies:${connectionId}:${symbol}:${stage}:sets`)
+        if (settingsHash && settingsHash.count) {
+          totals[stage] += parseInt(settingsHash.count, 10) || 0
+        }
+      } catch { /* non-critical */ }
+    }
   }
 
   return totals

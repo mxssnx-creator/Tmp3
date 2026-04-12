@@ -61,21 +61,26 @@ export async function GET(
     }
 
     // ── Read all namespaces in parallel ──────────────────────────────────────
+    // NOTE: hgetall returns null (not throws) when the key doesn't exist — always coerce to {}
     const [
-      progHash,
-      prehistoricHash,
-      realtimeHash,
+      progHashRaw,
+      prehistoricHashRaw,
+      realtimeHashRaw,
       engineState,
       engineProgression,
       prehistoricSymbolCount,
     ] = await Promise.all([
-      client.hgetall(`progression:${connectionId}`).catch(() => ({})) as Promise<Record<string, string>>,
-      client.hgetall(`prehistoric:${connectionId}`).catch(() => ({})) as Promise<Record<string, string>>,
-      client.hgetall(`realtime:${connectionId}`).catch(() => ({})) as Promise<Record<string, string>>,
+      client.hgetall(`progression:${connectionId}`).catch(() => null),
+      client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
+      client.hgetall(`realtime:${connectionId}`).catch(() => null),
       getSettings(`trade_engine_state:${connectionId}`).catch(() => ({})),
       getSettings(`engine_progression:${connectionId}`).catch(() => ({})),
       client.scard(`prehistoric:${connectionId}:symbols`).catch(() => 0),
     ])
+
+    const progHash: Record<string, string>       = progHashRaw       || {}
+    const prehistoricHash: Record<string, string> = prehistoricHashRaw || {}
+    const realtimeHash: Record<string, string>   = realtimeHashRaw   || {}
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
@@ -163,7 +168,7 @@ export async function GET(
     try {
       const posIds = await client.smembers(`pseudo_positions:${connectionId}`).catch(() => [] as string[])
       for (const posId of posIds.slice(0, 200)) {
-        const h = await client.hgetall(`pseudo_position:${connectionId}:${posId}`).catch(() => ({}))
+        const h = (await client.hgetall(`pseudo_position:${connectionId}:${posId}`).catch(() => null)) || {}
         if ((h as any)?.status === "active" || !(h as any)?.status) positionsOpen++
       }
     } catch { /* non-critical */ }
@@ -220,7 +225,7 @@ export async function GET(
 
     await Promise.all(
       stratDetailKeys.map(async (stage) => {
-        const dh = await client.hgetall(`strategy_detail:${connectionId}:${stage}`).catch(() => ({})) as Record<string, string>
+        const dh = ((await client.hgetall(`strategy_detail:${connectionId}:${stage}`).catch(() => null)) || {}) as Record<string, string>
         const createdSets       = n(dh.created_sets      || progHash[`strategy_${stage}_created_sets`])
         const avgPosPerSet      = parseFloat(dh.avg_pos_per_set      || progHash[`strategy_${stage}_avg_pos_per_set`]      || "0")
         const avgProfitFactor   = parseFloat(dh.avg_profit_factor    || progHash[`strategy_${stage}_avg_profit_factor`]    || "0")

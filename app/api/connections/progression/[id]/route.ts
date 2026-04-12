@@ -197,7 +197,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     try {
       if (client) {
         // Check for prehistoric progress tracking in Redis
-        const prehistoricData = await client.hgetall(`prehistoric:${connectionId}`).catch(() => ({}))
+        const prehistoricData = (await client.hgetall(`prehistoric:${connectionId}`).catch(() => null)) || {}
         if (prehistoricData && Object.keys(prehistoricData).length > 0) {
           prehistoricProgress.currentSymbol = prehistoricData.current_symbol || ""
           prehistoricProgress.candlesLoaded = Number(prehistoricData.candles_loaded || 0)

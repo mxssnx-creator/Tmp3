@@ -227,30 +227,57 @@ export async function POST(request: Request) {
       }
     }
     
-    // Step 2: Get symbols (single symbol for quickstart)
+    // Step 2: Get symbols (single most-volatile symbol for quickstart)
     console.log(`${LOG_PREFIX}: [2/4] Configuring symbol...`)
-    let symbols = body.symbols || [...DEFAULT_SYMBOLS]
-    
-    if (testPassed) {
+    let symbols: string[] = body.symbols || []
+
+    // PRIMARY: fetch most volatile symbol from public exchange API (no auth required)
+    if (symbols.length === 0) {
+      try {
+        const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"
+        const topRes = await fetch(
+          `${baseUrl}/api/exchange/${exchangeName}/top-symbols?t=${Date.now()}`,
+          { signal: AbortSignal.timeout(5000), cache: "no-store" }
+        )
+        if (topRes.ok) {
+          const topData = await topRes.json()
+          if (topData.symbol) {
+            symbols = [topData.symbol]
+            console.log(`${LOG_PREFIX}: [2/4] Most volatile symbol from public API: ${topData.symbol} (${(topData.priceChangePercent || 0).toFixed(2)}%)`)
+          }
+        }
+      } catch (e) {
+        console.warn(`${LOG_PREFIX}: [2/4] Public top-symbols fetch failed, trying exchange connector:`, e instanceof Error ? e.message : String(e))
+      }
+    }
+
+    // SECONDARY: use exchange connector's getTopSymbols (requires auth)
+    if (symbols.length === 0 && testPassed) {
       try {
         const connector = await createExchangeConnector(exchangeName, {
           apiKey: connection.api_key,
           apiSecret: connection.api_secret,
           isTestnet: false,
         })
-        
         if (typeof connector.getTopSymbols === "function") {
-          const topSymbols = await connector.getTopSymbols(1) // Get only 1 symbol
+          const topSymbols = await connector.getTopSymbols(1)
           if (topSymbols && topSymbols.length > 0) {
             symbols = topSymbols
-            console.log(`${LOG_PREFIX}: [2/4] Retrieved top symbol from exchange: ${symbols.join(", ")}`)
+            console.log(`${LOG_PREFIX}: [2/4] Top symbol from exchange connector: ${symbols.join(", ")}`)
           }
         }
       } catch {
-        // Use defaults if retrieval fails
+        // fall through to default
       }
     }
-    console.log(`${LOG_PREFIX}: [2/4] Symbol: ${symbols.join(", ")}`)
+
+    // FALLBACK: use default symbol
+    if (symbols.length === 0) {
+      symbols = [...DEFAULT_SYMBOLS]
+      console.log(`${LOG_PREFIX}: [2/4] Using default symbol: ${symbols.join(", ")}`)
+    }
+
+    console.log(`${LOG_PREFIX}: [2/4] Final symbol: ${symbols.join(", ")}`)
     
     await logProgressionEvent(connectionId, "quickstart_symbols", "info", "Trading symbols configured", {
       symbols,
