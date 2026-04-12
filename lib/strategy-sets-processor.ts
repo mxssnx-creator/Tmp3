@@ -100,12 +100,18 @@ export class StrategySetsProcessor {
     try {
       const startTime = Date.now()
 
+      // Sort indications by profitFactor descending so that the best-performing
+      // signals are processed first across all strategy type pools.
+      const sortedIndications = [...indications].sort(
+        (a, b) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0)
+      )
+
       // Process all 4 strategy types in parallel with independent logic
       const [baseResults, mainResults, realResults, liveResults] = await Promise.all([
-        this.processBaseStrategySet(symbol, indications),
-        this.processMainStrategySet(symbol, indications),
-        this.processRealStrategySet(symbol, indications),
-        this.processLiveStrategySet(symbol, indications),
+        this.processBaseStrategySet(symbol, sortedIndications),
+        this.processMainStrategySet(symbol, sortedIndications),
+        this.processRealStrategySet(symbol, sortedIndications),
+        this.processLiveStrategySet(symbol, sortedIndications),
       ])
 
       const duration = Date.now() - startTime
@@ -282,7 +288,7 @@ export class StrategySetsProcessor {
       }
 
       // Add new strategy
-      entries.unshift({
+      entries.push({
         id: `${strategyType}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         timestamp: new Date().toISOString(),
         profitFactor: strategy.profitFactor,
@@ -295,7 +301,11 @@ export class StrategySetsProcessor {
       // Get limit for this strategy type
       const maxEntries = this.getLimit(strategyType as keyof StrategySetLimits)
 
-      // Trim to max entries
+      // Sort by profitFactor descending so the best-performing entries are always
+      // processed first and retained when the pool is trimmed.
+      entries.sort((a: any, b: any) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0))
+
+      // Trim to max entries — lowest-PF entries are dropped first
       if (entries.length > maxEntries) {
         entries = entries.slice(0, maxEntries)
       }
@@ -353,7 +363,9 @@ export class StrategySetsProcessor {
 
       if (!data) return []
 
-      const entries = JSON.parse(data)
+      const entries: any[] = JSON.parse(data)
+      // Always return in best-performance-first order
+      entries.sort((a: any, b: any) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0))
       return entries.slice(0, limit)
     } catch (error) {
       console.error(`[v0] [StrategySets] Failed to get entries for ${type}:`, error)
