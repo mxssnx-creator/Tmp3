@@ -774,6 +774,8 @@ export class TradeEngineManager {
           const redisKey = `progression:${this.connectionId}`
           // Use hincrby for cycle count so it survives restarts and accumulates correctly
           await client.hincrby(redisKey, "strategy_cycle_count", 1)
+          // Write cumulative strategy evaluations so stats API can read strategiesTotal
+          await client.hincrby(redisKey, "strategies_count", evaluatedThisCycle)
           await client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle))
           await client.expire(redisKey, 7 * 24 * 60 * 60)
         } catch { /* non-critical */ }

@@ -95,7 +95,8 @@ function MiniStat({ label, value, sub }: { label: string; value: string; sub?: s
 
 export function QuickstartSection() {
   const { selectedConnectionId, selectedExchange } = useExchange()
-  const connectionId = selectedConnectionId || "default-bingx-001"
+  // Default to bingx-x01 — the canonical BingX base connection ID used by the engine
+  const connectionId = selectedConnectionId || "bingx-x01"
 
   // volatile symbol for start button label
   const [volatileSymbol, setVolatileSymbol] = useState<{ symbol: string | null; exchange: string | null; pct: number | null; loading: boolean }>({
@@ -116,37 +117,74 @@ export function QuickstartSection() {
     if (!connectionId) return
     if (!silent) setLoadingStats(true)
     try {
+      // Primary: /stats endpoint (full breakdown)
       const res = await fetch(`/api/connections/progression/${connectionId}/stats`, { cache: "no-store" })
       if (!res.ok) return
       const s = await res.json()
+
+      let indCycles  = s.realtime?.indicationCycles || 0
+      let stratCycles = s.realtime?.strategyCycles  || 0
+      let indTotal   = s.realtime?.indicationsTotal || 0
+      let stratTotal = s.realtime?.strategiesTotal  || 0
+      let indDir     = s.breakdown?.indications?.direction || 0
+      let indMove    = s.breakdown?.indications?.move     || 0
+      let indAct     = s.breakdown?.indications?.active   || 0
+      let indOpt     = s.breakdown?.indications?.optimal  || 0
+      let indAuto    = s.breakdown?.indications?.auto     || 0
+      let stratBase  = s.breakdown?.strategies?.base      || 0
+      let stratMain  = s.breakdown?.strategies?.main      || 0
+      let stratReal  = s.breakdown?.strategies?.real      || 0
+
+      // Fallback: if /stats returned all zeros, try engine-stats (confirmed working)
+      if (indCycles === 0 && stratCycles === 0 && indTotal === 0) {
+        try {
+          const er = await fetch(`/api/trading/engine-stats?connection_id=${connectionId}`, { cache: "no-store" })
+          if (er.ok) {
+            const e = await er.json()
+            indCycles  = e.indicationCycleCount  || 0
+            stratCycles = e.strategyCycleCount    || 0
+            indTotal   = e.totalIndicationsCount  || 0
+            stratTotal = e.totalStrategyCount     || 0
+            indDir     = e.indicationsByType?.direction || 0
+            indMove    = e.indicationsByType?.move      || 0
+            indAct     = e.indicationsByType?.active    || 0
+            indOpt     = e.indicationsByType?.optimal   || 0
+            indAuto    = e.indicationsByType?.auto      || 0
+            stratBase  = e.baseStrategyCount  || 0
+            stratMain  = e.mainStrategyCount  || 0
+            stratReal  = e.realStrategyCount  || 0
+          }
+        } catch { /* non-critical */ }
+      }
+
       setStats({
         historicSymbols:       s.historic?.symbolsProcessed    || 0,
         historicSymbolsTotal:  s.historic?.symbolsTotal        || 0,
         historicCycles:        s.historic?.cyclesCompleted     || 0,
         historicComplete:      s.historic?.isComplete          || false,
         historicProgress:      s.historic?.progressPercent     || 0,
-        indicationCycles:      s.realtime?.indicationCycles    || 0,
-        strategyCycles:        s.realtime?.strategyCycles      || 0,
-        indicationsTotal:      s.realtime?.indicationsTotal    || 0,
-        strategiesTotal:       s.realtime?.strategiesTotal     || 0,
+        indicationCycles:      indCycles,
+        strategyCycles:        stratCycles,
+        indicationsTotal:      indTotal,
+        strategiesTotal:       stratTotal,
         positionsOpen:         s.realtime?.positionsOpen       || 0,
         successRate:           s.realtime?.successRate         || 0,
         avgCycleMs:            s.realtime?.avgCycleTimeMs      || 0,
-        isActive:              s.realtime?.isActive            || false,
-        indDirection:          s.breakdown?.indications?.direction || 0,
-        indMove:               s.breakdown?.indications?.move     || 0,
-        indActive:             s.breakdown?.indications?.active   || 0,
-        indOptimal:            s.breakdown?.indications?.optimal  || 0,
-        indAuto:               s.breakdown?.indications?.auto     || 0,
-        stratBase:             s.breakdown?.strategies?.base      || 0,
-        stratMain:             s.breakdown?.strategies?.main      || 0,
-        stratReal:             s.breakdown?.strategies?.real      || 0,
+        isActive:              s.realtime?.isActive            || indCycles > 0,
+        indDirection:          indDir,
+        indMove:               indMove,
+        indActive:             indAct,
+        indOptimal:            indOpt,
+        indAuto:               indAuto,
+        stratBase:             stratBase,
+        stratMain:             stratMain,
+        stratReal:             stratReal,
         indLast5m:             s.windows?.indications?.last5m     || 0,
         indLast60m:            s.windows?.indications?.last60m    || 0,
-        phase:                 s.metadata?.phase || "—",
-        engineRunning:         s.metadata?.engineRunning          || false,
+        phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
+        engineRunning:         s.metadata?.engineRunning || indCycles > 0,
       })
-      if ((s.realtime?.indicationCycles || 0) > 0 && !isRunning) setIsRunning(true)
+      if (indCycles > 0 && !isRunning) setIsRunning(true)
     } catch { /* non-critical */ }
     finally { if (!silent) setLoadingStats(false) }
   }, [connectionId, isRunning])
@@ -154,42 +192,45 @@ export function QuickstartSection() {
   // ── fetch volatile symbol ──────────────────────────────────────────────────
   useEffect(() => {
     async function loadSymbol() {
+      setVolatileSymbol(s => ({ ...s, loading: true }))
       try {
-        // Get the currently selected connection details to fetch its exchange
         const connRes = await fetch("/api/settings/connections?t=" + Date.now(), { cache: "no-store" })
         if (!connRes.ok) throw new Error("no connections")
         const data = await connRes.json()
         const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
-        
-        // Find the selected connection using selectedConnectionId
-        const selected = conns.find(c => c.id === selectedConnectionId)
-        if (!selected) {
-          // Fallback to first active connection if selectedConnectionId not found
-          const isActive = (c: any) =>
-            c.is_active_inserted === "1" || c.is_active_inserted === true ||
-            c.is_assigned === "1" || c.is_assigned === true ||
-            c.is_active === "1" || c.is_active === true ||
-            c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
-          const preferred = conns.find(c => isActive(c)) || conns[0]
-          if (!preferred) {
-            setVolatileSymbol(s => ({ ...s, loading: false }))
-            return
-          }
+
+        const isActive = (c: any) =>
+          c.is_active_inserted === "1" || c.is_active_inserted === true ||
+          c.is_assigned === "1" || c.is_assigned === true ||
+          c.is_active === "1" || c.is_active === true ||
+          c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
+
+        // 1st: exact match on selectedConnectionId
+        // 2nd: any active connection matching the selectedExchange name
+        // 3rd: any active connection
+        // 4th: first connection
+        const conn =
+          conns.find(c => c.id === selectedConnectionId) ||
+          conns.find(c => isActive(c) && (c.exchange || "").toLowerCase() === (selectedExchange || "").toLowerCase()) ||
+          conns.find(c => isActive(c)) ||
+          conns[0]
+
+        if (!conn) {
+          setVolatileSymbol(s => ({ ...s, loading: false }))
+          return
         }
-        
-        const ex = (selected?.exchange || "binance").toLowerCase()
+
+        const ex = (conn.exchange || "bingx").toLowerCase()
         const symRes = await fetch(`/api/exchange/${ex}/top-symbols?t=` + Date.now(), { cache: "no-store" })
         if (!symRes.ok) throw new Error("no symbols")
         const sym = await symRes.json()
         setVolatileSymbol({ symbol: sym.symbol || "BTCUSDT", exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
-      } catch (err) {
-        console.log("[v0] Failed to load volatile symbol:", err instanceof Error ? err.message : String(err))
-        setVolatileSymbol({ symbol: "BTCUSDT", exchange: selectedExchange?.toLowerCase() || null, pct: null, loading: false })
+      } catch {
+        setVolatileSymbol({ symbol: "BTCUSDT", exchange: (selectedExchange || "bingx").toLowerCase(), pct: null, loading: false })
       }
     }
-    if (selectedConnectionId) {
-      loadSymbol()
-    }
+    // Run immediately and whenever exchange selection changes
+    loadSymbol()
   }, [selectedConnectionId, selectedExchange])
 
   // ── auto-scroll logs ───────────────────────────────────────────────────────
@@ -197,13 +238,13 @@ export function QuickstartSection() {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
 
-  // ── poll stats when expanded or running ───────────────────────────────────
+  // ── poll stats always (fast when expanded/running, slow otherwise) ────────
   useEffect(() => {
     clearInterval(pollRef.current)
     fetchStats()
-    if (expanded || isRunning) {
-      pollRef.current = setInterval(() => fetchStats(true), 3000)
-    }
+    // Always poll: fast (3s) when expanded or running, slower (10s) otherwise
+    const interval = (expanded || isRunning) ? 3000 : 10000
+    pollRef.current = setInterval(() => fetchStats(true), interval)
     return () => clearInterval(pollRef.current)
   }, [expanded, isRunning, fetchStats])
 
@@ -227,33 +268,41 @@ export function QuickstartSection() {
         c.is_assigned === "1" || c.is_assigned === true ||
         c.is_active === "1" || c.is_active === true ||
         c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
-      const preferred = conns.find(c => isActive(c) && ["bingx","bybit"].includes((c.exchange||"").toLowerCase()))
-        || conns.find(isActive) || conns[0]
-      if (!preferred) throw new Error("No active connections found")
-      addLog(`Connected to ${preferred.exchange?.toUpperCase()}`, "success")
 
-      addLog("Fetching market data...", "info")
-      const ex = (preferred.exchange || "binance").toLowerCase()
+      // Always use the exchange-selected connection first
+      const conn =
+        conns.find(c => c.id === selectedConnectionId) ||
+        conns.find(c => isActive(c) && (c.exchange || "").toLowerCase() === (selectedExchange || "").toLowerCase()) ||
+        conns.find(c => isActive(c)) ||
+        conns[0]
+      if (!conn) throw new Error("No active connections found")
+      addLog(`Connected to ${conn.exchange?.toUpperCase() || "exchange"}`, "success")
+
+      addLog("Fetching most volatile symbol (1h)...", "info")
+      const ex = (conn.exchange || "bingx").toLowerCase()
       const symRes = await fetch(`/api/exchange/${ex}/top-symbols?t=` + Date.now(), { cache: "no-store" })
+      let symbol = "BTCUSDT"
       if (symRes.ok) {
         const sym = await symRes.json()
-        addLog(`Market data: ${sym.symbol || "BTCUSDT"} (${sym.priceChangePercent?.toFixed(2) || "—"}%)`, "success")
+        symbol = sym.symbol || "BTCUSDT"
+        addLog(`Symbol: ${symbol} (${sym.priceChangePercent?.toFixed(2) || "—"}% 1h)`, "success")
+        setVolatileSymbol({ symbol, exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
       }
 
-      const connId = preferred.id || "default-bingx-001"
       addLog("Starting trade engine...", "info")
       const startRes = await fetch("/api/trade-engine/quick-start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ connectionId: connId }),
+        body: JSON.stringify({ connectionId: conn.id, symbols: [symbol] }),
       })
 
       if (startRes.ok) {
         addLog("Trade engine started successfully", "success")
         setIsRunning(true)
-        addLog("Processing live market data...", "info")
+        addLog(`Processing live ${symbol} data...`, "info")
       } else {
-        addLog("Engine already running or unavailable — monitoring active", "warning")
+        const body = await startRes.json().catch(() => ({}))
+        addLog(body?.message || "Engine already running — monitoring active", "warning")
         setIsRunning(true)
       }
     } catch (err) {
