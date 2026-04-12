@@ -227,7 +227,7 @@ export class StrategyCoordinator {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
       await client.hset(redisKey, "strategies_base_total", String(baseSets.length))
-      await client.hset(redisKey, "strategy_evaluated_base", String(baseSets.length))
+      await client.hset(redisKey, "strategies_base_evaluated", String(baseSets.length))
       await client.expire(redisKey, 7 * 24 * 60 * 60)
     } catch { /* non-critical */ }
 
@@ -338,7 +338,7 @@ export class StrategyCoordinator {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
       await client.hset(redisKey, "strategies_main_total", String(baseSets.length))   // base sets evaluated against Main threshold this cycle
-      await client.hset(redisKey, "strategy_evaluated_main", String(mainSets.length)) // sets that passed to Main this cycle
+      await client.hset(redisKey, "strategies_main_evaluated", String(mainSets.length)) // sets that passed to Main this cycle
       await client.expire(redisKey, 7 * 24 * 60 * 60)
     } catch { /* non-critical */ }
 
@@ -388,7 +388,7 @@ export class StrategyCoordinator {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
       await client.hset(redisKey, "strategies_real_total", String(mainSets.length))    // main sets evaluated this cycle
-      await client.hset(redisKey, "strategy_evaluated_real", String(realSets.length))  // sets that passed to Real this cycle
+      await client.hset(redisKey, "strategies_real_evaluated", String(realSets.length))  // sets that passed to Real this cycle
       await client.expire(redisKey, 7 * 24 * 60 * 60)
     } catch { /* non-critical */ }
 
