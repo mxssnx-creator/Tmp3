@@ -180,9 +180,9 @@ export function QuickstartTestProcedureDialog() {
           setLiveMonitor({
             cycles: data.indicationCycleCount || data.strategyCycleCount || data.cyclesCompleted || 0,
             indications: data.totalIndicationsCount || data.indications?.totalRecords || 0,
-            strategies: (data.baseStrategyCount || 0) + (data.mainStrategyCount || 0) + (data.realStrategyCount || 0) + (data.liveStrategyCount || 0),
+            strategies: data.totalStrategyCount || (data.baseStrategyCount || 0) + (data.mainStrategyCount || 0) + (data.realStrategyCount || 0) + (data.liveStrategyCount || 0),
             connections: 1,
-            symbols: data.symbolsProcessed || 0,
+            symbols: data.metadata?.symbolCount || data.symbolsProcessed || 0,
           })
         } else {
           setLiveMonitor({
