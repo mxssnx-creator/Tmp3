@@ -274,7 +274,8 @@ export class StrategyProcessor {
       const allIndications = await getIndications(this.connectionId, symbol)
 
       if (allIndications && Array.isArray(allIndications) && allIndications.length > 0) {
-        console.log(`[v0] [StrategyProcessor] Retrieved ${allIndications.length} indications for ${symbol}/${this.connectionId}`)
+        const sample = allIndications[0]
+        console.log(`[v0] [StrategyProcessor] Retrieved ${allIndications.length} indications for ${symbol}/${this.connectionId} | sample conf=${sample.confidence} (${typeof sample.confidence}), pf=${sample.profitFactor} (${typeof sample.profitFactor})`)
         return allIndications
       }
 
