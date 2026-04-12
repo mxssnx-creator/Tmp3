@@ -155,29 +155,42 @@ export function QuickstartSection() {
   useEffect(() => {
     async function loadSymbol() {
       try {
+        // Get the currently selected connection details to fetch its exchange
         const connRes = await fetch("/api/settings/connections?t=" + Date.now(), { cache: "no-store" })
         if (!connRes.ok) throw new Error("no connections")
         const data = await connRes.json()
         const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
-        const isActive = (c: any) =>
-          c.is_active_inserted === "1" || c.is_active_inserted === true ||
-          c.is_assigned === "1" || c.is_assigned === true ||
-          c.is_active === "1" || c.is_active === true ||
-          c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
-        const preferred = conns.find(c => isActive(c) && ["bingx","bybit"].includes((c.exchange||"").toLowerCase()))
-          || conns.find(isActive) || conns[0]
-        if (!preferred) { setVolatileSymbol(s => ({ ...s, loading: false })); return }
-        const ex = (preferred.exchange || "binance").toLowerCase()
+        
+        // Find the selected connection using selectedConnectionId
+        const selected = conns.find(c => c.id === selectedConnectionId)
+        if (!selected) {
+          // Fallback to first active connection if selectedConnectionId not found
+          const isActive = (c: any) =>
+            c.is_active_inserted === "1" || c.is_active_inserted === true ||
+            c.is_assigned === "1" || c.is_assigned === true ||
+            c.is_active === "1" || c.is_active === true ||
+            c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
+          const preferred = conns.find(c => isActive(c)) || conns[0]
+          if (!preferred) {
+            setVolatileSymbol(s => ({ ...s, loading: false }))
+            return
+          }
+        }
+        
+        const ex = (selected?.exchange || "binance").toLowerCase()
         const symRes = await fetch(`/api/exchange/${ex}/top-symbols?t=` + Date.now(), { cache: "no-store" })
         if (!symRes.ok) throw new Error("no symbols")
         const sym = await symRes.json()
         setVolatileSymbol({ symbol: sym.symbol || "BTCUSDT", exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
-      } catch {
+      } catch (err) {
+        console.log("[v0] Failed to load volatile symbol:", err instanceof Error ? err.message : String(err))
         setVolatileSymbol({ symbol: "BTCUSDT", exchange: selectedExchange?.toLowerCase() || null, pct: null, loading: false })
       }
     }
-    loadSymbol()
-  }, [selectedExchange])
+    if (selectedConnectionId) {
+      loadSymbol()
+    }
+  }, [selectedConnectionId, selectedExchange])
 
   // ── auto-scroll logs ───────────────────────────────────────────────────────
   useEffect(() => {
