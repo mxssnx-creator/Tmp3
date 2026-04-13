@@ -232,6 +232,8 @@ export async function GET(
         const avgProcessingMs   = parseFloat(dh.avg_processing_ms    || progHash[`strategy_${stage}_avg_processing_ms`]    || "0")
         // Average position evaluation score for Real stage (stored by strategy-coordinator)
         const avgPosEvalReal    = parseFloat(dh.avg_pos_eval_real    || progHash[`strategy_${stage}_avg_pos_eval_real`]    || "0")
+        // Count of positions that contributed to avgPosEvalReal (only meaningful for Real stage)
+        const countPosEval      = n(dh.count_pos_eval || progHash[`strategy_${stage}_count_pos_eval`])
         // Drawdown time (avg minutes from strategy sets)
         const avgDrawdownTime   = parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
 
@@ -245,10 +247,15 @@ export async function GET(
           evalPct = main > 0 ? Math.round((stratEvaluated.real / main) * 1000) / 10 : 0
         }
 
-        // Pass ratio = passed/evaluated for this stage
-        const stageEvaluated = stratEvaluated[stage] || 0
+        // Pass ratio = passed/evaluated for this stage — prefer detail hash's pass_rate
+        const stageEvaluated = n(dh.evaluated) || stratEvaluated[stage] || 0
         const stagePassed    = n(dh.passed_sets || progHash[`strategy_${stage}_passed`])
-        const passRatio      = stageEvaluated > 0 ? Math.round((stagePassed / stageEvaluated) * 1000) / 10 : 0
+        const passRatioRaw   = parseFloat(dh.pass_rate || "0")
+        const passRatio      = passRatioRaw > 0
+          ? Math.round(passRatioRaw * 1000) / 10   // convert 0-1 fraction → percent
+          : stageEvaluated > 0
+            ? Math.round((stagePassed / stageEvaluated) * 1000) / 10
+            : 0
 
         stratDetail[stage] = {
           avgPosPerSet:        isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100      : 0,
@@ -256,6 +263,7 @@ export async function GET(
           avgProfitFactor:     isFinite(avgProfitFactor) ? Math.round(avgProfitFactor * 1000) / 1000 : 0,
           avgProcessingTimeMs: isFinite(avgProcessingMs) ? Math.round(avgProcessingMs * 10) / 10     : 0,
           avgPosEvalReal:      isFinite(avgPosEvalReal)  ? Math.round(avgPosEvalReal * 1000) / 1000  : 0,
+          countPosEval:        countPosEval,
           avgDrawdownTime:     isFinite(avgDrawdownTime) ? Math.round(avgDrawdownTime * 10) / 10     : 0,
           evalPct,
           passRatio,
@@ -320,7 +328,7 @@ export async function GET(
     let redisDbEntries = 0
     try { redisDbEntries = await client.dbSize() } catch { /* non-critical */ }
 
-    // ── Build response ───────────────────────────────────────────────────────
+    // ── Build response ─────────────────────────────────────────────���─────────
     return NextResponse.json({
       success: true,
       connectionId,

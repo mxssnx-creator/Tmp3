@@ -234,6 +234,26 @@ export class StrategyCoordinator {
       await client.hset(redisKey, "strategies_base_total", String(baseSets.length))
       await client.hset(redisKey, "strategies_base_evaluated", String(baseSets.length))
       await client.expire(redisKey, 7 * 24 * 60 * 60)
+
+      // Write strategy_detail:{connId}:base — read by /stats route for avg PF, DDT, pass ratio
+      const baseAvgPF  = baseSets.length > 0 ? baseSets.reduce((s, st) => s + st.avgProfitFactor, 0) / baseSets.length : 0
+      const baseAvgDDT = baseSets.length > 0 ? baseSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / baseSets.length : 0
+      const detailKey  = `strategy_detail:${this.connectionId}:base`
+      await client.hset(detailKey, {
+        created_sets:      String(baseSets.length),
+        avg_profit_factor: String(baseAvgPF.toFixed(4)),
+        avg_drawdown_time: String(Math.round(baseAvgDDT)),
+        evaluated:         String(baseSets.length),
+        passed_sets:       "0",   // will be updated by createMainSets
+        updated_at:        String(Date.now()),
+      })
+      await client.expire(detailKey, 86400)
+
+      // Update evaluated/count counter keys for stats route hierarchy
+      await client.set(`strategies:${this.connectionId}:base:count`, String(baseSets.length))
+      await client.set(`strategies:${this.connectionId}:base:evaluated`, String(baseSets.length))
+      await client.expire(`strategies:${this.connectionId}:base:count`, 86400)
+      await client.expire(`strategies:${this.connectionId}:base:evaluated`, 86400)
     } catch { /* non-critical */ }
 
     console.log(`[v0] [StrategyFlow] ${symbol} BASE: ${baseSets.length} Sets created (${baseSets.reduce((s, set) => s + set.entryCount, 0)} total entries)`)
@@ -342,9 +362,40 @@ export class StrategyCoordinator {
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      await client.hset(redisKey, "strategies_main_total", String(baseSets.length))   // base sets evaluated against Main threshold this cycle
-      await client.hset(redisKey, "strategies_main_evaluated", String(mainSets.length)) // sets that passed to Main this cycle
+      await client.hset(redisKey, "strategies_main_total", String(baseSets.length))     // base sets evaluated this cycle
+      await client.hset(redisKey, "strategies_main_evaluated", String(mainSets.length)) // sets that passed to Main
       await client.expire(redisKey, 7 * 24 * 60 * 60)
+
+      // Write strategy_detail:{connId}:main and update base detail's passed_sets
+      const mainAvgPF  = mainSets.length > 0 ? mainSets.reduce((s, st) => s + st.avgProfitFactor, 0) / mainSets.length : 0
+      const mainAvgDDT = mainSets.length > 0 ? mainSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / mainSets.length : 0
+      const passRatioMain = baseSets.length > 0 ? mainSets.length / baseSets.length : 0
+
+      const mainDetailKey = `strategy_detail:${this.connectionId}:main`
+      await client.hset(mainDetailKey, {
+        created_sets:      String(mainSets.length),
+        avg_profit_factor: String(mainAvgPF.toFixed(4)),
+        avg_drawdown_time: String(Math.round(mainAvgDDT)),
+        evaluated:         String(baseSets.length),
+        passed_sets:       String(mainSets.length),
+        pass_rate:         String(passRatioMain.toFixed(4)),
+        updated_at:        String(Date.now()),
+      })
+      await client.expire(mainDetailKey, 86400)
+
+      // Update base detail to reflect how many passed to Main
+      await client.hset(`strategy_detail:${this.connectionId}:base`, {
+        passed_sets: String(mainSets.length),
+        pass_rate:   String(passRatioMain.toFixed(4)),
+      }).catch(() => {})
+
+      // Counter keys
+      await client.set(`strategies:${this.connectionId}:main:count`, String(mainSets.length))
+      await client.set(`strategies:${this.connectionId}:main:evaluated`, String(baseSets.length))
+      await client.set(`strategies:${this.connectionId}:base:passed`, String(mainSets.length))
+      await client.expire(`strategies:${this.connectionId}:main:count`, 86400)
+      await client.expire(`strategies:${this.connectionId}:main:evaluated`, 86400)
+      await client.expire(`strategies:${this.connectionId}:base:passed`, 86400)
     } catch { /* non-critical */ }
 
     const failed = baseSets.length - mainSets.length
@@ -400,9 +451,44 @@ export class StrategyCoordinator {
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      await client.hset(redisKey, "strategies_real_total", String(mainSets.length))    // main sets evaluated this cycle
-      await client.hset(redisKey, "strategies_real_evaluated", String(realSets.length))  // sets that passed to Real this cycle
+      await client.hset(redisKey, "strategies_real_total", String(mainSets.length))      // main sets evaluated this cycle
+      await client.hset(redisKey, "strategies_real_evaluated", String(realSets.length))  // sets that passed to Real
       await client.expire(redisKey, 7 * 24 * 60 * 60)
+
+      // Write strategy_detail:{connId}:real with full metrics including posEvalReal
+      const realAvgPF   = realSets.length > 0 ? realSets.reduce((s, st) => s + st.avgProfitFactor, 0) / realSets.length : 0
+      const realAvgDDT  = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / realSets.length : 0
+      // avgPosEvalReal: average confidence score across real sets (proxy for position quality)
+      const realAvgConf = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgConfidence || 0), 0) / realSets.length : 0
+      const passRatioReal = mainSets.length > 0 ? realSets.length / mainSets.length : 0
+
+      const realDetailKey = `strategy_detail:${this.connectionId}:real`
+      await client.hset(realDetailKey, {
+        created_sets:       String(realSets.length),
+        avg_profit_factor:  String(realAvgPF.toFixed(4)),
+        avg_drawdown_time:  String(Math.round(realAvgDDT)),
+        avg_pos_eval_real:  String(realAvgConf.toFixed(4)),
+        evaluated:          String(mainSets.length),
+        passed_sets:        String(realSets.length),
+        pass_rate:          String(passRatioReal.toFixed(4)),
+        count_pos_eval:     String(realSets.length),   // how many positions contributed to avgPosEvalReal
+        updated_at:         String(Date.now()),
+      })
+      await client.expire(realDetailKey, 86400)
+
+      // Update main detail's passed_sets
+      await client.hset(`strategy_detail:${this.connectionId}:main`, {
+        passed_sets: String(realSets.length),
+        pass_rate:   String(passRatioReal.toFixed(4)),
+      }).catch(() => {})
+
+      // Counter keys
+      await client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length))
+      await client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainSets.length))
+      await client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length))
+      await client.expire(`strategies:${this.connectionId}:real:count`, 86400)
+      await client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400)
+      await client.expire(`strategies:${this.connectionId}:main:passed`, 86400)
     } catch { /* non-critical */ }
 
     console.log(
@@ -468,6 +554,26 @@ export class StrategyCoordinator {
       const redisKey = `progression:${this.connectionId}`
       await client.hset(redisKey, "strategies_live_total", String(qualifying.length))
       await client.expire(redisKey, 7 * 24 * 60 * 60)
+
+      // Write strategy_detail:{connId}:live
+      const liveAvgPF  = qualifying.length > 0 ? qualifying.reduce((s, st) => s + st.avgProfitFactor, 0) / qualifying.length : 0
+      const liveAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
+      const passRatioLive = realSets.length > 0 ? qualifying.length / realSets.length : 0
+
+      const liveDetailKey = `strategy_detail:${this.connectionId}:live`
+      await client.hset(liveDetailKey, {
+        created_sets:      String(qualifying.length),
+        avg_profit_factor: String(liveAvgPF.toFixed(4)),
+        avg_drawdown_time: String(Math.round(liveAvgDDT)),
+        evaluated:         String(realSets.length),
+        passed_sets:       String(qualifying.length),
+        pass_rate:         String(passRatioLive.toFixed(4)),
+        updated_at:        String(Date.now()),
+      })
+      await client.expire(liveDetailKey, 86400)
+
+      await client.set(`strategies:${this.connectionId}:live:count`, String(qualifying.length))
+      await client.expire(`strategies:${this.connectionId}:live:count`, 86400)
     } catch { /* non-critical */ }
 
     // Attempt real exchange trading for qualifying LIVE sets when the connection has live trading enabled.

@@ -156,6 +156,14 @@ export function ActiveConnectionCard({
     avgDrawdownTimeMain: number
     avgDrawdownTimeReal: number
     avgPosEvalReal: number
+    // Evaluated / passed counts per stage
+    baseEvaluated: number
+    basePassed: number
+    mainEvaluated: number
+    mainPassed: number
+    realEvaluated: number
+    realPassed: number
+    countPosEvalReal: number
     // Prehistoric metadata
     rangeDays: number
     timeframeSeconds: number
@@ -277,9 +285,9 @@ export function ActiveConnectionCard({
           stratMain:  strat.main || 0,
           stratReal:  strat.real || 0,
           stratLive:  strat.live || 0,
-          basePassRatio:      sd.base?.passRatio      || 0,
-          mainPassRatio:      sd.main?.passRatio      || 0,
-          realPassRatio:      sd.real?.passRatio      || 0,
+          basePassRatio:       sd.base?.passRatio      || 0,
+          mainPassRatio:       sd.main?.passRatio      || 0,
+          realPassRatio:       sd.real?.passRatio      || 0,
           avgProfitFactorBase: sd.base?.avgProfitFactor || 0,
           avgProfitFactorMain: sd.main?.avgProfitFactor || 0,
           avgProfitFactorReal: sd.real?.avgProfitFactor || 0,
@@ -287,6 +295,14 @@ export function ActiveConnectionCard({
           avgDrawdownTimeMain: sd.main?.avgDrawdownTime || 0,
           avgDrawdownTimeReal: sd.real?.avgDrawdownTime || 0,
           avgPosEvalReal:      sd.real?.avgPosEvalReal  || 0,
+          // Evaluated / passed counts from per-stage detail
+          baseEvaluated:    sd.base?.evaluated   || (strat.base || 0),
+          basePassed:       sd.base?.passed       || (strat.main || 0),
+          mainEvaluated:    sd.main?.evaluated   || (strat.main || 0),
+          mainPassed:       sd.main?.passed       || (strat.real || 0),
+          realEvaluated:    sd.real?.evaluated   || (strat.real || 0),
+          realPassed:       sd.real?.passed       || (strat.real || 0),
+          countPosEvalReal: sd.real?.countPosEval || 0,
           rangeDays:               pm.rangeDays              || 1,
           timeframeSeconds:        pm.timeframeSeconds        || 1,
           intervalsProcessed:      pm.intervalsProcessed      || 0,
@@ -792,55 +808,93 @@ export function ActiveConnectionCard({
                         {/* Stage rows: Base → Main → Real */}
                         {[
                           {
-                            label: "Base", count: prehistoricStats.stratBase,
+                            label: "Base",
+                            count:     prehistoricStats.stratBase,
+                            evaluated: prehistoricStats.baseEvaluated,
+                            passed:    prehistoricStats.basePassed,
                             passRatio: prehistoricStats.basePassRatio,
-                            avgPF: prehistoricStats.avgProfitFactorBase,
-                            avgDDT: prehistoricStats.avgDrawdownTimeBase,
-                            avgPosEval: null,
+                            avgPF:     prehistoricStats.avgProfitFactorBase,
+                            avgDDT:    prehistoricStats.avgDrawdownTimeBase,
+                            avgPosEval: null as number | null,
+                            countPosEval: null as number | null,
                             color: "text-blue-600 dark:text-blue-400",
                           },
                           {
-                            label: "Main", count: prehistoricStats.stratMain,
+                            label: "Main",
+                            count:     prehistoricStats.stratMain,
+                            evaluated: prehistoricStats.mainEvaluated,
+                            passed:    prehistoricStats.mainPassed,
                             passRatio: prehistoricStats.mainPassRatio,
-                            avgPF: prehistoricStats.avgProfitFactorMain,
-                            avgDDT: prehistoricStats.avgDrawdownTimeMain,
-                            avgPosEval: null,
+                            avgPF:     prehistoricStats.avgProfitFactorMain,
+                            avgDDT:    prehistoricStats.avgDrawdownTimeMain,
+                            avgPosEval: null as number | null,
+                            countPosEval: null as number | null,
                             color: "text-purple-600 dark:text-purple-400",
                           },
                           {
-                            label: "Real", count: prehistoricStats.stratReal,
+                            label: "Real",
+                            count:     prehistoricStats.stratReal,
+                            evaluated: prehistoricStats.realEvaluated,
+                            passed:    prehistoricStats.realPassed,
                             passRatio: prehistoricStats.realPassRatio,
-                            avgPF: prehistoricStats.avgProfitFactorReal,
-                            avgDDT: prehistoricStats.avgDrawdownTimeReal,
+                            avgPF:     prehistoricStats.avgProfitFactorReal,
+                            avgDDT:    prehistoricStats.avgDrawdownTimeReal,
                             avgPosEval: prehistoricStats.avgPosEvalReal,
+                            countPosEval: prehistoricStats.countPosEvalReal,
                             color: "text-green-600 dark:text-green-400",
                           },
-                        ].map(({ label, count, passRatio, avgPF, avgDDT, avgPosEval, color }) => (
+                        ].map(({ label, count, evaluated, passed, passRatio, avgPF, avgDDT, avgPosEval, countPosEval, color }) => (
                           count > 0 && (
-                            <div key={label} className="grid grid-cols-[28px_40px_auto_auto_auto_auto] gap-x-2 items-center text-[10px]">
-                              <span className={`font-semibold ${color}`}>{label}</span>
-                              <span className="font-semibold tabular-nums">
-                                {count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count}
-                              </span>
-                              <span className="text-muted-foreground">
-                                ratio <span className="text-foreground font-medium">{passRatio > 0 ? `${passRatio.toFixed(1)}%` : "—"}</span>
-                              </span>
-                              <span className="text-muted-foreground">
-                                PF <span className={`font-medium ${avgPF >= 1.4 ? "text-green-600 dark:text-green-400" : avgPF >= 1.0 ? "text-foreground" : "text-red-500"}`}>
-                                  {avgPF > 0 ? avgPF.toFixed(2) : "—"}
+                            <div key={label} className="space-y-0.5">
+                              {/* Main row: label, sets count, pass ratio, PF */}
+                              <div className="flex items-center gap-2 text-[10px]">
+                                <span className={`font-semibold w-7 shrink-0 ${color}`}>{label}</span>
+                                <span className="font-semibold tabular-nums">
+                                  {count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count} sets
                                 </span>
-                              </span>
-                              <span className="text-muted-foreground">
-                                DDT <span className="text-foreground font-medium">
-                                  {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "—"}
-                                </span>
-                              </span>
-                              {avgPosEval !== null && (
-                                <span className="text-muted-foreground">
-                                  PosEval <span className={`font-medium ${avgPosEval >= 0.7 ? "text-green-600 dark:text-green-400" : avgPosEval >= 0.4 ? "text-amber-600 dark:text-amber-400" : "text-foreground"}`}>
-                                    {avgPosEval > 0 ? avgPosEval.toFixed(3) : "—"}
+                                {evaluated > 0 && (
+                                  <span className="text-muted-foreground">
+                                    eval <span className="text-foreground font-medium tabular-nums">
+                                      {evaluated >= 1000 ? `${(evaluated / 1000).toFixed(1)}K` : evaluated}
+                                    </span>
+                                    {passed > 0 && (
+                                      <span className="text-foreground font-medium tabular-nums ml-0.5">
+                                        /{passed >= 1000 ? `${(passed / 1000).toFixed(1)}K` : passed} pass
+                                      </span>
+                                    )}
+                                  </span>
+                                )}
+                                {passRatio > 0 && (
+                                  <span className="text-muted-foreground">
+                                    <span className={`font-medium ${passRatio >= 50 ? "text-green-600 dark:text-green-400" : passRatio >= 25 ? "text-amber-600 dark:text-amber-400" : "text-foreground"}`}>
+                                      {passRatio.toFixed(1)}%
+                                    </span>
+                                  </span>
+                                )}
+                                <span className="text-muted-foreground ml-auto">
+                                  PF <span className={`font-medium ${avgPF >= 1.4 ? "text-green-600 dark:text-green-400" : avgPF >= 1.0 ? "text-foreground" : "text-red-500"}`}>
+                                    {avgPF > 0 ? avgPF.toFixed(2) : "—"}
                                   </span>
                                 </span>
+                                <span className="text-muted-foreground">
+                                  DDT <span className="text-foreground font-medium">
+                                    {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "—"}
+                                  </span>
+                                </span>
+                              </div>
+                              {/* Real-stage extra row: PosEval avg + count */}
+                              {avgPosEval !== null && (
+                                <div className="flex items-center gap-2 text-[10px] pl-7">
+                                  <span className="text-muted-foreground">PosEval avg</span>
+                                  <span className={`font-medium ${avgPosEval >= 0.7 ? "text-green-600 dark:text-green-400" : avgPosEval >= 0.4 ? "text-amber-600 dark:text-amber-400" : "text-foreground"}`}>
+                                    {avgPosEval > 0 ? avgPosEval.toFixed(3) : "—"}
+                                  </span>
+                                  {countPosEval !== null && countPosEval > 0 && (
+                                    <span className="text-muted-foreground">
+                                      count <span className="text-foreground font-medium tabular-nums">{countPosEval}</span>
+                                    </span>
+                                  )}
+                                </div>
                               )}
                             </div>
                           )
