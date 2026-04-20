@@ -377,12 +377,18 @@ export async function executeLivePosition(
       return livePosition
     }
 
-    const connSettings = (await client?.hgetall(`connection:${connectionId}`)) || {}
+    // CRITICAL: Upstash returns values as strings OR native types depending on adapter.
+    // Use getConnection() to get the parsed hash (parseHashValue coerces "1"/"true"/true -> true).
+    // Raw hgetall followed by string-only equality was silently failing when the value
+    // came back as a boolean, causing every real order to become a "simulated" order
+    // despite the strategy-coordinator correctly detecting live_trade=true just one
+    // function call upstream.
+    const { getConnection: _getConn } = await import("@/lib/redis-db")
+    const { isTruthyFlag } = await import("@/lib/connection-state-utils")
+    const connSettings = (await _getConn(connectionId)) || {}
     const isLiveTradeEnabled =
-      connSettings.is_live_trade === "1" ||
-      connSettings.is_live_trade === "true" ||
-      connSettings.live_trade_enabled === "1" ||
-      connSettings.live_trade_enabled === "true"
+      isTruthyFlag(connSettings.is_live_trade) ||
+      isTruthyFlag(connSettings.live_trade_enabled)
 
     pushStep(livePosition, "preflight", true, `live_trade=${isLiveTradeEnabled}`)
     await logProgressionEvent(
