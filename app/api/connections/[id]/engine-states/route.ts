@@ -70,17 +70,28 @@ export async function GET(
     const flagLive    = toBoolean((connection as any).is_live_trade)
     const flagPreset  = toBoolean((connection as any).is_preset_trade)
 
-    // A single engineManager per connection holds one "engine_type" at a time.
-    // We cannot tell from the coordinator whether the currently-running engine
-    // is the main/live/preset variant, so we report `running=engineRunning` for
-    // every flag that is ON. That is still useful for drift detection:
-    //   - flag ON + running OFF  → drift (user expects engine, it is not up)
-    //   - flag OFF + running ON  → drift (engine up but user disabled)
-    const buildState = (flag: boolean) => ({
+    // Correct semantics now that Live/Preset are mode flags on a single engine
+    // (not separate engines). One TradeEngineManager per connection services all
+    // three modes — it checks the flag each cycle.
+    //
+    //   Enable slider:  inSync = flagEnabled === engineRunning
+    //                   (toggling Enable start/stops the engine directly)
+    //
+    //   Live / Preset:  inSync requires the engine to be running when the flag
+    //                   is ON (otherwise the flag has no effect). When the flag
+    //                   is OFF, inSync is always true — no engine is required.
+    const buildEnableState = (flag: boolean) => ({
       flag,
       running: engineRunning,
-      // `inSync` is `true` when both are on or both are off.
       inSync: flag === engineRunning,
+    })
+    const buildModeState = (flag: boolean) => ({
+      flag,
+      // "running" for mode flags = "engine is up and will pick up this flag"
+      running: engineRunning,
+      // Mode flag is in sync whenever it is OFF, or when it is ON and the
+      // engine is actually running to service it.
+      inSync: flag ? engineRunning : true,
     })
 
     return NextResponse.json(
@@ -89,9 +100,9 @@ export async function GET(
         connectionId,
         engineRunning,
         runningHint,
-        enabled: buildState(flagEnabled),
-        live: buildState(flagLive),
-        preset: buildState(flagPreset),
+        enabled: buildEnableState(flagEnabled),
+        live: buildModeState(flagLive),
+        preset: buildModeState(flagPreset),
         timestamp: new Date().toISOString(),
       },
       { headers }

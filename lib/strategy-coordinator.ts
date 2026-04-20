@@ -227,12 +227,19 @@ export class StrategyCoordinator {
     await setSettings(baseKey, { sets: baseSets, count: baseSets.length, created: new Date() })
 
     // Write Base counts to progression hash so stats API and dashboard read accurate per-stage counts.
-    // Use hset (not hincrby) so the count reflects actual current Sets, not accumulation across cycles.
+    // CRITICAL: Use hincrby (cumulative) not hset (snapshot). Previously each cycle overwrote the
+    // value with the current cycle's count, which made the dashboard oscillate between high/low
+    // values every few seconds ("jumping more and less"). The per-cycle snapshot is still
+    // available in `strategy_detail:{connId}:base` (`created_sets` field).
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      await client.hset(redisKey, "strategies_base_total", String(baseSets.length))
-      await client.hset(redisKey, "strategies_base_evaluated", String(baseSets.length))
+      if (baseSets.length > 0) {
+        await client.hincrby(redisKey, "strategies_base_total", baseSets.length)
+        await client.hincrby(redisKey, "strategies_base_evaluated", baseSets.length)
+      }
+      // Always write the current-cycle snapshot so UI can show "this cycle" counts separately.
+      await client.hset(redisKey, "strategies_base_current", String(baseSets.length))
       await client.expire(redisKey, 7 * 24 * 60 * 60)
 
       // Write strategy_detail:{connId}:base — read by /stats route for avg PF, DDT, pass ratio
@@ -358,12 +365,20 @@ export class StrategyCoordinator {
     const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
     await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
 
-    // Write Main counts to progression hash — use hset so value reflects current cycle, not accumulation.
+    // Write Main counts to progression hash — CUMULATIVE via hincrby so the dashboard
+    // does not oscillate with per-cycle snapshots (see matching fix in createBaseSets).
+    // Per-cycle snapshot is kept in `strategies_main_current` for components that want it.
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      await client.hset(redisKey, "strategies_main_total", String(baseSets.length))     // base sets evaluated this cycle
-      await client.hset(redisKey, "strategies_main_evaluated", String(mainSets.length)) // sets that passed to Main
+      if (baseSets.length > 0) {
+        await client.hincrby(redisKey, "strategies_main_total", baseSets.length)
+      }
+      if (mainSets.length > 0) {
+        await client.hincrby(redisKey, "strategies_main_evaluated", mainSets.length)
+      }
+      // Current-cycle snapshot
+      await client.hset(redisKey, "strategies_main_current", String(mainSets.length))
       await client.expire(redisKey, 7 * 24 * 60 * 60)
 
       // Write strategy_detail:{connId}:main and update base detail's passed_sets
@@ -447,12 +462,20 @@ export class StrategyCoordinator {
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
     await setSettings(realKey, { sets: realSets, count: realSets.length, created: new Date() })
 
-    // Write Real counts to progression hash — use hset so value reflects current cycle, not accumulation.
+    // Write Real counts to progression hash — CUMULATIVE via hincrby so the dashboard
+    // doesn't oscillate with per-cycle snapshots (see matching fix in createBaseSets/createMainSets).
+    // Per-cycle snapshot is kept in `strategies_real_current` for components that want it.
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      await client.hset(redisKey, "strategies_real_total", String(mainSets.length))      // main sets evaluated this cycle
-      await client.hset(redisKey, "strategies_real_evaluated", String(realSets.length))  // sets that passed to Real
+      if (mainSets.length > 0) {
+        await client.hincrby(redisKey, "strategies_real_total", mainSets.length)
+      }
+      if (realSets.length > 0) {
+        await client.hincrby(redisKey, "strategies_real_evaluated", realSets.length)
+      }
+      // Current-cycle snapshot
+      await client.hset(redisKey, "strategies_real_current", String(realSets.length))
       await client.expire(redisKey, 7 * 24 * 60 * 60)
 
       // Write strategy_detail:{connId}:real with full metrics including posEvalReal

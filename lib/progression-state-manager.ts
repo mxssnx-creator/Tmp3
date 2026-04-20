@@ -171,25 +171,36 @@ export class ProgressionStateManager {
 
       const redisKey = `progression:${connectionId}`
 
-      // Read current values from Redis first (to handle server restarts)
-      let existing: Record<string, string> = {}
+      // CRITICAL FIX: use atomic hincrby instead of read-modify-write hset.
+      // Three processors (indication/strategy/realtime) call incrementCycle
+      // concurrently. The old read-then-write pattern had a race window that
+      // dropped updates, which contributed to jumping/inconsistent counters
+      // across refreshes. hincrby is atomic at the Redis level.
+      let newCompleted = 0
+      let newSuccessful = 0
+      let newFailed = 0
       try {
-        existing = await client.hgetall(redisKey)
+        newCompleted = await client.hincrby(redisKey, "cycles_completed", 1)
+        if (successful) {
+          newSuccessful = await client.hincrby(redisKey, "successful_cycles", 1)
+          // Read failed without incrementing (small extra call, avoids race)
+          newFailed = parseInt(
+            ((await client.hget(redisKey, "failed_cycles")) as any) || "0",
+            10,
+          )
+        } else {
+          newFailed = await client.hincrby(redisKey, "failed_cycles", 1)
+          newSuccessful = parseInt(
+            ((await client.hget(redisKey, "successful_cycles")) as any) || "0",
+            10,
+          )
+        }
       } catch (e) {
-        console.warn(`[v0] Failed to read progression data for ${connectionId}:`, e)
+        console.warn(`[v0] Failed to increment progression counters for ${connectionId}:`, e)
         return
       }
 
-      const currentCompleted = parseInt(existing?.cycles_completed || "0", 10)
-      const currentSuccessful = parseInt(existing?.successful_cycles || "0", 10)
-      const currentFailed = parseInt(existing?.failed_cycles || "0", 10)
-
-      // Increment based on Redis values
-      const newCompleted = currentCompleted + 1
-      const newSuccessful = successful ? currentSuccessful + 1 : currentSuccessful
-      const newFailed = successful ? currentFailed : currentFailed + 1
-
-      // Update local counter for tracking
+      // Update local counter for tracking (best-effort mirror; not authoritative)
       this.cycleCounters.set(connectionId, {
         completed: newCompleted,
         successful: newSuccessful,
@@ -198,22 +209,18 @@ export class ProgressionStateManager {
 
       const successRate = newCompleted > 0 ? (newSuccessful / newCompleted) * 100 : 0
 
-      // Write update to Redis
+      // Write metadata (non-counter fields) with hset — these are just
+      // timestamps/labels, not counters, so overwriting is correct.
       try {
         await client.hset(redisKey, {
-          cycles_completed: String(newCompleted),
-          successful_cycles: String(newSuccessful),
-          failed_cycles: String(newFailed),
           cycle_success_rate: String(successRate.toFixed(2)),
           last_cycle_time: new Date().toISOString(),
           last_update: new Date().toISOString(),
           connection_id: connectionId,
         })
-
-        // Set expiration
         await client.expire(redisKey, 7 * 24 * 60 * 60)
       } catch (writeError) {
-        console.warn(`[v0] Failed to write progression data for ${connectionId}:`, writeError)
+        console.warn(`[v0] Failed to write progression metadata for ${connectionId}:`, writeError)
         return
       }
 
