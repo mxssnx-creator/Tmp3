@@ -272,6 +272,18 @@ export class TradeEngineManager {
         this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
       }
 
+      // CRITICAL: Mark the engine as running BEFORE scheduling any processor
+      // ticks. The processor loops are self-scheduling setTimeout chains that
+      // guard every tick with `if (!this.isRunning) return` to terminate cleanly
+      // on stop(). If we flip isRunning to true AFTER calling startIndicationProcessor
+      // (as earlier revisions did), the very first tick fires at 0 ms with
+      // isRunning still false, exits without rescheduling, and the processor
+      // never runs — which is exactly why strategy/real/live pipelines were
+      // producing zero output. We keep the bottom-of-start() assignments as a
+      // belt-and-braces no-op.
+      this.isRunning = true
+      this.startTime = new Date()
+
       // Phase 3-4: Start indication and strategy processors
       await this.updateProgressionPhase("indications", 60, "Processing indications continuously")
       this.startIndicationProcessor(config.indicationInterval)
@@ -308,10 +320,10 @@ export class TradeEngineManager {
       this.startHealthMonitoring()
       this.startHeartbeat()
       
-      // Phase 6: Live trading ready
-      this.isRunning = true
+      // Phase 6: Live trading ready — isRunning/startTime already set before
+      // processors started (see note above). We only clear the isStarting flag
+      // here so that a second concurrent start() call now sees an idle engine.
       this.isStarting = false
-      this.startTime = new Date()
       await this.updateProgressionPhase("live_trading", 100, `Live trading ACTIVE - monitoring ${symbols.length} symbols`)
       
       // Log final initialization success
@@ -358,12 +370,16 @@ export class TradeEngineManager {
       // (indication/strategy/realtime are now setTimeout-based; healthCheck/heartbeat
       // remain setInterval. clearInterval and clearTimeout are interchangeable on
       // Node.js Timeouts but we use clearTimeout where appropriate for clarity.)
+      // Flip isRunning off BEFORE clearing timers so any in-flight tick that
+      // hasn't been cancelled yet will see isRunning=false on its next check
+      // and abort cleanly without rescheduling.
+      this.isRunning = false
       if (this.indicationTimer) { clearTimeout(this.indicationTimer); this.indicationTimer = undefined }
       if (this.strategyTimer)   { clearTimeout(this.strategyTimer);   this.strategyTimer = undefined }
       if (this.realtimeTimer)   { clearTimeout(this.realtimeTimer);   this.realtimeTimer = undefined }
       if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = undefined }
       if (this.heartbeatTimer)   { clearInterval(this.heartbeatTimer);   this.heartbeatTimer = undefined }
-      
+
       await this.updateProgressionPhase("error", 0, errorMsg)
       await this.updateEngineState("error", errorMsg)
       await this.setRunningFlag(false)
@@ -394,6 +410,11 @@ export class TradeEngineManager {
   async stop(): Promise<void> {
     console.log("[v0] Stopping trade engine for connection:", this.connectionId)
 
+    // Flip isRunning off FIRST so that any currently-executing tick body
+    // (which may be mid-await when stop() is called) will see isRunning=false
+    // before calling scheduleNext() and will not re-arm its timer.
+    this.isRunning = false
+
     // Clear all timers. Processor loops are setTimeout-based; health/heartbeat
     // are still setInterval. clearTimeout + clearInterval are the same kernel
     // primitive in Node, but we keep the semantically correct one per timer.
@@ -417,8 +438,6 @@ export class TradeEngineManager {
       clearInterval(this.heartbeatTimer)
       this.heartbeatTimer = undefined
     }
-
-    this.isRunning = false
 
     // Update engine state and clear running flag
     await this.updateEngineState("stopped")
