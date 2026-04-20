@@ -10,6 +10,13 @@ export interface Settings {
   negativeChangePercent: number
   leveragePercentage: number
   prehistoricDataDays: number
+  /**
+   * Hours of prehistoric (historical) candle data to load on engine start.
+   * UI: slider 1-50 hours, step 1, default 8. Stored in Redis under
+   * `app_settings.prehistoric_range_hours` (snake_case is intentional — the
+   * engine-manager reads from this exact key).
+   */
+  prehistoric_range_hours: number
   marketTimeframe: number
   tradeIntervalSeconds: number
   realPositionsIntervalSeconds: number
