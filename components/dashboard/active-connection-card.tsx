@@ -426,15 +426,11 @@ export function ActiveConnectionCard({
     return () => clearInterval(interval)
   }, [globalEngineRunning, connection.connectionId, connection.isActive])
 
-  // Handle Live Trade toggle
+  // Handle Live Trade toggle — no longer gated on connection.isActive:
+  // the /live-trade route auto-starts the engine when Live is turned on,
+  // so the user can flip Live and the engine comes up with the flag set.
   const handleLiveTradeToggle = async (newState: boolean) => {
     const connName = connection.exchangeName
-    // Validation — connection must be enabled first
-    if (newState && !connection.isActive) {
-      toast.error("Enable the connection toggle first")
-      return
-    }
-
     setLiveTradeLoading(true)
     try {
       const res = await fetch(`/api/settings/connections/${connection.connectionId}/live-trade`, {
@@ -464,12 +460,9 @@ export function ActiveConnectionCard({
     }
   }
 
-  // Handle Preset Mode toggle
+  // Handle Preset Mode toggle — no longer gated on connection.isActive,
+  // same rationale as handleLiveTradeToggle above.
   const handlePresetModeToggle = async (newState: boolean) => {
-    if (newState && !connection.isActive) {
-      toast.error("Enable the connection toggle first")
-      return
-    }
     setPresetModeLoading(true)
     try {
       const res = await fetch(`/api/settings/connections/${connection.connectionId}/preset-toggle`, {
@@ -672,13 +665,15 @@ export function ActiveConnectionCard({
 
               <Separator orientation="vertical" className="h-4" />
 
-              {/* Live Trade toggle */}
+              {/* Live Trade toggle — independent mode flag. The route will start the
+                  engine automatically if it is not already running, so we no longer
+                  disable the switch just because Enable is off. */}
               <div className="flex items-center gap-2">
                 <Switch
                   id={`live-${connection.connectionId}`}
                   checked={liveTrade}
                   onCheckedChange={handleLiveTradeToggle}
-                  disabled={liveTradeLoading || !connection.isActive}
+                  disabled={liveTradeLoading}
                   className="scale-[0.8]"
                 />
                 <Label
@@ -708,13 +703,13 @@ export function ActiveConnectionCard({
 
               <Separator orientation="vertical" className="h-4" />
 
-              {/* Preset Mode toggle */}
+              {/* Preset Mode toggle — independent mode flag, same semantics as Live. */}
               <div className="flex items-center gap-2">
                 <Switch
                   id={`preset-${connection.connectionId}`}
                   checked={presetMode}
                   onCheckedChange={handlePresetModeToggle}
-                  disabled={presetModeLoading || !connection.isActive}
+                  disabled={presetModeLoading}
                   className="scale-[0.8]"
                 />
                 <Label
