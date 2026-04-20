@@ -53,13 +53,14 @@ export async function GET(
     const engineRunning =
       !!coordinator && coordinator.isEngineRunning(connectionId)
 
-    // Redis hint key for stale-flag detection — written by the coordinator on
-    // successful startup and cleared on stop. If the in-memory manager is
-    // missing but this hint is still "1", we treat it as stale drift.
+    // Redis hint key for stale-flag detection — written by the delete route
+    // (and future reconciliation code) as a hash like { running, cleared_at }.
+    // Used as a tiebreaker when the in-memory manager is missing.
     let runningHint = false
     try {
       const hint = await getSettings(`engine_is_running:${connectionId}`)
-      runningHint = hint === "true" || hint === true || hint === "1"
+      const raw = hint && typeof hint === "object" ? (hint as any).running : hint
+      runningHint = raw === true || raw === "true" || raw === 1 || raw === "1"
     } catch {
       /* non-critical */
     }
