@@ -149,13 +149,17 @@ export function ActiveConnectionCard({
     basePassRatio: number
     mainPassRatio: number
     realPassRatio: number
+    livePassRatio: number
     avgProfitFactorBase: number
     avgProfitFactorMain: number
     avgProfitFactorReal: number
+    avgProfitFactorLive: number
     avgDrawdownTimeBase: number
     avgDrawdownTimeMain: number
     avgDrawdownTimeReal: number
+    avgHoldTimeLive: number
     avgPosEvalReal: number
+    avgPosEvalLive: number   // avg realised ROI per closed position
     // Evaluated / passed counts per stage
     baseEvaluated: number
     basePassed: number
@@ -163,7 +167,13 @@ export function ActiveConnectionCard({
     mainPassed: number
     realEvaluated: number
     realPassed: number
+    liveEvaluated: number
+    livePassed: number
     countPosEvalReal: number
+    countPosEvalLive: number
+    liveTotalPnl: number
+    liveAvgPnl: number
+    liveAvgPosSizeUsd: number
     // Live exchange execution metrics
     liveOrdersPlaced: number
     liveOrdersFilled: number
@@ -301,13 +311,17 @@ export function ActiveConnectionCard({
           basePassRatio:       sd.base?.passRatio      || 0,
           mainPassRatio:       sd.main?.passRatio      || 0,
           realPassRatio:       sd.real?.passRatio      || 0,
+          livePassRatio:       sd.live?.passRatio      || 0,
           avgProfitFactorBase: sd.base?.avgProfitFactor || 0,
           avgProfitFactorMain: sd.main?.avgProfitFactor || 0,
           avgProfitFactorReal: sd.real?.avgProfitFactor || 0,
+          avgProfitFactorLive: sd.live?.avgProfitFactor || 0,
           avgDrawdownTimeBase: sd.base?.avgDrawdownTime || 0,
           avgDrawdownTimeMain: sd.main?.avgDrawdownTime || 0,
           avgDrawdownTimeReal: sd.real?.avgDrawdownTime || 0,
+          avgHoldTimeLive:     sd.live?.avgDrawdownTime || 0, // minutes
           avgPosEvalReal:      sd.real?.avgPosEvalReal  || 0,
+          avgPosEvalLive:      sd.live?.avgPosEvalReal  || 0, // ROI fraction
           // Evaluated / passed counts from per-stage detail
           baseEvaluated:    sd.base?.evaluated   || (strat.base || 0),
           basePassed:       sd.base?.passed       || (strat.main || 0),
@@ -315,7 +329,13 @@ export function ActiveConnectionCard({
           mainPassed:       sd.main?.passed       || (strat.real || 0),
           realEvaluated:    sd.real?.evaluated   || (strat.real || 0),
           realPassed:       sd.real?.passed       || (strat.real || 0),
+          liveEvaluated:    sd.live?.evaluated   || 0,  // orders placed
+          livePassed:       sd.live?.passed      || 0,  // orders filled
           countPosEvalReal: sd.real?.countPosEval || 0,
+          countPosEvalLive: sd.live?.countPosEval || 0,
+          liveTotalPnl:     sd.live?.totalPnl    || 0,
+          liveAvgPnl:       sd.live?.avgPnl      || 0,
+          liveAvgPosSizeUsd: sd.live?.avgPosPerSet || 0,
           // Live exchange execution
           liveOrdersPlaced:      json?.liveExecution?.ordersPlaced     || 0,
           liveOrdersFilled:      json?.liveExecution?.ordersFilled     || 0,
@@ -828,10 +848,10 @@ export function ActiveConnectionCard({
                     )}
 
                     {/* Strategy stages breakdown */}
-                    {prehistoricStats && (prehistoricStats.stratBase > 0 || prehistoricStats.stratMain > 0 || prehistoricStats.stratReal > 0) && (
+                    {prehistoricStats && (prehistoricStats.stratBase > 0 || prehistoricStats.stratMain > 0 || prehistoricStats.stratReal > 0 || prehistoricStats.livePositionsCreated > 0) && (
                       <div className="space-y-1">
                         <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Strategy Sets</div>
-                        {/* Stage rows: Base → Main → Real */}
+                        {/* Stage rows: Base → Main → Real → Live (exchange-side outcomes) */}
                         {[
                           {
                             label: "Base",
@@ -844,6 +864,7 @@ export function ActiveConnectionCard({
                             avgPosEval: null as number | null,
                             countPosEval: null as number | null,
                             color: "text-blue-600 dark:text-blue-400",
+                            isLive: false,
                           },
                           {
                             label: "Main",
@@ -856,6 +877,7 @@ export function ActiveConnectionCard({
                             avgPosEval: null as number | null,
                             countPosEval: null as number | null,
                             color: "text-purple-600 dark:text-purple-400",
+                            isLive: false,
                           },
                           {
                             label: "Real",
@@ -868,24 +890,41 @@ export function ActiveConnectionCard({
                             avgPosEval: prehistoricStats.avgPosEvalReal,
                             countPosEval: prehistoricStats.countPosEvalReal,
                             color: "text-green-600 dark:text-green-400",
+                            isLive: false,
                           },
-                        ].map(({ label, count, evaluated, passed, passRatio, avgPF, avgDDT, avgPosEval, countPosEval, color }) => (
+                          {
+                            // Live tier — real exchange positions history, sourced from
+                            // local Redis archive (no exchange history calls).
+                            label: "Live",
+                            count:     prehistoricStats.livePositionsCreated,
+                            evaluated: prehistoricStats.liveEvaluated,  // orders placed
+                            passed:    prehistoricStats.livePassed,     // orders filled
+                            passRatio: prehistoricStats.livePassRatio,  // fill rate %
+                            avgPF:     prehistoricStats.avgProfitFactorLive,
+                            avgDDT:    prehistoricStats.avgHoldTimeLive, // avg hold time
+                            avgPosEval: prehistoricStats.avgPosEvalLive, // realised ROI
+                            countPosEval: prehistoricStats.countPosEvalLive,
+                            color: "text-amber-600 dark:text-amber-400",
+                            isLive: true,
+                          },
+                        ].map(({ label, count, evaluated, passed, passRatio, avgPF, avgDDT, avgPosEval, countPosEval, color, isLive }) => (
                           count > 0 && (
                             <div key={label} className="space-y-0.5">
-                              {/* Main row: label, sets count, pass ratio, PF */}
+                              {/* Main row: label, sets/positions count, pass/fill ratio, PF */}
                               <div className="flex items-center gap-2 text-[10px]">
                                 <span className={`font-semibold w-7 shrink-0 ${color}`}>{label}</span>
                                 <span className="font-semibold tabular-nums">
-                                  {count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count} sets
+                                  {count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count} {isLive ? "pos" : "sets"}
                                 </span>
                                 {evaluated > 0 && (
                                   <span className="text-muted-foreground">
-                                    eval <span className="text-foreground font-medium tabular-nums">
+                                    {isLive ? "placed " : "eval "}
+                                    <span className="text-foreground font-medium tabular-nums">
                                       {evaluated >= 1000 ? `${(evaluated / 1000).toFixed(1)}K` : evaluated}
                                     </span>
                                     {passed > 0 && (
                                       <span className="text-foreground font-medium tabular-nums ml-0.5">
-                                        /{passed >= 1000 ? `${(passed / 1000).toFixed(1)}K` : passed} pass
+                                        /{passed >= 1000 ? `${(passed / 1000).toFixed(1)}K` : passed} {isLive ? "filled" : "pass"}
                                       </span>
                                     )}
                                   </span>
@@ -903,13 +942,13 @@ export function ActiveConnectionCard({
                                   </span>
                                 </span>
                                 <span className="text-muted-foreground">
-                                  DDT <span className="text-foreground font-medium">
+                                  {isLive ? "Hold" : "DDT"} <span className="text-foreground font-medium">
                                     {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "—"}
                                   </span>
                                 </span>
                               </div>
                               {/* Real-stage extra row: PosEval avg + count */}
-                              {avgPosEval !== null && (
+                              {avgPosEval !== null && !isLive && (
                                 <div className="flex items-center gap-2 text-[10px] pl-7">
                                   <span className="text-muted-foreground">PosEval avg</span>
                                   <span className={`font-medium ${avgPosEval >= 0.7 ? "text-green-600 dark:text-green-400" : avgPosEval >= 0.4 ? "text-amber-600 dark:text-amber-400" : "text-foreground"}`}>
@@ -918,6 +957,32 @@ export function ActiveConnectionCard({
                                   {countPosEval !== null && countPosEval > 0 && (
                                     <span className="text-muted-foreground">
                                       count <span className="text-foreground font-medium tabular-nums">{countPosEval}</span>
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                              {/* Live-tier exclusive sub-row: realised ROI, win-rate, total PnL */}
+                              {isLive && (
+                                <div className="flex items-center gap-2 text-[10px] pl-7">
+                                  <span className="text-muted-foreground">ROI avg</span>
+                                  <span className={`font-medium tabular-nums ${avgPosEval > 0 ? "text-green-600 dark:text-green-400" : avgPosEval < 0 ? "text-red-500" : "text-foreground"}`}>
+                                    {avgPosEval !== 0 ? `${(avgPosEval * 100).toFixed(2)}%` : "—"}
+                                  </span>
+                                  <span className="text-muted-foreground">
+                                    WR <span className={`font-medium ${prehistoricStats.liveWinRate >= 60 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveWinRate >= 40 ? "text-amber-600 dark:text-amber-400" : "text-red-500"}`}>
+                                      {prehistoricStats.liveWinRate > 0 ? `${prehistoricStats.liveWinRate.toFixed(1)}%` : "—"}
+                                    </span>
+                                  </span>
+                                  <span className="text-muted-foreground ml-auto">
+                                    PnL <span className={`font-semibold tabular-nums ${prehistoricStats.liveTotalPnl > 0 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveTotalPnl < 0 ? "text-red-500" : "text-foreground"}`}>
+                                      {prehistoricStats.liveTotalPnl !== 0
+                                        ? `${prehistoricStats.liveTotalPnl > 0 ? "+" : ""}$${Math.abs(prehistoricStats.liveTotalPnl).toFixed(2)}`
+                                        : "—"}
+                                    </span>
+                                  </span>
+                                  {countPosEval !== null && countPosEval > 0 && (
+                                    <span className="text-muted-foreground">
+                                      n=<span className="text-foreground font-medium tabular-nums">{countPosEval}</span>
                                     </span>
                                   )}
                                 </div>

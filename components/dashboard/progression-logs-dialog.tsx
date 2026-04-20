@@ -366,11 +366,13 @@ export function ProgressionLogsDialog({
                       Total: {fmt(bd?.strategies.total || rt?.strategiesTotal || 0)}
                     </span>
                   </div>
-                  <div className="grid grid-cols-3 gap-3 text-center text-xs">
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-center text-xs">
                     {[
                       { label: "Base", value: bd?.strategies.base || 0, eval: bd?.strategies.baseEvaluated || 0, cls: "text-orange-700 dark:text-orange-400", bg: "bg-orange-50 dark:bg-orange-950" },
                       { label: "Main", value: bd?.strategies.main || 0, eval: bd?.strategies.mainEvaluated || 0, cls: "text-yellow-700 dark:text-yellow-400", bg: "bg-yellow-50 dark:bg-yellow-950" },
                       { label: "Real", value: bd?.strategies.real || 0, eval: bd?.strategies.realEvaluated || 0, cls: "text-green-700 dark:text-green-400",  bg: "bg-green-50 dark:bg-green-950" },
+                      // Live = exchange-side tracked locally (no exchange-history fetch)
+                      { label: "Live", value: bd?.strategies.live || 0, eval: 0,                                   cls: "text-amber-700 dark:text-amber-400",  bg: "bg-amber-50 dark:bg-amber-950" },
                     ].map(({ label, value, eval: evaluated, cls, bg }) => (
                       <div key={label} className={`rounded-lg ${bg} p-3`}>
                         <div className={`text-xl font-bold tabular-nums ${cls}`}>{fmt(value)}</div>

@@ -21,6 +21,20 @@ interface StratDetail {
   avgProfitFactor: number
   avgProcessingTimeMs: number
   evalPct: number
+  // Shared optional fields also present on real and live tiers
+  avgPosEvalReal?: number
+  countPosEval?: number
+  avgDrawdownTime?: number
+  passRatio?: number
+  evaluated?: number
+  passed?: number
+  failed?: number
+  // Live-exclusive fields (populated only for strategyDetail.live)
+  winRate?: number
+  totalPnl?: number
+  avgPnl?: number
+  openPositions?: number
+  volumeUsdTotal?: number
 }
 
 interface StatsResponse {
@@ -38,7 +52,7 @@ interface StatsResponse {
     strategies: { base: number; main: number; real: number; live: number; total: number
                   baseEvaluated: number; mainEvaluated: number; realEvaluated: number }
   }
-  strategyDetail: { base: StratDetail; main: StratDetail; real: StratDetail }
+  strategyDetail: { base: StratDetail; main: StratDetail; real: StratDetail; live?: StratDetail }
   windows: { indications: { last5m: number; last60m: number }; strategies: { last5m: number; last60m: number } }
   metadata: { engineRunning: boolean; phase: string; progress: number; message: string; lastUpdate: string }
 }
@@ -292,13 +306,18 @@ export function QuickstartOverviewDialog() {
                 <Zap className="w-3.5 h-3.5 text-amber-500" />
                 Strategies Summary
               </div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
                 <StatCell label="Base" value={fmt(bd?.strategies.base || 0)} accent="text-orange-600 dark:text-orange-400" />
                 <StatCell label="Main" value={fmt(bd?.strategies.main || 0)} accent="text-yellow-600 dark:text-yellow-400"
                   sub={bd?.strategies.base ? `${pct(bd.strategies.main, bd.strategies.base)} of Base` : undefined}
                 />
                 <StatCell label="Real" value={fmt(bd?.strategies.real || 0)} accent="text-green-600 dark:text-green-400"
                   sub={bd?.strategies.main ? `${pct(bd.strategies.real, bd.strategies.main)} of Main` : undefined}
+                />
+                {/* Live = real exchange positions, tracked locally — so the UI
+                    can show exchange-side outcomes without an exchange fetch. */}
+                <StatCell label="Live" value={fmt(sd?.live?.createdSets || 0)} accent="text-amber-600 dark:text-amber-400"
+                  sub={bd?.strategies.real ? `${pct(sd?.live?.createdSets || 0, bd.strategies.real)} of Real` : undefined}
                 />
               </div>
             </div>
@@ -483,6 +502,19 @@ export function QuickstartOverviewDialog() {
               detail={sd?.real}
               accentCls="text-green-600 dark:text-green-400"
               bgCls="bg-green-50/50 dark:bg-green-950/20 border-green-200/50 dark:border-green-800/30"
+            />
+
+            {/* Live = real exchange positions history, tracked locally in Redis.
+                No exchange-history call required — strategyDetail.live is derived
+                from the progression counters + closed-position archive. */}
+            <StratSection
+              label="Live"
+              count={sd?.live?.createdSets || 0}
+              evaluated={sd?.live?.evaluated || 0}
+              evaluatedOf={bd?.strategies.real || 0}
+              detail={sd?.live}
+              accentCls="text-amber-600 dark:text-amber-400"
+              bgCls="bg-amber-50/50 dark:bg-amber-950/20 border-amber-200/50 dark:border-amber-800/30"
             />
 
             <div className="rounded-md border p-2.5">
