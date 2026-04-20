@@ -856,33 +856,40 @@ export async function getLivePositions(connectionId: string): Promise<LivePositi
   const client = getRedisClient()
   try {
     const ids = ((await client.lrange(`live:positions:${connectionId}`, 0, 500).catch(() => [])) || []) as string[]
-    const positions: LivePosition[] = []
+
+    // Deduplicate while preserving order — the open index may contain stale
+    // duplicates from retried writes.
+    const uniqueIds: string[] = []
     const seen = new Set<string>()
     for (const id of ids) {
       if (seen.has(id)) continue
       seen.add(id)
-      const data = await client.get(`live:position:${id}`)
-      if (data) {
-        try {
-          positions.push(JSON.parse(data as string))
-        } catch {
-          /* ignore */
-        }
+      uniqueIds.push(id)
+    }
+
+    // Batch all GETs into a single concurrent fan-out. Previously each id
+    // paid a full Redis round-trip; with 500 open positions that was ~500
+    // sequential awaits. Promise.all collapses them into one RTT window.
+    const positions: LivePosition[] = []
+    if (uniqueIds.length > 0) {
+      const rawValues = await Promise.all(
+        uniqueIds.map((id) => client.get(`live:position:${id}`).catch(() => null)),
+      )
+      for (const data of rawValues) {
+        if (!data) continue
+        try { positions.push(JSON.parse(data as string)) } catch { /* ignore */ }
       }
     }
     if (positions.length > 0) return positions
 
     // Fallback scan if the index is empty.
     const keys = ((await client.keys(`live:position:live:${connectionId}:*`).catch(() => [])) || []) as string[]
-    for (const key of keys) {
-      const data = await client.get(key)
-      if (data) {
-        try {
-          positions.push(JSON.parse(data as string))
-        } catch {
-          /* ignore */
-        }
-      }
+    if (keys.length === 0) return positions
+
+    const rawFallback = await Promise.all(keys.map((k) => client.get(k).catch(() => null)))
+    for (const data of rawFallback) {
+      if (!data) continue
+      try { positions.push(JSON.parse(data as string)) } catch { /* ignore */ }
     }
     return positions
   } catch (err) {
@@ -914,19 +921,25 @@ export async function getClosedLivePositions(
   const client = getRedisClient()
   try {
     const ids = ((await client.lrange(`live:positions:${connectionId}:closed`, 0, limit - 1).catch(() => [])) || []) as string[]
-    const positions: LivePosition[] = []
+
+    // Deduplicate + batch GETs concurrently (same rationale as getLivePositions).
+    const uniqueIds: string[] = []
     const seen = new Set<string>()
     for (const id of ids) {
       if (seen.has(id)) continue
       seen.add(id)
-      const data = await client.get(`live:position:${id}`)
-      if (data) {
-        try {
-          positions.push(JSON.parse(data as string))
-        } catch {
-          /* ignore malformed */
-        }
-      }
+      uniqueIds.push(id)
+    }
+
+    const positions: LivePosition[] = []
+    if (uniqueIds.length === 0) return positions
+
+    const rawValues = await Promise.all(
+      uniqueIds.map((id) => client.get(`live:position:${id}`).catch(() => null)),
+    )
+    for (const data of rawValues) {
+      if (!data) continue
+      try { positions.push(JSON.parse(data as string)) } catch { /* ignore malformed */ }
     }
     return positions
   } catch (err) {
@@ -1028,12 +1041,11 @@ export async function reconcileLivePositions(
   }
 
   try {
-    const openPositions = [
-      ...(await getLivePositionsByStatus(connectionId, "open")),
-      ...(await getLivePositionsByStatus(connectionId, "filled")),
-      ...(await getLivePositionsByStatus(connectionId, "partially_filled")),
-      ...(await getLivePositionsByStatus(connectionId, "placed")),
-    ]
+    // One index scan instead of four — see identical fix in syncWithExchange().
+    const allOpen = await getLivePositions(connectionId)
+    const openPositions = allOpen.filter(
+      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
+    )
 
     if (openPositions.length === 0) return summary
 
@@ -1109,25 +1121,32 @@ export async function reconcileLivePositions(
           const closedIndexKey = `live:positions:${connectionId}:closed`
           const movedMarker    = `live:positions:${connectionId}:moved:${pos.id}`
 
+          // Persist the updated position, then check the idempotent move
+          // marker so we don't double-archive. Everything after the marker
+          // check is independent — fan it out in a single Promise.all so each
+          // reconciliation pays one RTT window instead of ~7 sequential ones.
           await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
-
           const alreadyMoved = await client.get(movedMarker).catch(() => null)
-          if (!alreadyMoved) {
-            await client.lrem(openIndexKey, 0, pos.id).catch(() => {})
-            await client.lpush(closedIndexKey, pos.id).catch(() => {})
-            await client.ltrim(closedIndexKey, 0, 4999).catch(() => {})
-            await client.expire(closedIndexKey, 30 * 24 * 60 * 60).catch(() => {})
-            await client.setex(movedMarker, 604800, "1").catch(() => {})
-          }
 
-          // Metrics + lock release
           const progKey = `progression:${connectionId}`
-          await client.hincrby(progKey, "live_positions_closed_count", 1).catch(() => {})
+          const writes: Promise<any>[] = [
+            client.hincrby(progKey, "live_positions_closed_count", 1).catch(() => {}),
+            client.expire(progKey, 7 * 24 * 60 * 60).catch(() => {}),
+            client.del(`live:lock:${connectionId}:${pos.symbol}:${pos.direction}`).catch(() => {}),
+          ]
           if (realizedPnl > 0) {
-            await client.hincrby(progKey, "live_wins_count", 1).catch(() => {})
+            writes.push(client.hincrby(progKey, "live_wins_count", 1).catch(() => {}))
           }
-          await client.expire(progKey, 7 * 24 * 60 * 60).catch(() => {})
-          await client.del(`live:lock:${connectionId}:${pos.symbol}:${pos.direction}`).catch(() => {})
+          if (!alreadyMoved) {
+            writes.push(
+              client.lrem(openIndexKey, 0, pos.id).catch(() => {}),
+              client.lpush(closedIndexKey, pos.id).catch(() => {}),
+              client.ltrim(closedIndexKey, 0, 4999).catch(() => {}),
+              client.expire(closedIndexKey, 30 * 24 * 60 * 60).catch(() => {}),
+              client.setex(movedMarker, 604800, "1").catch(() => {}),
+            )
+          }
+          await Promise.all(writes)
 
           summary.closed++
         }
@@ -1162,12 +1181,17 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
   const client = getRedisClient()
 
   try {
-    const openPositions = [
-      ...(await getLivePositionsByStatus(connectionId, "open")),
-      ...(await getLivePositionsByStatus(connectionId, "filled")),
-      ...(await getLivePositionsByStatus(connectionId, "partially_filled")),
-      ...(await getLivePositionsByStatus(connectionId, "placed")),
-    ]
+    // Previously each status filter triggered a full getLivePositions() scan,
+    // meaning we fetched the same open-positions index from Redis FOUR times
+    // just to bucket by status. Load once, then filter in memory.
+    const allOpen = await getLivePositions(connectionId)
+    const openPositions = allOpen.filter(
+      (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
+    )
+
+    if (openPositions.length === 0) {
+      return
+    }
 
     console.log(`${LOG_PREFIX} Syncing ${openPositions.length} open/placed positions with exchange`)
 

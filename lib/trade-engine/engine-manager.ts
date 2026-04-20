@@ -1354,53 +1354,76 @@ export class TradeEngineManager {
   }
 
   /**
-   * Get symbols for this connection - uses connection's active_symbols first
+   * Get symbols for this connection - uses connection's active_symbols first.
+   *
+   * PERFORMANCE: The engine previously called getSymbols() on every tick across
+   * 3 processors (indication / strategy / realtime) which translated to ~12
+   * Redis reads per second just to resolve a list that changes at most a few
+   * times per day. We now cache the resolved array in memory for 5 seconds so
+   * each 1-second cycle reuses the same lookup. The short TTL keeps UI-driven
+   * symbol changes propagating to the engine within the next tick or two.
    */
+  private _symbolsCache: string[] | null = null
+  private _symbolsCachedAt = 0
+  private static readonly _SYMBOLS_TTL_MS = 5000
+
   private async getSymbols(): Promise<string[]> {
-    try {
-      // First, check connection's configured symbols in Redis
-      const connState = await getSettings(`trade_engine_state:${this.connectionId}`)
-      if (connState && typeof connState === "object") {
-        const connSymbols = (connState as any).symbols || (connState as any).active_symbols
-        if (Array.isArray(connSymbols) && connSymbols.length > 0) {
-          return connSymbols
-        }
-      }
-
-      // Check connection settings directly
-      const connSettings = await getSettings(`connection:${this.connectionId}`)
-      if (connSettings && typeof connSettings === "object") {
-        const symbolsField = (connSettings as any).active_symbols || (connSettings as any).symbols
-        let symbols = symbolsField
-        // Handle JSON string
-        if (typeof symbols === "string") {
-          try {
-            symbols = JSON.parse(symbols)
-          } catch { /* ignore */ }
-        }
-        if (Array.isArray(symbols) && symbols.length > 0) {
-          return symbols
-        }
-      }
-
-      // Fall back to global main symbols setting
-      const useMainSymbols = await getSettings("useMainSymbols")
-      if (useMainSymbols === true || useMainSymbols === "true") {
-        const mainSymbols = await getSettings("mainSymbols")
-        if (Array.isArray(mainSymbols) && mainSymbols.length > 0) {
-          return mainSymbols
-        }
-      }
-
-      // Default symbols - SINGLE HIGH-VOLATILITY ALTCOIN FOR TESTING
-      // DRIFT - focused high-frequency trading test
-      const defaultSymbols = ["DRIFTUSDT"]
-      return defaultSymbols
-    } catch (error) {
-      console.error("[v0] Failed to get symbols, using fallback:", error instanceof Error ? error.message : String(error))
-      // Fallback to test symbol only
-      return ["DRIFTUSDT"]
+    const now = Date.now()
+    if (this._symbolsCache && now - this._symbolsCachedAt < EngineManager._SYMBOLS_TTL_MS) {
+      return this._symbolsCache
     }
+
+    const resolve = async (): Promise<string[]> => {
+      try {
+        // Fire both primary lookups concurrently so the first tick after TTL
+        // expiry doesn't pay two sequential Redis round-trips.
+        const [connState, connSettings] = await Promise.all([
+          getSettings(`trade_engine_state:${this.connectionId}`),
+          getSettings(`connection:${this.connectionId}`),
+        ])
+
+        if (connState && typeof connState === "object") {
+          const connSymbols = (connState as any).symbols || (connState as any).active_symbols
+          if (Array.isArray(connSymbols) && connSymbols.length > 0) return connSymbols
+        }
+
+        if (connSettings && typeof connSettings === "object") {
+          const symbolsField = (connSettings as any).active_symbols || (connSettings as any).symbols
+          let symbols = symbolsField
+          if (typeof symbols === "string") {
+            try { symbols = JSON.parse(symbols) } catch { /* ignore */ }
+          }
+          if (Array.isArray(symbols) && symbols.length > 0) return symbols
+        }
+
+        // Global main-symbols fallback
+        const useMainSymbols = await getSettings("useMainSymbols")
+        if (useMainSymbols === true || useMainSymbols === "true") {
+          const mainSymbols = await getSettings("mainSymbols")
+          if (Array.isArray(mainSymbols) && mainSymbols.length > 0) return mainSymbols
+        }
+
+        return ["DRIFTUSDT"]
+      } catch (error) {
+        console.error("[v0] Failed to get symbols, using fallback:", error instanceof Error ? error.message : String(error))
+        return ["DRIFTUSDT"]
+      }
+    }
+
+    const resolved = await resolve()
+    this._symbolsCache = resolved
+    this._symbolsCachedAt = now
+    return resolved
+  }
+
+  /**
+   * Force-expire the cached symbol list. Call from the heartbeat or when an
+   * admin API updates the connection's active_symbols so the next tick picks
+   * up the new value immediately rather than waiting for the TTL.
+   */
+  public invalidateSymbolsCache(): void {
+    this._symbolsCache = null
+    this._symbolsCachedAt = 0
   }
 
   /**

@@ -127,21 +127,27 @@ export class StrategyCoordinator {
     const results: StrategyEvaluation[] = []
 
     try {
+      // Sets flow BASE → MAIN → REAL → LIVE. Each stage used to re-read its
+      // predecessor's output from Redis via getSettings(); we now pipe the
+      // computed arrays directly between stages in memory to eliminate 3
+      // Redis round-trips per symbol per cycle. Each stage still persists
+      // its own output to Redis for downstream consumers (stats API, dashboard).
+      //
       // STAGE 1: BASE — one Set per (indication_type × direction)
-      const baseResult = await this.createBaseSets(symbol, indications)
+      const { result: baseResult, sets: baseSets } = await this.createBaseSets(symbol, indications)
       results.push(baseResult)
 
       // STAGE 2: MAIN — promote Sets with avgPF >= 1.2, expand config entries
-      const mainResult = await this.createMainSets(symbol)
+      const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets)
       results.push(mainResult)
 
       // STAGE 3: REAL — promote Sets with avgPF >= 1.4
-      const realResult = await this.evaluateRealSets(symbol)
+      const { result: realResult, sets: realSets } = await this.evaluateRealSets(symbol, mainSets)
       results.push(realResult)
 
       // STAGE 4: LIVE — best 500 Sets for execution (skip in prehistoric mode)
       if (!isPrehistoric) {
-        const liveResult = await this.createLiveSets(symbol)
+        const { result: liveResult } = await this.createLiveSets(symbol, realSets)
         results.push(liveResult)
       }
 
@@ -159,7 +165,10 @@ export class StrategyCoordinator {
    * Create one StrategySet per (indication_type × direction) combination.
    * Each Set holds multiple config entries (max 250), but counts as 1 Set.
    */
-  private async createBaseSets(symbol: string, indications: any[]): Promise<StrategyEvaluation> {
+  private async createBaseSets(
+    symbol: string,
+    indications: any[],
+  ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
     // Group indications by (type × direction)
     const setMap = new Map<string, { indicationType: string; direction: "long" | "short"; indications: any[] }>()
 
@@ -234,46 +243,51 @@ export class StrategyCoordinator {
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      if (baseSets.length > 0) {
-        await client.hincrby(redisKey, "strategies_base_total", baseSets.length)
-        await client.hincrby(redisKey, "strategies_base_evaluated", baseSets.length)
-      }
-      // Always write the current-cycle snapshot so UI can show "this cycle" counts separately.
-      await client.hset(redisKey, "strategies_base_current", String(baseSets.length))
-      await client.expire(redisKey, 7 * 24 * 60 * 60)
-
-      // Write strategy_detail:{connId}:base — read by /stats route for avg PF, DDT, pass ratio
+      const detailKey  = `strategy_detail:${this.connectionId}:base`
       const baseAvgPF  = baseSets.length > 0 ? baseSets.reduce((s, st) => s + st.avgProfitFactor, 0) / baseSets.length : 0
       const baseAvgDDT = baseSets.length > 0 ? baseSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / baseSets.length : 0
-      const detailKey  = `strategy_detail:${this.connectionId}:base`
-      await client.hset(detailKey, {
-        created_sets:      String(baseSets.length),
-        avg_profit_factor: String(baseAvgPF.toFixed(4)),
-        avg_drawdown_time: String(Math.round(baseAvgDDT)),
-        evaluated:         String(baseSets.length),
-        passed_sets:       "0",   // will be updated by createMainSets
-        updated_at:        String(Date.now()),
-      })
-      await client.expire(detailKey, 86400)
 
-      // Update evaluated/count counter keys for stats route hierarchy
-      await client.set(`strategies:${this.connectionId}:base:count`, String(baseSets.length))
-      await client.set(`strategies:${this.connectionId}:base:evaluated`, String(baseSets.length))
-      await client.expire(`strategies:${this.connectionId}:base:count`, 86400)
-      await client.expire(`strategies:${this.connectionId}:base:evaluated`, 86400)
+      // Fan-out all independent writes. The awaited chain used to add ~8 Redis
+      // round-trips to every BASE cycle even when nothing had changed; issuing
+      // them concurrently cuts that to a single bounded round-trip window.
+      const writes: Promise<any>[] = [
+        client.hset(redisKey, "strategies_base_current", String(baseSets.length)),
+        client.expire(redisKey, 7 * 24 * 60 * 60),
+        client.hset(detailKey, {
+          created_sets:      String(baseSets.length),
+          avg_profit_factor: String(baseAvgPF.toFixed(4)),
+          avg_drawdown_time: String(Math.round(baseAvgDDT)),
+          evaluated:         String(baseSets.length),
+          passed_sets:       "0",   // will be updated by createMainSets
+          updated_at:        String(Date.now()),
+        }),
+        client.expire(detailKey, 86400),
+        client.set(`strategies:${this.connectionId}:base:count`, String(baseSets.length)),
+        client.set(`strategies:${this.connectionId}:base:evaluated`, String(baseSets.length)),
+        client.expire(`strategies:${this.connectionId}:base:count`, 86400),
+        client.expire(`strategies:${this.connectionId}:base:evaluated`, 86400),
+      ]
+      if (baseSets.length > 0) {
+        writes.push(client.hincrby(redisKey, "strategies_base_total", baseSets.length))
+        writes.push(client.hincrby(redisKey, "strategies_base_evaluated", baseSets.length))
+      }
+      await Promise.all(writes)
     } catch { /* non-critical */ }
 
     console.log(`[v0] [StrategyFlow] ${symbol} BASE: ${baseSets.length} Sets created (${baseSets.reduce((s, set) => s + set.entryCount, 0)} total entries)`)
 
     return {
-      type: "base",
-      symbol,
-      timestamp: new Date(),
-      totalCreated: baseSets.length,
-      passedEvaluation: baseSets.length,
-      failedEvaluation: 0,
-      avgProfitFactor: baseSets.length > 0 ? baseSets.reduce((s, set) => s + set.avgProfitFactor, 0) / baseSets.length : 0,
-      avgDrawdownTime: 0,
+      result: {
+        type: "base",
+        symbol,
+        timestamp: new Date(),
+        totalCreated: baseSets.length,
+        passedEvaluation: baseSets.length,
+        failedEvaluation: 0,
+        avgProfitFactor: baseSets.length > 0 ? baseSets.reduce((s, set) => s + set.avgProfitFactor, 0) / baseSets.length : 0,
+        avgDrawdownTime: 0,
+      },
+      sets: baseSets,
     }
   }
 
@@ -283,10 +297,20 @@ export class StrategyCoordinator {
    * Promote BASE Sets with avgProfitFactor >= 1.2 to MAIN.
    * Expand each Set with multiple position-size / leverage variants (max 250 entries).
    */
-  private async createMainSets(symbol: string): Promise<StrategyEvaluation> {
-    const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
-    const stored = await getSettings(baseKey)
-    const baseSets: StrategySet[] = stored?.sets || []
+  private async createMainSets(
+    symbol: string,
+    inputSets?: StrategySet[],
+  ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
+    // Prefer in-memory input (hot-path pipelined from createBaseSets). Fall
+    // back to Redis only when called standalone (tests / diagnostics).
+    let baseSets: StrategySet[]
+    if (inputSets) {
+      baseSets = inputSets
+    } else {
+      const baseKey = `strategies:${this.connectionId}:${symbol}:base:sets`
+      const stored = await getSettings(baseKey)
+      baseSets = stored?.sets || []
+    }
 
     const metrics = this.METRICS.main
     const maxEntries = this.config.maxEntriesPerSet || 250
@@ -371,46 +395,38 @@ export class StrategyCoordinator {
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      if (baseSets.length > 0) {
-        await client.hincrby(redisKey, "strategies_main_total", baseSets.length)
-      }
-      if (mainSets.length > 0) {
-        await client.hincrby(redisKey, "strategies_main_evaluated", mainSets.length)
-      }
-      // Current-cycle snapshot
-      await client.hset(redisKey, "strategies_main_current", String(mainSets.length))
-      await client.expire(redisKey, 7 * 24 * 60 * 60)
-
-      // Write strategy_detail:{connId}:main and update base detail's passed_sets
+      const mainDetailKey = `strategy_detail:${this.connectionId}:main`
       const mainAvgPF  = mainSets.length > 0 ? mainSets.reduce((s, st) => s + st.avgProfitFactor, 0) / mainSets.length : 0
       const mainAvgDDT = mainSets.length > 0 ? mainSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / mainSets.length : 0
       const passRatioMain = baseSets.length > 0 ? mainSets.length / baseSets.length : 0
 
-      const mainDetailKey = `strategy_detail:${this.connectionId}:main`
-      await client.hset(mainDetailKey, {
-        created_sets:      String(mainSets.length),
-        avg_profit_factor: String(mainAvgPF.toFixed(4)),
-        avg_drawdown_time: String(Math.round(mainAvgDDT)),
-        evaluated:         String(baseSets.length),
-        passed_sets:       String(mainSets.length),
-        pass_rate:         String(passRatioMain.toFixed(4)),
-        updated_at:        String(Date.now()),
-      })
-      await client.expire(mainDetailKey, 86400)
-
-      // Update base detail to reflect how many passed to Main
-      await client.hset(`strategy_detail:${this.connectionId}:base`, {
-        passed_sets: String(mainSets.length),
-        pass_rate:   String(passRatioMain.toFixed(4)),
-      }).catch(() => {})
-
-      // Counter keys
-      await client.set(`strategies:${this.connectionId}:main:count`, String(mainSets.length))
-      await client.set(`strategies:${this.connectionId}:main:evaluated`, String(baseSets.length))
-      await client.set(`strategies:${this.connectionId}:base:passed`, String(mainSets.length))
-      await client.expire(`strategies:${this.connectionId}:main:count`, 86400)
-      await client.expire(`strategies:${this.connectionId}:main:evaluated`, 86400)
-      await client.expire(`strategies:${this.connectionId}:base:passed`, 86400)
+      const writes: Promise<any>[] = [
+        client.hset(redisKey, "strategies_main_current", String(mainSets.length)),
+        client.expire(redisKey, 7 * 24 * 60 * 60),
+        client.hset(mainDetailKey, {
+          created_sets:      String(mainSets.length),
+          avg_profit_factor: String(mainAvgPF.toFixed(4)),
+          avg_drawdown_time: String(Math.round(mainAvgDDT)),
+          evaluated:         String(baseSets.length),
+          passed_sets:       String(mainSets.length),
+          pass_rate:         String(passRatioMain.toFixed(4)),
+          updated_at:        String(Date.now()),
+        }),
+        client.expire(mainDetailKey, 86400),
+        client.hset(`strategy_detail:${this.connectionId}:base`, {
+          passed_sets: String(mainSets.length),
+          pass_rate:   String(passRatioMain.toFixed(4)),
+        }).catch(() => {}),
+        client.set(`strategies:${this.connectionId}:main:count`, String(mainSets.length)),
+        client.set(`strategies:${this.connectionId}:main:evaluated`, String(baseSets.length)),
+        client.set(`strategies:${this.connectionId}:base:passed`, String(mainSets.length)),
+        client.expire(`strategies:${this.connectionId}:main:count`, 86400),
+        client.expire(`strategies:${this.connectionId}:main:evaluated`, 86400),
+        client.expire(`strategies:${this.connectionId}:base:passed`, 86400),
+      ]
+      if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", baseSets.length))
+      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", mainSets.length))
+      await Promise.all(writes)
     } catch { /* non-critical */ }
 
     const failed = baseSets.length - mainSets.length
@@ -422,14 +438,17 @@ export class StrategyCoordinator {
     }
 
     return {
-      type: "main",
-      symbol,
-      timestamp: new Date(),
-      totalCreated: baseSets.length,
-      passedEvaluation: mainSets.length,
-      failedEvaluation: failed,
-      avgProfitFactor: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgProfitFactor, 0) / mainSets.length : 0,
-      avgDrawdownTime: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / mainSets.length : 0,
+      result: {
+        type: "main",
+        symbol,
+        timestamp: new Date(),
+        totalCreated: baseSets.length,
+        passedEvaluation: mainSets.length,
+        failedEvaluation: failed,
+        avgProfitFactor: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgProfitFactor, 0) / mainSets.length : 0,
+        avgDrawdownTime: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / mainSets.length : 0,
+      },
+      sets: mainSets,
     }
   }
 
@@ -438,10 +457,16 @@ export class StrategyCoordinator {
   /**
    * Promote MAIN Sets with avgProfitFactor >= 1.4 to REAL.
    */
-  private async evaluateRealSets(symbol: string): Promise<StrategyEvaluation> {
-    const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
-    const stored = await getSettings(mainKey)
-    const mainSets: StrategySet[] = stored?.sets || []
+  private async evaluateRealSets(
+    symbol: string,
+    inputSets?: StrategySet[],
+  ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
+    let stored: any = null
+    if (!inputSets) {
+      const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
+      stored = await getSettings(mainKey)
+    }
+    const mainSets: StrategySet[] = inputSets ?? (stored?.sets || [])
 
     const metrics = this.METRICS.real
 
@@ -468,50 +493,41 @@ export class StrategyCoordinator {
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      if (mainSets.length > 0) {
-        await client.hincrby(redisKey, "strategies_real_total", mainSets.length)
-      }
-      if (realSets.length > 0) {
-        await client.hincrby(redisKey, "strategies_real_evaluated", realSets.length)
-      }
-      // Current-cycle snapshot
-      await client.hset(redisKey, "strategies_real_current", String(realSets.length))
-      await client.expire(redisKey, 7 * 24 * 60 * 60)
-
-      // Write strategy_detail:{connId}:real with full metrics including posEvalReal
+      const realDetailKey = `strategy_detail:${this.connectionId}:real`
       const realAvgPF   = realSets.length > 0 ? realSets.reduce((s, st) => s + st.avgProfitFactor, 0) / realSets.length : 0
       const realAvgDDT  = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / realSets.length : 0
-      // avgPosEvalReal: average confidence score across real sets (proxy for position quality)
       const realAvgConf = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgConfidence || 0), 0) / realSets.length : 0
       const passRatioReal = mainSets.length > 0 ? realSets.length / mainSets.length : 0
 
-      const realDetailKey = `strategy_detail:${this.connectionId}:real`
-      await client.hset(realDetailKey, {
-        created_sets:       String(realSets.length),
-        avg_profit_factor:  String(realAvgPF.toFixed(4)),
-        avg_drawdown_time:  String(Math.round(realAvgDDT)),
-        avg_pos_eval_real:  String(realAvgConf.toFixed(4)),
-        evaluated:          String(mainSets.length),
-        passed_sets:        String(realSets.length),
-        pass_rate:          String(passRatioReal.toFixed(4)),
-        count_pos_eval:     String(realSets.length),   // how many positions contributed to avgPosEvalReal
-        updated_at:         String(Date.now()),
-      })
-      await client.expire(realDetailKey, 86400)
-
-      // Update main detail's passed_sets
-      await client.hset(`strategy_detail:${this.connectionId}:main`, {
-        passed_sets: String(realSets.length),
-        pass_rate:   String(passRatioReal.toFixed(4)),
-      }).catch(() => {})
-
-      // Counter keys
-      await client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length))
-      await client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainSets.length))
-      await client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length))
-      await client.expire(`strategies:${this.connectionId}:real:count`, 86400)
-      await client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400)
-      await client.expire(`strategies:${this.connectionId}:main:passed`, 86400)
+      const writes: Promise<any>[] = [
+        client.hset(redisKey, "strategies_real_current", String(realSets.length)),
+        client.expire(redisKey, 7 * 24 * 60 * 60),
+        client.hset(realDetailKey, {
+          created_sets:       String(realSets.length),
+          avg_profit_factor:  String(realAvgPF.toFixed(4)),
+          avg_drawdown_time:  String(Math.round(realAvgDDT)),
+          avg_pos_eval_real:  String(realAvgConf.toFixed(4)),
+          evaluated:          String(mainSets.length),
+          passed_sets:        String(realSets.length),
+          pass_rate:          String(passRatioReal.toFixed(4)),
+          count_pos_eval:     String(realSets.length),
+          updated_at:         String(Date.now()),
+        }),
+        client.expire(realDetailKey, 86400),
+        client.hset(`strategy_detail:${this.connectionId}:main`, {
+          passed_sets: String(realSets.length),
+          pass_rate:   String(passRatioReal.toFixed(4)),
+        }).catch(() => {}),
+        client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
+        client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainSets.length)),
+        client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
+        client.expire(`strategies:${this.connectionId}:real:count`, 86400),
+        client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400),
+        client.expire(`strategies:${this.connectionId}:main:passed`, 86400),
+      ]
+      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", mainSets.length))
+      if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realSets.length))
+      await Promise.all(writes)
     } catch { /* non-critical */ }
 
     console.log(
@@ -519,27 +535,38 @@ export class StrategyCoordinator {
     )
 
     return {
-      type: "real",
-      symbol,
-      timestamp: new Date(),
-      totalCreated: mainSets.length,
-      passedEvaluation: realSets.length,
-      failedEvaluation: mainSets.length - realSets.length,
-      avgProfitFactor: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgProfitFactor, 0) / realSets.length : 0,
-      avgDrawdownTime: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / realSets.length : 0,
+      result: {
+        type: "real",
+        symbol,
+        timestamp: new Date(),
+        totalCreated: mainSets.length,
+        passedEvaluation: realSets.length,
+        failedEvaluation: mainSets.length - realSets.length,
+        avgProfitFactor: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgProfitFactor, 0) / realSets.length : 0,
+        avgDrawdownTime: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / realSets.length : 0,
+      },
+      sets: realSets,
     }
   }
 
-  // ─── STAGE 4: LIVE ───────────────────────────��───────────────────────────────
+  // ─── STAGE 4: LIVE ────────────────────��──────��───────────────────────────────
 
   /**
    * Select the best 500 Sets from REAL for live trading.
    * Creates exactly ONE pseudo position per Set (per indication_type × direction).
    */
-  private async createLiveSets(symbol: string): Promise<StrategyEvaluation> {
-    const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
-    const stored = await getSettings(realKey)
-    const realSets: StrategySet[] = stored?.sets || []
+  private async createLiveSets(
+    symbol: string,
+    inputSets?: StrategySet[],
+  ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
+    let realSets: StrategySet[]
+    if (inputSets) {
+      realSets = inputSets
+    } else {
+      const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
+      const stored = await getSettings(realKey)
+      realSets = stored?.sets || []
+    }
 
     const metrics = this.METRICS.live
     const maxLive = this.config.maxLiveSets || 500
@@ -770,39 +797,41 @@ export class StrategyCoordinator {
         } catch { /* skip price lookup */ }
 
         if (entryPrice > 0) {
-          let positionsCreated = 0
-          for (const set of qualifying) {
-            try {
-              // Pick the best-performing entry from this Set as the representative config.
-              // "Best" = highest profitFactor (already sorted by pruneEntries).
-              const bestEntry = set.entries.reduce(
-                (best, e) => (e.profitFactor > best.profitFactor ? e : best),
-                set.entries[0]
-              )
-              if (!bestEntry) continue
+          // Pseudo-position creation is local Redis work with per-Set idempotency
+          // enforced inside createPosition (one active pseudo position per Set).
+          // Safe to fan out in parallel — no exchange calls, no shared balance.
+          const creations = await Promise.all(
+            qualifying.map(async (set) => {
+              try {
+                const bestEntry = set.entries.reduce(
+                  (best, e) => (e.profitFactor > best.profitFactor ? e : best),
+                  set.entries[0],
+                )
+                if (!bestEntry) return false
 
-              const tp = Math.max(0.5, (bestEntry.profitFactor - 1) * 100)
-              const sl = Math.min(5, 100 / Math.max(1, bestEntry.profitFactor) * 0.5)
-              const trailing = bestEntry.confidence >= 0.85
+                const tp = Math.max(0.5, (bestEntry.profitFactor - 1) * 100)
+                const sl = Math.min(5, 100 / Math.max(1, bestEntry.profitFactor) * 0.5)
+                const trailing = bestEntry.confidence >= 0.85
+                const configSetKey = `${set.indicationType}:${set.direction}:${symbol}`
 
-              // configSetKey identifies this unique Set (indication_type × direction).
-              // One active pseudo position per Set is enforced inside createPosition.
-              const configSetKey = `${set.indicationType}:${set.direction}:${symbol}`
-
-              const posId = await posManager.createPosition({
-                symbol,
-                side: set.direction,
-                indicationType: set.indicationType,
-                entryPrice,
-                takeprofitFactor: tp,
-                stoplossRatio: sl,
-                profitFactor: bestEntry.profitFactor,
-                trailingEnabled: trailing,
-                configSetKey,
-              })
-              if (posId) positionsCreated++
-            } catch { /* non-critical per-Set error */ }
-          }
+                const posId = await posManager.createPosition({
+                  symbol,
+                  side: set.direction,
+                  indicationType: set.indicationType,
+                  entryPrice,
+                  takeprofitFactor: tp,
+                  stoplossRatio: sl,
+                  profitFactor: bestEntry.profitFactor,
+                  trailingEnabled: trailing,
+                  configSetKey,
+                })
+                return Boolean(posId)
+              } catch {
+                return false
+              }
+            }),
+          )
+          const positionsCreated = creations.filter(Boolean).length
           console.log(`[v0] [StrategyFlow] ${symbol} LIVE: Created/updated ${positionsCreated} pseudo positions for ${qualifying.length} Sets`)
         } else {
           console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: No entry price, skipping position creation`)
@@ -817,14 +846,17 @@ export class StrategyCoordinator {
     )
 
     return {
-      type: "live",
-      symbol,
-      timestamp: new Date(),
-      totalCreated: realSets.length,
-      passedEvaluation: qualifying.length,
-      failedEvaluation: realSets.length - qualifying.length,
-      avgProfitFactor: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgProfitFactor, 0) / qualifying.length : 0,
-      avgDrawdownTime: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgDrawdownTime, 0) / qualifying.length : 0,
+      result: {
+        type: "live",
+        symbol,
+        timestamp: new Date(),
+        totalCreated: realSets.length,
+        passedEvaluation: qualifying.length,
+        failedEvaluation: realSets.length - qualifying.length,
+        avgProfitFactor: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgProfitFactor, 0) / qualifying.length : 0,
+        avgDrawdownTime: qualifying.length > 0 ? qualifying.reduce((s, set) => s + set.avgDrawdownTime, 0) / qualifying.length : 0,
+      },
+      sets: qualifying,
     }
   }
 
