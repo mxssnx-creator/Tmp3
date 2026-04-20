@@ -25,6 +25,7 @@
 import { getRedisClient, initRedis } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { VolumeCalculator } from "@/lib/volume-calculator"
+import { SystemLogger } from "@/lib/system-logger"
 import type { RealPosition } from "./real-stage"
 
 const LOG_PREFIX = "[v0] [LivePositionStage]"
@@ -548,11 +549,30 @@ export async function executeLivePosition(
       pushStep(livePosition, "place_order", false, livePosition.statusReason)
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_failed_count")
+
+      // Per-connection progression log (for the UI Progression panel).
       await logProgressionEvent(connectionId, "live_trading", "error", `Entry order failed for ${realPosition.symbol}`, {
         error: orderResult?.error,
         side: exchangeSide,
         quantity: computedVolume,
+        price: currentPrice,
+        leverage: livePosition.leverage,
       })
+
+      // Systemwide error log — makes this visible in the global error view
+      // alongside API errors so one place shows both UI + exchange failures.
+      // Wrapped in try/catch because we never block the main return on logging.
+      try {
+        await SystemLogger.logError(
+          new Error(
+            `Exchange entry order failed: ${orderResult?.error || "unknown"} [symbol=${realPosition.symbol}, side=${exchangeSide}, qty=${computedVolume}]`,
+          ),
+          connectionId,
+          "live-stage.placeOrder",
+        )
+      } catch {
+        /* logging must never throw */
+      }
       return livePosition
     }
 
@@ -693,7 +713,8 @@ export async function executeLivePosition(
     return livePosition
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
-    console.error(`${LOG_PREFIX} Unhandled error:`, errMsg)
+    const errStack = err instanceof Error ? err.stack : undefined
+    console.error(`${LOG_PREFIX} Unhandled error:`, errMsg, errStack || "")
     livePosition.status = "error"
     livePosition.statusReason = errMsg
     pushStep(livePosition, "unhandled_error", false, errMsg)
@@ -704,8 +725,20 @@ export async function executeLivePosition(
       "live_trading",
       "error",
       `Live pipeline unhandled error for ${realPosition.symbol}`,
-      { error: errMsg }
+      { error: errMsg, stack: errStack }
     )
+
+    // Surface unhandled live-pipeline failures into the systemwide log too,
+    // not just the per-connection progression view.
+    try {
+      await SystemLogger.logError(
+        err instanceof Error ? err : new Error(errMsg),
+        connectionId,
+        `live-stage.executeLivePosition[${realPosition.symbol}/${realPosition.direction}]`,
+      )
+    } catch {
+      /* logging must never throw */
+    }
     await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
     return livePosition
   }
