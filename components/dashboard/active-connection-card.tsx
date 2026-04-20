@@ -164,6 +164,19 @@ export function ActiveConnectionCard({
     realEvaluated: number
     realPassed: number
     countPosEvalReal: number
+    // Live exchange execution metrics
+    liveOrdersPlaced: number
+    liveOrdersFilled: number
+    liveOrdersFailed: number
+    liveOrdersRejected: number
+    liveOrdersSimulated: number
+    livePositionsCreated: number
+    livePositionsClosed: number
+    livePositionsOpen: number
+    liveWins: number
+    liveVolumeUsdTotal: number
+    liveFillRate: number
+    liveWinRate: number
     // Prehistoric metadata
     rangeDays: number
     timeframeSeconds: number
@@ -303,6 +316,19 @@ export function ActiveConnectionCard({
           realEvaluated:    sd.real?.evaluated   || (strat.real || 0),
           realPassed:       sd.real?.passed       || (strat.real || 0),
           countPosEvalReal: sd.real?.countPosEval || 0,
+          // Live exchange execution
+          liveOrdersPlaced:      json?.liveExecution?.ordersPlaced     || 0,
+          liveOrdersFilled:      json?.liveExecution?.ordersFilled     || 0,
+          liveOrdersFailed:      json?.liveExecution?.ordersFailed     || 0,
+          liveOrdersRejected:    json?.liveExecution?.ordersRejected   || 0,
+          liveOrdersSimulated:   json?.liveExecution?.ordersSimulated  || 0,
+          livePositionsCreated:  json?.liveExecution?.positionsCreated || 0,
+          livePositionsClosed:   json?.liveExecution?.positionsClosed  || 0,
+          livePositionsOpen:     json?.liveExecution?.positionsOpen    || 0,
+          liveWins:              json?.liveExecution?.wins             || 0,
+          liveVolumeUsdTotal:    json?.liveExecution?.volumeUsdTotal   || 0,
+          liveFillRate:          json?.liveExecution?.fillRate         || 0,
+          liveWinRate:           json?.liveExecution?.winRate          || 0,
           rangeDays:               pm.rangeDays              || 1,
           timeframeSeconds:        pm.timeframeSeconds        || 1,
           intervalsProcessed:      pm.intervalsProcessed      || 0,

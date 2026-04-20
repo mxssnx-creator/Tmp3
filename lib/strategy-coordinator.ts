@@ -592,7 +592,18 @@ export class StrategyCoordinator {
           const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
           const connector = await exchangeConnectorFactory.getOrCreateConnector(this.connectionId)
           if (connector) {
-            let liveExecutions = 0
+            // Dispatch each qualifying set as a live exchange position. The
+            // full pipeline (pre-flight → price fetch → volume calc → leverage
+            // setup → entry order → fill poll → SL/TP → exchange sync → logs
+            // → metrics) is owned by executeLivePosition. We only supply the
+            // strategic inputs (direction, SL/TP %, leverage hint) and let the
+            // pipeline decide the exact quantity and entry price from live
+            // exchange state.
+            let placed = 0
+            let filled = 0
+            let rejected = 0
+            let errored = 0
+
             for (const set of qualifying) {
               try {
                 const bestEntry = set.entries.reduce(
@@ -600,37 +611,67 @@ export class StrategyCoordinator {
                   set.entries[0]
                 )
                 if (!bestEntry) continue
+
+                // Derive SL/TP % from the set's profit factor. The pipeline
+                // converts these to concrete prices after the entry fills.
                 const tp = Math.max(0.5, (bestEntry.profitFactor - 1) * 100)
-                const sl = Math.min(5, 100 / Math.max(1, bestEntry.profitFactor) * 0.5)
-                const liveResult = await executeLivePosition(this.connectionId, {
-                  id: `real:${this.connectionId}:${set.setKey}:${symbol}`,
-                  connectionId: this.connectionId,
-                  symbol,
-                  direction: set.direction,
-                  quantity: 0.001, // minimal — risk management is at exchange level
-                  entryPrice: 0,   // market order, price determined at fill
-                  leverage: bestEntry.leverage || 1,
-                  riskAmount: 0.001 * sl / 100,
-                  rewardTarget: 0.001 * tp / 100,
-                  stopLoss: sl,
-                  takeProfit: tp,
-                  mainPositionCount: set.entryCount,
-                  evaluationScore: bestEntry.confidence,
-                  ratioMet: bestEntry.confidence >= 0.65,
-                  timestamp: Date.now(),
-                  ratios: {
-                    profitabilityRatio: bestEntry.profitFactor,
-                    accountRiskRatio: sl / 100,
-                    successRateRatio: bestEntry.confidence,
-                    consistencyRatio: set.avgConfidence,
+                const sl = Math.min(5, (100 / Math.max(1, bestEntry.profitFactor)) * 0.5)
+
+                const liveResult = await executeLivePosition(
+                  this.connectionId,
+                  {
+                    id: `real:${this.connectionId}:${set.setKey}:${symbol}:${Date.now()}`,
+                    connectionId: this.connectionId,
+                    symbol,
+                    direction: set.direction,
+                    // Seed values — the live pipeline will recalc both from
+                    // the exchange connector and VolumeCalculator.
+                    quantity: 0,
+                    entryPrice: 0,
+                    leverage: bestEntry.leverage || 1,
+                    riskAmount: 0,
+                    rewardTarget: 0,
+                    stopLoss: sl,
+                    takeProfit: tp,
+                    mainPositionCount: set.entryCount,
+                    evaluationScore: bestEntry.confidence,
+                    ratioMet: bestEntry.confidence >= 0.65,
+                    timestamp: Date.now(),
+                    ratios: {
+                      profitabilityRatio: bestEntry.profitFactor,
+                      accountRiskRatio: sl / 100,
+                      successRateRatio: bestEntry.confidence,
+                      consistencyRatio: set.avgConfidence,
+                    },
+                    status: "pending",
                   },
-                  status: "pending",
-                }, connector)
-                if (liveResult && liveResult.status !== "error") liveExecutions++
-              } catch { /* per-set non-critical */ }
+                  connector
+                )
+
+                if (!liveResult) continue
+                if (liveResult.status === "open" || liveResult.status === "filled" || liveResult.status === "partially_filled") {
+                  filled++
+                  placed++
+                } else if (liveResult.status === "placed") {
+                  placed++
+                } else if (liveResult.status === "rejected") {
+                  rejected++
+                } else if (liveResult.status === "error") {
+                  errored++
+                }
+              } catch (err) {
+                errored++
+                console.warn(
+                  `[v0] [StrategyFlow] ${symbol} per-set live execution error:`,
+                  err instanceof Error ? err.message : String(err)
+                )
+              }
             }
-            if (liveExecutions > 0) {
-              console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${liveExecutions} REAL exchange orders placed`)
+
+            if (placed > 0 || rejected > 0 || errored > 0) {
+              console.log(
+                `[v0] [StrategyFlow] ${symbol} LIVE summary — placed=${placed} filled=${filled} rejected=${rejected} errored=${errored}`
+              )
             }
           } else {
             console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: live_trade=true but connector not available`)
