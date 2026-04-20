@@ -18,6 +18,17 @@ import { useExchange } from "@/lib/exchange-context"
 interface StratDetail {
   avgPosPerSet: number; createdSets: number; avgProfitFactor: number
   avgProcessingTimeMs: number; evalPct: number
+  // Live-only extras (optional on base/main/real)
+  winRate?: number; totalPnl?: number; avgPnl?: number
+  openPositions?: number; volumeUsdTotal?: number
+}
+
+interface LiveExecution {
+  ordersPlaced: number; ordersFilled: number; ordersFailed: number
+  ordersRejected: number; ordersSimulated: number
+  positionsCreated: number; positionsClosed: number; positionsOpen: number
+  wins: number; volumeUsdTotal: number
+  fillRate: number; winRate: number
 }
 
 interface StatsResponse {
@@ -35,7 +46,8 @@ interface StatsResponse {
     strategies: { base: number; main: number; real: number; live: number; total: number
                   baseEvaluated: number; mainEvaluated: number; realEvaluated: number }
   }
-  strategyDetail: { base: StratDetail; main: StratDetail; real: StratDetail }
+  strategyDetail: { base: StratDetail; main: StratDetail; real: StratDetail; live?: StratDetail }
+  liveExecution?: LiveExecution
   windows: { indications: { last5m: number; last60m: number }; strategies: { last5m: number; last60m: number } }
   metadata: { engineRunning: boolean; phase: string; progress: number; message: string; lastUpdate: string }
 }
@@ -135,6 +147,7 @@ export function QuickstartComprehensiveLogDialog() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [expandedLog, setExpandedLog] = useState<number | null>(null)
+  const [logFilter, setLogFilter] = useState<"all" | "info" | "success" | "warning" | "error">("all")
   const logsEndRef = useRef<HTMLDivElement>(null)
   const pollRef = useRef<NodeJS.Timeout>()
 
@@ -455,6 +468,58 @@ export function QuickstartComprehensiveLogDialog() {
                   bgCls="bg-green-50/40 dark:bg-green-950/20 border-green-200/50 dark:border-green-800/30"
                 />
 
+                {/* 4th tier — Live exchange execution. Mirrors Real's shape with extra metrics. */}
+                <StratCard
+                  label="Live"
+                  count={bd?.strategies.live || stats?.liveExecution?.positionsCreated || 0}
+                  evaluated={stats?.liveExecution?.ordersFilled || sd?.live?.passed || 0}
+                  evaluatedOf={stats?.liveExecution?.ordersPlaced || sd?.live?.evaluated || 0}
+                  detail={sd?.live}
+                  accentCls="text-amber-600 dark:text-amber-400"
+                  bgCls="bg-amber-50/40 dark:bg-amber-950/20 border-amber-200/50 dark:border-amber-800/30"
+                />
+
+                {/* Live Execution detail when present */}
+                {stats?.liveExecution && (stats.liveExecution.ordersPlaced > 0 || stats.liveExecution.positionsCreated > 0) && (
+                  <SectionCard className="bg-amber-50/30 border-amber-200/50 dark:bg-amber-950/10 dark:border-amber-800/30">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-amber-700 dark:text-amber-400">
+                      <TrendingUp className="w-3.5 h-3.5" />
+                      Live Exchange Execution
+                      {stats.liveExecution.positionsOpen > 0 && (
+                        <Badge className="bg-green-600 text-[9px] h-4 px-1.5 ml-auto">{stats.liveExecution.positionsOpen} open</Badge>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-1 text-[11px]">
+                      <Row label="Orders Placed"    value={fmt(stats.liveExecution.ordersPlaced)} />
+                      <Row label="Orders Filled"    value={fmt(stats.liveExecution.ordersFilled)} />
+                      <Row label="Positions Created" value={fmt(stats.liveExecution.positionsCreated)} />
+                      <Row label="Positions Closed"  value={fmt(stats.liveExecution.positionsClosed)} />
+                      <Row label="Fill Rate" value={`${stats.liveExecution.fillRate.toFixed(1)}%`} />
+                      <Row label="Win Rate"  value={`${stats.liveExecution.winRate.toFixed(1)}%`} />
+                      <Row label="Wins"      value={fmt(stats.liveExecution.wins)} />
+                      <Row
+                        label="Volume"
+                        value={stats.liveExecution.volumeUsdTotal >= 1000
+                          ? `$${(stats.liveExecution.volumeUsdTotal / 1000).toFixed(1)}K`
+                          : `$${stats.liveExecution.volumeUsdTotal.toFixed(2)}`}
+                      />
+                    </div>
+                    {(stats.liveExecution.ordersRejected > 0 || stats.liveExecution.ordersFailed > 0 || stats.liveExecution.ordersSimulated > 0) && (
+                      <div className="flex flex-wrap gap-1.5 text-[10px] pt-1 border-t">
+                        {stats.liveExecution.ordersRejected > 0 && (
+                          <span className="px-2 py-0.5 rounded bg-yellow-100 text-yellow-800">Rejected: {stats.liveExecution.ordersRejected}</span>
+                        )}
+                        {stats.liveExecution.ordersFailed > 0 && (
+                          <span className="px-2 py-0.5 rounded bg-red-100 text-red-800">Failed: {stats.liveExecution.ordersFailed}</span>
+                        )}
+                        {stats.liveExecution.ordersSimulated > 0 && (
+                          <span className="px-2 py-0.5 rounded bg-blue-100 text-blue-800">Simulated: {stats.liveExecution.ordersSimulated}</span>
+                        )}
+                      </div>
+                    )}
+                  </SectionCard>
+                )}
+
                 <SectionCard>
                   <div className="text-xs font-semibold flex items-center gap-1.5">
                     <Zap className="w-3.5 h-3.5 text-amber-500" />
@@ -476,14 +541,26 @@ export function QuickstartComprehensiveLogDialog() {
 
           {/* ── Logs ──────────────────────────────────────────────────────── */}
           <TabsContent value="logs" className="flex-1 flex flex-col min-h-0 p-4">
-            <div className="flex items-center justify-between pb-2 shrink-0">
+            <div className="flex items-center justify-between pb-2 shrink-0 gap-2 flex-wrap">
               <span className="text-xs text-muted-foreground">
                 {logs.length} entries {isLoading && "· updating…"}
               </span>
-              <Button size="sm" variant="outline" onClick={() => fetchData()} disabled={isLoading} className="h-7 gap-1.5 text-xs">
-                <RefreshCw className={`w-3 h-3 ${isLoading ? "animate-spin" : ""}`} />
-                Refresh
-              </Button>
+              <div className="flex items-center gap-1 flex-wrap">
+                {(["all", "info", "success", "warning", "error"] as const).map(f => (
+                  <Button
+                    key={f}
+                    size="sm"
+                    variant={logFilter === f ? "default" : "outline"}
+                    className="h-6 px-2 text-[10px]"
+                    onClick={() => setLogFilter(f)}
+                  >
+                    {f.charAt(0).toUpperCase() + f.slice(1)}
+                  </Button>
+                ))}
+                <Button size="sm" variant="outline" onClick={() => fetchData()} disabled={isLoading} className="h-6 w-6 p-0">
+                  <RefreshCw className={`w-3 h-3 ${isLoading ? "animate-spin" : ""}`} />
+                </Button>
+              </div>
             </div>
 
             <ScrollArea className="flex-1 border rounded-md">
@@ -493,7 +570,7 @@ export function QuickstartComprehensiveLogDialog() {
                 </div>
               ) : (
                 <div className="space-y-px p-2">
-                  {logs.map((log, idx) => (
+                  {logs.filter(l => logFilter === "all" || l.level === logFilter).map((log, idx) => (
                     <div key={idx}>
                       <button
                         type="button"

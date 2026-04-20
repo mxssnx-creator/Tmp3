@@ -4,12 +4,15 @@ import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { getProgressionLogs } from "@/lib/engine-progression-logs"
 
 function mapPhaseToType(phase: string) {
+  // Order matters — "live_trading" must be classified before "position" so
+  // that the new Live filter in the UI captures exchange-side events only.
+  if (phase.includes("live")) return "live"
   if (phase.includes("indication")) return "indication"
   if (phase.includes("strategy")) return "strategy"
   if (phase.includes("position")) return "position"
   if (phase.includes("error")) return "error"
   return "engine"
-}
+  }
 
 function isTruthy(value: unknown): boolean {
   return value === true || value === 1 || value === "1" || value === "true"
@@ -286,6 +289,20 @@ export async function GET(request: Request) {
             optimal: baseOptimal,
           },
           livePositions: livePositionsCount,
+          // Live exchange execution metrics sourced from the progression hash
+          // (written by live-stage.ts). Counters only — no exchange history
+          // calls. Keeps the endpoint fast even with heavy live activity.
+          liveMetrics: {
+            ordersPlaced:     parseInt(progHash.live_orders_placed_count    || "0", 10) || 0,
+            ordersFilled:     parseInt(progHash.live_orders_filled_count    || "0", 10) || 0,
+            ordersFailed:     parseInt(progHash.live_orders_failed_count    || "0", 10) || 0,
+            ordersRejected:   parseInt(progHash.live_orders_rejected_count  || "0", 10) || 0,
+            ordersSimulated:  parseInt(progHash.live_orders_simulated_count || "0", 10) || 0,
+            positionsCreated: parseInt(progHash.live_positions_created_count || "0", 10) || 0,
+            positionsClosed:  parseInt(progHash.live_positions_closed_count  || "0", 10) || 0,
+            wins:             parseInt(progHash.live_wins_count             || "0", 10) || 0,
+            volumeUsdTotal:   parseFloat(progHash.live_volume_usd_total     || "0") || 0,
+          },
           prehistoric: {
             loaded: isTruthy((state as any).prehistoric_data_loaded),
             symbols: prehistoricSymbols || toNumber((state as any).config_set_symbols_processed),
@@ -414,6 +431,33 @@ export async function GET(request: Request) {
         )
       : 0
 
+    // Aggregate Live execution metrics across all connections (progression hash counters only).
+    const aggregatedLive = perConnection.reduce(
+      (acc, item) => {
+        const lm = (item as any).liveMetrics || {}
+        acc.ordersPlaced     += lm.ordersPlaced     || 0
+        acc.ordersFilled     += lm.ordersFilled     || 0
+        acc.ordersFailed     += lm.ordersFailed     || 0
+        acc.ordersRejected   += lm.ordersRejected   || 0
+        acc.ordersSimulated  += lm.ordersSimulated  || 0
+        acc.positionsCreated += lm.positionsCreated || 0
+        acc.positionsClosed  += lm.positionsClosed  || 0
+        acc.wins             += lm.wins             || 0
+        acc.volumeUsdTotal   += lm.volumeUsdTotal   || 0
+        return acc
+      },
+      {
+        ordersPlaced: 0, ordersFilled: 0, ordersFailed: 0, ordersRejected: 0, ordersSimulated: 0,
+        positionsCreated: 0, positionsClosed: 0, wins: 0, volumeUsdTotal: 0,
+      },
+    )
+    const liveFillRate = aggregatedLive.ordersPlaced > 0
+      ? Math.round((aggregatedLive.ordersFilled / aggregatedLive.ordersPlaced) * 1000) / 10
+      : 0
+    const liveWinRate = aggregatedLive.positionsClosed > 0
+      ? Math.round((aggregatedLive.wins / aggregatedLive.positionsClosed) * 1000) / 10
+      : 0
+
     const basePseudoByIndication = perConnection.reduce(
       (acc, item) => {
         acc.direction += item.basePseudoByIndication.direction
@@ -462,6 +506,13 @@ export async function GET(request: Request) {
         real: aggregatedPseudo.real || totalTrades,
       },
       livePositions,
+      // Detailed Live execution metrics — orders, positions, fill & win rates
+      liveExecution: {
+        ...aggregatedLive,
+        positionsOpen: Math.max(0, aggregatedLive.positionsCreated - aggregatedLive.positionsClosed),
+        fillRate: liveFillRate,
+        winRate: liveWinRate,
+      },
       cycleDurationMs,
       realtimeCycles,
       realtimeRunningConnections: perConnection.filter((item) => item.realtimeCycles > 0).length,

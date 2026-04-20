@@ -18,7 +18,7 @@ import { useExchange } from "@/lib/exchange-context"
 interface LogEntry {
   id: string
   timestamp: string
-  type: "indication" | "strategy" | "position" | "engine" | "error"
+  type: "indication" | "strategy" | "position" | "live" | "engine" | "error"
   symbol?: string
   phase?: string
   message: string
@@ -93,6 +93,21 @@ interface ProgressSummary {
     }
   }
   livePositions: number
+  // Live Exchange execution — aggregated from progression counters (no exchange history call)
+  liveExecution?: {
+    ordersPlaced: number
+    ordersFilled: number
+    ordersFailed: number
+    ordersRejected: number
+    ordersSimulated: number
+    positionsCreated: number
+    positionsClosed: number
+    positionsOpen: number
+    wins: number
+    volumeUsdTotal: number
+    fillRate: number
+    winRate: number
+  }
   cycleDurationMs: number
   realtimeCycles?: number
   realtimeRunningConnections?: number
@@ -171,6 +186,7 @@ export function DetailedLoggingDialog() {
       case "indication": return "bg-blue-100 text-blue-800"
       case "strategy": return "bg-purple-100 text-purple-800"
       case "position": return "bg-green-100 text-green-800"
+      case "live": return "bg-amber-100 text-amber-800"
       case "engine": return "bg-orange-100 text-orange-800"
       case "error": return "bg-red-100 text-red-800"
       default: return "bg-gray-100 text-gray-800"
@@ -182,6 +198,7 @@ export function DetailedLoggingDialog() {
       case "indication": return <Activity className="h-3 w-3" />
       case "strategy": return <TrendingUp className="h-3 w-3" />
       case "position": return <Database className="h-3 w-3" />
+      case "live": return <TrendingUp className="h-3 w-3" />
       default: return <Clock className="h-3 w-3" />
     }
   }
@@ -238,7 +255,7 @@ export function DetailedLoggingDialog() {
         {/* Filters - only show for logs tab */}
         {activeTab === "logs" && (
           <div className="flex gap-1 flex-wrap">
-            {["all", "indication", "strategy", "position", "engine", "error"].map(f => (
+            {["all", "indication", "strategy", "position", "live", "engine", "error"].map(f => (
               <Button
                 key={f}
                 variant={filter === f ? "default" : "outline"}
@@ -288,13 +305,13 @@ export function DetailedLoggingDialog() {
                     </div>
                   </div>
 
-                  {/* Strategy Sets and Evaluations */}
+                  {/* Strategy Sets and Evaluations — includes Live tier */}
                   <div className="space-y-2">
                     <div className="flex items-center gap-2 text-xs font-semibold text-emerald-700">
                       <GitBranch className="h-4 w-4" />
-                      Strategy Coverage (Independent)
+                      Strategy Coverage (Base → Main → Real → Live)
                     </div>
-                    <div className="grid grid-cols-3 gap-1">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-1">
                       <div className="bg-emerald-50 rounded p-2 text-center">
                         <div className="text-emerald-700 font-bold">{summary.strategyCountsByType?.base || 0}</div>
                         <div className="text-muted-foreground text-[8px]">Base Sets</div>
@@ -307,18 +324,98 @@ export function DetailedLoggingDialog() {
                         <div className="text-emerald-700 font-bold">{summary.strategyCountsByType?.real || 0}</div>
                         <div className="text-muted-foreground text-[8px]">Real Sets</div>
                       </div>
+                      <div className="bg-amber-50 rounded p-2 text-center">
+                        <div className="text-amber-700 font-bold">{summary.liveExecution?.positionsCreated || 0}</div>
+                        <div className="text-muted-foreground text-[8px]">Live Pos</div>
+                      </div>
                     </div>
-                    <div className="grid grid-cols-3 gap-1">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-1">
                       <div className="bg-emerald-100 rounded p-1 text-center text-[10px]">Eval Base: {summary.strategyEvaluatedByType?.base || 0}</div>
                       <div className="bg-emerald-100 rounded p-1 text-center text-[10px]">Eval Main: {summary.strategyEvaluatedByType?.main || 0}</div>
                       <div className="bg-emerald-100 rounded p-1 text-center text-[10px]">Eval Real: {summary.strategyEvaluatedByType?.real || 0}</div>
+                      <div className="bg-amber-100 rounded p-1 text-center text-[10px]">Placed: {summary.liveExecution?.ordersPlaced || 0}</div>
                     </div>
-                    <div className="grid grid-cols-3 gap-1">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-1">
                       <div className="bg-emerald-200/70 rounded p-1 text-center text-[10px]">Passed Base: {summary.strategyPassedByType?.base || 0}</div>
                       <div className="bg-emerald-200/70 rounded p-1 text-center text-[10px]">Passed Main: {summary.strategyPassedByType?.main || 0}</div>
                       <div className="bg-emerald-200/70 rounded p-1 text-center text-[10px]">Passed Real: {summary.strategyPassedByType?.real || 0}</div>
+                      <div className="bg-amber-200/70 rounded p-1 text-center text-[10px]">Filled: {summary.liveExecution?.ordersFilled || 0}</div>
                     </div>
                   </div>
+
+                  {/* Live Execution — exchange-side outcomes (local tracking only) */}
+                  {summary.liveExecution && (summary.liveExecution.ordersPlaced > 0 || summary.liveExecution.positionsCreated > 0) && (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 text-xs font-semibold text-amber-700">
+                        <TrendingUp className="h-4 w-4" />
+                        Live Exchange Execution
+                        {summary.liveExecution.positionsOpen > 0 && (
+                          <Badge variant="outline" className="text-[9px] gap-1 bg-amber-50 border-amber-300">
+                            <span className="relative flex h-1.5 w-1.5">
+                              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                              <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500" />
+                            </span>
+                            {summary.liveExecution.positionsOpen} open
+                          </Badge>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-1">
+                        <div className="bg-amber-50 rounded p-2 text-center">
+                          <div className="text-amber-700 font-bold">{summary.liveExecution.ordersPlaced}</div>
+                          <div className="text-muted-foreground text-[8px]">Orders Placed</div>
+                        </div>
+                        <div className="bg-amber-50 rounded p-2 text-center">
+                          <div className="text-amber-700 font-bold">{summary.liveExecution.ordersFilled}</div>
+                          <div className="text-muted-foreground text-[8px]">Orders Filled</div>
+                        </div>
+                        <div className="bg-amber-50 rounded p-2 text-center">
+                          <div className="text-amber-700 font-bold">{summary.liveExecution.positionsCreated}</div>
+                          <div className="text-muted-foreground text-[8px]">Positions</div>
+                        </div>
+                        <div className="bg-amber-50 rounded p-2 text-center">
+                          <div className="text-amber-700 font-bold">{summary.liveExecution.positionsClosed}</div>
+                          <div className="text-muted-foreground text-[8px]">Closed</div>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-1 text-[10px]">
+                        <div className="bg-amber-100 rounded p-1 text-center">
+                          Fill <span className="font-semibold">{summary.liveExecution.fillRate.toFixed(1)}%</span>
+                        </div>
+                        <div className="bg-amber-100 rounded p-1 text-center">
+                          WR <span className="font-semibold">{summary.liveExecution.winRate.toFixed(1)}%</span>
+                        </div>
+                        <div className="bg-amber-100 rounded p-1 text-center">
+                          Wins <span className="font-semibold">{summary.liveExecution.wins}</span>
+                        </div>
+                        <div className="bg-amber-100 rounded p-1 text-center">
+                          Vol <span className="font-semibold">
+                            ${summary.liveExecution.volumeUsdTotal >= 1000
+                              ? `${(summary.liveExecution.volumeUsdTotal / 1000).toFixed(1)}K`
+                              : summary.liveExecution.volumeUsdTotal.toFixed(2)}
+                          </span>
+                        </div>
+                      </div>
+                      {(summary.liveExecution.ordersRejected > 0 || summary.liveExecution.ordersFailed > 0 || summary.liveExecution.ordersSimulated > 0) && (
+                        <div className="grid grid-cols-3 gap-1 text-[10px]">
+                          {summary.liveExecution.ordersRejected > 0 && (
+                            <div className="bg-yellow-50 border border-yellow-200 rounded p-1 text-center">
+                              Rejected: <span className="font-semibold text-yellow-700">{summary.liveExecution.ordersRejected}</span>
+                            </div>
+                          )}
+                          {summary.liveExecution.ordersFailed > 0 && (
+                            <div className="bg-red-50 border border-red-200 rounded p-1 text-center">
+                              Failed: <span className="font-semibold text-red-700">{summary.liveExecution.ordersFailed}</span>
+                            </div>
+                          )}
+                          {summary.liveExecution.ordersSimulated > 0 && (
+                            <div className="bg-blue-50 border border-blue-200 rounded p-1 text-center">
+                              Simulated: <span className="font-semibold text-blue-700">{summary.liveExecution.ordersSimulated}</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* Indications by Type */}
                   <div className="space-y-2">
