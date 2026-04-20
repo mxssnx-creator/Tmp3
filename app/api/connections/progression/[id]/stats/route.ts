@@ -124,18 +124,29 @@ export async function GET(
         : 0
 
     // ── REALTIME section ─────────────────────────────────────────────────────
-    // Primary: realtime:{connId} hash (written by trackRealtimeCycle)
-    // Secondary: progression hash (written by ProgressionStateManager.incrementCycle)
-    // Tertiary: trade_engine_state
-    const realtimeIndicationCycles = pick(
+    // Primary:   live_*_cycle_count    — only ticks that produced real work
+    //                                     (indications generated / strategies evaluated).
+    //                                     This is the user-facing "live progression" metric.
+    // Secondary: *_cycle_count         — every tick incl. warmup/empty. Prehistoric processing
+    //                                     churn, surfaced under historic.processing below,
+    //                                     kept calculatively hidden from the main display.
+    //
+    // If the live counter is still zero (first few moments after start), fall back to the
+    // churn counter so the UI doesn't render a misleading 0 while the engine spins up.
+    const churnIndicationCycles = pick(
       n(progHash.indication_cycle_count),
-      n(realtimeHash.cycle_count),        // realtime hash may double-count with indication, use prog hash first
+      n(realtimeHash.cycle_count),
       n(es.indication_cycle_count)
     )
-    const realtimeStrategyCycles = pick(
+    const churnStrategyCycles = pick(
       n(progHash.strategy_cycle_count),
       n(es.strategy_cycle_count)
     )
+    const liveIndicationCycles = n(progHash.indication_live_cycle_count)
+    const liveStrategyCycles   = n(progHash.strategy_live_cycle_count)
+
+    const realtimeIndicationCycles = liveIndicationCycles || churnIndicationCycles
+    const realtimeStrategyCycles   = liveStrategyCycles   || churnStrategyCycles
     const realtimeCycles = pick(
       n(progHash.realtime_cycle_count),
       n(realtimeHash.cycle_count),
@@ -428,6 +439,15 @@ export async function GET(
         cyclesCompleted:        historicCyclesCompleted,
         isComplete:             historicIsComplete,
         progressPercent:        historicProgressPercent,
+
+        // Prehistoric-processing churn counters — tick every time the engine spins
+        // through its evaluation loop, incl. idle/warmup ticks. Kept here so the UI
+        // can hide them from the primary live-progression display while still
+        // exposing them for debugging / operations dashboards.
+        processing: {
+          indicationChurnCycles: churnIndicationCycles,
+          strategyChurnCycles:   churnStrategyCycles,
+        },
       },
 
       realtime: {
@@ -437,6 +457,25 @@ export async function GET(
         indicationsTotal,
         strategiesTotal,
         positionsOpen,
+        // Sets + Positions are the canonical "continuous live progression" anchors
+        // the user relies on. These come straight from atomic hincrby writes
+        // inside StrategyCoordinator (sets) and live-stage (positions/orders).
+        setsCreated: {
+          base:  stratCounts.base  || 0,
+          main:  stratCounts.main  || 0,
+          real:  stratCounts.real  || 0,
+          total: (stratCounts.base || 0) + (stratCounts.main || 0) + (stratCounts.real || 0),
+        },
+        positions: {
+          opened:    n(progHash.live_positions_created_count),
+          closed:    n(progHash.live_positions_closed_count),
+          open:      Math.max(
+            0,
+            n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)
+          ),
+          ordersPlaced: n(progHash.live_orders_placed_count),
+          ordersFilled: n(progHash.live_orders_filled_count),
+        },
         isActive:         realtimeIsActive,
         successRate:      Math.round(successRate * 10) / 10,
         avgCycleTimeMs,

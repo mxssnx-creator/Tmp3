@@ -16,11 +16,30 @@ console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${
 
 // CRITICAL: Create a shared Map that will be used by ALL instances
 // This fixes the issue where class field initialization fails in cached bundles
+//
+// MEMORY: The engine loop runs ~10-15 cycles/sec across every tracked symbol.
+// Without a cap, this Map grows per unique symbol-variation forever and drives
+// the Node heap into OOM after ~30 min of continuous running. Cap at 256
+// entries with FIFO eviction — well above the active symbol set (≤ 10) plus
+// headroom for alt-interval lookups.
+const MARKET_DATA_CACHE_MAX_ENTRIES = 256
 const SHARED_MARKET_DATA_CACHE = new Map<string, { data: any; timestamp: number }>()
 const SHARED_SETTINGS_CACHE = { data: null as any, timestamp: 0 }
 // High-frequency TTL: 200ms matches the batch-prefetch window in market-data-cache.ts
 // so processIndication always reads from the same fresh batch within each 1s cycle
 const SHARED_CACHE_TTL = 200
+
+/**
+ * Bounded setter for the shared market data cache — evicts the oldest entry
+ * (insertion order of a Map) whenever the cap is hit.
+ */
+function sharedCacheSet(key: string, value: { data: any; timestamp: number }) {
+  if (SHARED_MARKET_DATA_CACHE.size >= MARKET_DATA_CACHE_MAX_ENTRIES && !SHARED_MARKET_DATA_CACHE.has(key)) {
+    const oldestKey = SHARED_MARKET_DATA_CACHE.keys().next().value
+    if (oldestKey !== undefined) SHARED_MARKET_DATA_CACHE.delete(oldestKey)
+  }
+  SHARED_MARKET_DATA_CACHE.set(key, value)
+}
 
 // CRITICAL FIX: Monkey-patch the Map prototype to handle undefined 'this' context
 // This ensures that even if 'this.marketDataCache' is undefined, calling .get() won't crash
@@ -72,8 +91,17 @@ function getProgressionManager() {
 }
 
 // MODULE-LEVEL caches - guaranteed to exist, avoids `this` context issues entirely
+// Same 256-entry bound as the shared cache — see SHARED_MARKET_DATA_CACHE comment.
 const MODULE_MARKET_DATA_CACHE = new Map<string, { data: any; timestamp: number }>()
 const MODULE_CACHE_TTL = 200 // 200ms matches the batch-prefetch window
+
+function moduleCacheSet(key: string, value: { data: any; timestamp: number }) {
+  if (MODULE_MARKET_DATA_CACHE.size >= MARKET_DATA_CACHE_MAX_ENTRIES && !MODULE_MARKET_DATA_CACHE.has(key)) {
+    const oldestKey = MODULE_MARKET_DATA_CACHE.keys().next().value
+    if (oldestKey !== undefined) MODULE_MARKET_DATA_CACHE.delete(oldestKey)
+  }
+  MODULE_MARKET_DATA_CACHE.set(key, value)
+}
 
 // Module-level settings cache
 let MODULE_SETTINGS_CACHE: { data: any; timestamp: number } | null = null
@@ -102,7 +130,7 @@ async function getMarketDataCachedModule(symbol: string): Promise<any> {
     const latest = Array.isArray(rawData) ? rawData[0] : rawData
 
     if (latest) {
-      MODULE_MARKET_DATA_CACHE.set(symbol, { data: latest, timestamp: now })
+      moduleCacheSet(symbol, { data: latest, timestamp: now })
       return latest
     }
     return null
@@ -360,7 +388,7 @@ export class IndicationProcessor {
                 volume: latestCandle.volume,
                 timestamp: new Date(latestCandle.timestamp).toISOString(),
               }
-              SHARED_MARKET_DATA_CACHE.set(symbol, { data: marketData, timestamp: Date.now() })
+              sharedCacheSet(symbol, { data: marketData, timestamp: Date.now() })
             }
           } catch (e) {
             // ignore
@@ -371,7 +399,7 @@ export class IndicationProcessor {
           const hashData = await client.hgetall(`market_data:${symbol}`)
           if (hashData && Object.keys(hashData).length > 0) {
             marketData = hashData
-            SHARED_MARKET_DATA_CACHE.set(symbol, { data: marketData, timestamp: Date.now() })
+            sharedCacheSet(symbol, { data: marketData, timestamp: Date.now() })
           }
         }
         
@@ -482,8 +510,7 @@ export class IndicationProcessor {
 
   private async getLatestMarketDataCached(symbol: string): Promise<any> {
     // CRITICAL FIX: Use module-level SHARED_MARKET_DATA_CACHE directly, never this.marketDataCache
-    const cache = SHARED_MARKET_DATA_CACHE
-    const cached = cache.get(symbol)
+    const cached = SHARED_MARKET_DATA_CACHE.get(symbol)
     const now = Date.now()
     
     if (cached && (now - cached.timestamp) < SHARED_CACHE_TTL) {
@@ -506,7 +533,7 @@ export class IndicationProcessor {
           try {
             const parsed = JSON.parse(rawData)
             if (parsed && parsed.candles && parsed.candles.length > 0) {
-              cache.set(symbol, { data: parsed, timestamp: now })
+              sharedCacheSet(symbol, { data: parsed, timestamp: now })
               return parsed
             }
           } catch (parseErr) {
@@ -517,13 +544,13 @@ export class IndicationProcessor {
         // Try hash key as last resort
         const hashData = await client.hgetall(`market_data:${symbol}`)
         if (hashData && Object.keys(hashData).length > 0) {
-          cache.set(symbol, { data: hashData, timestamp: now })
+          sharedCacheSet(symbol, { data: hashData, timestamp: now })
           return hashData
         }
       }
       
       if (data) {
-        cache.set(symbol, { data, timestamp: now })
+        sharedCacheSet(symbol, { data, timestamp: now })
       }
       return data
     } catch (e) {

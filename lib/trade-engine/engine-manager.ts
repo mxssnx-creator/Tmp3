@@ -729,16 +729,26 @@ export class TradeEngineManager {
         console.log(`[v0] [IndicationProcessor] Per-symbol: ${JSON.stringify(symbolIndicationCounts)}`)
         console.log(`[v0] [IndicationProcessor] Per-type: ${JSON.stringify(indicationTypeCounts)}`)
 
-        // Write per-type counters into progression hash so dashboard reads real values
+        // Write per-type counters into progression hash so dashboard reads real values.
+        //
+        // COUNTER TAXONOMY (user-facing progression vs. prehistoric/churn processing):
+        //   * indication_cycle_count          — EVERY tick (incl. warmup/empty cycles). Treat as
+        //                                       "prehistoric processing" churn — hidden from the
+        //                                       primary live-progression display.
+        //   * indication_live_cycle_count     — only ticks that produced at least one indication.
+        //                                       This is the meaningful "live progression" counter.
+        //   * indications_count / per-type    — cumulative indications generated (hincrby).
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
-          // Use hincrby for cycle count so it survives server restarts and accumulates across
-          // all engines running for this connection (not reset to local scope on reload)
+          // Churn counter — every tick. Used for debugging/health, not for live progression.
           await client.hincrby(redisKey, "indication_cycle_count", 1)
           await client.hset(redisKey, "symbols_processed", String(symbols.length))
           await client.expire(redisKey, 7 * 24 * 60 * 60)
+
           if (Object.keys(indicationTypeCounts).length > 0) {
+            // Productive cycle — only increments when the engine actually generated indications.
+            await client.hincrby(redisKey, "indication_live_cycle_count", 1)
             // Atomically increment per-type fields in the progression hash
             for (const [type, count] of Object.entries(indicationTypeCounts)) {
               const field = `indications_${type}_count`
@@ -754,11 +764,17 @@ export class TradeEngineManager {
         this.componentHealth.indications.cycleCount = cycleCount
         this.componentHealth.indications.successRate = cycleCount > 0 ? ((cycleCount - errorCount) / cycleCount) * 100 : 100
 
-        // Update progression cycle every cycle with detailed logging
-        try {
-          await ProgressionStateManager.incrementCycle(this.connectionId, true, processedThisCycle)
-        } catch (incError) {
-          console.error(`[v0] [Engine] Cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
+        // PROGRESSION CONTRACT: the global cycles_completed counter represents
+        // meaningful live progress (indications were generated), not churn.
+        // Skip the increment for empty warmup/prehistoric ticks — that keeps
+        // the dashboard success-rate honest and prevents cycles_completed from
+        // drifting into the tens of thousands while nothing has happened yet.
+        if (processedThisCycle > 0) {
+          try {
+            await ProgressionStateManager.incrementCycle(this.connectionId, true, processedThisCycle)
+          } catch (incError) {
+            console.error(`[v0] [Engine] Cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
+          }
         }
 
         // Persist cycle count every 100 cycles to reduce Redis writes
@@ -899,22 +915,30 @@ export class TradeEngineManager {
         // Per-stage Set counts (strategies_base_total, strategies_main_total,
         // strategies_real_total, strategy_evaluated_*) are written atomically inside
         // StrategyCoordinator.executeStrategyFlow() to avoid double-counting.
+        //
+        // See indication-processor comment above for counter taxonomy:
+        //   strategy_cycle_count          = every tick (churn)
+        //   strategy_live_cycle_count     = only ticks that evaluated at least 1 strategy
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
-          // Use hincrby for cycle count so it survives restarts and accumulates correctly
           await client.hincrby(redisKey, "strategy_cycle_count", 1)
-          // Write cumulative strategy evaluations so stats API can read strategiesTotal
-          await client.hincrby(redisKey, "strategies_count", evaluatedThisCycle)
+          if (evaluatedThisCycle > 0) {
+            await client.hincrby(redisKey, "strategy_live_cycle_count", 1)
+            await client.hincrby(redisKey, "strategies_count", evaluatedThisCycle)
+          }
           await client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle))
           await client.expire(redisKey, 7 * 24 * 60 * 60)
         } catch { /* non-critical */ }
 
-        // Update progression cycle
-        try {
-          await ProgressionStateManager.incrementCycle(this.connectionId, true, evaluatedThisCycle)
-        } catch (incError) {
-          console.error(`[v0] [Engine] Strategy cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
+        // Only count productive strategy cycles toward cycles_completed
+        // (see same-pattern comment in indication processor).
+        if (evaluatedThisCycle > 0) {
+          try {
+            await ProgressionStateManager.incrementCycle(this.connectionId, true, evaluatedThisCycle)
+          } catch (incError) {
+            console.error(`[v0] [Engine] Strategy cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
+          }
         }
 
         // Persist cycle count every 50 cycles (faster update rate for strategies)
