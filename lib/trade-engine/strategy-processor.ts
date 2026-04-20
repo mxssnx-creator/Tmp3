@@ -48,15 +48,20 @@ export class StrategyProcessor {
       const coordinator = new StrategyCoordinator(this.connectionId)
       const results = await coordinator.executeStrategyFlow(symbol, indications, false)
 
-        // Calculate totals across all stages
-        let totalEvaluated = 0
-        let totalLiveReady = 0
-        const stageSummary: Record<string, any> = {}
+      // Calculate totals across all stages + fan out stats tracking.
+      // The original loop awaited `trackStrategyStats` sequentially once per
+      // stage (typically 4 awaits per symbol per cycle). Since the stats
+      // trackers are independent per stage, we compute totals synchronously
+      // and fire all stage writes in a single Promise.all.
+      let totalEvaluated = 0
+      let totalLiveReady = 0
+      const stageSummary: Record<string, any> = {}
+      const statsWrites: Promise<any>[] = []
 
       for (const result of results) {
         totalEvaluated += result.totalCreated
         totalLiveReady += result.passedEvaluation
-        
+
         stageSummary[result.type] = {
           setsEvaluated: result.totalCreated,
           setsPassed: result.passedEvaluation,
@@ -69,23 +74,22 @@ export class StrategyProcessor {
           `[v0] [StrategyFlow] ${symbol} ${result.type.toUpperCase()}: ${result.passedEvaluation}/${result.totalCreated} Sets passed | ` +
           `PF=${result.avgProfitFactor.toFixed(2)} | DDT=${Math.round(result.avgDrawdownTime)}min`
         )
-        
-        // REAL-TIME: Always track stats for every stage (even zero-pass cycles)
-        // so that the DB accurately reflects all evaluation attempts, not just successes.
-        try {
-          await trackStrategyStats(
+
+        statsWrites.push(
+          trackStrategyStats(
             this.connectionId,
             symbol,
             result.type,
             result.totalCreated,
             result.passedEvaluation,
             result.avgProfitFactor,
-            result.avgDrawdownTime
-          )
-        } catch (e) {
-          // Ignore DB errors - processing continues
-        }
+            result.avgDrawdownTime,
+          ).catch(() => { /* non-critical */ }),
+        )
       }
+
+      // Await all stats writes together — no per-stage blocking.
+      if (statsWrites.length > 0) await Promise.all(statsWrites)
 
       if (totalLiveReady > 0) {
         console.log(`[v0] [StrategyFlow] ${symbol}: READY FOR TRADING - ${totalLiveReady} live Sets selected`)

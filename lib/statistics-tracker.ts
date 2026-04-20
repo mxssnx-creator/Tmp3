@@ -23,27 +23,29 @@ export async function trackIndicationStats(
     console.warn(`[v0] [Stats] Failed to track indication in DB:`, e instanceof Error ? e.message : String(e))
   }
 
-  // Track in Redis using counters (not unbounded sets) for dashboard counts
+  // Track in Redis using counters (not unbounded sets) for dashboard counts.
+  // Fan out all writes concurrently so we don't pay 9 sequential Redis
+  // round-trips for every indication result.
   try {
     await initRedis()
     const client = getRedisClient()
-    
-    // Use INCR counters instead of SADD with unique IDs to prevent unbounded growth
-    await client.incr(`indications:${connectionId}:${indicationType}:count`)
-    await client.expire(`indications:${connectionId}:${indicationType}:count`, 86400) // 24h TTL
-    await client.incr(`indications:${connectionId}:count`)
-    await client.expire(`indications:${connectionId}:count`, 86400) // 24h TTL
-    
-    // Store latest value for dashboard display (single key, not growing set)
-    const latestKey = `indications:${connectionId}:${indicationType}:latest`
-    await client.set(latestKey, JSON.stringify({ symbol, value, confidence, timestamp: Date.now() }))
-    await client.expire(latestKey, 3600) // 1h TTL
 
-    // Also increment per-type counter in the progression hash so dashboard reads real values
-    const field = `indications_${indicationType}_count`
-    await client.hincrby(`progression:${connectionId}`, field, 1)
-    await client.hincrby(`progression:${connectionId}`, "indications_count", 1)
-    await client.expire(`progression:${connectionId}`, 7 * 24 * 60 * 60)
+    const typeCountKey = `indications:${connectionId}:${indicationType}:count`
+    const totalCountKey = `indications:${connectionId}:count`
+    const latestKey = `indications:${connectionId}:${indicationType}:latest`
+    const progKey = `progression:${connectionId}`
+
+    await Promise.all([
+      client.incr(typeCountKey),
+      client.expire(typeCountKey, 86400),
+      client.incr(totalCountKey),
+      client.expire(totalCountKey, 86400),
+      client.set(latestKey, JSON.stringify({ symbol, value, confidence, timestamp: Date.now() })),
+      client.expire(latestKey, 3600),
+      client.hincrby(progKey, `indications_${indicationType}_count`, 1),
+      client.hincrby(progKey, "indications_count", 1),
+      client.expire(progKey, 7 * 24 * 60 * 60),
+    ])
   } catch (e) {
     console.error(`[v0] [Stats] Failed to track indication in Redis:`, e instanceof Error ? e.message : String(e))
   }
@@ -76,33 +78,30 @@ export async function trackStrategyStats(
     await initRedis()
     const client = getRedisClient()
 
-    // Use incrby (single command) instead of looping incr (N commands)
-    await client.incrby(`strategies:${connectionId}:${strategyType}:count`, 1)
-    await client.expire(`strategies:${connectionId}:${strategyType}:count`, 86400)
-    await client.incrby(`strategies:${connectionId}:count`, 1)
-    await client.expire(`strategies:${connectionId}:count`, 86400)
+    const typeCountKey = `strategies:${connectionId}:${strategyType}:count`
+    const totalCountKey = `strategies:${connectionId}:count`
+    const evalKey = `strategies:${connectionId}:${strategyType}:evaluated`
+    const passedKey = `strategies:${connectionId}:${strategyType}:passed`
+    const latestKey = `strategies:${connectionId}:${strategyType}:latest`
 
+    const writes: Promise<any>[] = [
+      client.incrby(typeCountKey, 1),
+      client.expire(typeCountKey, 86400),
+      client.incrby(totalCountKey, 1),
+      client.expire(totalCountKey, 86400),
+      client.set(
+        latestKey,
+        JSON.stringify({ symbol, totalCreated, passedCount, profitFactor, drawdownTimeMinutes, timestamp: Date.now() }),
+      ),
+      client.expire(latestKey, 3600),
+    ]
     if (totalCreated > 0) {
-      await client.incrby(`strategies:${connectionId}:${strategyType}:evaluated`, totalCreated)
-      await client.expire(`strategies:${connectionId}:${strategyType}:evaluated`, 86400)
+      writes.push(client.incrby(evalKey, totalCreated), client.expire(evalKey, 86400))
     }
     if (passedCount > 0) {
-      await client.incrby(`strategies:${connectionId}:${strategyType}:passed`, passedCount)
-      await client.expire(`strategies:${connectionId}:${strategyType}:passed`, 86400)
+      writes.push(client.incrby(passedKey, passedCount), client.expire(passedKey, 86400))
     }
-
-    await client.set(
-      `strategies:${connectionId}:${strategyType}:latest`,
-      JSON.stringify({
-        symbol,
-        totalCreated,
-        passedCount,
-        profitFactor,
-        drawdownTimeMinutes,
-        timestamp: Date.now(),
-      }),
-    )
-    await client.expire(`strategies:${connectionId}:${strategyType}:latest`, 3600)
+    await Promise.all(writes)
     // NOTE: Per-stage progression hash fields (strategies_base_total, strategies_main_total,
     // strategies_real_total, strategy_evaluated_*) are written exclusively by StrategyCoordinator
     // to avoid double-counting. trackStrategyStats only writes to the flat counter keys above

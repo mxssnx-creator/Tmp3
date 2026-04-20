@@ -82,7 +82,23 @@ export class RealtimeProcessor {
         return { updates: 0 }
       }
 
-      // Process each position in parallel
+      // Pre-warm the price cache for every unique symbol in parallel before
+      // fanning out the per-position work. Previously every position paid
+      // its own `getMarketData` round-trip on the first cycle after the
+      // TTL expired (even though most positions share a symbol). Fetching
+      // the distinct set first collapses those N reads into M << N.
+      const uniqueSymbols = new Set<string>()
+      for (const p of activePositions) {
+        if (p?.symbol) uniqueSymbols.add(p.symbol)
+      }
+      if (uniqueSymbols.size > 0) {
+        await Promise.all(
+          Array.from(uniqueSymbols).map((sym) => this.getCurrentPrice(sym).catch(() => null)),
+        )
+      }
+
+      // Process each position in parallel — every call now hits the
+      // freshly-warmed price cache synchronously.
       await Promise.all(activePositions.map((position) => this.processPosition(position)))
       return { updates: count }
     } catch (error) {

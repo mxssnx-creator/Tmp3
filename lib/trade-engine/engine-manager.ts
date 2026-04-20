@@ -616,15 +616,25 @@ export class TradeEngineManager {
         updated_at: new Date().toISOString(),
       })
 
-      // Also store in Redis sets for dashboard queries
+      // Also store in Redis sets for dashboard queries. Previously this loop
+      // fired ~4 sequential awaits per symbol (4N round-trips for N symbols).
+      // Fan-out everything in a single Promise.all — with 8h lookback × dozens
+      // of symbols this alone saves hundreds of serialised awaits at startup.
       try {
         const client = getRedisClient()
-        for (const symbol of symbols) {
-          await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
-          await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
-          await client.set(`prehistoric:${this.connectionId}:${symbol}:loaded`, "true")
-          await client.expire(`prehistoric:${this.connectionId}:${symbol}:loaded`, 86400)
+        const symbolsKey = `prehistoric:${this.connectionId}:symbols`
+        const writes: Promise<any>[] = []
+        if (symbols.length > 0) {
+          // Single SADD with multiple members, then one EXPIRE for the index.
+          writes.push((client as any).sadd(symbolsKey, ...symbols))
+          writes.push(client.expire(symbolsKey, 86400))
         }
+        for (const symbol of symbols) {
+          const loadedKey = `prehistoric:${this.connectionId}:${symbol}:loaded`
+          // set with EX in a single command avoids the set+expire pair.
+          writes.push(client.set(loadedKey, "true", { EX: 86400 } as any))
+        }
+        await Promise.all(writes)
       } catch (e) {
         console.warn("[v0] [Engine] Prehistoric Redis store failed:", e instanceof Error ? e.message : String(e))
       }

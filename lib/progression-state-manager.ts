@@ -180,20 +180,28 @@ export class ProgressionStateManager {
       let newSuccessful = 0
       let newFailed = 0
       try {
-        newCompleted = await client.hincrby(redisKey, "cycles_completed", 1)
+        // Fire the counter increment + the read of the non-incremented counter
+        // concurrently. The two operations are independent (hincrby on one
+        // field, hget on another) so there is no ordering constraint, and we
+        // save one Redis round-trip per cycle.
         if (successful) {
-          newSuccessful = await client.hincrby(redisKey, "successful_cycles", 1)
-          // Read failed without incrementing (small extra call, avoids race)
-          newFailed = parseInt(
-            ((await client.hget(redisKey, "failed_cycles")) as any) || "0",
-            10,
-          )
+          const [completed, successCount, failedStr] = await Promise.all([
+            client.hincrby(redisKey, "cycles_completed", 1),
+            client.hincrby(redisKey, "successful_cycles", 1),
+            client.hget(redisKey, "failed_cycles"),
+          ])
+          newCompleted = Number(completed) || 0
+          newSuccessful = Number(successCount) || 0
+          newFailed = parseInt((failedStr as any) || "0", 10)
         } else {
-          newFailed = await client.hincrby(redisKey, "failed_cycles", 1)
-          newSuccessful = parseInt(
-            ((await client.hget(redisKey, "successful_cycles")) as any) || "0",
-            10,
-          )
+          const [completed, failCount, successStr] = await Promise.all([
+            client.hincrby(redisKey, "cycles_completed", 1),
+            client.hincrby(redisKey, "failed_cycles", 1),
+            client.hget(redisKey, "successful_cycles"),
+          ])
+          newCompleted = Number(completed) || 0
+          newFailed = Number(failCount) || 0
+          newSuccessful = parseInt((successStr as any) || "0", 10)
         }
       } catch (e) {
         console.warn(`[v0] Failed to increment progression counters for ${connectionId}:`, e)
@@ -209,16 +217,18 @@ export class ProgressionStateManager {
 
       const successRate = newCompleted > 0 ? (newSuccessful / newCompleted) * 100 : 0
 
-      // Write metadata (non-counter fields) with hset — these are just
-      // timestamps/labels, not counters, so overwriting is correct.
+      // Write metadata (non-counter fields) + expire in parallel.
       try {
-        await client.hset(redisKey, {
-          cycle_success_rate: String(successRate.toFixed(2)),
-          last_cycle_time: new Date().toISOString(),
-          last_update: new Date().toISOString(),
-          connection_id: connectionId,
-        })
-        await client.expire(redisKey, 7 * 24 * 60 * 60)
+        const nowIso = new Date().toISOString()
+        await Promise.all([
+          client.hset(redisKey, {
+            cycle_success_rate: String(successRate.toFixed(2)),
+            last_cycle_time: nowIso,
+            last_update: nowIso,
+            connection_id: connectionId,
+          }),
+          client.expire(redisKey, 7 * 24 * 60 * 60),
+        ])
       } catch (writeError) {
         console.warn(`[v0] Failed to write progression metadata for ${connectionId}:`, writeError)
         return
@@ -242,26 +252,37 @@ export class ProgressionStateManager {
       const client = getRedisClient()
       const key = `progression:${connectionId}`
 
-      // Get current state
-      const current = await this.getProgressionState(connectionId)
+      // PERFORMANCE: The previous implementation called `getProgressionState`
+      // which does a full `hgetall` + JSON parse on every call — expensive
+      // and unnecessary. We now use atomic hincrby for the counter and a
+      // per-connection Set for the processed symbols which deduplicates in
+      // O(1) Redis-side without needing to re-read the whole hash.
+      const symbolsSetKey = `${key}:prehistoric_symbols_set`
+      const nowIso = new Date().toISOString()
 
-      // Update prehistoric metrics
-      const prehistoricCycles = (current.prehistoricCyclesCompleted || 0) + 1
-      const symbolsProcessed = current.prehistoricSymbolsProcessed || []
-      
-      if (!symbolsProcessed.includes(symbol)) {
-        symbolsProcessed.push(symbol)
-      }
+      const [prehistoricCycles] = await Promise.all([
+        client.hincrby(key, "prehistoric_cycles_completed", 1),
+        client.sadd(symbolsSetKey, symbol).catch(() => 0),
+        client.expire(symbolsSetKey, 7 * 24 * 60 * 60).catch(() => 0),
+      ])
 
-      // Save to Redis
-      await client.hset(key, {
-        prehistoric_cycles_completed: String(prehistoricCycles),
-        prehistoric_symbols_processed: JSON.stringify(symbolsProcessed),
-        prehistoric_phase_active: "true",
-        last_update: new Date().toISOString(),
-      })
+      // Mirror the processed symbols list into the hash so existing readers
+      // (which still expect `prehistoric_symbols_processed` as JSON) keep
+      // working. `smembers` replaces the old read-modify-write cycle.
+      const symbolsProcessed = ((await client.smembers(symbolsSetKey).catch(() => [])) || []) as string[]
 
-      console.log(`[v0] [Prehistoric] Symbol ${symbol}: Cycle ${prehistoricCycles} | Processed: ${symbolsProcessed.join(", ")}`)
+      await Promise.all([
+        client.hset(key, {
+          prehistoric_symbols_processed: JSON.stringify(symbolsProcessed),
+          prehistoric_phase_active: "true",
+          last_update: nowIso,
+        }),
+        client.expire(key, 7 * 24 * 60 * 60),
+      ])
+
+      console.log(
+        `[v0] [Prehistoric] Symbol ${symbol}: Cycle ${prehistoricCycles} | Processed: ${symbolsProcessed.join(", ")}`,
+      )
     } catch (error) {
       console.error(`[v0] Failed to track prehistoric cycle for ${connectionId}:`, error)
     }

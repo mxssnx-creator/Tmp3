@@ -57,16 +57,33 @@ export class PseudoPositionManager {
     }
   }
 
-  /** List all positions for this connection, optionally filtered */
+  /**
+   * List all positions for this connection, optionally filtered.
+   *
+   * PERFORMANCE: The previous implementation awaited `readPosition(id)` once
+   * per id — one Redis round-trip per position. With dozens of active
+   * pseudo positions this ran serially on every realtime tick (1/sec per
+   * engine), easily dominating cycle time. We now fan-out all reads in a
+   * single `Promise.all` so the whole list is fetched in one RTT window and
+   * filtering happens after in O(N) on the already-materialised array.
+   */
   private async listPositions(filter?: { status?: string; side?: string; symbol?: string; indicationType?: string }): Promise<any[]> {
     try {
       const client = getRedisClient()
       const ids = await client.smembers(this.positionsSetKey())
       if (!ids || ids.length === 0) return []
 
+      const raw = await Promise.all(ids.map((id: string) => this.readPosition(id).catch(() => null)))
+      const hasFilter = Boolean(
+        filter?.status || filter?.side || filter?.symbol || filter?.indicationType,
+      )
+
+      if (!hasFilter) {
+        return raw.filter((p): p is any => Boolean(p))
+      }
+
       const positions: any[] = []
-      for (const id of ids) {
-        const pos = await this.readPosition(id)
+      for (const pos of raw) {
         if (!pos) continue
         if (filter?.status && pos.status !== filter.status) continue
         if (filter?.side && pos.side !== filter.side) continue
