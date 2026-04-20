@@ -599,31 +599,35 @@ export class StrategyCoordinator {
 
     // Write live set count into progression hash — use hset so count reflects current cycle snapshot.
     // NOTE: strategies_real_total and strategy_evaluated_real are already written by evaluateRealSets.
+    // Previously this block fired 7 sequential Redis round-trips (hset × 2, set, expire × 3, + a
+    // compound hset). Parallelising them cuts the per-cycle Redis stall to a single network hop
+    // worth of latency, matching the base/main/real coordinators.
     try {
       const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      await client.hset(redisKey, "strategies_live_total", String(qualifying.length))
-      await client.expire(redisKey, 7 * 24 * 60 * 60)
+      const liveDetailKey = `strategy_detail:${this.connectionId}:live`
+      const liveCountKey = `strategies:${this.connectionId}:live:count`
 
-      // Write strategy_detail:{connId}:live
       const liveAvgPF  = qualifying.length > 0 ? qualifying.reduce((s, st) => s + st.avgProfitFactor, 0) / qualifying.length : 0
       const liveAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
       const passRatioLive = realSets.length > 0 ? qualifying.length / realSets.length : 0
 
-      const liveDetailKey = `strategy_detail:${this.connectionId}:live`
-      await client.hset(liveDetailKey, {
-        created_sets:      String(qualifying.length),
-        avg_profit_factor: String(liveAvgPF.toFixed(4)),
-        avg_drawdown_time: String(Math.round(liveAvgDDT)),
-        evaluated:         String(realSets.length),
-        passed_sets:       String(qualifying.length),
-        pass_rate:         String(passRatioLive.toFixed(4)),
-        updated_at:        String(Date.now()),
-      })
-      await client.expire(liveDetailKey, 86400)
-
-      await client.set(`strategies:${this.connectionId}:live:count`, String(qualifying.length))
-      await client.expire(`strategies:${this.connectionId}:live:count`, 86400)
+      await Promise.all([
+        client.hset(redisKey, "strategies_live_total", String(qualifying.length)),
+        client.expire(redisKey, 7 * 24 * 60 * 60),
+        client.hset(liveDetailKey, {
+          created_sets:      String(qualifying.length),
+          avg_profit_factor: String(liveAvgPF.toFixed(4)),
+          avg_drawdown_time: String(Math.round(liveAvgDDT)),
+          evaluated:         String(realSets.length),
+          passed_sets:       String(qualifying.length),
+          pass_rate:         String(passRatioLive.toFixed(4)),
+          updated_at:        String(Date.now()),
+        }),
+        client.expire(liveDetailKey, 86400),
+        // `set` with EX in a single command avoids the separate expire round-trip.
+        client.set(liveCountKey, String(qualifying.length), { EX: 86400 } as any),
+      ])
     } catch { /* non-critical */ }
 
     // Attempt real exchange trading for qualifying LIVE sets when the connection has live trading enabled.

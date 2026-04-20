@@ -122,14 +122,18 @@ async function savePosition(pos: LivePosition): Promise<void> {
     // 1. Write the position snapshot
     await client.setex(key, 604800, JSON.stringify(pos))
 
-    // 2. Register id in the open index exactly once per lifetime
+    // 2. Register id in the open index exactly once per lifetime. When the
+    // marker isn't set yet the four follow-up writes are independent, so we
+    // collapse them into a single Promise.all round-trip window.
     if (!_indexedInMemory.has(pos.id)) {
       const alreadyIndexed = await client.get(indexedMarker).catch(() => null)
       if (!alreadyIndexed) {
-        await client.lpush(openIndexKey, pos.id).catch(() => {})
-        await client.setex(indexedMarker, 604800, "1").catch(() => {})
-        await client.ltrim(openIndexKey, 0, 1999).catch(() => {})
-        await client.expire(openIndexKey, 604800).catch(() => {})
+        await Promise.all([
+          client.lpush(openIndexKey, pos.id).catch(() => {}),
+          client.setex(indexedMarker, 604800, "1").catch(() => {}),
+          client.ltrim(openIndexKey, 0, 1999).catch(() => {}),
+          client.expire(openIndexKey, 604800).catch(() => {}),
+        ])
       }
       _indexedInMemory.add(pos.id)
     }
@@ -146,11 +150,15 @@ async function savePosition(pos: LivePosition): Promise<void> {
       const movedMarker = `live:positions:${pos.connectionId}:moved:${pos.id}`
       const alreadyMoved = await client.get(movedMarker).catch(() => null)
       if (!alreadyMoved) {
-        await client.lrem(openIndexKey, 0, pos.id).catch(() => {})
-        await client.lpush(closedIndexKey, pos.id).catch(() => {})
-        await client.ltrim(closedIndexKey, 0, 4999).catch(() => {})
-        await client.expire(closedIndexKey, 30 * 24 * 60 * 60).catch(() => {})
-        await client.setex(movedMarker, 604800, "1").catch(() => {})
+        // These five writes are independent — lrem + lpush + ltrim + two
+        // expiries. Parallelising halves the per-close latency.
+        await Promise.all([
+          client.lrem(openIndexKey, 0, pos.id).catch(() => {}),
+          client.lpush(closedIndexKey, pos.id).catch(() => {}),
+          client.ltrim(closedIndexKey, 0, 4999).catch(() => {}),
+          client.expire(closedIndexKey, 30 * 24 * 60 * 60).catch(() => {}),
+          client.setex(movedMarker, 604800, "1").catch(() => {}),
+        ])
       }
     }
   } catch (err) {
@@ -159,10 +167,16 @@ async function savePosition(pos: LivePosition): Promise<void> {
 }
 
 async function incrementMetric(connectionId: string, field: string, by = 1): Promise<void> {
+  // Fire the counter bump and the TTL refresh in parallel — the expire is
+  // independent of the hincrby result and would otherwise force a second
+  // round-trip for every live-stage metric update.
   try {
     const client = getRedisClient()
-    await client.hincrby(`progression:${connectionId}`, field, by)
-    await client.expire(`progression:${connectionId}`, 7 * 24 * 60 * 60)
+    const key = `progression:${connectionId}`
+    await Promise.all([
+      client.hincrby(key, field, by),
+      client.expire(key, 7 * 24 * 60 * 60),
+    ])
   } catch {
     /* non-critical */
   }
