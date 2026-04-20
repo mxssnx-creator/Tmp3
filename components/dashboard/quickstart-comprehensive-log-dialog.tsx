@@ -255,35 +255,27 @@ export function QuickstartComprehensiveLogDialog() {
               </div>
             ) : (
               <>
-                {/* Key counters */}
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-                  {[
-                    { label: "Ind Cycles",  value: fmt(rt?.indicationCycles || 0), color: "text-blue-600 dark:text-blue-400" },
-                    { label: "Indications", value: fmt(rt?.indicationsTotal  || 0), color: "text-violet-600 dark:text-violet-400" },
-                    { label: "Strategies",  value: fmt(rt?.strategiesTotal   || 0), color: "text-amber-600 dark:text-amber-400" },
-                    { label: "Positions",   value: fmt(rt?.positionsOpen     || 0), color: "text-green-600 dark:text-green-400" },
-                  ].map(({ label, value, color }) => (
-                    <div key={label} className="rounded-md bg-muted/60 p-2.5 text-center">
-                      <div className={`text-xl font-bold tabular-nums ${color}`}>{value}</div>
-                      <div className="text-[10px] text-muted-foreground mt-0.5">{label}</div>
-                    </div>
-                  ))}
-                </div>
-
-                {/* Prehistoric */}
-                <SectionCard>
+                {/* Prehistoric (rendered FIRST — the engine loads historic
+                    data before running any live cycles, so the dashboard's
+                    vertical order should match the actual processing order.
+                    Previously the live "Key counters" grid was shown above
+                    this card, which hid the historic context on open). */}
+                <SectionCard className="bg-blue-50/30 dark:bg-blue-950/20">
                   <div className="flex items-center gap-2 text-xs font-semibold">
                     <Database className="w-3.5 h-3.5 text-blue-500" />
-                    Prehistoric Processing
+                    Historical Processing
                     {h?.isComplete
-                      ? <CheckCircle2 className="w-3 h-3 text-green-500 ml-auto" />
-                      : <Circle className="w-3 h-3 text-muted-foreground/30 ml-auto" />
+                      ? <Badge className="bg-green-600 hover:bg-green-600 text-white text-[10px] h-4 px-1.5 ml-auto">Loaded</Badge>
+                      : <Badge variant="secondary" className="text-[10px] h-4 px-1.5 ml-auto tabular-nums">{h?.progressPercent || 0}%</Badge>
                     }
                   </div>
-                  {!h?.isComplete && <Progress value={h?.progressPercent || 0} className="h-1" />}
-                  <div className="grid grid-cols-4 gap-1.5 text-center text-[10px]">
+                  {!h?.isComplete && <Progress value={h?.progressPercent || 0} className="h-1.5" />}
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-1.5 text-center text-[10px]">
                     <div className="rounded bg-muted/50 p-1.5">
-                      <div className="font-bold text-sm tabular-nums">{h?.symbolsProcessed || 0}</div>
+                      <div className="font-bold text-sm tabular-nums">
+                        {h?.symbolsProcessed || 0}
+                        <span className="text-muted-foreground font-normal">/{h?.symbolsTotal || 0}</span>
+                      </div>
                       <div className="text-muted-foreground">Symbols</div>
                     </div>
                     <div className="rounded bg-muted/50 p-1.5">
@@ -300,6 +292,21 @@ export function QuickstartComprehensiveLogDialog() {
                     </div>
                   </div>
                 </SectionCard>
+
+                {/* Live Key counters (AFTER historical). */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                  {[
+                    { label: "Ind Cycles",  value: fmt(rt?.indicationCycles || 0), color: "text-blue-600 dark:text-blue-400" },
+                    { label: "Indications", value: fmt(rt?.indicationsTotal  || 0), color: "text-violet-600 dark:text-violet-400" },
+                    { label: "Strategies",  value: fmt(rt?.strategiesTotal   || 0), color: "text-amber-600 dark:text-amber-400" },
+                    { label: "Positions",   value: fmt(rt?.positionsOpen     || 0), color: "text-green-600 dark:text-green-400" },
+                  ].map(({ label, value, color }) => (
+                    <div key={label} className="rounded-md bg-muted/60 p-2.5 text-center">
+                      <div className={`text-xl font-bold tabular-nums ${color}`}>{value}</div>
+                      <div className="text-[10px] text-muted-foreground mt-0.5">{label}</div>
+                    </div>
+                  ))}
+                </div>
 
                 {/* Live metrics + windows */}
                 <SectionCard>

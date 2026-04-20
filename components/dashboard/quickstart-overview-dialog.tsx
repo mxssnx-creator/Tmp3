@@ -164,7 +164,7 @@ function IndWindow({ label, count, total }: { label: string; count: number; tota
   )
 }
 
-// ─── component ────────────────────────────────────────────────────────────────
+// ─── component ────────────────────────────────────────────────────────���───────
 
 export function QuickstartOverviewDialog() {
   const { selectedConnectionId, selectedConnection, selectedExchange } = useExchange()
@@ -272,12 +272,51 @@ export function QuickstartOverviewDialog() {
 
           {/* ── Overview ─────────────────────────────────────────────────── */}
           <TabsContent value="overview" className="flex-1 overflow-y-auto p-4 space-y-3">
-            {/* top counters */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              <StatCell label="Ind Cycles"   value={fmt(rt?.indicationCycles || 0)}  accent="text-blue-600 dark:text-blue-400" />
-              <StatCell label="Strat Cycles" value={fmt(rt?.strategyCycles   || 0)}  accent="text-violet-600 dark:text-violet-400" />
-              <StatCell label="Indications"  value={fmt(rt?.indicationsTotal || 0)}  accent="text-green-600 dark:text-green-400" />
-              <StatCell label="Positions"    value={fmt(rt?.positionsOpen    || 0)}  accent="text-amber-600 dark:text-amber-400" />
+            {/* Historical Processing — shown FIRST, matching the engine's
+                own top-to-bottom flow: historic load → live cycles → exec.
+                This section was previously buried in the separate
+                "prehistoric" tab, which meant users opening the Overview tab
+                saw zero historical context up front. */}
+            <div className="rounded-md border p-3 space-y-2 bg-blue-50/30 dark:bg-blue-950/20">
+              <div className="flex items-center gap-2 text-xs font-semibold">
+                <Database className="w-3.5 h-3.5 text-blue-500" />
+                Historical Processing
+                {h?.isComplete ? (
+                  <Badge className="bg-green-600 hover:bg-green-600 text-white text-[10px] h-4 px-1.5 ml-auto">Loaded</Badge>
+                ) : (
+                  <Badge variant="secondary" className="text-[10px] h-4 px-1.5 ml-auto tabular-nums">
+                    {h?.progressPercent || 0}%
+                  </Badge>
+                )}
+              </div>
+              {!h?.isComplete && (
+                <Progress value={h?.progressPercent || 0} className="h-1.5" />
+              )}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <StatCell
+                  label="Symbols"
+                  value={`${h?.symbolsProcessed || 0}/${h?.symbolsTotal || 0}`}
+                  accent="text-blue-600 dark:text-blue-400"
+                />
+                <StatCell label="Candles"     value={fmt(h?.candlesLoaded       || 0)} accent="text-sky-600 dark:text-sky-400" />
+                <StatCell label="Indicators"  value={fmt(h?.indicatorsCalculated|| 0)} accent="text-teal-600 dark:text-teal-400" />
+                <StatCell label="Preh Cycles" value={fmt(h?.cyclesCompleted     || 0)} accent="text-indigo-600 dark:text-indigo-400" />
+              </div>
+            </div>
+
+            {/* Live Processing counters (Ind Cycles / Strat Cycles / Indications / Positions). */}
+            <div className="rounded-md border p-3 space-y-2">
+              <div className="flex items-center gap-2 text-xs font-semibold">
+                <TrendingUp className="w-3.5 h-3.5 text-green-500" />
+                Live Processing
+                {rt?.isActive && <Badge className="bg-blue-600 text-[10px] h-4 px-1.5 ml-auto">Active</Badge>}
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <StatCell label="Ind Cycles"   value={fmt(rt?.indicationCycles || 0)}  accent="text-blue-600 dark:text-blue-400" />
+                <StatCell label="Strat Cycles" value={fmt(rt?.strategyCycles   || 0)}  accent="text-violet-600 dark:text-violet-400" />
+                <StatCell label="Indications"  value={fmt(rt?.indicationsTotal || 0)}  accent="text-green-600 dark:text-green-400" />
+                <StatCell label="Positions"    value={fmt(rt?.positionsOpen    || 0)}  accent="text-amber-600 dark:text-amber-400" />
+              </div>
             </div>
 
             {/* time windows */}

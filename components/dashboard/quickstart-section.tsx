@@ -501,7 +501,7 @@ export function QuickstartSection() {
       </div>
 
       <div className="p-2.5 space-y-2">
-        {/* ── action row ─────────────────────────────────────────────────── */}
+        {/* ── action row ───────────────────────────────────��─────────────── */}
         <div className="flex flex-wrap items-center gap-1.5">
           <Button
             size="sm"
@@ -621,7 +621,58 @@ export function QuickstartSection() {
           </Button>
         </div>
 
-        {/* ── quick stats row (always visible) ──────────────────────────── */}
+        {/* ── historical processing row (always visible, BEFORE live stats) ──
+            Shows prehistoric load status up-front so users can see how much
+            historical context the engine has behind it before we show any
+            realtime cycle counters. This mirrors the ordering the engine
+            itself follows: historic data is loaded first, then live loops
+            start — so the dashboard should read the same way top-to-bottom.
+         */}
+        <div
+          className={`flex flex-wrap items-center gap-1.5 rounded-md border px-2 py-1.5 ${
+            stats.historicComplete
+              ? "bg-green-50/50 dark:bg-green-950/20 border-green-500/20"
+              : "bg-blue-50/40 dark:bg-blue-950/20 border-blue-500/20"
+          }`}
+        >
+          <div className="flex items-center gap-1.5 shrink-0">
+            <Database className={`w-3.5 h-3.5 ${stats.historicComplete ? "text-green-600 dark:text-green-500" : "text-blue-600 dark:text-blue-500"}`} />
+            <span className="text-[11px] font-semibold text-foreground">Historical</span>
+            {stats.historicComplete ? (
+              <Badge className="bg-green-600 hover:bg-green-600 text-white h-4 text-[9px] px-1.5 py-0">Loaded</Badge>
+            ) : (
+              <Badge variant="secondary" className="h-4 text-[9px] px-1.5 py-0 tabular-nums">
+                {stats.historicProgress}%
+              </Badge>
+            )}
+          </div>
+
+          {/* inline progress bar when still loading — keeps the row slim */}
+          {!stats.historicComplete && (
+            <div className="flex-1 min-w-[80px] max-w-[160px] h-1 bg-muted rounded-full overflow-hidden">
+              <div
+                className="h-full bg-blue-500/70 rounded-full transition-all"
+                style={{ width: `${Math.min(100, Math.max(0, stats.historicProgress))}%` }}
+              />
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-1.5 ml-auto">
+            <MiniStat
+              label="Symbols"
+              value={`${stats.historicSymbols}/${stats.historicSymbolsTotal || "—"}`}
+            />
+            {stats.historicCandles > 0 && (
+              <MiniStat label="Candles" value={fmt(stats.historicCandles)} />
+            )}
+            {stats.historicIndicators > 0 && (
+              <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
+            )}
+            <MiniStat label="P-Cycles" value={fmt(stats.historicCycles)} />
+          </div>
+        </div>
+
+        {/* ── live processing row (always visible, AFTER historical) ───── */}
         <div className="flex flex-wrap gap-1.5">
           <MiniStat label="Ind Cycles"   value={fmt(stats.indicationCycles)}  />
           <MiniStat label="Indications"  value={fmt(stats.indicationsTotal)}   />
