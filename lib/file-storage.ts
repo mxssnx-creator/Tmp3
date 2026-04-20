@@ -547,7 +547,8 @@ function getDefaultSettings(): Settings {
     max_leverage: 125,
     risk_percentage: 20,
 
-    prehistoricDataDays: 5, // Default 5 days of historical data (1-15 range)
+    prehistoricDataDays: 5, // Legacy (days) — kept for backward compat
+    prehistoric_range_hours: 8, // Canonical: 1-50h, step 1, default 8h — read by engine-manager
     marketTimeframe: 1, // Default 1 second update interval (1,2,3,5,10,15 options)
 
     mainTradeInterval: 1, // Main trade execution interval in seconds (default: 1, range: 1-10)

@@ -20,6 +20,7 @@ export const initialSettings: Settings = {
   negativeChangePercent: 20, // 5-30 step 5, Default 20 - used for loss trigger calculation
   leveragePercentage: 100, // 5-100 step 5, Default 100
   prehistoricDataDays: 5,
+  prehistoric_range_hours: 8, // 1-50 hours, step 1, default 8 (canonical prehistoric range)
   marketTimeframe: 1,
   tradeIntervalSeconds: 1,
   realPositionsIntervalSeconds: 0.3,

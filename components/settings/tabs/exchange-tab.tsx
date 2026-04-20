@@ -100,19 +100,20 @@ export function ExchangeTab({
               <p className="text-sm text-muted-foreground">Configure historical data retrieval and market timeframes</p>
 
               <div className="grid md:grid-cols-2 gap-6">
+                {/* Hours-based prehistoric range (1-50h, step 1, default 8). */}
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <Label>Days of Prehistoric Data</Label>
-                    <span className="text-sm font-medium">{settings.prehistoricDataDays || 5} days</span>
+                    <Label>Hours of Prehistoric Data</Label>
+                    <span className="text-sm font-medium">{settings.prehistoric_range_hours ?? 8} h</span>
                   </div>
                   <Slider
                     min={1}
-                    max={15}
+                    max={50}
                     step={1}
-                    value={[settings.prehistoricDataDays || 5]}
-                    onValueChange={([value]) => handleSettingChange("prehistoricDataDays", value)}
+                    value={[settings.prehistoric_range_hours ?? 8]}
+                    onValueChange={([value]) => handleSettingChange("prehistoric_range_hours", value)}
                   />
-                  <p className="text-xs text-muted-foreground">Historical data to load on startup (1-15 days)</p>
+                  <p className="text-xs text-muted-foreground">Historical candle range loaded on engine start (1-50 hours, default 8)</p>
                 </div>
 
                 <div className="space-y-2">
