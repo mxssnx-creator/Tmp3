@@ -63,8 +63,11 @@ export class VolumeCalculator {
 
       // CRITICAL: Check minimum volume constraint BEFORE accepting
       if (exchangeMinVolume > 0 && calculatedVolume < exchangeMinVolume) {
-        // Position too small - REJECT instead of forcing
+        // Position too small - REJECT instead of forcing. Include finalVolume: 0 so
+        // downstream callers reading `finalVolume` get a defined number (not undefined).
         return {
+          calculatedVolume,
+          finalVolume: 0,
           volume: 0,
           volumeUsd: 0,
           leverage,
@@ -73,7 +76,11 @@ export class VolumeCalculator {
         }
       }
 
+      // Return both `volume` (legacy) and `finalVolume` (new canonical) so all
+      // callers work regardless of which field they read.
       return {
+        calculatedVolume,
+        finalVolume,
         volume: finalVolume,
         volumeUsd: finalVolume * currentPrice,
         leverage,
