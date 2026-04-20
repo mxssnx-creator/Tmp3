@@ -1,12 +1,14 @@
 /**
- * Trade Engine Manager V10
+ * Trade Engine Manager V11
  * Manages asynchronous processing for symbols, indications, pseudo positions, and strategies
  * V10: Define totalStrategiesEvaluated globally to prevent stale closure ReferenceError
- * @version 10.0.0
- * @lastUpdate 2026-04-06T04:01:00Z - Global variable fallback for stale closures
+ * V11: Self-scheduling setTimeout loops with configurable cycle pause
+ *      (app_settings.cyclePauseMs, default 50 ms) to fix 4 s+ cycle hang.
+ * @version 11.0.0
+ * @lastUpdate 2026-04-20 — self-scheduling cycle loops
  */
 
-const _ENGINE_BUILD_VERSION = "10.0.0"
+const _ENGINE_BUILD_VERSION = "11.0.0"
 
 // CRITICAL FIX: Define totalStrategiesEvaluated in global scope as fallback
 // This allows stale closures from old code to continue without ReferenceError
@@ -62,6 +64,61 @@ function registerEngineTimer(timer: ReturnType<typeof setInterval>): void {
 function unregisterEngineTimer(timer: ReturnType<typeof setInterval>): void {
   engineGlobal.__engine_timers?.delete(timer)
 }
+
+/**
+ * Configurable pause (ms) between engine cycles.
+ *
+ * Value comes from the `app_settings.cyclePauseMs` key in Redis, clamped to
+ * [10, 200]. Default 50 ms. Cached in-memory for 10 s to avoid hitting Redis
+ * on every cycle of every loop. A synchronous getter (`getCyclePauseMsSync`)
+ * returns the last-known value and triggers an async refresh when the cache
+ * has expired, so cycle scheduling never blocks on Redis I/O.
+ */
+const DEFAULT_CYCLE_PAUSE_MS = 50
+const CYCLE_PAUSE_MIN = 10
+const CYCLE_PAUSE_MAX = 200
+const CYCLE_PAUSE_CACHE_TTL_MS = 10_000
+
+let _cyclePauseMsCached: number = DEFAULT_CYCLE_PAUSE_MS
+let _cyclePauseMsFetchedAt = 0
+let _cyclePauseMsRefreshing = false
+
+function clampCyclePauseMs(n: unknown): number {
+  const v = typeof n === "number" ? n : Number(n)
+  if (!Number.isFinite(v)) return DEFAULT_CYCLE_PAUSE_MS
+  return Math.max(CYCLE_PAUSE_MIN, Math.min(CYCLE_PAUSE_MAX, Math.round(v)))
+}
+
+function refreshCyclePauseMsAsync(): void {
+  if (_cyclePauseMsRefreshing) return
+  _cyclePauseMsRefreshing = true
+  ;(async () => {
+    try {
+      const { getSettings } = await import("@/lib/redis-db")
+      const s = (await getSettings("app_settings")) || {}
+      if (s && typeof s === "object" && "cyclePauseMs" in s) {
+        _cyclePauseMsCached = clampCyclePauseMs((s as any).cyclePauseMs)
+      }
+      _cyclePauseMsFetchedAt = Date.now()
+    } catch {
+      // Keep last-known value on error
+      _cyclePauseMsFetchedAt = Date.now()
+    } finally {
+      _cyclePauseMsRefreshing = false
+    }
+  })()
+}
+
+function getCyclePauseMsSync(): number {
+  if (Date.now() - _cyclePauseMsFetchedAt > CYCLE_PAUSE_CACHE_TTL_MS) {
+    // Fire-and-forget refresh; return the cached value immediately.
+    refreshCyclePauseMsAsync()
+  }
+  return _cyclePauseMsCached
+}
+
+// Prime the cache on module load so the first cycle uses a recent value.
+refreshCyclePauseMsAsync()
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
@@ -578,24 +635,35 @@ export class TradeEngineManager {
    */
   // Indication processor - runs strategy evaluation on interval
   // Version 3.0 - Removed totalStrategiesEvaluated to fix stale closure issues
-  private startIndicationProcessor(intervalSeconds: number = 1): void {
+  // Version 4.0 - Converted from setInterval to self-scheduling setTimeout so
+  //   each cycle runs back-to-back with a configurable pause (app_settings.cyclePauseMs,
+  //   10-200ms, default 50ms). This removes the old "skip-when-busy" pattern that
+  //   was causing the cycle time to climb to 4s+ and the engine to appear hung.
+  private startIndicationProcessor(_intervalSeconds: number = 1): void {
     // Counter variables for metrics tracking - simplified to avoid closure issues
     let cycleCount = 0
     let attemptedCycles = 0
     let totalDuration = 0
     let errorCount = 0
-    let isProcessing = false
 
-    this.indicationTimer = setInterval(async () => {
-      if (isProcessing) return
-      isProcessing = true
+    const scheduleNext = () => {
+      if (!this.isRunning) return
+      const pause = getCyclePauseMsSync()
+      this.indicationTimer = setTimeout(tick, pause)
+      registerEngineTimer(this.indicationTimer)
+    }
+
+    const tick = async () => {
+      if (!this.isRunning) return
       const startTime = Date.now()
-      
+      // Local abort flag — when true, the finally block will NOT schedule the next cycle.
+      let aborted = false
+
       // V8: Early exit if this timer is from a stale module version
       if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
         console.log(`[v0] Stale timer detected (version mismatch), self-clearing...`)
         if (this.indicationTimer) {
-          clearInterval(this.indicationTimer)
+          clearTimeout(this.indicationTimer)
           unregisterEngineTimer(this.indicationTimer)
         }
         return
@@ -604,7 +672,7 @@ export class TradeEngineManager {
       try {
         const symbols = await this.getSymbols()
         if (!symbols || symbols.length === 0) {
-          isProcessing = false
+          // No symbols yet — fall through; finally will schedule the next attempt.
           return
         }
 
@@ -708,17 +776,18 @@ export class TradeEngineManager {
         } catch { /* ignore errors */ }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error)
-        
+
         // Suppress known stale closure errors from HMR - these will clear on server restart
         if (errorMessage.includes("totalStrategiesEvaluated is not defined")) {
-          // Self-heal: clear this stale timer
+          // Self-heal: clear this stale timer and do NOT reschedule
+          aborted = true
           if (this.indicationTimer) {
-            clearInterval(this.indicationTimer)
+            clearTimeout(this.indicationTimer)
             console.log("[v0] Cleared stale indication timer with totalStrategiesEvaluated error")
           }
           return
         }
-        
+
         errorCount++
         this.componentHealth.indications.errorCount++
         // Track failed cycle on every error to keep progression counters accurate.
@@ -736,35 +805,45 @@ export class TradeEngineManager {
         )
         console.error("[v0] Indication processor error:", error)
       } finally {
-        isProcessing = false
+        // Schedule next cycle after configurable pause so the event loop can breathe.
+        if (!aborted) scheduleNext()
       }
-    }, intervalSeconds * 1000)
-    
-    // Register timer for cleanup on module reload
+    }
+
+    // Kick off the first cycle immediately (0 ms delay).
+    this.indicationTimer = setTimeout(tick, 0)
     registerEngineTimer(this.indicationTimer)
   }
 
   /**
    * Start strategy processor (async)
-   * With debouncing to prevent overlapping cycles
+   *
+   * Self-scheduling setTimeout loop — cycles run back-to-back with a
+   * configurable pause (app_settings.cyclePauseMs). Natural serialisation
+   * prevents overlap without needing an isProcessing flag.
    */
-  private startStrategyProcessor(intervalSeconds: number = 1): void {
+  private startStrategyProcessor(_intervalSeconds: number = 1): void {
     let cycleCount = 0
     let totalDuration = 0
     let errorCount = 0
     let totalStrategiesEvaluated = 0
-    let isProcessing = false
 
-    this.strategyTimer = setInterval(async () => {
-      if (isProcessing) return
-      isProcessing = true
+    const scheduleNext = () => {
+      if (!this.isRunning) return
+      const pause = getCyclePauseMsSync()
+      this.strategyTimer = setTimeout(tick, pause)
+      registerEngineTimer(this.strategyTimer)
+    }
+
+    const tick = async () => {
+      if (!this.isRunning) return
       const startTime = Date.now()
-      
+
       // V8: Early exit if this timer is from a stale module version
       if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
         console.log(`[v0] Stale strategy timer detected, self-clearing...`)
         if (this.strategyTimer) {
-          clearInterval(this.strategyTimer)
+          clearTimeout(this.strategyTimer)
           unregisterEngineTimer(this.strategyTimer)
         }
         return
@@ -869,35 +948,43 @@ export class TradeEngineManager {
         })
         console.error("[v0] Strategy error:", errorMessage)
       } finally {
-        isProcessing = false
+        scheduleNext()
       }
-    }, intervalSeconds * 1000)
-    
-    // Register timer for cleanup on module reload
+    }
+
+    // Kick off the first cycle immediately.
+    this.strategyTimer = setTimeout(tick, 0)
     registerEngineTimer(this.strategyTimer)
   }
 
   /**
    * Start realtime processor (async)
-   * With debouncing to prevent overlapping cycles
+   *
+   * Self-scheduling setTimeout loop — each cycle runs back-to-back with a
+   * configurable pause (app_settings.cyclePauseMs, 10-200ms, default 50ms).
    */
-  private startRealtimeProcessor(intervalSeconds: number = 1): void {
+  private startRealtimeProcessor(_intervalSeconds: number = 1): void {
     let cycleCount = 0
     let totalDuration = 0
     let errorCount = 0
-    let isProcessing = false
 
-    this.realtimeTimer = setInterval(async () => {
+    const scheduleNext = () => {
+      if (!this.isRunning) return
+      const pause = getCyclePauseMsSync()
+      this.realtimeTimer = setTimeout(tick, pause)
+      registerEngineTimer(this.realtimeTimer)
+    }
+
+    const tick = async () => {
+      if (!this.isRunning) return
       // V8: Early exit if this timer is from a stale module version
       if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
         if (this.realtimeTimer) {
-          clearInterval(this.realtimeTimer)
+          clearTimeout(this.realtimeTimer)
           unregisterEngineTimer(this.realtimeTimer)
         }
         return
       }
-      if (isProcessing) return
-      isProcessing = true
       const startTime = Date.now()
 
       try {
@@ -953,9 +1040,12 @@ export class TradeEngineManager {
           errorCount,
         })
       } finally {
-        isProcessing = false
+        scheduleNext()
       }
-    }, intervalSeconds * 1000)
+    }
+
+    // Kick off the first cycle immediately.
+    this.realtimeTimer = setTimeout(tick, 0)
     
     // Register timer for cleanup on module reload
     registerEngineTimer(this.realtimeTimer)
