@@ -53,6 +53,13 @@ interface LiveStats {
   stratMain: number
   stratReal: number
   stratLive: number
+  // live execution — real exchange positions
+  livePositionsOpen: number
+  livePositionsCreated: number
+  livePositionsClosed: number
+  liveOrdersPlaced: number
+  liveOrdersFilled: number
+  liveWinRate: number
   // windows
   indLast5m: number
   indLast60m: number
@@ -68,6 +75,8 @@ const EMPTY_STATS: LiveStats = {
   strategiesTotal: 0, positionsOpen: 0, successRate: 0, avgCycleMs: 0, isActive: false,
   indDirection: 0, indMove: 0, indActive: 0, indOptimal: 0, indAuto: 0,
   stratBase: 0, stratMain: 0, stratReal: 0, stratLive: 0,
+  livePositionsOpen: 0, livePositionsCreated: 0, livePositionsClosed: 0,
+  liveOrdersPlaced: 0, liveOrdersFilled: 0, liveWinRate: 0,
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
 }
 
@@ -113,6 +122,16 @@ export function QuickstartSection() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [stats, setStats] = useState<LiveStats>(EMPTY_STATS)
   const [loadingStats, setLoadingStats] = useState(false)
+
+  // Quickstart controls — how many top-volatile symbols to process (1-10)
+  // and whether live exchange trading is currently enabled for the connection.
+  const [symbolCount, setSymbolCount] = useState<number>(1)
+  const [liveTradeActive, setLiveTradeActive] = useState<boolean>(false)
+  const [liveTradeLoading, setLiveTradeLoading] = useState<boolean>(false)
+  // Connection the quickstart actually bound to on last start (or the
+  // component default) — used as the target for the Live toggle.
+  const [activeConnectionId, setActiveConnectionId] = useState<string>(connectionId)
+
   const logsEndRef = useRef<HTMLDivElement>(null)
   const pollRef    = useRef<NodeJS.Timeout>()
 
@@ -187,6 +206,13 @@ export function QuickstartSection() {
         stratMain:             stratMain,
         stratReal:             stratReal,
         stratLive:             s.breakdown?.strategies?.live   || 0,
+        // Live exchange execution — from liveExecution block of the /stats endpoint
+        livePositionsOpen:     s.liveExecution?.positionsOpen    || 0,
+        livePositionsCreated:  s.liveExecution?.positionsCreated || 0,
+        livePositionsClosed:   s.liveExecution?.positionsClosed  || 0,
+        liveOrdersPlaced:      s.liveExecution?.ordersPlaced     || 0,
+        liveOrdersFilled:      s.liveExecution?.ordersFilled     || 0,
+        liveWinRate:           s.liveExecution?.winRate          || 0,
         indLast5m:             s.windows?.indications?.last5m     || 0,
         indLast60m:            s.windows?.indications?.last60m    || 0,
         phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
@@ -290,29 +316,49 @@ export function QuickstartSection() {
         conns[0]
       if (!conn) throw new Error("No active connections found")
       addLog(`Connected to ${conn.exchange?.toUpperCase() || "exchange"}`, "success")
+      setActiveConnectionId(conn.id)
+      // Seed live state from whatever the connection already says
+      setLiveTradeActive(conn.is_live_trade === "1" || conn.is_live_trade === true)
 
-      addLog("Fetching most volatile symbol (1h)...", "info")
+      const clampedCount = Math.max(1, Math.min(10, symbolCount))
+      addLog(
+        clampedCount === 1
+          ? "Fetching most volatile symbol (1h)..."
+          : `Fetching top ${clampedCount} volatile symbols (1h)...`,
+        "info",
+      )
       const ex = (conn.exchange || "bingx").toLowerCase()
-      const symRes = await fetch(`/api/exchange/${ex}/top-symbols?t=` + Date.now(), { cache: "no-store" })
-      let symbol = "BTCUSDT"
+      const symRes = await fetch(
+        `/api/exchange/${ex}/top-symbols?limit=${clampedCount}&t=${Date.now()}`,
+        { cache: "no-store" },
+      )
+      let chosen: string[] = ["BTCUSDT"]
       if (symRes.ok) {
         const sym = await symRes.json()
-        symbol = sym.symbol || "BTCUSDT"
-        addLog(`Symbol: ${symbol} (${sym.priceChangePercent?.toFixed(2) || "—"}% 1h)`, "success")
-        setVolatileSymbol({ symbol, exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
+        // Prefer the new symbolList (string[]) → fall back to the object list → single symbol
+        const list: string[] =
+          (Array.isArray(sym.symbolList) && sym.symbolList.length > 0)
+            ? sym.symbolList
+            : (Array.isArray(sym.symbols) && sym.symbols.length > 0 && typeof sym.symbols[0] === "object")
+              ? sym.symbols.map((s: any) => s.symbol).filter(Boolean)
+              : (sym.symbol ? [sym.symbol] : [])
+        if (list.length > 0) chosen = list
+        const top = chosen[0]
+        addLog(`Selected: ${chosen.join(", ")} (top: ${sym.priceChangePercent?.toFixed(2) ?? "—"}% 1h)`, "success")
+        setVolatileSymbol({ symbol: top, exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
       }
 
-      addLog("Starting trade engine...", "info")
+      addLog(`Starting trade engine with ${chosen.length} symbol${chosen.length > 1 ? "s" : ""}...`, "info")
       const startRes = await fetch("/api/trade-engine/quick-start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ connectionId: conn.id, symbols: [symbol] }),
+        body: JSON.stringify({ connectionId: conn.id, symbols: chosen }),
       })
 
       if (startRes.ok) {
         addLog("Trade engine started successfully", "success")
         setIsRunning(true)
-        addLog(`Processing live ${symbol} data...`, "info")
+        addLog(`Processing live data for: ${chosen.join(", ")}`, "info")
       } else {
         const body = await startRes.json().catch(() => ({}))
         addLog(body?.message || "Engine already running — monitoring active", "warning")
@@ -334,7 +380,70 @@ export function QuickstartSection() {
   const handleRefresh = async () => {
     await loadSymbol(true)
     await fetchStats(true)
+    await refreshLiveTradeStatus()
   }
+
+  // ── live-trade toggle ─────────────────────────────────────────────────────
+  // Enables or disables real exchange trading for the active connection via
+  // /api/settings/connections/[id]/live-trade. The server validates that
+  // credentials exist and starts the independent live-trade engine.
+  const refreshLiveTradeStatus = useCallback(async () => {
+    const id = activeConnectionId || connectionId
+    if (!id) return
+    try {
+      const res = await fetch(`/api/settings/connections?t=${Date.now()}`, { cache: "no-store" })
+      if (!res.ok) return
+      const data = await res.json()
+      const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
+      const conn = conns.find(c => c.id === id)
+      if (conn) {
+        setLiveTradeActive(conn.is_live_trade === "1" || conn.is_live_trade === true)
+      }
+    } catch { /* non-critical */ }
+  }, [activeConnectionId, connectionId])
+
+  const handleToggleLiveTrade = async () => {
+    if (liveTradeLoading) return
+    const id = activeConnectionId || connectionId
+    if (!id) {
+      addLog("No connection selected — start the engine first", "warning")
+      return
+    }
+    const nextState = !liveTradeActive
+    setLiveTradeLoading(true)
+    addLog(`${nextState ? "Enabling" : "Disabling"} LIVE exchange trading...`, "info")
+    try {
+      const res = await fetch(`/api/settings/connections/${id}/live-trade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ is_live_trade: nextState }),
+      })
+      const body = await res.json().catch(() => ({} as any))
+      if (!res.ok || body?.success === false) {
+        const hint = body?.hint ? ` — ${body.hint}` : ""
+        addLog(`Live toggle failed: ${body?.error || res.statusText}${hint}`, "error")
+        return
+      }
+      setLiveTradeActive(nextState)
+      addLog(
+        nextState
+          ? "LIVE exchange trading ENABLED — real orders will be placed"
+          : "LIVE exchange trading disabled",
+        nextState ? "success" : "info",
+      )
+      // Refresh stats immediately so the Live counter reflects the new engine
+      setTimeout(() => fetchStats(true), 1000)
+    } catch (err) {
+      addLog(`Live toggle error: ${err instanceof Error ? err.message : String(err)}`, "error")
+    } finally {
+      setLiveTradeLoading(false)
+    }
+  }
+
+  // Sync live-trade status on mount and whenever the active connection changes
+  useEffect(() => {
+    refreshLiveTradeStatus()
+  }, [refreshLiveTradeStatus])
 
   const logColor = (type: string) => {
     switch (type) {
@@ -402,7 +511,68 @@ export function QuickstartSection() {
             className="h-7 text-xs px-2.5 gap-1"
           >
             {starting ? <Loader2 className="w-3 h-3 animate-spin" /> : isRunning ? <StopCircle className="w-3 h-3" /> : <Play className="w-3 h-3" />}
-            {starting ? "Starting..." : isRunning ? "Stop" : volatileSymbol.symbol ? `Start (${volatileSymbol.symbol})` : "Start Engine"}
+            {starting
+              ? "Starting..."
+              : isRunning
+                ? "Stop"
+                : volatileSymbol.symbol
+                  ? symbolCount === 1
+                    ? `Start (${volatileSymbol.symbol})`
+                    : `Start (top ${symbolCount})`
+                  : "Start Engine"}
+          </Button>
+
+          {/* Symbol count selector — controls how many top-volatile symbols the quickstart processes. */}
+          <div
+            className="flex items-center gap-1 h-7 px-1.5 rounded-md border bg-muted/30"
+            title="Number of top-volatile symbols to process (1-10)"
+          >
+            <span className="text-[10px] text-muted-foreground uppercase tracking-wide">Symbols</span>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-5 w-5 p-0 rounded text-xs"
+              onClick={() => setSymbolCount(c => Math.max(1, c - 1))}
+              disabled={symbolCount <= 1 || isRunning || starting}
+              aria-label="Decrease symbol count"
+            >
+              −
+            </Button>
+            <span className="text-xs font-semibold tabular-nums w-4 text-center">{symbolCount}</span>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-5 w-5 p-0 rounded text-xs"
+              onClick={() => setSymbolCount(c => Math.min(10, c + 1))}
+              disabled={symbolCount >= 10 || isRunning || starting}
+              aria-label="Increase symbol count"
+            >
+              +
+            </Button>
+          </div>
+
+          {/* Live exchange-trading toggle — fires /api/settings/connections/[id]/live-trade */}
+          <Button
+            size="sm"
+            variant={liveTradeActive ? "default" : "outline"}
+            onClick={handleToggleLiveTrade}
+            disabled={liveTradeLoading}
+            className={`h-7 text-xs px-2.5 gap-1 ${liveTradeActive ? "bg-green-600 hover:bg-green-700 text-white" : ""}`}
+            title={liveTradeActive ? "Live exchange trading is ON — click to disable" : "Enable live exchange trading"}
+            aria-pressed={liveTradeActive}
+          >
+            {liveTradeLoading
+              ? <Loader2 className="w-3 h-3 animate-spin" />
+              : (
+                <span className={`relative flex h-2 w-2 ${liveTradeActive ? "" : "opacity-40"}`}>
+                  {liveTradeActive && (
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-300 opacity-75" />
+                  )}
+                  <span className={`relative inline-flex rounded-full h-2 w-2 ${liveTradeActive ? "bg-white" : "bg-muted-foreground"}`} />
+                </span>
+              )
+            }
+            Live{liveTradeActive ? " ON" : ""}
           </Button>
 
           <Button
@@ -457,6 +627,31 @@ export function QuickstartSection() {
           <MiniStat label="Indications"  value={fmt(stats.indicationsTotal)}   />
           <MiniStat label="Strategies"   value={fmt(stats.strategiesTotal)}    />
           <MiniStat label="Positions"    value={fmt(stats.positionsOpen)}      />
+          {/* Live positions — real exchange positions mirrored by the live engine.
+              Always shown (even at 0) so users can see the counter spin up. */}
+          <div
+            className={`flex flex-col items-center justify-center rounded px-2 py-1.5 min-w-[52px] border ${
+              stats.livePositionsOpen > 0
+                ? "bg-green-50 dark:bg-green-950/30 border-green-300 dark:border-green-900/50"
+                : "bg-muted/60 border-transparent"
+            }`}
+            title={`Live positions open on exchange · Filled ${stats.liveOrdersFilled}/${stats.liveOrdersPlaced} · WR ${stats.liveWinRate.toFixed(1)}%`}
+          >
+            <span className={`text-[13px] font-bold tabular-nums leading-none ${
+              stats.livePositionsOpen > 0 ? "text-green-700 dark:text-green-400" : "text-foreground"
+            }`}>
+              {fmt(stats.livePositionsOpen)}
+            </span>
+            <span className="text-[9px] text-muted-foreground leading-none mt-0.5 flex items-center gap-0.5">
+              {liveTradeActive && stats.livePositionsOpen > 0 && (
+                <span className="relative flex h-1.5 w-1.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500" />
+                </span>
+              )}
+              Live Pos
+            </span>
+          </div>
           <MiniStat label="Success"      value={`${stats.successRate.toFixed(0)}%`} />
           {stats.avgCycleMs > 0 && (
             <MiniStat label="Avg Cycle"  value={`${stats.avgCycleMs}ms`}      />
