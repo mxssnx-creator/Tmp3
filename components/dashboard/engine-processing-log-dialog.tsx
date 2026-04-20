@@ -441,13 +441,14 @@ export function EngineProcessingLogDialog({ connectionId: propConnectionId }: { 
                 <Card className="p-4 space-y-2">
                   <div className="text-sm font-medium flex items-center gap-2">
                     <Zap className="w-4 h-4 text-amber-500" />
-                    Strategies by Stage
+                    Strategies by Stage (Base → Main → Real → Live)
                   </div>
-                  <div className="grid grid-cols-3 gap-2 text-center text-xs">
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-center text-xs">
                     {[
                       { label: "Base", value: stats.breakdown.strategies.base, bg: "bg-orange-50 dark:bg-orange-950/30", txt: "text-orange-700 dark:text-orange-400" },
                       { label: "Main", value: stats.breakdown.strategies.main, bg: "bg-yellow-50 dark:bg-yellow-950/30", txt: "text-yellow-700 dark:text-yellow-400" },
                       { label: "Real", value: stats.breakdown.strategies.real, bg: "bg-green-50 dark:bg-green-950/30",  txt: "text-green-700 dark:text-green-400" },
+                      { label: "Live", value: (stats.breakdown.strategies as any).live || 0, bg: "bg-amber-50 dark:bg-amber-950/30", txt: "text-amber-700 dark:text-amber-400" },
                     ].map(({ label, value, bg, txt }) => (
                       <div key={label} className={`rounded ${bg} p-2`}>
                         <div className={`text-lg font-bold tabular-nums ${txt}`}>{fmt(value)}</div>

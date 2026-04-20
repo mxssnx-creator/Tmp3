@@ -82,6 +82,8 @@ export function ProgressionLogsDialog({
   const [tradingState, setTradingState] = useState<StatsShape["progressionState"] | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [activeTab, setActiveTab] = useState<"log" | "info" | "breakdown">("log")
+  // Category filter for the log list — "all" by default, otherwise by level
+  const [logFilter, setLogFilter] = useState<"all" | "info" | "warning" | "error" | "debug">("all")
 
   const loadData = useCallback(async () => {
     setIsLoading(true)
@@ -188,16 +190,38 @@ export function ProgressionLogsDialog({
 
           {/* ── Logs ── */}
           <TabsContent value="log" className="flex-1 overflow-hidden flex flex-col">
-            <div className="flex items-center justify-between px-4 py-2.5 border-b">
-              <span className="text-sm text-muted-foreground">
-                {logs.length} entries {isLoading && "(updating...)"}
-              </span>
-              <div className="flex gap-2">
-                <Button variant="outline" size="sm" onClick={loadData} disabled={isLoading}>
-                  <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? "animate-spin" : ""}`} />
+            <div className="flex items-center justify-between px-4 py-2.5 border-b gap-2 flex-wrap">
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">
+                  {logs.length} entries {isLoading && "(updating...)"}
+                </span>
+                {/* Live auto-refresh indicator */}
+                <Badge variant="outline" className="text-[10px] gap-1 h-5">
+                  <span className="relative flex h-1.5 w-1.5">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500" />
+                  </span>
+                  2s
+                </Badge>
+              </div>
+              <div className="flex items-center gap-1 flex-wrap">
+                {/* Category filter */}
+                {(["all", "info", "warning", "error", "debug"] as const).map((f) => (
+                  <Button
+                    key={f}
+                    variant={logFilter === f ? "default" : "outline"}
+                    size="sm"
+                    className="h-6 px-2 text-[10px]"
+                    onClick={() => setLogFilter(f)}
+                  >
+                    {f.charAt(0).toUpperCase() + f.slice(1)}
+                  </Button>
+                ))}
+                <Button variant="outline" size="sm" onClick={loadData} disabled={isLoading} className="h-6 w-6 p-0">
+                  <RefreshCw className={`w-3 h-3 ${isLoading ? "animate-spin" : ""}`} />
                 </Button>
-                <Button variant="outline" size="sm" onClick={handleClearLogs} disabled={logs.length === 0}>
-                  <Trash2 className="w-3.5 h-3.5" />
+                <Button variant="outline" size="sm" onClick={handleClearLogs} disabled={logs.length === 0} className="h-6 w-6 p-0">
+                  <Trash2 className="w-3 h-3" />
                 </Button>
               </div>
             </div>
@@ -213,7 +237,9 @@ export function ProgressionLogsDialog({
                 </div>
               ) : (
                 <div className="space-y-px p-3">
-                  {logs.map((log, idx) => (
+                  {logs
+                    .filter(l => logFilter === "all" || (l.level || "info").toLowerCase() === logFilter)
+                    .map((log, idx) => (
                     <div
                       key={idx}
                       className="grid grid-cols-[auto_auto_auto_1fr] gap-2 text-xs p-2 rounded hover:bg-muted/40"

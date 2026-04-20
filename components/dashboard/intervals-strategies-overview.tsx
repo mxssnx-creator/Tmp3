@@ -84,6 +84,7 @@ export function IntervalsStrategiesOverview({ connections }: { connections: any[
             { type: "base", enabled: true, rangeCount: 0, activePositions: statsData.activeConnections?.total || 0, totalIndications: 0, successRate: 0 },
             { type: "main", enabled: statsData.tradeEngines?.mainEnabled || false, rangeCount: 0, activePositions: statsData.activeConnections?.active || 0, totalIndications: 0, successRate: 0 },
             { type: "real", enabled: statsData.tradeEngines?.liveTradeEnabled || false, rangeCount: 0, activePositions: statsData.activeConnections?.liveTrade || 0, totalIndications: 0, successRate: 0 },
+            { type: "live", enabled: statsData.tradeEngines?.liveTradeEnabled || false, rangeCount: 0, activePositions: statsData.activeConnections?.liveTrade || 0, totalIndications: 0, successRate: 0 },
           ]
           setStrategies(fallbackStrategies)
         }
