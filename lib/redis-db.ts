@@ -637,24 +637,73 @@ export async function getConnection(id: string): Promise<any | null> {
   return parseHash(hash)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// PERF: in-memory TTL cache for `getAllConnections`.
+// The dashboard polls every ~8s and each active card fans out multiple
+// per-connection requests. Without this cache we issue N KEYS + N HGETALL
+// ops per poll per component. A short TTL (1.5s) dedupes bursts without
+// introducing user-visible staleness (all writes invalidate the cache
+// immediately via `invalidateConnectionsCache()`).
+// ────────────────────────────────────────────────────────────────────────────
+const __CONN_CACHE_TTL_MS = 1500
+let __connCache: { at: number; value: any[] } | null = null
+let __connInflight: Promise<any[]> | null = null
+
+export function invalidateConnectionsCache(): void {
+  __connCache = null
+  __connInflight = null
+}
+
 export async function getAllConnections(): Promise<any[]> {
-  await initRedis()
-  const client = getClient()
-  const keys = await client.keys("connection:*")
-  const connections: any[] = []
-  
-  for (const key of keys) {
-    // Skip special keys like connection:settings:*
-    if (key.includes(":settings:") || key.includes(":stats:") || key.includes(":logs:")) {
-      continue
-    }
-    const hash = await client.hgetall(key)
-    if (hash) {
-      connections.push(parseHash(hash))
-    }
+  const now = Date.now()
+  if (__connCache && now - __connCache.at < __CONN_CACHE_TTL_MS) {
+    return __connCache.value
   }
-  
-  return connections
+  if (__connInflight) return __connInflight
+
+  __connInflight = (async () => {
+    try {
+      await initRedis()
+      const client = getClient()
+      const keys = await client.keys("connection:*")
+
+      // Filter out special sibling keys up-front so we don't fan out HGETALLs
+      // for them (reduces Redis roundtrips in large deployments).
+      const realKeys = keys.filter(
+        (k) =>
+          !k.includes(":settings:") &&
+          !k.includes(":stats:") &&
+          !k.includes(":logs:")
+      )
+
+      // Parallelize HGETALL across all connection keys. Previously ran
+      // sequentially in a for-loop, which scaled linearly with connection count.
+      const hashes = await Promise.all(
+        realKeys.map(async (key) => {
+          try {
+            return await client.hgetall(key)
+          } catch (err) {
+            console.warn(
+              `[v0] [redis-db] getAllConnections: hgetall failed for ${key}`,
+              err instanceof Error ? err.message : err
+            )
+            return null
+          }
+        })
+      )
+
+      const connections = hashes
+        .filter((h): h is Record<string, any> => !!h && Object.keys(h).length > 0)
+        .map(parseHash)
+
+      __connCache = { at: Date.now(), value: connections }
+      return connections
+    } finally {
+      __connInflight = null
+    }
+  })()
+
+  return __connInflight
 }
 
 export async function saveConnection(connection: any): Promise<void> {
@@ -672,12 +721,14 @@ export async function saveConnection(connection: any): Promise<void> {
   })
   
   await client.hset(`connection:${id}`, data)
+  invalidateConnectionsCache()
 }
 
 export async function deleteConnection(id: string): Promise<void> {
   await initRedis()
   const client = getClient()
   await client.del(`connection:${id}`)
+  invalidateConnectionsCache()
 }
 
 // ========== Settings Operations ==========
@@ -1075,6 +1126,7 @@ export async function createConnection(data: any): Promise<any> {
     updated_at: new Date().toISOString(),
   }
   await client.hset(`connection:${id}`, connectionData)
+  invalidateConnectionsCache()
   return connectionData
 }
 
@@ -1090,6 +1142,7 @@ export async function updateConnection(id: string, updates: any): Promise<any> {
     updated_at: new Date().toISOString(),
   }
   await client.hset(`connection:${id}`, updated)
+  invalidateConnectionsCache()
   return updated
 }
 

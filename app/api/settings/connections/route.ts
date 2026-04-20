@@ -27,17 +27,12 @@ export async function GET(request: NextRequest) {
     console.log(`[v0] [API] [Connections] ${API_VERSION} - Client version: ${clientVersion}`)
 
     await initRedis()
-    
-    let connections = await getAllConnections()
 
-    // If no connections exist, seed default base connections
-    if (connections.length === 0) {
-      console.log("[v0] [API] No connections found - triggering seed...")
-      const { ensureDefaultExchangesExist } = await import("@/lib/default-exchanges-seeder")
-      await ensureDefaultExchangesExist()
-      connections = await getAllConnections()
-      console.log("[v0] [API] Seeded connections, now have:", connections.length)
-    }
+    // STABILITY RULE: defaults are assigned only at startup (via /api/startup/initialize
+    // and the base seeder with its persistent marker). This GET MUST NOT trigger
+    // re-seeding — otherwise deleting/unassigning a base connection would re-spawn it
+    // on the next poll. An empty list is a valid, respected state.
+    let connections = await getAllConnections()
 
     if (exchange) {
       connections = connections.filter((c) => c.exchange?.toLowerCase() === exchange.toLowerCase())

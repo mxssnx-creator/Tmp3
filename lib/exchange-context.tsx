@@ -42,15 +42,20 @@ export function ExchangeProvider({ children }: { children: ReactNode }) {
         const data = await response.json()
         const connections = data.connections || []
         
-        const BASE_EXCHANGES = ["bybit", "bingx"]
         const toBoolean = (v: unknown) => v === true || v === 1 || v === "1" || v === "true"
-        
+
+        // STABLE ASSIGNMENT RULE: a connection appears in Main Connections ONLY when
+        // the user has explicitly assigned it (is_active_inserted / is_dashboard_inserted /
+        // is_assigned) or the dashboard toggle is currently on (is_enabled_dashboard).
+        // We do NOT auto-include connections just because they are base (bybit/bingx);
+        // that was the root cause of cards "re-appearing" after enable/delete.
         const mainConnections = connections.filter((c: any) => {
-          const exchange = (c.exchange || "").toLowerCase().trim()
-          const isBase = BASE_EXCHANGES.includes(exchange)
-          const isInserted = toBoolean(c.is_active_inserted) || toBoolean(c.is_dashboard_inserted)
+          const isInserted =
+            toBoolean(c.is_active_inserted) ||
+            toBoolean(c.is_dashboard_inserted) ||
+            toBoolean(c.is_assigned)
           const isDashboardActive = toBoolean(c.is_enabled_dashboard)
-          return isBase || isInserted || isDashboardActive
+          return isInserted || isDashboardActive
         })
         
         setActiveConnections(mainConnections)
