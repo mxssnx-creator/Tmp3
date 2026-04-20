@@ -86,28 +86,57 @@ export async function executeLivePosition(
   try {
     if (isLiveTradeEnabled) {
       // REAL TRADING: Only execute on exchange when live_trade is enabled
+
+      // Validate required fields BEFORE attempting to place order
+      if (!realPosition.direction || !realPosition.symbol || !realPosition.quantity) {
+        throw new Error(
+          `Invalid realPosition for exchange order: symbol=${realPosition.symbol}, ` +
+          `direction=${realPosition.direction}, quantity=${realPosition.quantity}`
+        )
+      }
+
+      // Normalize direction ("long"/"short") → exchange-side ("buy"/"sell")
+      const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
+
       console.log(
-        `${LOG_PREFIX} EXECUTING REAL: ${realPosition.symbol} ${realPosition.direction} qty=${realPosition.quantity.toFixed(4)} on EXCHANGE`
+        `${LOG_PREFIX} EXECUTING REAL: ${realPosition.symbol} ${realPosition.direction} → ${exchangeSide} qty=${realPosition.quantity.toFixed(4)} on EXCHANGE`
       )
 
-      // Place order on exchange - ONLY when live_trade is enabled
-      const order = await exchangeConnector.placeOrder({
-        symbol: realPosition.symbol,
-        side: realPosition.direction.toUpperCase(),
-        type: "market",
-        quantity: realPosition.quantity,
-        leverage: realPosition.leverage,
-        stopLoss: realPosition.stopLoss,
-        takeProfit: realPosition.takeProfit,
-      })
+      // Check whether the connector exposes a positional signature (lib/exchange-connectors/*)
+      // or the legacy object signature (lib/exchanges.ts). Dispatch accordingly.
+      let order: any
+      if (exchangeConnector && typeof exchangeConnector.placeOrder === "function") {
+        // Use positional signature expected by lib/exchange-connectors/*
+        // placeOrder(symbol, side, quantity, price?, orderType?)
+        try {
+          order = await exchangeConnector.placeOrder(
+            realPosition.symbol,
+            exchangeSide,
+            realPosition.quantity,
+            undefined,
+            "market",
+          )
+        } catch (err) {
+          console.error(`${LOG_PREFIX} placeOrder threw:`, err)
+          throw err
+        }
+      } else {
+        throw new Error(`${LOG_PREFIX} exchangeConnector.placeOrder is not a function`)
+      }
 
-      if (order && order.id) {
-        livePosition.orderId = order.id
+      // Connectors return { success, orderId, error } — not { id }
+      if (order && order.success && (order.orderId || order.id)) {
+        livePosition.orderId = order.orderId || order.id
         livePosition.status = "open"
 
         console.log(
-          `${LOG_PREFIX} Order placed on exchange: ${order.id} for ${realPosition.symbol}`
+          `${LOG_PREFIX} Order placed on exchange: ${livePosition.orderId} for ${realPosition.symbol}`
         )
+      } else if (order && !order.success) {
+        console.warn(
+          `${LOG_PREFIX} Exchange order failed for ${realPosition.symbol}: ${order.error || "unknown"}`
+        )
+        livePosition.status = "error"
       }
     } else {
       // SIMULATION MODE: Track pseudo position without exchange execution
