@@ -26,16 +26,13 @@ export async function GET() {
   try {
     await initRedis()
     const client = getRedisClient()
-    
-    // Ensure default connections exist before fetching stats
-    const allConnections = await getAllConnections()
-    if (allConnections.length === 0) {
-      console.log("[v0] [SystemStats] No connections, triggering seed...")
-      const { ensureDefaultExchangesExist } = await import("@/lib/default-exchanges-seeder")
-      await ensureDefaultExchangesExist()
-    }
-    
+
+    // STABILITY RULE: do NOT trigger default connection seeding from stats requests.
+    // Seeding is a startup-only concern; triggering it from polled endpoints causes
+    // user-deleted base connections to reappear and breaks the "stable assignment"
+    // contract. An empty list is a valid, respected state.
     const connections = await getAllConnections()
+    const allConnections = connections
     console.log(`[v0] [SystemStats] Analyzing ${connections.length} total connections`)
     
     // BASE CONNECTIONS = All base exchange connections (predefined or user-created)
@@ -57,9 +54,18 @@ export async function GET() {
     const workingAll = allConnections.filter((c: any) => isConnectionWorking(c))
     console.log(`[v0] [SystemStats] Working/tested: ${workingAll.length}`)
     
-    // Get total Redis keys count - same pattern as monitoring route
-    const allRedisKeys = await client.keys("*").catch(() => [])
-    const totalKeys = Array.isArray(allRedisKeys) ? allRedisKeys.length : 0
+    // PERF: use DBSIZE instead of KEYS("*") — KEYS is O(N) and blocks the Redis
+    // server. DBSIZE is O(1). Falls back to 0 if the client does not support it.
+    let totalKeys = 0
+    try {
+      const dbSizeFn = (client as any).dbsize || (client as any).dbSize
+      if (typeof dbSizeFn === "function") {
+        totalKeys = await dbSizeFn.call(client)
+      }
+    } catch (err) {
+      console.warn("[v0] [SystemStats] DBSIZE failed (falling back to 0):", err instanceof Error ? err.message : err)
+      totalKeys = 0
+    }
     console.log(`[v0] [SystemStats] Total DB keys: ${totalKeys}`)
 
     // Trade Engine Status from Redis (stored as hash, not string)
@@ -134,21 +140,34 @@ export async function GET() {
     let totalIndicationsCount = 0
     let totalStrategiesCount  = 0
 
+    // PERF: iterate over connections we already have in memory and HGETALL each
+    // progression hash in parallel. Avoids a Redis-blocking KEYS("progression:*") scan
+    // which was O(total DB keys). Bounded to N connections (usually < 10).
     try {
-      const progressionKeys = await client.keys("progression:*")
-      for (const key of progressionKeys) {
-        try {
-          const ph = await client.hgetall(key)
-          if (ph && typeof ph === "object") {
-            totalIndicationCycles += parseInt(ph.indication_cycle_count || "0", 10)
-            totalStrategyCycles   += parseInt(ph.strategy_cycle_count   || "0", 10)
-            totalIndicationsCount += parseInt(ph.indications_count       || "0", 10)
-            totalStrategiesCount  += parseInt(ph.strategies_count        || "0", 10)
+      const relevantIds: string[] = connections
+        .map((c: any) => c?.id)
+        .filter((id: unknown): id is string => typeof id === "string" && id.length > 0)
+
+      const progressionHashes = await Promise.all(
+        relevantIds.map(async (id) => {
+          try {
+            return await client.hgetall(`progression:${id}`)
+          } catch {
+            return null
           }
-        } catch { /* skip per-key errors */ }
+        })
+      )
+
+      for (const ph of progressionHashes) {
+        if (ph && typeof ph === "object") {
+          totalIndicationCycles += parseInt((ph as any).indication_cycle_count || "0", 10)
+          totalStrategyCycles   += parseInt((ph as any).strategy_cycle_count   || "0", 10)
+          totalIndicationsCount += parseInt((ph as any).indications_count       || "0", 10)
+          totalStrategiesCount  += parseInt((ph as any).strategies_count        || "0", 10)
+        }
       }
     } catch (e) {
-      console.warn("[v0] [SystemStats] Error aggregating progression keys:", e)
+      console.warn("[v0] [SystemStats] Error aggregating progression hashes:", e instanceof Error ? e.message : e)
     }
 
     // Fallback to focusConnection metrics if all progression hashes are empty

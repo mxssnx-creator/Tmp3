@@ -195,6 +195,17 @@ export function ActiveConnectionCard({
     currentSymbol: string
     isComplete: boolean
   } | null>(null)
+  // Live engine-running state — synced bidirectionally with the Enable / Live /
+  // Preset sliders. The DB flag remains the source of truth for the slider's
+  // `checked` value; this state lets the UI surface a drift indicator when the
+  // engine actually running does not match the flag.
+  const [engineStates, setEngineStates] = useState<{
+    engineRunning: boolean
+    runningHint: boolean
+    enabled: { flag: boolean; running: boolean; inSync: boolean }
+    live:    { flag: boolean; running: boolean; inSync: boolean }
+    preset:  { flag: boolean; running: boolean; inSync: boolean }
+  } | null>(null)
   const details = connection.details
 
   // Sync local toggle states from connection details
@@ -204,6 +215,56 @@ export function ActiveConnectionCard({
       setPresetMode(toBoolean(details.is_preset_trade))
     }
   }, [details])
+
+  // Poll per-connection engine-states endpoint so the Enable / Live / Preset
+  // sliders stay in sync with actual engine state. Uses a self-scheduling
+  // timeout that picks a faster cadence when the connection is marked active.
+  useEffect(() => {
+    let cancelled = false
+    let timeoutId: ReturnType<typeof setTimeout>
+
+    const fetchEngineStates = async () => {
+      try {
+        const res = await fetch(
+          `/api/connections/${connection.connectionId}/engine-states`,
+          { cache: "no-store" }
+        )
+        if (!res.ok) return
+        const data = await res.json()
+        if (cancelled || !data?.success) return
+        setEngineStates({
+          engineRunning: !!data.engineRunning,
+          runningHint:   !!data.runningHint,
+          enabled: data.enabled,
+          live:    data.live,
+          preset:  data.preset,
+        })
+        // If the DB flag says "live" but the engine is not running, re-sync the
+        // local toggle to the flag (authoritative). We do NOT flip the DB here —
+        // the toggle API is the only writer; we only correct local state drift.
+        if (typeof data?.live?.flag === "boolean") setLiveTrade(data.live.flag)
+        if (typeof data?.preset?.flag === "boolean") setPresetMode(data.preset.flag)
+      } catch {
+        /* non-critical polling */
+      }
+    }
+
+    const scheduleNext = () => {
+      const delay = connection.isActive ? 3000 : 8000
+      timeoutId = setTimeout(async () => {
+        await fetchEngineStates()
+        if (!cancelled) scheduleNext()
+      }, delay)
+    }
+
+    fetchEngineStates()
+    scheduleNext()
+
+    return () => {
+      cancelled = true
+      clearTimeout(timeoutId)
+    }
+  }, [connection.connectionId, connection.isActive])
 
   // Poll progression
   const fetchProgression = useCallback(async () => {
@@ -593,7 +654,18 @@ export function ActiveConnectionCard({
                       <Loader2 className="h-3 w-3 animate-spin" /> Enable
                     </span>
                   ) : (
-                    "Enable"
+                    <span className="flex items-center gap-1">
+                      Enable
+                      {engineStates && !engineStates.enabled.inSync && (
+                        <span
+                          title={engineStates.enabled.flag
+                            ? "Flag is ON but engine is not running — will reconcile shortly"
+                            : "Engine is running but flag is OFF — will stop shortly"}
+                          className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
+                          aria-label="engine state drift"
+                        />
+                      )}
+                    </span>
                   )}
                 </Label>
               </div>
@@ -622,6 +694,13 @@ export function ActiveConnectionCard({
                   ) : (
                     <span className="flex items-center gap-1">
                       <Activity className="h-3 w-3" /> Live Trade
+                      {engineStates && liveTrade && !engineStates.live.inSync && (
+                        <span
+                          title="Live flag ON but engine state differs — reconciling"
+                          className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
+                          aria-label="live engine state drift"
+                        />
+                      )}
                     </span>
                   )}
                 </Label>
@@ -649,7 +728,16 @@ export function ActiveConnectionCard({
                       <Loader2 className="h-3 w-3 animate-spin" /> Preset Mode
                     </span>
                   ) : (
-                    "Preset Mode"
+                    <span className="flex items-center gap-1">
+                      Preset Mode
+                      {engineStates && presetMode && !engineStates.preset.inSync && (
+                        <span
+                          title="Preset flag ON but engine state differs — reconciling"
+                          className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
+                          aria-label="preset engine state drift"
+                        />
+                      )}
+                    </span>
                   )}
                 </Label>
               </div>

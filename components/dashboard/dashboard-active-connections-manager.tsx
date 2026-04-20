@@ -34,6 +34,12 @@ export function DashboardActiveConnectionsManager() {
   const [globalEngineLoading, setGlobalEngineLoading] = useState(true)
   const globalEngineRef = React.useRef(false)
   const activeConnectionsRef = React.useRef<ActiveConnectionWithDetails[]>([])
+  // Refs used to skip the interval reload while a toggle/remove is in flight,
+  // preventing the 8s poll from stomping on optimistic UI state.
+  const togglingRef = React.useRef<Set<string>>(new Set())
+  const removingRef = React.useRef<Set<string>>(new Set())
+  React.useEffect(() => { togglingRef.current = togglingIds }, [togglingIds])
+  React.useEffect(() => { removingRef.current = removingIds }, [removingIds])
 
 
 
@@ -50,7 +56,12 @@ export function DashboardActiveConnectionsManager() {
     }
   }
 
-  const loadConnections = async () => {
+  const loadConnections = async (opts?: { force?: boolean }) => {
+    // Skip background reloads while a toggle or remove is in flight to avoid
+    // stomping on optimistic UI state (and clobbering an unassign with a stale list).
+    if (!opts?.force && (togglingRef.current.size > 0 || removingRef.current.size > 0)) {
+      return
+    }
     try {
       const timestamp = new Date().getTime()
       const response = await fetch(`/api/settings/connections?v=${VERSION}&t=${timestamp}`, {
@@ -74,23 +85,25 @@ export function DashboardActiveConnectionsManager() {
       const seenIds = new Set<string>()
       
       for (const conn of allConnections) {
-        const exchange = (conn.exchange || "").toLowerCase().trim()
-        const isBase = BASE_EXCHANGES.includes(exchange)
-
-        // is_active_inserted = "1" means this connection was explicitly added to the Active panel
-        // is_dashboard_inserted = "1" also means it was added to dashboard
-        // NOTE: is_inserted alone (Settings-level visibility) does NOT qualify — only explicit panel assignment
+        // STABLE ASSIGNMENT RULE (fixes "connection gets re-added after enable/delete"):
+        // A card appears ONLY when the user explicitly assigned the connection to the
+        // Main Connections panel. We do NOT auto-include based on exchange type —
+        // that caused bybit/bingx cards to re-materialize on every 8s poll even after
+        // the user removed/disabled them.
         const isActiveInserted =
           toBoolean(conn.is_active_inserted) ||
-          toBoolean(conn.is_dashboard_inserted)
+          toBoolean(conn.is_dashboard_inserted) ||
+          toBoolean((conn as any).is_assigned)
 
         // isEnabledDashboard = connection's dashboard toggle is ON (processing enabled)
         const isEnabledDashboard =
           toBoolean(conn.is_enabled_dashboard)
 
-        if (isBase || isActiveInserted || isEnabledDashboard) {
+        if (isActiveInserted || isEnabledDashboard) {
           if (seenIds.has(conn.id)) continue
           seenIds.add(conn.id)
+          const exchange = (conn.exchange || "").toLowerCase().trim()
+          const isBase = BASE_EXCHANGES.includes(exchange)
           activeConns.push({
             id: `active-${conn.id}`,
             connectionId: conn.id,
@@ -201,7 +214,7 @@ export function DashboardActiveConnectionsManager() {
       }
 
       setTimeout(() => {
-        loadConnections()
+        loadConnections({ force: true })
         checkGlobalEngine()
       }, 800)
     } catch (error) {
@@ -255,7 +268,7 @@ export function DashboardActiveConnectionsManager() {
         description: `${connectionName} has been removed from active connections`
       })
 
-      setTimeout(() => loadConnections(), 500)
+      setTimeout(() => loadConnections({ force: true }), 500)
     } catch (error) {
       console.error(`[Manager] Remove error for ${connectionName}:`, error)
       toast.error("Failed to remove connection", {
@@ -288,7 +301,7 @@ export function DashboardActiveConnectionsManager() {
       })
       
       // Reload connections
-      setTimeout(() => loadConnections(), 300)
+      setTimeout(() => loadConnections({ force: true }), 300)
     } catch (error) {
       toast.error("Failed to reset dashboard", {
         description: error instanceof Error ? error.message : "Unknown error"
