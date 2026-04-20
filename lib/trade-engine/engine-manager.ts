@@ -354,12 +354,15 @@ export class TradeEngineManager {
       if (error instanceof Error) {
         console.error(`[v0] [EngineManager] Stack:`, error.stack)
       }
-      // CRITICAL: Clean up any timers that were already started before the error
-      if (this.indicationTimer) { clearInterval(this.indicationTimer); this.indicationTimer = undefined }
-      if (this.strategyTimer) { clearInterval(this.strategyTimer); this.strategyTimer = undefined }
-      if (this.realtimeTimer) { clearInterval(this.realtimeTimer); this.realtimeTimer = undefined }
+      // CRITICAL: Clean up any timers that were already started before the error.
+      // (indication/strategy/realtime are now setTimeout-based; healthCheck/heartbeat
+      // remain setInterval. clearInterval and clearTimeout are interchangeable on
+      // Node.js Timeouts but we use clearTimeout where appropriate for clarity.)
+      if (this.indicationTimer) { clearTimeout(this.indicationTimer); this.indicationTimer = undefined }
+      if (this.strategyTimer)   { clearTimeout(this.strategyTimer);   this.strategyTimer = undefined }
+      if (this.realtimeTimer)   { clearTimeout(this.realtimeTimer);   this.realtimeTimer = undefined }
       if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = undefined }
-      if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = undefined }
+      if (this.heartbeatTimer)   { clearInterval(this.heartbeatTimer);   this.heartbeatTimer = undefined }
       
       await this.updateProgressionPhase("error", 0, errorMsg)
       await this.updateEngineState("error", errorMsg)
@@ -391,17 +394,19 @@ export class TradeEngineManager {
   async stop(): Promise<void> {
     console.log("[v0] Stopping trade engine for connection:", this.connectionId)
 
-    // Clear all timers
+    // Clear all timers. Processor loops are setTimeout-based; health/heartbeat
+    // are still setInterval. clearTimeout + clearInterval are the same kernel
+    // primitive in Node, but we keep the semantically correct one per timer.
     if (this.indicationTimer) {
-      clearInterval(this.indicationTimer)
+      clearTimeout(this.indicationTimer)
       this.indicationTimer = undefined
     }
     if (this.strategyTimer) {
-      clearInterval(this.strategyTimer)
+      clearTimeout(this.strategyTimer)
       this.strategyTimer = undefined
     }
     if (this.realtimeTimer) {
-      clearInterval(this.realtimeTimer)
+      clearTimeout(this.realtimeTimer)
       this.realtimeTimer = undefined
     }
     if (this.healthCheckTimer) {

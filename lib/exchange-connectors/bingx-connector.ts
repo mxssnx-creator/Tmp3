@@ -258,20 +258,44 @@ export class BingXConnector extends BaseExchangeConnector {
     orderType: "limit" | "market" = "limit"
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
-      this.log(`Placing ${orderType} ${side} order: ${quantity} ${symbol}`)
+      // ── Quantity sanity & formatting ─────────────────────────────────────
+      // BingX rejects orders with absurdly tiny or over-precise quantities
+      // with "this api is not exist" (their generic failure). Round to a
+      // reasonable number of significant digits and enforce a conservative
+      // minimum so we don't waste a signed request on a doomed order.
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        const msg = `Invalid quantity: ${quantity}`
+        this.logError(`✗ ${msg}`)
+        return { success: false, error: msg }
+      }
+      // Round to 6 decimal places (enough for both high- and low-priced assets)
+      // and strip trailing zeros in the serialised form below.
+      const roundedQty = Math.round(quantity * 1e6) / 1e6
+      if (roundedQty < 0.000001) {
+        const msg = `Quantity too small after rounding: ${quantity} → ${roundedQty}`
+        this.logError(`✗ ${msg}`)
+        return { success: false, error: msg }
+      }
+      // Format without scientific notation or trailing zeros.
+      const qtyStr = roundedQty.toFixed(6).replace(/\.?0+$/, "")
+      this.log(`Placing ${orderType} ${side} order: ${qtyStr} ${symbol}`)
 
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/order" : "/openApi/swap/v3/trade/order"
+      // Perpetual futures trade endpoints live under /openApi/swap/v2/* — v3
+      // is only used for market data (/quote/*) and balance (/user/balance).
+      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/order" : "/openApi/swap/v2/trade/order"
 
       const params: Record<string, any> = {
         symbol,
         side: side.toUpperCase(),
         type: orderType === "market" ? "MARKET" : "LIMIT",
-        quantity: String(quantity),
+        quantity: qtyStr,
         timestamp: Date.now(),
       }
 
       if (price && orderType === "limit") {
-        params.price = String(price)
+        // Same precision treatment for price
+        const priceRounded = Math.round(price * 1e8) / 1e8
+        params.price = priceRounded.toFixed(8).replace(/\.?0+$/, "")
       }
 
       const signature = this.getSignature(params)
@@ -312,7 +336,11 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       this.log(`Cancelling order ${orderId} for ${symbol}`)
 
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/cancel_order" : "/openApi/swap/v3/trade/cancel_order"
+      // Perp swap: DELETE /openApi/swap/v2/trade/order (no separate cancel path).
+      // Spot: POST /openApi/spot/v1/trade/cancel (v1 spot still uses a subpath).
+      const isSpot = this.credentials.apiType === "spot"
+      const endpoint = isSpot ? "/openApi/spot/v1/trade/cancel" : "/openApi/swap/v2/trade/order"
+      const method = isSpot ? "POST" : "DELETE"
 
       const params = {
         symbol,
@@ -329,7 +357,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
 
       const response = await this.rateLimitedFetch(url, {
-        method: "POST",
+        method,
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
@@ -356,7 +384,10 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       this.log(`Fetching order ${orderId} for ${symbol}`)
 
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/query_order" : "/openApi/swap/v3/trade/query_order"
+      // Perp swap: GET /openApi/swap/v2/trade/order (same path as place/cancel, different method).
+      // Spot: GET /openApi/spot/v1/trade/query (v1 spot uses a subpath).
+      const isSpot = this.credentials.apiType === "spot"
+      const endpoint = isSpot ? "/openApi/spot/v1/trade/query" : "/openApi/swap/v2/trade/order"
 
       const params = {
         symbol,
@@ -369,6 +400,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
 
       const response = await this.rateLimitedFetch(url, {
+        method: "GET",
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
@@ -390,7 +422,8 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       this.log(`Fetching open orders${symbol ? ` for ${symbol}` : ""}`)
 
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/openOrders" : "/openApi/swap/v3/trade/openOrders"
+      // Perp: /openApi/swap/v2/trade/openOrders (not v3).
+      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/openOrders" : "/openApi/swap/v2/trade/openOrders"
 
       const params: Record<string, any> = {
         timestamp: Date.now(),
@@ -426,7 +459,8 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       this.log(`Fetching order history${symbol ? ` for ${symbol}` : ""} (limit: ${limit})`)
 
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/allOrders" : "/openApi/swap/v3/trade/allOrders"
+      // Perp: /openApi/swap/v2/trade/allOrders (not v3).
+      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/allOrders" : "/openApi/swap/v2/trade/allOrders"
 
       const params: Record<string, any> = {
         limit,
@@ -543,7 +577,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const signature = this.getSignature(params)
       const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/swap/v3/trade/positionSide/set?${queryString}`
+      // Perp: /openApi/swap/v2/trade/positionSide/dual — v3 path does not exist.
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/positionSide/dual?${queryString}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -705,7 +740,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const signature = this.getSignature(params)
       const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/swap/v3/trade/leverage?${queryString}`
+      // Perp: /openApi/swap/v2/trade/leverage (not v3).
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${queryString}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -739,7 +775,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const signature = this.getSignature(params)
       const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/swap/v3/trade/marginType?${queryString}`
+      // Perp: /openApi/swap/v2/trade/marginType (not v3).
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${queryString}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -772,7 +809,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const signature = this.getSignature(params)
       const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/swap/v3/trade/positionSide/set?${queryString}`
+      // Perp: /openApi/swap/v2/trade/positionSide/dual — v3 and /set do not exist.
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/positionSide/dual?${queryString}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
