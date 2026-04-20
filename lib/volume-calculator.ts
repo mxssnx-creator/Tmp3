@@ -150,7 +150,20 @@ export class VolumeCalculator {
 
       // Get exchange min volume from Redis trading pair data
       const tradingPair = await getSettings(`trading_pair:${symbol}`)
-      const exchangeMinVolume = tradingPair?.min_order_size ? parseFloat(tradingPair.min_order_size) : undefined
+      let exchangeMinVolume = tradingPair?.min_order_size ? parseFloat(tradingPair.min_order_size) : undefined
+
+      // Conservative per-quote fallbacks when no trading-pair metadata is
+      // available. This prevents the engine from submitting dust-sized orders
+      // (e.g. 0.00002 BTC) that every exchange rejects with a cryptic error.
+      if (!exchangeMinVolume || exchangeMinVolume <= 0) {
+        const upper = symbol.toUpperCase().replace("-", "")
+        if (upper.endsWith("USDT") || upper.endsWith("USDC") || upper.endsWith("USD")) {
+          // Notional-based minimum: $5 USD at current price — covers BingX,
+          // Binance and most other majors (their BTC perp min is $5 / ~0.0001 BTC).
+          const MIN_NOTIONAL_USD = 5
+          exchangeMinVolume = currentPrice > 0 ? MIN_NOTIONAL_USD / currentPrice : 0
+        }
+      }
 
       let accountBalance = 10000 // Default fallback
 

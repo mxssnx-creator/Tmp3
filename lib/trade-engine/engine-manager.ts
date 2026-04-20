@@ -272,6 +272,13 @@ export class TradeEngineManager {
         this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
       }
 
+      // Mark engine as running BEFORE starting the self-scheduling processor
+      // loops. The new setTimeout-based loops check `this.isRunning` at the
+      // start of every tick, and the first tick fires at 0 ms — if the flag is
+      // still false at that moment the loop aborts and never re-schedules,
+      // leaving strategy/indication stats stuck at zero.
+      this.isRunning = true
+
       // Phase 3-4: Start indication and strategy processors
       await this.updateProgressionPhase("indications", 60, "Processing indications continuously")
       this.startIndicationProcessor(config.indicationInterval)
@@ -308,8 +315,7 @@ export class TradeEngineManager {
       this.startHealthMonitoring()
       this.startHeartbeat()
       
-      // Phase 6: Live trading ready
-      this.isRunning = true
+      // Phase 6: Live trading ready (isRunning was set earlier before processors started)
       this.isStarting = false
       this.startTime = new Date()
       await this.updateProgressionPhase("live_trading", 100, `Live trading ACTIVE - monitoring ${symbols.length} symbols`)
