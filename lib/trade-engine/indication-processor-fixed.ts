@@ -614,9 +614,38 @@ export class IndicationProcessor {
         }
       }
 
-      // Store indications
+      // Store indication payloads (raw JSON list, per-type TTL keys).
       await storeIndications(this.connectionId, symbol, indications)
-      
+
+      // ── Increment the per-type counters that the dashboard reads ─────────
+      //
+      // `storeIndications` only persists the *raw* indication payloads; it
+      // does NOT bump the `indications:{connId}:{type}:count` keys nor the
+      // `indications_{type}_count` fields on the `progression:{connId}` hash.
+      //
+      // The dashboard ("Indications by Type" breakdown on the main connection
+      // card) reads exclusively from those counters, so without this call
+      // every counter stays at zero even when the engine is generating real
+      // indications every cycle — which is what made the per-type counts
+      // look identical (and Auto stuck at 0) in recent versions.
+      //
+      // We fan out one `trackIndicationStats` call per indication in parallel
+      // so a busy cycle (10–12 indications) pays a single Redis round-trip
+      // window instead of N sequential ones.
+      if (indications.length > 0) {
+        await Promise.all(
+          indications.map((ind) =>
+            trackIndicationStats(
+              this.connectionId,
+              symbol,
+              ind.type,
+              Number(ind.value) || 0,
+              Number(ind.confidence) || 0,
+            ).catch(() => { /* non-critical stats path */ }),
+          ),
+        )
+      }
+
       return indications
     } catch (error) {
       console.error(`[v0] [IndicationProcessor] Error in processIndication for ${symbol}:`, error)
