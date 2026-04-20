@@ -10,7 +10,7 @@
 import { getGlobalTradeEngineCoordinator } from "./trade-engine"
 import { getAllConnections, getRedisClient, initRedis } from "./redis-db"
 import { loadSettingsAsync } from "./settings-storage"
-import { hasConnectionCredentials, isConnectionMainProcessing, isConnectionInActivePanel, isTruthyFlag } from "./connection-state-utils"
+import { hasConnectionCredentials, isConnectionMainProcessing, isTruthyFlag } from "./connection-state-utils"
 
 let autoStartInitialized = false
 let autoStartTimer: NodeJS.Timeout | null = null
@@ -98,19 +98,23 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
           return
         }
 
-        // Filter for connections that should have a running engine.
-        // PRIMARY: active-inserted connections (shown in the main panel) with any credentials.
-        // These are connections the user has explicitly added to the dashboard — they should
-        // always run regardless of the is_enabled_dashboard toggle state.
-        // SECONDARY: fully main-processing connections (assigned + dashboard-enabled).
+        // STABILITY RULE: the "Enable" slider on the connection card is the
+        // authoritative gate for whether a connection's engine should be
+        // running. This monitor must ONLY start engines for connections where
+        // the user has explicitly enabled them (is_enabled_dashboard=1) AND
+        // the connection is assigned to the main panel. Previously the filter
+        // also accepted is_active_inserted alone, which caused engines to be
+        // re-started for connections the user had just toggled off — making
+        // the Enable slider feel non-functional and creating drift between
+        // the UI and the actual engine state.
         const connectionsThatShouldBeRunning = connections.filter((c) => {
-          const isActiveInserted = isConnectionInActivePanel(c)
           const isFullyEnabled = isConnectionMainProcessing(c)
+          if (!isFullyEnabled) return false
           // Allow placeholder/predefined credentials — engine handles auth failures gracefully
           const hasAnyCredentials = hasConnectionCredentials(c, 5, true)
           const isPredefined = isTruthyFlag(c.is_predefined)
           const isTestnet = isTruthyFlag(c.is_testnet) || isTruthyFlag(c.demo_mode)
-          return (isFullyEnabled || isActiveInserted) && (hasAnyCredentials || isPredefined || isTestnet)
+          return hasAnyCredentials || isPredefined || isTestnet
         })
 
         // Load settings ONCE per interval, not per connection
