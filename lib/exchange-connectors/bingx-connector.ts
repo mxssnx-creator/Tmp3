@@ -46,6 +46,41 @@ export class BingXConnector extends BaseExchangeConnector {
     return result
   }
 
+  /**
+   * Convert a plain symbol (e.g. "BTCUSDT") into the BingX-specific format
+   * required by the perpetual-futures endpoints ("BTC-USDT").
+   *
+   * Spot endpoints historically accept both "BTCUSDT" and "BTC-USDT", but
+   * perpetual-futures trade endpoints (/openApi/swap/v2/trade/*) will respond
+   * with the generic "this api is not exist" error when the symbol lacks the
+   * hyphen, which is the most common source of order-placement failures.
+   *
+   * This helper is idempotent (already-hyphenated input is returned as-is) and
+   * only applied when the credentials describe a non-spot account.
+   */
+  private toBingXSymbol(symbol: string): string {
+    if (!symbol) return symbol
+    // Already hyphenated → nothing to do.
+    if (symbol.includes("-")) return symbol
+    // Spot still uses the plain BTCUSDT format on BingX.
+    if (this.credentials.apiType === "spot") return symbol
+
+    const upper = symbol.toUpperCase()
+    // Handle common quote assets; insert a dash before the quote.
+    const quotes = ["USDT", "USDC", "BTC", "ETH", "USD"]
+    for (const quote of quotes) {
+      if (upper.endsWith(quote) && upper.length > quote.length) {
+        return `${upper.slice(0, upper.length - quote.length)}-${quote}`
+      }
+    }
+    return upper
+  }
+
+  /** BingX returns `code` as a number on some endpoints and a string on others. */
+  private isBingXSuccess(code: unknown): boolean {
+    return code === 0 || code === "0"
+  }
+
   getCapabilities(): string[] {
     return ["futures", "perpetual_futures", "leverage", "hedge_mode", "cross_margin"]
   }
@@ -155,8 +190,8 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`Response status: ${response.status}`)
       this.log(`Response code: ${data.code}`)
 
-      // Check for error responses
-      if (!response.ok || data.code !== 0) {
+      // Check for error responses — BingX can return `code` as a number or string
+      if (!response.ok || !this.isBingXSuccess(data.code)) {
         const errorMsg = data.msg || data.error || `HTTP ${response.status}: ${response.statusText}`
         this.logError(`API Error (code ${data.code}): ${errorMsg}`)
         throw new Error(errorMsg)
@@ -259,50 +294,61 @@ export class BingXConnector extends BaseExchangeConnector {
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
       // ── Quantity sanity & formatting ─────────────────────────────────────
-      // BingX rejects orders with absurdly tiny or over-precise quantities
-      // with "this api is not exist" (their generic failure). Round to a
-      // reasonable number of significant digits and enforce a conservative
-      // minimum so we don't waste a signed request on a doomed order.
+      // BingX rejects quantities that fall below the symbol step size, and in
+      // many cases responds with its generic "this api is not exist" error
+      // instead of a precise reason. Normalise the quantity to a reasonable
+      // precision and refuse obviously-doomed amounts before signing.
       if (!Number.isFinite(quantity) || quantity <= 0) {
         const msg = `Invalid quantity: ${quantity}`
         this.logError(`✗ ${msg}`)
         return { success: false, error: msg }
       }
       // Round to 6 decimal places (enough for both high- and low-priced assets)
-      // and strip trailing zeros in the serialised form below.
+      // then strip trailing zeros when serialising.
       const roundedQty = Math.round(quantity * 1e6) / 1e6
       if (roundedQty < 0.000001) {
         const msg = `Quantity too small after rounding: ${quantity} → ${roundedQty}`
         this.logError(`✗ ${msg}`)
         return { success: false, error: msg }
       }
-      // Format without scientific notation or trailing zeros.
+      // Serialise without scientific notation or trailing zeros.
       const qtyStr = roundedQty.toFixed(6).replace(/\.?0+$/, "")
-      this.log(`Placing ${orderType} ${side} order: ${qtyStr} ${symbol}`)
 
-      // Perpetual futures trade endpoints live under /openApi/swap/v2/* — v3
-      // is only used for market data (/quote/*) and balance (/user/balance).
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/order" : "/openApi/swap/v2/trade/order"
+      // ── Symbol formatting ────────────────────────────────────────────────
+      // BingX perpetual futures require the hyphenated form "BTC-USDT". Spot
+      // accepts either. Passing "BTCUSDT" to a perp trade endpoint is the
+      // single biggest cause of "this api is not exist" errors in the wild.
+      const isSpot = this.credentials.apiType === "spot"
+      const bingxSymbol = this.toBingXSymbol(symbol)
+
+      this.log(`Placing ${orderType} ${side} order: ${qtyStr} ${bingxSymbol} (raw=${symbol})`)
+
+      // Trade endpoints live under /openApi/swap/v2/* for perpetual futures
+      // and /openApi/spot/v1/* for spot.
+      const endpoint = isSpot ? "/openApi/spot/v1/trade/order" : "/openApi/swap/v2/trade/order"
 
       const params: Record<string, any> = {
-        symbol,
+        symbol: bingxSymbol,
         side: side.toUpperCase(),
         type: orderType === "market" ? "MARKET" : "LIMIT",
         quantity: qtyStr,
         timestamp: Date.now(),
       }
 
+      // BingX perpetual futures requires positionSide. Sending LONG/SHORT
+      // works in both hedge and one-way mode; omit for spot.
+      if (!isSpot) {
+        params.positionSide = side === "buy" ? "LONG" : "SHORT"
+      }
+
       if (price && orderType === "limit") {
-        // Same precision treatment for price
+        // Same precision treatment for price.
         const priceRounded = Math.round(price * 1e8) / 1e8
         params.price = priceRounded.toFixed(8).replace(/\.?0+$/, "")
       }
 
       const signature = this.getSignature(params)
-      const stringParams: Record<string, string> = {}
-      for (const [key, value] of Object.entries(params)) {
-        stringParams[key] = String(value)
-      }
+      const stringParams = this.toStringParams(params)
       const queryString = `${new URLSearchParams(stringParams).toString()}&signature=${signature}`
       const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
 
@@ -317,14 +363,17 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
-      const orderId = data.data?.orderId || data.data?.id
-      this.log(`�� Order placed successfully: ${orderId}`)
+      // BingX wraps the order payload inconsistently: sometimes data.data.order,
+      // sometimes data.data, sometimes data.data.orderId directly.
+      const orderInfo = data.data?.order || data.data || {}
+      const orderId = orderInfo.orderId || orderInfo.id || data.data?.orderId
+      this.log(`✓ Order placed successfully: ${orderId}`)
 
-      return { success: true, orderId }
+      return { success: true, orderId: orderId ? String(orderId) : undefined }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to place order: ${errorMsg}`)
@@ -341,19 +390,16 @@ export class BingXConnector extends BaseExchangeConnector {
       const isSpot = this.credentials.apiType === "spot"
       const endpoint = isSpot ? "/openApi/spot/v1/trade/cancel" : "/openApi/swap/v2/trade/order"
       const method = isSpot ? "POST" : "DELETE"
+      const bingxSymbol = this.toBingXSymbol(symbol)
 
       const params = {
-        symbol,
+        symbol: bingxSymbol,
         orderId,
         timestamp: Date.now(),
       }
 
       const signature = this.getSignature(params)
-      const stringParams: Record<string, string> = {}
-      for (const [key, value] of Object.entries(params)) {
-        stringParams[key] = String(value)
-      }
-      const queryString = `${new URLSearchParams(stringParams).toString()}&signature=${signature}`
+      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
       const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
 
       const response = await this.rateLimitedFetch(url, {
@@ -367,8 +413,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       this.log(`✓ Order cancelled successfully`)
@@ -388,9 +434,10 @@ export class BingXConnector extends BaseExchangeConnector {
       // Spot: GET /openApi/spot/v1/trade/query (v1 spot uses a subpath).
       const isSpot = this.credentials.apiType === "spot"
       const endpoint = isSpot ? "/openApi/spot/v1/trade/query" : "/openApi/swap/v2/trade/order"
+      const bingxSymbol = this.toBingXSymbol(symbol)
 
       const params = {
-        symbol,
+        symbol: bingxSymbol,
         orderId,
         timestamp: Date.now(),
       }
@@ -406,7 +453,7 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
+      if (!this.isBingXSuccess(data.code)) {
         return null
       }
 
@@ -430,7 +477,7 @@ export class BingXConnector extends BaseExchangeConnector {
       }
 
       if (symbol) {
-        params.symbol = symbol
+        params.symbol = this.toBingXSymbol(symbol)
       }
 
       const signature = this.getSignature(params)
@@ -443,11 +490,13 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
+      if (!this.isBingXSuccess(data.code)) {
         return []
       }
 
-      return data.data || []
+      // Swap openOrders returns { orders: [...] }; spot returns an array directly.
+      const rows = data.data?.orders || data.data
+      return Array.isArray(rows) ? rows : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch open orders: ${errorMsg}`)
@@ -468,7 +517,7 @@ export class BingXConnector extends BaseExchangeConnector {
       }
 
       if (symbol) {
-        params.symbol = symbol
+        params.symbol = this.toBingXSymbol(symbol)
       }
 
       const signature = this.getSignature(params)
@@ -481,11 +530,12 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
+      if (!this.isBingXSuccess(data.code)) {
         return []
       }
 
-      return data.data || []
+      const rows = data.data?.orders || data.data
+      return Array.isArray(rows) ? rows : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch order history: ${errorMsg}`)
@@ -516,7 +566,7 @@ export class BingXConnector extends BaseExchangeConnector {
       }
 
       if (symbol) {
-        params.symbol = symbol
+        params.symbol = this.toBingXSymbol(symbol)
       }
 
       const signature = this.getSignature(params)
@@ -537,11 +587,11 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
+      if (!this.isBingXSuccess(data.code)) {
         return []
       }
 
-      return data.data || []
+      return Array.isArray(data.data) ? data.data : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch positions: ${errorMsg}`)
@@ -563,7 +613,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`Modifying position ${symbol}${leverage ? ` leverage=${leverage}` : ""}${marginType ? ` marginType=${marginType}` : ""}`)
 
       const params: Record<string, any> = {
-        symbol,
+        symbol: this.toBingXSymbol(symbol),
         timestamp: Date.now(),
       }
 
@@ -587,8 +637,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       this.log(`✓ Position modified successfully`)
@@ -645,8 +695,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       const address = data.data?.address
@@ -682,8 +732,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       const txId = data.data?.txId
@@ -716,11 +766,11 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
+      if (!this.isBingXSuccess(data.code)) {
         return []
       }
 
-      return data.data || []
+      return Array.isArray(data.data) ? data.data : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch transfer history: ${errorMsg}`)
@@ -730,10 +780,15 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setLeverage(symbol: string, leverage: number): Promise<{ success: boolean; error?: string }> {
     try {
-      this.log(`Setting leverage to ${leverage}x for ${symbol}`)
+      const bingxSymbol = this.toBingXSymbol(symbol)
+      this.log(`Setting leverage to ${leverage}x for ${bingxSymbol}`)
 
+      // BingX perpetual requires a `side` param on leverage changes; LONG is a
+      // sensible default for initial position opening. If you need SHORT
+      // leverage configured independently, call this again with the opposite.
       const params: Record<string, string> = {
-        symbol,
+        symbol: bingxSymbol,
+        side: "LONG",
         leverage: String(leverage),
         timestamp: String(Date.now()),
       }
@@ -750,8 +805,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       this.log(`✓ Leverage set to ${leverage}x`)
@@ -765,10 +820,11 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setMarginType(symbol: string, marginType: "cross" | "isolated"): Promise<{ success: boolean; error?: string }> {
     try {
-      this.log(`Setting margin type to ${marginType} for ${symbol}`)
+      const bingxSymbol = this.toBingXSymbol(symbol)
+      this.log(`Setting margin type to ${marginType} for ${bingxSymbol}`)
 
       const params: Record<string, string> = {
-        symbol,
+        symbol: bingxSymbol,
         marginType: marginType === "cross" ? "CROSSED" : "ISOLATED",
         timestamp: String(Date.now()),
       }
@@ -785,8 +841,13 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        // Margin-type-unchanged is not a real error on BingX; ignore code 101404.
+        if (data.code === 101404 || /no need to change/i.test(String(data.msg || ""))) {
+          this.log(`Margin type already ${marginType} — no change needed`)
+          return { success: true }
+        }
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       this.log(`✓ Margin type set to ${marginType}`)
@@ -819,8 +880,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       this.log(`✓ Position mode set to ${hedgeMode ? "hedge" : "one-way"}`)
