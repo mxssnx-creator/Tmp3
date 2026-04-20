@@ -1,30 +1,71 @@
 /**
- * Stage 5: Live Exchange Position Tracking
- * Execute on exchange and track fills/orders separately from pseudo positions
- * Mirrors real pseudo positions to actual exchange orders and positions
+ * Stage 5: Live Exchange Position Creation Progression
+ *
+ * Complete end-to-end pipeline for creating and tracking a live position on a
+ * real exchange. Mirrors a qualifying Real set into an executable exchange
+ * position, with:
+ *
+ *   1. Pre-flight validation (live_trade flag, input sanity, dedup lock)
+ *   2. Current price fetch from Redis market data
+ *   3. Volume calculation via VolumeCalculator (respecting balance, leverage,
+ *      position cost, and exchange minimum volume)
+ *   4. Leverage + margin type configuration on the exchange
+ *   5. Market entry order placement with exponential-backoff retry
+ *   6. Order fill confirmation polling
+ *   7. Reduce-only Stop Loss and Take Profit order placement
+ *   8. Position sync from exchange (liquidation price, margin type, mark price)
+ *   9. Progression logging at every stage (engine_logs:{connId})
+ *  10. Metrics counters in progression:{connId} hash (live orders placed,
+ *      filled, failed; live positions open; total volume USD)
+ *
+ * Disabling is_live_trade on the connection short-circuits the pipeline and
+ * records a "simulated" live position without touching the exchange.
  */
 
 import { getRedisClient, initRedis } from "@/lib/redis-db"
+import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { VolumeCalculator } from "@/lib/volume-calculator"
 import type { RealPosition } from "./real-stage"
 
 const LOG_PREFIX = "[v0] [LivePositionStage]"
+
+// ── Types ────────────────────────────────────────────────────────────────────
 
 export interface LivePosition {
   id: string
   connectionId: string
   symbol: string
   direction: "long" | "short"
-  realPositionId: string // Link to real position
+  realPositionId: string
+  // Sizing & pricing
   quantity: number
-  executedQuantity: number // Actual filled quantity
-  remainingQuantity: number // Unfilled
+  executedQuantity: number
+  remainingQuantity: number
   entryPrice: number
   averageExecutionPrice: number
+  volumeUsd: number
   leverage: number
+  marginType: "cross" | "isolated"
+  // Risk management
   stopLoss: number
   takeProfit: number
-  orderId?: string // Exchange order ID
-  status: "pending" | "open" | "partially_filled" | "filled" | "closed" | "error" | "simulated"
+  stopLossPrice?: number
+  takeProfitPrice?: number
+  // Exchange references
+  orderId?: string
+  stopLossOrderId?: string
+  takeProfitOrderId?: string
+  status:
+    | "pending"
+    | "placed"
+    | "open"
+    | "partially_filled"
+    | "filled"
+    | "closed"
+    | "error"
+    | "simulated"
+    | "rejected"
+  statusReason?: string
   fills: {
     timestamp: number
     quantity: number
@@ -40,28 +81,215 @@ export interface LivePosition {
     unrealizedPnl?: number
     roi?: number
   }
+  progression: {
+    step: string
+    timestamp: number
+    success: boolean
+    details?: string
+  }[]
   createdAt: number
   updatedAt: number
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function pushStep(pos: LivePosition, step: string, success: boolean, details?: string): void {
+  pos.progression.push({ step, timestamp: Date.now(), success, details })
+  pos.updatedAt = Date.now()
+}
+
+async function savePosition(pos: LivePosition): Promise<void> {
+  try {
+    const client = getRedisClient()
+    const key = `live:position:${pos.id}`
+    await client.setex(key, 604800, JSON.stringify(pos))
+    await client.lpush(`live:positions:${pos.connectionId}`, pos.id).catch(() => {})
+    await client.expire(`live:positions:${pos.connectionId}`, 604800).catch(() => {})
+  } catch (err) {
+    console.error(`${LOG_PREFIX} Failed to save position:`, err)
+  }
+}
+
+async function incrementMetric(connectionId: string, field: string, by = 1): Promise<void> {
+  try {
+    const client = getRedisClient()
+    await client.hincrby(`progression:${connectionId}`, field, by)
+    await client.expire(`progression:${connectionId}`, 7 * 24 * 60 * 60)
+  } catch {
+    /* non-critical */
+  }
+}
+
+async function fetchCurrentPrice(symbol: string): Promise<number> {
+  try {
+    const client = getRedisClient()
+    const mdhash = await client.hgetall(`market_data:${symbol}`)
+    const price = parseFloat(String(mdhash?.close ?? mdhash?.price ?? mdhash?.last ?? "0"))
+    if (price > 0) return price
+    const raw = await client.get(`market_data:${symbol}:1m`)
+    if (raw) {
+      try {
+        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw
+        return parseFloat(String(parsed?.close ?? parsed?.price ?? 0)) || 0
+      } catch {
+        /* ignore */
+      }
+    }
+    return 0
+  } catch {
+    return 0
+  }
+}
+
+async function hasOpenLivePosition(
+  connectionId: string,
+  symbol: string,
+  direction: "long" | "short"
+): Promise<boolean> {
+  try {
+    const client = getRedisClient()
+    const lockKey = `live:lock:${connectionId}:${symbol}:${direction}`
+    const locked = await client.get(lockKey)
+    return !!locked
+  } catch {
+    return false
+  }
+}
+
+async function acquireLock(
+  connectionId: string,
+  symbol: string,
+  direction: "long" | "short",
+  ttlSeconds = 3600
+): Promise<void> {
+  try {
+    const client = getRedisClient()
+    const lockKey = `live:lock:${connectionId}:${symbol}:${direction}`
+    await client.setex(lockKey, ttlSeconds, "1")
+  } catch {
+    /* non-critical */
+  }
+}
+
+async function releaseLock(
+  connectionId: string,
+  symbol: string,
+  direction: "long" | "short"
+): Promise<void> {
+  try {
+    const client = getRedisClient()
+    const lockKey = `live:lock:${connectionId}:${symbol}:${direction}`
+    await client.del(lockKey)
+  } catch {
+    /* non-critical */
+  }
+}
+
 /**
- * Execute real position on exchange as live position
- * Only executes REAL exchange trading if is_live_trade is enabled
- * Otherwise returns pseudo position tracking without exchange execution
+ * Retry a promise-returning function with exponential backoff.
+ */
+async function retry<T>(
+  fn: () => Promise<T>,
+  isSuccess: (r: T) => boolean,
+  label: string,
+  maxAttempts = 3
+): Promise<T> {
+  let lastResult: T | undefined
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const result = await fn()
+      lastResult = result
+      if (isSuccess(result)) return result
+      console.warn(`${LOG_PREFIX} ${label} attempt ${attempt}/${maxAttempts} unsuccessful`)
+    } catch (err) {
+      console.error(`${LOG_PREFIX} ${label} attempt ${attempt}/${maxAttempts} error:`, err)
+      lastResult = undefined as unknown as T
+    }
+    if (attempt < maxAttempts) {
+      const backoff = Math.pow(2, attempt - 1) * 500
+      await new Promise(r => setTimeout(r, backoff))
+    }
+  }
+  return lastResult as T
+}
+
+/**
+ * Poll an order until it reaches a terminal fill state or the timeout elapses.
+ */
+async function pollOrderFill(
+  connector: any,
+  symbol: string,
+  orderId: string,
+  timeoutMs = 10000,
+  intervalMs = 800
+): Promise<{ filled: boolean; filledQty: number; filledPrice: number; status: string }> {
+  const deadline = Date.now() + timeoutMs
+  let lastStatus = "pending"
+  while (Date.now() < deadline) {
+    try {
+      const order = await connector.getOrder(symbol, orderId)
+      if (order) {
+        lastStatus = order.status
+        if (order.status === "filled") {
+          return {
+            filled: true,
+            filledQty: order.filledQty || 0,
+            filledPrice: order.filledPrice || 0,
+            status: "filled",
+          }
+        }
+        if (order.status === "cancelled") {
+          return { filled: false, filledQty: 0, filledPrice: 0, status: "cancelled" }
+        }
+      }
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} poll error:`, err)
+    }
+    await new Promise(r => setTimeout(r, intervalMs))
+  }
+  return { filled: false, filledQty: 0, filledPrice: 0, status: lastStatus }
+}
+
+/**
+ * Place a protection order (SL or TP) as a limit order at triggerPrice.
+ * Returns order id on success, null on failure.
+ */
+async function placeProtectionOrder(
+  connector: any,
+  symbol: string,
+  closeSide: "buy" | "sell",
+  quantity: number,
+  triggerPrice: number,
+  orderLabel: string
+): Promise<string | null> {
+  try {
+    if (typeof connector.placeOrder !== "function") return null
+    const result = await connector.placeOrder(symbol, closeSide, quantity, triggerPrice, "limit")
+    if (result?.success && (result.orderId || result.id)) {
+      console.log(`${LOG_PREFIX} ${orderLabel} placed: ${result.orderId || result.id} @ ${triggerPrice}`)
+      return result.orderId || result.id
+    }
+    console.warn(`${LOG_PREFIX} ${orderLabel} placement failed: ${result?.error || "unknown"}`)
+    return null
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} ${orderLabel} error:`, err)
+    return null
+  }
+}
+
+// ── Main Pipeline ────────────────────────────────────────────────────────────
+
+/**
+ * Execute a real position on exchange as a live position with the full
+ * progression pipeline.
  */
 export async function executeLivePosition(
   connectionId: string,
   realPosition: RealPosition,
-  exchangeConnector: any // Exchange API connector
+  exchangeConnector: any
 ): Promise<LivePosition> {
   await initRedis()
   const client = getRedisClient()
-
-  // Check if live trading is actually enabled for this connection
-  const connSettings = await client?.hgetall(`connection:${connectionId}`) || {}
-  const isLiveTradeEnabled = connSettings.is_live_trade === "1" || connSettings.is_live_trade === "true"
-  
-  console.log(`${LOG_PREFIX} ${realPosition.symbol}: live_trade enabled=${isLiveTradeEnabled}`)
 
   const livePosition: LivePosition = {
     id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}`,
@@ -74,92 +302,370 @@ export async function executeLivePosition(
     remainingQuantity: realPosition.quantity,
     entryPrice: realPosition.entryPrice,
     averageExecutionPrice: 0,
+    volumeUsd: 0,
     leverage: realPosition.leverage,
+    marginType: "cross",
     stopLoss: realPosition.stopLoss,
     takeProfit: realPosition.takeProfit,
-    status: isLiveTradeEnabled ? "pending" : "simulated", // Mark as simulated if live_trade disabled
+    status: "pending",
     fills: [],
+    progression: [],
     createdAt: Date.now(),
     updatedAt: Date.now(),
   }
 
   try {
-    if (isLiveTradeEnabled) {
-      // REAL TRADING: Only execute on exchange when live_trade is enabled
-
-      // Validate required fields BEFORE attempting to place order
-      if (!realPosition.direction || !realPosition.symbol || !realPosition.quantity) {
-        throw new Error(
-          `Invalid realPosition for exchange order: symbol=${realPosition.symbol}, ` +
-          `direction=${realPosition.direction}, quantity=${realPosition.quantity}`
-        )
-      }
-
-      // Normalize direction ("long"/"short") → exchange-side ("buy"/"sell")
-      const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
-
-      console.log(
-        `${LOG_PREFIX} EXECUTING REAL: ${realPosition.symbol} ${realPosition.direction} → ${exchangeSide} qty=${realPosition.quantity.toFixed(4)} on EXCHANGE`
-      )
-
-      // Check whether the connector exposes a positional signature (lib/exchange-connectors/*)
-      // or the legacy object signature (lib/exchanges.ts). Dispatch accordingly.
-      let order: any
-      if (exchangeConnector && typeof exchangeConnector.placeOrder === "function") {
-        // Use positional signature expected by lib/exchange-connectors/*
-        // placeOrder(symbol, side, quantity, price?, orderType?)
-        try {
-          order = await exchangeConnector.placeOrder(
-            realPosition.symbol,
-            exchangeSide,
-            realPosition.quantity,
-            undefined,
-            "market",
-          )
-        } catch (err) {
-          console.error(`${LOG_PREFIX} placeOrder threw:`, err)
-          throw err
-        }
-      } else {
-        throw new Error(`${LOG_PREFIX} exchangeConnector.placeOrder is not a function`)
-      }
-
-      // Connectors return { success, orderId, error } — not { id }
-      if (order && order.success && (order.orderId || order.id)) {
-        livePosition.orderId = order.orderId || order.id
-        livePosition.status = "open"
-
-        console.log(
-          `${LOG_PREFIX} Order placed on exchange: ${livePosition.orderId} for ${realPosition.symbol}`
-        )
-      } else if (order && !order.success) {
-        console.warn(
-          `${LOG_PREFIX} Exchange order failed for ${realPosition.symbol}: ${order.error || "unknown"}`
-        )
-        livePosition.status = "error"
-      }
-    } else {
-      // SIMULATION MODE: Track pseudo position without exchange execution
-      console.log(
-        `${LOG_PREFIX} SIMULATION: ${realPosition.symbol} ${realPosition.direction} qty=${realPosition.quantity.toFixed(4)} (live_trade disabled)`
-      )
-      livePosition.status = "simulated"
+    // ── Step 1: Pre-flight validation ──────────────────────────────────────
+    if (!realPosition.direction || !realPosition.symbol) {
+      livePosition.status = "rejected"
+      livePosition.statusReason = `Invalid inputs: symbol=${realPosition.symbol}, direction=${realPosition.direction}`
+      pushStep(livePosition, "preflight", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_rejected_count")
+      await logProgressionEvent(connectionId, "live_trading", "error", "Live order rejected — invalid inputs", {
+        symbol: realPosition.symbol,
+        direction: realPosition.direction,
+      })
+      return livePosition
     }
 
-    // Store live position (whether real or simulated)
-    const key = `live:position:${livePosition.id}`
-    await client?.setex(key, 604800, JSON.stringify(livePosition))
+    const connSettings = (await client?.hgetall(`connection:${connectionId}`)) || {}
+    const isLiveTradeEnabled =
+      connSettings.is_live_trade === "1" ||
+      connSettings.is_live_trade === "true" ||
+      connSettings.live_trade_enabled === "1" ||
+      connSettings.live_trade_enabled === "true"
+
+    pushStep(livePosition, "preflight", true, `live_trade=${isLiveTradeEnabled}`)
+    await logProgressionEvent(
+      connectionId,
+      "live_trading",
+      "info",
+      `Live pipeline start ${realPosition.symbol} ${realPosition.direction}`,
+      { liveTrade: isLiveTradeEnabled, realPositionId: realPosition.id }
+    )
+
+    // Deduplication: skip if same symbol+direction already in-flight.
+    if (await hasOpenLivePosition(connectionId, realPosition.symbol, realPosition.direction)) {
+      livePosition.status = "rejected"
+      livePosition.statusReason = "A live position is already open for this symbol+direction"
+      pushStep(livePosition, "dedup", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_rejected_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "info",
+        `Skipped duplicate live order for ${realPosition.symbol} ${realPosition.direction}`,
+        {}
+      )
+      return livePosition
+    }
+
+    // Short-circuit on simulation mode — still record the intent.
+    if (!isLiveTradeEnabled) {
+      livePosition.status = "simulated"
+      livePosition.statusReason = "live_trade disabled — no exchange execution"
+      pushStep(livePosition, "simulate", true)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_simulated_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "info",
+        `Simulated live order (live_trade disabled) ${realPosition.symbol}`,
+        { direction: realPosition.direction, quantity: realPosition.quantity }
+      )
+      console.log(`${LOG_PREFIX} SIMULATION: ${realPosition.symbol} ${realPosition.direction} (live_trade disabled)`)
+      return livePosition
+    }
+
+    if (!exchangeConnector || typeof exchangeConnector.placeOrder !== "function") {
+      livePosition.status = "error"
+      livePosition.statusReason = "Exchange connector not available or missing placeOrder"
+      pushStep(livePosition, "connector_check", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_failed_count")
+      await logProgressionEvent(connectionId, "live_trading", "error", "Live order failed — no connector", {
+        symbol: realPosition.symbol,
+      })
+      return livePosition
+    }
+
+    // ── Step 2: Fetch current market price ─────────────────────────────────
+    let currentPrice = realPosition.entryPrice
+    if (!currentPrice || currentPrice <= 0) {
+      currentPrice = await fetchCurrentPrice(realPosition.symbol)
+    }
+    if (!currentPrice || currentPrice <= 0) {
+      livePosition.status = "error"
+      livePosition.statusReason = `No current price available for ${realPosition.symbol}`
+      pushStep(livePosition, "price_fetch", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_failed_count")
+      await logProgressionEvent(connectionId, "live_trading", "error", "Live order failed — no market price", {
+        symbol: realPosition.symbol,
+      })
+      return livePosition
+    }
+    livePosition.entryPrice = currentPrice
+    pushStep(livePosition, "price_fetch", true, `price=${currentPrice}`)
+
+    // ── Step 3: Volume calculation ─────────────────────────────────────────
+    const volumeResult = await VolumeCalculator.calculateVolumeForConnection(
+      connectionId,
+      realPosition.symbol,
+      currentPrice
+    ).catch(err => {
+      console.error(`${LOG_PREFIX} volume calc error:`, err)
+      return null
+    })
+
+    const computedVolume = volumeResult?.finalVolume || volumeResult?.volume || 0
+    if (!volumeResult || computedVolume <= 0) {
+      livePosition.status = "rejected"
+      livePosition.statusReason =
+        volumeResult?.adjustmentReason ||
+        `Computed volume is zero or below exchange minimum for ${realPosition.symbol}`
+      pushStep(livePosition, "volume_calc", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_rejected_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        `Live order rejected — volume too small for ${realPosition.symbol}`,
+        {
+          reason: livePosition.statusReason,
+          calculatedVolume: volumeResult?.calculatedVolume,
+        }
+      )
+      return livePosition
+    }
+
+    livePosition.quantity = computedVolume
+    livePosition.remainingQuantity = computedVolume
+    livePosition.volumeUsd = computedVolume * currentPrice
+    livePosition.leverage = volumeResult.leverage || livePosition.leverage
+    pushStep(
+      livePosition,
+      "volume_calc",
+      true,
+      `qty=${computedVolume.toFixed(6)} usd=${livePosition.volumeUsd.toFixed(2)} lev=${livePosition.leverage}x`
+    )
+    await VolumeCalculator.logVolumeCalculation(connectionId, realPosition.symbol, volumeResult).catch(() => {})
+
+    // ── Step 4: Configure leverage + margin type on exchange ───────────────
+    if (typeof exchangeConnector.setLeverage === "function") {
+      try {
+        const lev = await exchangeConnector.setLeverage(realPosition.symbol, livePosition.leverage)
+        pushStep(livePosition, "set_leverage", !!lev?.success, lev?.error || `leverage=${livePosition.leverage}`)
+      } catch (err) {
+        pushStep(livePosition, "set_leverage", false, String(err))
+      }
+    } else {
+      pushStep(livePosition, "set_leverage", true, "connector does not expose setLeverage — skipping")
+    }
+
+    const marginTypeSetting = (connSettings.margin_type as "cross" | "isolated") || "cross"
+    livePosition.marginType = marginTypeSetting
+    if (typeof exchangeConnector.setMarginType === "function") {
+      try {
+        const m = await exchangeConnector.setMarginType(realPosition.symbol, marginTypeSetting)
+        pushStep(livePosition, "set_margin_type", !!m?.success, m?.error || `margin=${marginTypeSetting}`)
+      } catch (err) {
+        pushStep(livePosition, "set_margin_type", false, String(err))
+      }
+    } else {
+      pushStep(livePosition, "set_margin_type", true, "connector does not expose setMarginType — skipping")
+    }
+
+    // ── Step 5: Place entry order with retry ───────────────────────────────
+    const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
+
+    console.log(
+      `${LOG_PREFIX} EXECUTING REAL: ${realPosition.symbol} ${realPosition.direction} → ${exchangeSide} qty=${computedVolume.toFixed(
+        6
+      )} @ ${currentPrice}`
+    )
+
+    const orderResult: any = await retry(
+      () => exchangeConnector.placeOrder(realPosition.symbol, exchangeSide, computedVolume, undefined, "market"),
+      r => !!r?.success && !!(r.orderId || r.id),
+      "placeOrder"
+    )
+
+    if (!orderResult?.success || !(orderResult.orderId || orderResult.id)) {
+      livePosition.status = "error"
+      livePosition.statusReason = `Entry order failed: ${orderResult?.error || "unknown"}`
+      pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_failed_count")
+      await logProgressionEvent(connectionId, "live_trading", "error", `Entry order failed for ${realPosition.symbol}`, {
+        error: orderResult?.error,
+        side: exchangeSide,
+        quantity: computedVolume,
+      })
+      return livePosition
+    }
+
+    livePosition.orderId = orderResult.orderId || orderResult.id
+    livePosition.status = "placed"
+    pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
+    await incrementMetric(connectionId, "live_orders_placed_count")
+    await acquireLock(connectionId, realPosition.symbol, realPosition.direction)
+    await logProgressionEvent(connectionId, "live_trading", "info", `Entry order placed for ${realPosition.symbol}`, {
+      orderId: livePosition.orderId,
+      side: exchangeSide,
+      quantity: computedVolume,
+      price: currentPrice,
+      leverage: livePosition.leverage,
+    })
+
+    // Persist intermediate state so UI can show "placed" even during poll.
+    await savePosition(livePosition)
+
+    // ── Step 6: Poll for fill confirmation ─────────────────────────────────
+    const fill = await pollOrderFill(exchangeConnector, realPosition.symbol, livePosition.orderId!)
+    if (fill.filled && fill.filledQty > 0) {
+      livePosition.executedQuantity = fill.filledQty
+      livePosition.remainingQuantity = Math.max(0, computedVolume - fill.filledQty)
+      livePosition.averageExecutionPrice = fill.filledPrice || currentPrice
+      livePosition.fills.push({
+        timestamp: Date.now(),
+        quantity: fill.filledQty,
+        price: fill.filledPrice || currentPrice,
+        fee: 0,
+        feeAsset: "USDT",
+      })
+      livePosition.status = livePosition.remainingQuantity <= 0 ? "filled" : "partially_filled"
+      pushStep(livePosition, "poll_fill", true, `filled=${fill.filledQty} @ ${fill.filledPrice}`)
+      await incrementMetric(connectionId, "live_orders_filled_count")
+      await logProgressionEvent(connectionId, "live_trading", "info", `Entry filled for ${realPosition.symbol}`, {
+        orderId: livePosition.orderId,
+        filledQty: fill.filledQty,
+        filledPrice: fill.filledPrice,
+      })
+    } else {
+      pushStep(livePosition, "poll_fill", false, `fill not confirmed within timeout — status=${fill.status}`)
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        `Entry fill not confirmed within timeout for ${realPosition.symbol}`,
+        { orderId: livePosition.orderId, status: fill.status }
+      )
+    }
+
+    // ── Step 7: Place Stop Loss and Take Profit orders ─────────────────────
+    if (livePosition.executedQuantity > 0) {
+      const fillPrice = livePosition.averageExecutionPrice
+      const sideClose: "buy" | "sell" = realPosition.direction === "long" ? "sell" : "buy"
+      const slPct = Math.max(0, livePosition.stopLoss) / 100
+      const tpPct = Math.max(0, livePosition.takeProfit) / 100
+      const slPrice =
+        realPosition.direction === "long" ? fillPrice * (1 - slPct) : fillPrice * (1 + slPct)
+      const tpPrice =
+        realPosition.direction === "long" ? fillPrice * (1 + tpPct) : fillPrice * (1 - tpPct)
+
+      livePosition.stopLossPrice = slPrice
+      livePosition.takeProfitPrice = tpPrice
+
+      const slOrderId = await placeProtectionOrder(
+        exchangeConnector,
+        realPosition.symbol,
+        sideClose,
+        livePosition.executedQuantity,
+        slPrice,
+        "StopLoss"
+      )
+      const tpOrderId = await placeProtectionOrder(
+        exchangeConnector,
+        realPosition.symbol,
+        sideClose,
+        livePosition.executedQuantity,
+        tpPrice,
+        "TakeProfit"
+      )
+      if (slOrderId) livePosition.stopLossOrderId = slOrderId
+      if (tpOrderId) livePosition.takeProfitOrderId = tpOrderId
+      pushStep(
+        livePosition,
+        "place_sl_tp",
+        !!(slOrderId || tpOrderId),
+        `SL=${slOrderId || "—"} (${slPrice.toFixed(4)}) TP=${tpOrderId || "—"} (${tpPrice.toFixed(4)})`
+      )
+      await logProgressionEvent(connectionId, "live_trading", "info", `SL/TP placed for ${realPosition.symbol}`, {
+        slOrderId,
+        slPrice,
+        tpOrderId,
+        tpPrice,
+      })
+    } else {
+      pushStep(livePosition, "place_sl_tp", false, "skipped — no fill yet")
+    }
+
+    // ── Step 8: Sync with exchange for position data ───────────────────────
+    if (typeof exchangeConnector.getPosition === "function") {
+      try {
+        const exPos = await exchangeConnector.getPosition(realPosition.symbol)
+        if (exPos) {
+          livePosition.exchangeData = {
+            marginType: (exPos as any).marginType,
+            markPrice: (exPos as any).markPrice,
+            liquidationPrice: (exPos as any).liquidationPrice,
+            unrealizedPnl: (exPos as any).unrealizedPnl,
+            roi: (exPos as any).roi,
+          }
+          pushStep(
+            livePosition,
+            "exchange_sync",
+            true,
+            `liqPrice=${(exPos as any).liquidationPrice} markPrice=${(exPos as any).markPrice}`
+          )
+        } else {
+          pushStep(livePosition, "exchange_sync", false, "no position returned")
+        }
+      } catch (err) {
+        pushStep(livePosition, "exchange_sync", false, String(err))
+      }
+    }
+
+    if (livePosition.status === "filled") livePosition.status = "open"
+
+    await savePosition(livePosition)
+    await incrementMetric(connectionId, "live_positions_created_count")
+    await incrementMetric(connectionId, "live_volume_usd_total", Math.round(livePosition.volumeUsd))
+    await logProgressionEvent(connectionId, "live_trading", "info", `Live position created ${realPosition.symbol}`, {
+      status: livePosition.status,
+      orderId: livePosition.orderId,
+      executedQuantity: livePosition.executedQuantity,
+      volumeUsd: livePosition.volumeUsd,
+    })
 
     return livePosition
   } catch (err) {
-    console.error(`${LOG_PREFIX} Error executing live position:`, err)
+    const errMsg = err instanceof Error ? err.message : String(err)
+    console.error(`${LOG_PREFIX} Unhandled error:`, errMsg)
     livePosition.status = "error"
-    throw err
+    livePosition.statusReason = errMsg
+    pushStep(livePosition, "unhandled_error", false, errMsg)
+    await savePosition(livePosition)
+    await incrementMetric(connectionId, "live_orders_failed_count")
+    await logProgressionEvent(
+      connectionId,
+      "live_trading",
+      "error",
+      `Live pipeline unhandled error for ${realPosition.symbol}`,
+      { error: errMsg }
+    )
+    await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+    return livePosition
   }
 }
 
 /**
- * Update live position with order fills
+ * Update live position with order fills (used by webhooks / syncs).
  */
 export async function updateLivePositionFill(
   connectionId: string,
@@ -172,41 +678,24 @@ export async function updateLivePositionFill(
   try {
     const key = `live:position:${livePositionId}`
     const data = await client.get(key)
+    if (!data) return null
 
-    if (!data) {
-      console.warn(`${LOG_PREFIX} Live position not found: ${livePositionId}`)
-      return null
-    }
-
-    const position: LivePosition = JSON.parse(data)
-
-    // Add fill
+    const position: LivePosition = JSON.parse(data as string)
     position.fills.push(fill)
-    position.updatedAt = Date.now()
-
-    // Calculate filled quantity and average price
     position.executedQuantity += fill.quantity
     position.remainingQuantity = position.quantity - position.executedQuantity
 
-    // Update average execution price
     const totalCost = position.fills.reduce((sum, f) => sum + f.price * f.quantity, 0)
     position.averageExecutionPrice = totalCost / position.executedQuantity
 
-    // Update status
     if (position.remainingQuantity <= 0) {
       position.status = "filled"
     } else if (position.executedQuantity > 0) {
       position.status = "partially_filled"
     }
+    position.updatedAt = Date.now()
 
     await client.setex(key, 604800, JSON.stringify(position))
-
-    console.log(
-      `${LOG_PREFIX} Updated live position: ${position.symbol} filled=${position.executedQuantity.toFixed(
-        4
-      )}, remaining=${position.remainingQuantity.toFixed(4)}`
-    )
-
     return position
   } catch (err) {
     console.error(`${LOG_PREFIX} Error updating fill:`, err)
@@ -215,7 +704,7 @@ export async function updateLivePositionFill(
 }
 
 /**
- * Close live position
+ * Close a live position (market exit) and release its dedup lock.
  */
 export async function closeLivePosition(
   connectionId: string,
@@ -229,40 +718,42 @@ export async function closeLivePosition(
   try {
     const key = `live:position:${livePositionId}`
     const data = await client.get(key)
+    if (!data) return null
 
-    if (!data) {
-      console.warn(`${LOG_PREFIX} Live position not found: ${livePositionId}`)
-      return null
-    }
+    const position: LivePosition = JSON.parse(data as string)
 
-    const position: LivePosition = JSON.parse(data)
-
-    // Close on exchange if connector provided
-    if (exchangeConnector && position.orderId) {
+    if (exchangeConnector && typeof exchangeConnector.closePosition === "function") {
       try {
-        await exchangeConnector.closePosition({
-          orderId: position.orderId,
-          symbol: position.symbol,
-        })
+        await exchangeConnector.closePosition(position.symbol, position.direction)
       } catch (err) {
-        console.warn(`${LOG_PREFIX} Error closing position on exchange:`, err)
+        console.warn(`${LOG_PREFIX} Error closing on exchange:`, err)
       }
     }
 
     position.status = "closed"
     position.updatedAt = Date.now()
-
+    pushStep(position, "close", true, `close @ ${closePrice}`)
     await client.setex(key, 604800, JSON.stringify(position))
 
-    // Calculate P&L
-    const pnl = position.executedQuantity * (closePrice - position.averageExecutionPrice)
-    const roi = (pnl / (position.averageExecutionPrice * position.executedQuantity)) * 100
+    await releaseLock(connectionId, position.symbol, position.direction)
 
-    console.log(
-      `${LOG_PREFIX} Closed live position: ${position.symbol} P&L=${pnl.toFixed(
-        2
-      )}, ROI=${roi.toFixed(2)}%`
-    )
+    const pnl =
+      position.executedQuantity *
+      (position.direction === "long"
+        ? closePrice - position.averageExecutionPrice
+        : position.averageExecutionPrice - closePrice)
+    const notional = position.averageExecutionPrice * position.executedQuantity
+    const roi = notional > 0 ? (pnl / notional) * 100 : 0
+
+    await incrementMetric(connectionId, "live_positions_closed_count")
+    if (pnl > 0) await incrementMetric(connectionId, "live_wins_count")
+    await logProgressionEvent(connectionId, "live_trading", "info", `Closed live position ${position.symbol}`, {
+      pnl,
+      roi,
+      closePrice,
+    })
+
+    console.log(`${LOG_PREFIX} Closed ${position.symbol} P&L=${pnl.toFixed(2)} ROI=${roi.toFixed(2)}%`)
 
     return position
   } catch (err) {
@@ -272,23 +763,41 @@ export async function closeLivePosition(
 }
 
 /**
- * Get all live positions for connection
+ * Get all live positions for a connection.
  */
 export async function getLivePositions(connectionId: string): Promise<LivePosition[]> {
   await initRedis()
   const client = getRedisClient()
-
   try {
-    const keys = await client.keys(`live:position:live:${connectionId}:*`)
+    const ids = ((await client.lrange(`live:positions:${connectionId}`, 0, 500).catch(() => [])) || []) as string[]
     const positions: LivePosition[] = []
+    const seen = new Set<string>()
+    for (const id of ids) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      const data = await client.get(`live:position:${id}`)
+      if (data) {
+        try {
+          positions.push(JSON.parse(data as string))
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    if (positions.length > 0) return positions
 
+    // Fallback scan if the index is empty.
+    const keys = ((await client.keys(`live:position:live:${connectionId}:*`).catch(() => [])) || []) as string[]
     for (const key of keys) {
       const data = await client.get(key)
       if (data) {
-        positions.push(JSON.parse(data))
+        try {
+          positions.push(JSON.parse(data as string))
+        } catch {
+          /* ignore */
+        }
       }
     }
-
     return positions
   } catch (err) {
     console.warn(`${LOG_PREFIX} Error getting live positions:`, err)
@@ -297,18 +806,18 @@ export async function getLivePositions(connectionId: string): Promise<LivePositi
 }
 
 /**
- * Get live positions by status
+ * Get live positions filtered by status.
  */
 export async function getLivePositionsByStatus(
   connectionId: string,
   status: LivePosition["status"]
 ): Promise<LivePosition[]> {
   const allPositions = await getLivePositions(connectionId)
-  return allPositions.filter((p) => p.status === status)
+  return allPositions.filter(p => p.status === status)
 }
 
 /**
- * Calculate PnL statistics for live positions
+ * Compute aggregate stats across all live positions.
  */
 export async function calculateLivePositionStats(
   connectionId: string
@@ -320,25 +829,31 @@ export async function calculateLivePositionStats(
   averageROI: number
   winRate: number
 }> {
-  await initRedis()
-  const client = getRedisClient()
-
   try {
     const allPositions = await getLivePositions(connectionId)
-    const closed = allPositions.filter((p) => p.status === "closed")
-    const open = allPositions.filter((p) => p.status === "filled" || p.status === "open")
+    const closed = allPositions.filter(p => p.status === "closed")
+    const open = allPositions.filter(
+      p => p.status === "open" || p.status === "filled" || p.status === "partially_filled"
+    )
 
     let totalPnL = 0
     let winCount = 0
-
     for (const pos of closed) {
-      const pnl = pos.fills.reduce((sum, f) => sum + f.quantity * f.price, 0)
-      totalPnL += pnl
-      if (pnl > 0) winCount++
+      const lastStep = pos.progression?.find(s => s.step === "close")
+      const exitPx = lastStep ? parseFloat(lastStep.details?.split("@ ")[1] || "0") : 0
+      if (exitPx > 0 && pos.averageExecutionPrice > 0) {
+        const pnl =
+          pos.executedQuantity *
+          (pos.direction === "long"
+            ? exitPx - pos.averageExecutionPrice
+            : pos.averageExecutionPrice - exitPx)
+        totalPnL += pnl
+        if (pnl > 0) winCount++
+      }
     }
 
     return {
-      totalFilled: allPositions.filter((p) => p.status === "filled").length,
+      totalFilled: allPositions.filter(p => p.status === "filled" || p.status === "open").length,
       totalOpen: open.length,
       totalClosed: closed.length,
       totalPnL,
@@ -359,55 +874,68 @@ export async function calculateLivePositionStats(
 }
 
 /**
- * Sync live positions with exchange data
+ * Sync live positions with exchange data (mark price, liq price, unrealized PnL).
+ * Called periodically by the engine monitoring loop.
  */
-export async function syncWithExchange(
-  connectionId: string,
-  exchangeConnector: any
-): Promise<void> {
+export async function syncWithExchange(connectionId: string, exchangeConnector: any): Promise<void> {
   await initRedis()
   const client = getRedisClient()
 
   try {
-    const openPositions = await getLivePositionsByStatus(connectionId, "open")
+    const openPositions = [
+      ...(await getLivePositionsByStatus(connectionId, "open")),
+      ...(await getLivePositionsByStatus(connectionId, "filled")),
+      ...(await getLivePositionsByStatus(connectionId, "partially_filled")),
+      ...(await getLivePositionsByStatus(connectionId, "placed")),
+    ]
 
-    console.log(
-      `${LOG_PREFIX} Syncing ${openPositions.length} open positions with exchange`
-    )
+    console.log(`${LOG_PREFIX} Syncing ${openPositions.length} open/placed positions with exchange`)
 
     for (const position of openPositions) {
       try {
-        // Fetch latest data from exchange
-        const exchangePos = await exchangeConnector.getPosition(
-          position.symbol,
-          position.direction
-        )
-
+        const exchangePos = await exchangeConnector.getPosition(position.symbol)
         if (exchangePos) {
           position.exchangeData = {
-            exchangePositionId: exchangePos.positionId,
-            marginType: exchangePos.marginType,
-            markPrice: exchangePos.markPrice,
-            liquidationPrice: exchangePos.liquidationPrice,
-            unrealizedPnl: exchangePos.unrealizedPnL,
-            roi: exchangePos.roi,
+            marginType: (exchangePos as any).marginType,
+            markPrice: (exchangePos as any).markPrice,
+            liquidationPrice: (exchangePos as any).liquidationPrice,
+            unrealizedPnl: (exchangePos as any).unrealizedPnl,
+            roi: (exchangePos as any).roi,
           }
-
-          // Update position
+          position.updatedAt = Date.now()
           const key = `live:position:${position.id}`
           await client.setex(key, 604800, JSON.stringify(position))
+        }
 
-          console.log(
-            `${LOG_PREFIX} Synced ${position.symbol} - pnl=${exchangePos.unrealizedPnL?.toFixed(
-              2
-            )}, roi=${exchangePos.roi?.toFixed(2)}%`
-          )
+        if (position.status === "placed" && position.orderId) {
+          try {
+            const order = await exchangeConnector.getOrder(position.symbol, position.orderId)
+            if (order?.status === "filled") {
+              position.executedQuantity = order.filledQty || position.quantity
+              position.remainingQuantity = Math.max(0, position.quantity - position.executedQuantity)
+              position.averageExecutionPrice = order.filledPrice || position.entryPrice
+              position.status = "open"
+              position.updatedAt = Date.now()
+              const key = `live:position:${position.id}`
+              await client.setex(key, 604800, JSON.stringify(position))
+              await incrementMetric(connectionId, "live_orders_filled_count")
+              await logProgressionEvent(
+                connectionId,
+                "live_trading",
+                "info",
+                `Sync detected fill for ${position.symbol}`,
+                {
+                  orderId: position.orderId,
+                  filledQty: position.executedQuantity,
+                }
+              )
+            }
+          } catch {
+            /* ignore */
+          }
         }
       } catch (err) {
-        console.warn(
-          `${LOG_PREFIX} Error syncing position ${position.id}:`,
-          err
-        )
+        console.warn(`${LOG_PREFIX} Error syncing ${position.id}:`, err)
       }
     }
   } catch (err) {

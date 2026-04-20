@@ -179,7 +179,7 @@ export async function GET(
       ep?.phase === "realtime" ||
       es.status === "running"
 
-    // ── BREAKDOWN section ────────────────────────────────��───────────────────
+    // ── BREAKDOWN section ────────────────────────────────���───────────────────
     // Indication per-type counts live in two places:
     //   1. progression hash: indications_{type}_count  (written by statistics-tracker hincrby)
     //   2. standalone key:   indications:{connId}:{type}:count  (also by statistics-tracker incr)
@@ -382,6 +382,41 @@ export async function GET(
         base: stratDetail.base,
         main: stratDetail.main,
         real: stratDetail.real,
+      },
+
+      // ── Live Exchange Execution metrics ─────────────────────────────────
+      // Read directly from progression hash counters written by the live-stage
+      // pipeline (see lib/trade-engine/stages/live-stage.ts). Every stage of
+      // the pipeline increments one of these so the UI can show a real-time
+      // picture of exchange-level activity.
+      liveExecution: {
+        // Orders
+        ordersPlaced:     n(progHash.live_orders_placed_count),
+        ordersFilled:     n(progHash.live_orders_filled_count),
+        ordersFailed:     n(progHash.live_orders_failed_count),
+        ordersRejected:   n(progHash.live_orders_rejected_count),
+        ordersSimulated:  n(progHash.live_orders_simulated_count),
+        // Positions
+        positionsCreated: n(progHash.live_positions_created_count),
+        positionsClosed:  n(progHash.live_positions_closed_count),
+        positionsOpen:    Math.max(
+          0,
+          n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)
+        ),
+        wins:             n(progHash.live_wins_count),
+        // Volume
+        volumeUsdTotal:   n(progHash.live_volume_usd_total),
+        // Derived
+        fillRate: (() => {
+          const placed = n(progHash.live_orders_placed_count)
+          const filled = n(progHash.live_orders_filled_count)
+          return placed > 0 ? Math.round((filled / placed) * 1000) / 10 : 0
+        })(),
+        winRate: (() => {
+          const closed = n(progHash.live_positions_closed_count)
+          const wins   = n(progHash.live_wins_count)
+          return closed > 0 ? Math.round((wins / closed) * 1000) / 10 : 0
+        })(),
       },
 
       // Prehistoric processing metadata — range, timeframe, interval progress
