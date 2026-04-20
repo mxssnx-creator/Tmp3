@@ -680,6 +680,45 @@ export class StrategyCoordinator {
       } catch (liveErr) {
         console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: Real exchange execution error:`, liveErr instanceof Error ? liveErr.message : String(liveErr))
       }
+
+      // After dispatching new entries, reconcile already-open positions with
+      // the exchange so that any SL/TP/manual-close that happened since the
+      // last cycle transitions the Redis record to "closed". Rate-limited per
+      // connection to once every 30 seconds to stay well within exchange
+      // rate limits while still providing near-real-time closure tracking.
+      try {
+        const client = getRedisClient()
+        const rlKey = `live:reconcile:ratelimit:${this.connectionId}`
+        const last = await client.get(rlKey).catch(() => null)
+        const now = Date.now()
+        const lastTs = last ? parseInt(last as string, 10) : 0
+        if (!lastTs || now - lastTs > 30_000) {
+          await client.setex(rlKey, 60, String(now)).catch(() => {})
+          // Fire-and-forget: don't block the strategy flow on exchange IO.
+          ;(async () => {
+            try {
+              const { reconcileLivePositions } = await import("@/lib/trade-engine/stages/live-stage")
+              const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
+              const connector = await exchangeConnectorFactory.getOrCreateConnector(this.connectionId)
+              if (connector) {
+                const result = await reconcileLivePositions(this.connectionId, connector)
+                if (result.closed > 0) {
+                  console.log(
+                    `[v0] [StrategyFlow] ${this.connectionId} reconcile closed ${result.closed} positions via exchange sync`
+                  )
+                }
+              }
+            } catch (reconErr) {
+              console.warn(
+                `[v0] [StrategyFlow] ${this.connectionId} reconcile error:`,
+                reconErr instanceof Error ? reconErr.message : String(reconErr)
+              )
+            }
+          })()
+        }
+      } catch {
+        /* non-critical; skip if redis rate-limit read fails */
+      }
     }
 
     // Create EXACTLY ONE pseudo position per Set (one per indication_type × direction combination).

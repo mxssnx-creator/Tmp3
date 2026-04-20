@@ -79,8 +79,14 @@ export interface LivePosition {
     markPrice?: number
     liquidationPrice?: number
     unrealizedPnl?: number
+    unrealizedPnL?: number   // alias; some code-paths write either casing
     roi?: number
+    syncedAt?: number        // last reconciliation timestamp
   }
+  // Close / terminal state
+  closedAt?: number
+  realizedPnL?: number
+  closeReason?: string       // "sl_hit" | "tp_hit" | "manual" | "exchange_reconciliation" | ...
   progression: {
     step: string
     timestamp: number
@@ -98,26 +104,53 @@ function pushStep(pos: LivePosition, step: string, success: boolean, details?: s
   pos.updatedAt = Date.now()
 }
 
+// In-memory set of ids already registered in the Redis index this runtime.
+// Avoids a roundtrip GET on every intermediate savePosition() call. Cleared
+// on serverless cold start, which is correct because Redis dedup marker
+// (`live:positions:{connId}:indexed:{id}`) is the ultimate source of truth.
+const _indexedInMemory = new Set<string>()
+
 async function savePosition(pos: LivePosition): Promise<void> {
   try {
     const client = getRedisClient()
     const key = `live:position:${pos.id}`
-    const indexKey = `live:positions:${pos.connectionId}`
-    const indexedMarker = `live:positions:${pos.connectionId}:indexed:${pos.id}`
+    const openIndexKey   = `live:positions:${pos.connectionId}`
+    const closedIndexKey = `live:positions:${pos.connectionId}:closed`
+    const indexedMarker  = `live:positions:${pos.connectionId}:indexed:${pos.id}`
 
+    // 1. Write the position snapshot
     await client.setex(key, 604800, JSON.stringify(pos))
 
-    // Only register the id in the index list the first time we save this
-    // position. Subsequent saves (intermediate state updates, final snapshot
-    // after SL/TP) must not push the same id again — otherwise the index list
-    // bloats unboundedly and getLivePositions does redundant GETs.
-    const alreadyIndexed = await client.get(indexedMarker).catch(() => null)
-    if (!alreadyIndexed) {
-      await client.lpush(indexKey, pos.id).catch(() => {})
-      await client.setex(indexedMarker, 604800, "1").catch(() => {})
-      // Keep the index bounded — trim to the 2000 most recent ids.
-      await client.ltrim(indexKey, 0, 1999).catch(() => {})
-      await client.expire(indexKey, 604800).catch(() => {})
+    // 2. Register id in the open index exactly once per lifetime
+    if (!_indexedInMemory.has(pos.id)) {
+      const alreadyIndexed = await client.get(indexedMarker).catch(() => null)
+      if (!alreadyIndexed) {
+        await client.lpush(openIndexKey, pos.id).catch(() => {})
+        await client.setex(indexedMarker, 604800, "1").catch(() => {})
+        await client.ltrim(openIndexKey, 0, 1999).catch(() => {})
+        await client.expire(openIndexKey, 604800).catch(() => {})
+      }
+      _indexedInMemory.add(pos.id)
+    }
+
+    // 3. When a position reaches a terminal status, move it out of the open
+    // index and into the closed archive so getLivePositions() only scans
+    // currently-active records (major performance win for long-running apps).
+    const isTerminal =
+      pos.status === "closed" ||
+      pos.status === "error" ||
+      pos.status === "rejected"
+
+    if (isTerminal) {
+      const movedMarker = `live:positions:${pos.connectionId}:moved:${pos.id}`
+      const alreadyMoved = await client.get(movedMarker).catch(() => null)
+      if (!alreadyMoved) {
+        await client.lrem(openIndexKey, 0, pos.id).catch(() => {})
+        await client.lpush(closedIndexKey, pos.id).catch(() => {})
+        await client.ltrim(closedIndexKey, 0, 4999).catch(() => {})
+        await client.expire(closedIndexKey, 30 * 24 * 60 * 60).catch(() => {})
+        await client.setex(movedMarker, 604800, "1").catch(() => {})
+      }
     }
   } catch (err) {
     console.error(`${LOG_PREFIX} Failed to save position:`, err)
@@ -825,9 +858,42 @@ export async function getLivePositions(connectionId: string): Promise<LivePositi
 export async function getLivePositionsByStatus(
   connectionId: string,
   status: LivePosition["status"]
-): Promise<LivePosition[]> {
+  ): Promise<LivePosition[]> {
   const allPositions = await getLivePositions(connectionId)
   return allPositions.filter(p => p.status === status)
+  }
+
+/**
+ * Fetch the most recent closed/terminal positions from the closed archive.
+ * Closed positions are stored separately so the open index stays small.
+ */
+export async function getClosedLivePositions(
+  connectionId: string,
+  limit = 200
+): Promise<LivePosition[]> {
+  await initRedis()
+  const client = getRedisClient()
+  try {
+    const ids = ((await client.lrange(`live:positions:${connectionId}:closed`, 0, limit - 1).catch(() => [])) || []) as string[]
+    const positions: LivePosition[] = []
+    const seen = new Set<string>()
+    for (const id of ids) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      const data = await client.get(`live:position:${id}`)
+      if (data) {
+        try {
+          positions.push(JSON.parse(data as string))
+        } catch {
+          /* ignore malformed */
+        }
+      }
+    }
+    return positions
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} getClosedLivePositions error:`, err)
+    return []
+  }
 }
 
 /**
@@ -844,7 +910,13 @@ export async function calculateLivePositionStats(
   winRate: number
 }> {
   try {
-    const allPositions = await getLivePositions(connectionId)
+    // Merge open (live) and closed (archive) indices so aggregate stats are
+    // accurate across the position's full lifecycle, not just currently-open.
+    const [openPositions, closedPositions] = await Promise.all([
+      getLivePositions(connectionId),
+      getClosedLivePositions(connectionId, 1000),
+    ])
+    const allPositions = [...openPositions, ...closedPositions]
     const closed = allPositions.filter(p => p.status === "closed")
     const open = allPositions.filter(
       p => p.status === "open" || p.status === "filled" || p.status === "partially_filled"
@@ -884,6 +956,161 @@ export async function calculateLivePositionStats(
       averageROI: 0,
       winRate: 0,
     }
+  }
+}
+
+/**
+ * Reconcile Redis-tracked live positions with the exchange.
+ *
+ * For every Redis-tracked open position:
+ *   - If present on the exchange: refresh markPrice / liqPrice / unrealizedPnL
+ *   - If NOT present on the exchange: it was closed externally (SL/TP hit,
+ *     liquidated, or manually closed). Transition to "closed", compute realised
+ *     PnL, move to the closed archive, increment metrics, release the lock.
+ *
+ * Returns a summary usable for logging / API responses.
+ */
+export async function reconcileLivePositions(
+  connectionId: string,
+  exchangeConnector: any,
+): Promise<{
+  reconciled: number
+  updated: number
+  closed: number
+  errors: number
+}> {
+  await initRedis()
+  const client = getRedisClient()
+
+  const summary = { reconciled: 0, updated: 0, closed: 0, errors: 0 }
+
+  if (!exchangeConnector || typeof exchangeConnector.getPositions !== "function") {
+    return summary
+  }
+
+  try {
+    const openPositions = [
+      ...(await getLivePositionsByStatus(connectionId, "open")),
+      ...(await getLivePositionsByStatus(connectionId, "filled")),
+      ...(await getLivePositionsByStatus(connectionId, "partially_filled")),
+      ...(await getLivePositionsByStatus(connectionId, "placed")),
+    ]
+
+    if (openPositions.length === 0) return summary
+
+    // Single batch fetch of ALL exchange positions rather than per-symbol
+    // calls — dramatically fewer API hits when multiple positions are open.
+    let exchangePositions: any[] = []
+    try {
+      exchangePositions = (await exchangeConnector.getPositions().catch(() => [])) || []
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} reconcile getPositions failed:`, err instanceof Error ? err.message : String(err))
+      return summary
+    }
+
+    const exchangeMap = new Map<string, any>()
+    for (const ep of exchangePositions) {
+      const sym = String(ep.symbol || ep.Symbol || "").toUpperCase()
+      if (!sym) continue
+      const size = parseFloat(String(ep.size ?? ep.positionAmt ?? ep.quantity ?? "0"))
+      if (!size) continue
+      const sideRaw = String(ep.side ?? ep.positionSide ?? (size > 0 ? "long" : "short")).toLowerCase()
+      const direction: "long" | "short" = (sideRaw.includes("short") || sideRaw === "sell") ? "short" : "long"
+      exchangeMap.set(`${sym}|${direction}`, ep)
+    }
+
+    for (const pos of openPositions) {
+      summary.reconciled++
+      try {
+        const mapKey = `${pos.symbol.toUpperCase()}|${pos.direction}`
+        const exPos = exchangeMap.get(mapKey)
+
+        if (exPos) {
+          const markPrice = parseFloat(String(exPos.markPrice ?? exPos.indexPrice ?? exPos.lastPrice ?? "0"))
+          const liqPrice  = parseFloat(String(exPos.liquidationPrice ?? exPos.liqPrice ?? "0"))
+          const uPnl      = parseFloat(String(exPos.unrealizedProfit ?? exPos.unrealisedPnl ?? exPos.unrealizedPnl ?? "0"))
+
+          pos.exchangeData = {
+            ...pos.exchangeData,
+            markPrice: markPrice || pos.exchangeData?.markPrice,
+            liquidationPrice: liqPrice || pos.exchangeData?.liquidationPrice,
+            unrealizedPnL: uPnl || pos.exchangeData?.unrealizedPnL,
+            syncedAt: Date.now(),
+          }
+          pos.updatedAt = Date.now()
+          await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
+          summary.updated++
+        } else {
+          // Position closed externally — compute PnL, move to archive.
+          const exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || pos.entryPrice
+          const qty      = pos.executedQuantity || pos.quantity || 0
+          const avgEntry = pos.averageExecutionPrice || pos.entryPrice || 0
+
+          let realizedPnl = 0
+          if (exitPrice > 0 && avgEntry > 0 && qty > 0) {
+            realizedPnl = qty *
+              (pos.direction === "long" ? exitPrice - avgEntry : avgEntry - exitPrice)
+          }
+
+          pos.status = "closed"
+          pos.closedAt = Date.now()
+          pos.realizedPnL = realizedPnl
+          pos.closeReason = pos.closeReason || "exchange_reconciliation"
+          pos.progression.push({
+            step: "close",
+            timestamp: Date.now(),
+            success: true,
+            details: `Reconciled @ ${exitPrice.toFixed(8)} PnL=${realizedPnl.toFixed(4)}`,
+          })
+          pos.updatedAt = Date.now()
+
+          // Reuse the savePosition terminal-archival behaviour inline to
+          // avoid a circular import / extra Redis GET.
+          const openIndexKey   = `live:positions:${connectionId}`
+          const closedIndexKey = `live:positions:${connectionId}:closed`
+          const movedMarker    = `live:positions:${connectionId}:moved:${pos.id}`
+
+          await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
+
+          const alreadyMoved = await client.get(movedMarker).catch(() => null)
+          if (!alreadyMoved) {
+            await client.lrem(openIndexKey, 0, pos.id).catch(() => {})
+            await client.lpush(closedIndexKey, pos.id).catch(() => {})
+            await client.ltrim(closedIndexKey, 0, 4999).catch(() => {})
+            await client.expire(closedIndexKey, 30 * 24 * 60 * 60).catch(() => {})
+            await client.setex(movedMarker, 604800, "1").catch(() => {})
+          }
+
+          // Metrics + lock release
+          const progKey = `progression:${connectionId}`
+          await client.hincrby(progKey, "live_positions_closed_count", 1).catch(() => {})
+          if (realizedPnl > 0) {
+            await client.hincrby(progKey, "live_wins_count", 1).catch(() => {})
+          }
+          await client.expire(progKey, 7 * 24 * 60 * 60).catch(() => {})
+          await client.del(`live:lock:${connectionId}:${pos.symbol}:${pos.direction}`).catch(() => {})
+
+          summary.closed++
+        }
+      } catch (err) {
+        summary.errors++
+        console.warn(
+          `${LOG_PREFIX} reconcile per-position error for ${pos.id}:`,
+          err instanceof Error ? err.message : String(err),
+        )
+      }
+    }
+
+    if (summary.closed > 0 || summary.updated > 0) {
+      console.log(
+        `${LOG_PREFIX} ${connectionId} reconciled=${summary.reconciled} updated=${summary.updated} closed=${summary.closed}`
+      )
+    }
+
+    return summary
+  } catch (err) {
+    console.error(`${LOG_PREFIX} reconcileLivePositions fatal:`, err)
+    return summary
   }
 }
 
