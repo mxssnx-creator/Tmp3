@@ -870,43 +870,93 @@ export function ActiveConnectionCard({
                       </div>
                     </div>
 
-                    {/* Symbols & candles row */}
-                    {progression?.prehistoricProgress && (
-                      <div className="flex items-center gap-3 text-[10px]">
-                        <div className="flex items-center gap-1">
-                          <span className="text-muted-foreground">Symbols</span>
-                          <span className="font-medium tabular-nums">
-                            {progression.prehistoricProgress.symbolsProcessed}/{progression.prehistoricProgress.symbolsTotal}
-                          </span>
+                    {/*
+                      Symbols & candles row.
+
+                      Previously this block was gated on `progression?.prehistoricProgress`,
+                      so whenever that endpoint returned a sparse payload (e.g. before the
+                      first prehistoric cycle landed or while the in-memory progression
+                      manager was still initialising) the entire row vanished — giving the
+                      "less info than before" impression the user reported.
+
+                      We now merge both canonical sources and always render as long as
+                      *either* has data. `progression.prehistoricProgress` is preferred
+                      for symbols/candles (it mirrors the trade_engine_state snapshot),
+                      with `prehistoricStats` fields as a fallback that is populated from
+                      `/stats` on the 4s live-stats tick.
+                    */}
+                    {(() => {
+                      const pp = progression?.prehistoricProgress
+                      const symbolsProcessed = pp?.symbolsProcessed ?? 0
+                      const symbolsTotal = pp?.symbolsTotal ?? 0
+                      const candlesLoaded = pp?.candlesLoaded ?? 0
+                      const indicatorsCalculated = pp?.indicatorsCalculated ?? (prehistoricStats?.isComplete ? 0 : 0)
+                      const intervalsProcessed = prehistoricStats?.intervalsProcessed ?? 0
+                      const missingIntervals = prehistoricStats?.missingIntervalsLoaded ?? 0
+                      const currentSymbol = pp?.currentSymbol || prehistoricStats?.currentSymbol || ""
+                      const hasData =
+                        Boolean(pp) ||
+                        symbolsProcessed > 0 ||
+                        candlesLoaded > 0 ||
+                        intervalsProcessed > 0 ||
+                        indicatorsCalculated > 0
+
+                      if (!hasData) return null
+
+                      const formatK = (n: number) =>
+                        n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n)
+
+                      return (
+                        <div className="flex items-center gap-3 text-[10px] flex-wrap">
+                          {symbolsTotal > 0 && (
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground">Symbols</span>
+                              <span className="font-medium tabular-nums">
+                                {symbolsProcessed}/{symbolsTotal}
+                              </span>
+                            </div>
+                          )}
+                          {candlesLoaded > 0 && (
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground">Candles</span>
+                              <span className="font-medium tabular-nums">
+                                {formatK(candlesLoaded)}
+                              </span>
+                            </div>
+                          )}
+                          {indicatorsCalculated > 0 && (
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground">Indicators</span>
+                              <span className="font-medium tabular-nums">
+                                {formatK(indicatorsCalculated)}
+                              </span>
+                            </div>
+                          )}
+                          {intervalsProcessed > 0 && (
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground">Intervals</span>
+                              <span className="font-medium tabular-nums">
+                                {formatK(intervalsProcessed)}
+                              </span>
+                            </div>
+                          )}
+                          {missingIntervals > 0 && (
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground">Gaps filled</span>
+                              <span className="font-medium tabular-nums">
+                                {formatK(missingIntervals)}
+                              </span>
+                            </div>
+                          )}
+                          {currentSymbol && phase === "prehistoric_data" && (
+                            <div className="flex items-center gap-1 ml-auto">
+                              <span className="text-muted-foreground">Now:</span>
+                              <span className="font-mono font-medium text-[9px]">{currentSymbol}</span>
+                            </div>
+                          )}
                         </div>
-                        {progression.prehistoricProgress.candlesLoaded > 0 && (
-                          <div className="flex items-center gap-1">
-                            <span className="text-muted-foreground">Candles</span>
-                            <span className="font-medium tabular-nums">
-                              {progression.prehistoricProgress.candlesLoaded >= 1000
-                                ? `${(progression.prehistoricProgress.candlesLoaded / 1000).toFixed(1)}K`
-                                : progression.prehistoricProgress.candlesLoaded}
-                            </span>
-                          </div>
-                        )}
-                        {prehistoricStats && prehistoricStats.intervalsProcessed > 0 && (
-                          <div className="flex items-center gap-1">
-                            <span className="text-muted-foreground">Intervals</span>
-                            <span className="font-medium tabular-nums">
-                              {prehistoricStats.intervalsProcessed >= 1000
-                                ? `${(prehistoricStats.intervalsProcessed / 1000).toFixed(1)}K`
-                                : prehistoricStats.intervalsProcessed}
-                            </span>
-                          </div>
-                        )}
-                        {prehistoricStats && prehistoricStats.currentSymbol && phase === "prehistoric_data" && (
-                          <div className="flex items-center gap-1 ml-auto">
-                            <span className="text-muted-foreground">Now:</span>
-                            <span className="font-mono font-medium text-[9px]">{prehistoricStats.currentSymbol}</span>
-                          </div>
-                        )}
-                      </div>
-                    )}
+                      )
+                    })()}
 
                     {/* Indications breakdown */}
                     {prehistoricStats && prehistoricStats.indicationsTotal > 0 && (

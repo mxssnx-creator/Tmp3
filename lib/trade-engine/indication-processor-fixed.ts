@@ -452,14 +452,100 @@ export class IndicationProcessor {
       const primaryPF = 1.0 + primaryConf * 0.5
       const secondaryPF = 1.0 + secondaryConf * 0.3
 
-      // Generate indications - 4 types × 2 directions = 8 indications per cycle
+      // ── Indication emission with differentiated semantics ────────────────
+      //
+      // Before this fix, every cycle pushed exactly one of every type per
+      // direction (4 types × 2 dirs = 8 flat), so the dashboard showed
+      // Dir=Move=Act=Opt in perfect lockstep and Auto was always 0.
+      //
+      // Each type now only fires when its own criterion is satisfied, so the
+      // per-type counts naturally diverge and reflect real market structure:
+      //
+      //   direction — always emitted (2/cycle): primary + hedge trend signal
+      //   move      — body size exceeds ambient noise (rangePercent ≥ 0.15%)
+      //   active    — candle volume > recent-volume average (elevated activity)
+      //   optimal   — strong confidence + strong body (conf ≥ 0.72 AND body-ratio ≥ 0.55)
+      //   auto      — step-based indicator alignment across short/mid/long windows
+      //
+      // The scoring below is derived from the real candle data already in scope
+      // (currentOpen/High/Low/Close/Volume, candles[], stepIndicators), so we
+      // don't incur any extra fetches.
+
       const indications: any[] = []
       const now = Date.now()
 
-      for (const [dir, conf, pf] of [
-        [primaryDir, primaryConf, primaryPF],
-        [secondaryDir, secondaryConf, secondaryPF],
-      ] as Array<["long" | "short", number, number]>) {
+      // Range-percent of the current candle (used by move threshold)
+      const rangePercent = currentClose > 0 ? (range / currentClose) * 100 : 0
+
+      // Recent-volume baseline: mean volume of the last ~20 candles (or fewer
+      // if the window is smaller). Falls back to currentVolume so the first
+      // warm-up ticks don't spuriously fire "active".
+      let recentVolAvg = 0
+      {
+        const window = candles.slice(-20)
+        let sum = 0
+        let n = 0
+        for (const c of window) {
+          const v = Number(c?.volume ?? c?.v ?? 0)
+          if (Number.isFinite(v) && v > 0) { sum += v; n++ }
+        }
+        recentVolAvg = n > 0 ? sum / n : currentVolume
+      }
+
+      // Auto-alignment: derived from the step-based indicator suite
+      // (MA + RSI + MACD) across short / mid / long windows. Each step
+      // indicator exposes `{ ma, rsi, macd: { macd, signal }, bb }`, so we
+      // project each to a direction:
+      //   * RSI  > 50 → long, RSI < 50 → short
+      //   * MACD histogram > 0 (macd > signal) → long, else short
+      //   * Price vs MA: close > ma → long, else short
+      // A window is "aligned" when at least 2 of those 3 sub-signals agree;
+      // we fire "auto" for the primary direction when ≥ 2 of the 3 windows
+      // (steps 5 / 15 / 28) align in that direction.
+      const autoAlignment = (() => {
+        try {
+          const projectWindow = (step: number): { dir: "long" | "short" | null; strength: number } => {
+            const s = (stepIndicators as any)?.[step]
+            if (!s) return { dir: null, strength: 0 }
+            const rsi = Number(s.rsi) || 50
+            const macdHist = (Number(s?.macd?.macd) || 0) - (Number(s?.macd?.signal) || 0)
+            const ma = Number(s.ma) || 0
+            const votes: Array<"long" | "short"> = []
+            if (rsi !== 50) votes.push(rsi > 50 ? "long" : "short")
+            if (macdHist !== 0) votes.push(macdHist > 0 ? "long" : "short")
+            if (ma > 0) votes.push(currentClose >= ma ? "long" : "short")
+            if (votes.length < 2) return { dir: null, strength: 0 }
+            const longs = votes.filter((v) => v === "long").length
+            const shorts = votes.length - longs
+            if (longs === shorts) return { dir: null, strength: 0 }
+            const dir: "long" | "short" = longs > shorts ? "long" : "short"
+            // Strength = RSI distance from 50 (0–1) blended with vote majority.
+            const rsiStrength = Math.min(1, Math.abs(rsi - 50) / 40)
+            const voteStrength = Math.max(longs, shorts) / votes.length
+            return { dir, strength: rsiStrength * 0.5 + voteStrength * 0.5 }
+          }
+
+          const windows = [projectWindow(5), projectWindow(15), projectWindow(28)]
+          const alignedWindows = windows.filter((w) => w.dir === primaryDir)
+          if (alignedWindows.length < 2) return null
+          const avgStrength =
+            alignedWindows.reduce((a, b) => a + b.strength, 0) / alignedWindows.length
+          return { aligned: true, strength: Math.min(0.95, 0.5 + avgStrength * 0.45) }
+        } catch {
+          return null
+        }
+      })()
+
+      // Loop over primary + hedge directions. Each condition is independent
+      // so in a calm market only `direction` fires; on a big bullish candle
+      // with elevated volume, all five fire.
+      const pairs: Array<["long" | "short", number, number, boolean]> = [
+        [primaryDir,   primaryConf,   primaryPF,   true],   // primary
+        [secondaryDir, secondaryConf, secondaryPF, false],  // hedge
+      ]
+
+      for (const [dir, conf, pf, isPrimary] of pairs) {
+        // 1. Direction — always emitted
         indications.push({
           type: "direction",
           symbol,
@@ -467,35 +553,65 @@ export class IndicationProcessor {
           profitFactor: pf,
           confidence: conf,
           timestamp: now,
-          metadata: { direction: dir },
+          metadata: { direction: dir, primary: isPrimary },
         })
-        indications.push({
-          type: "move",
-          symbol,
-          value: currentClose,
-          profitFactor: pf * 0.95,
-          confidence: conf * 0.95,
-          timestamp: now,
-          metadata: { direction: dir },
-        })
-        indications.push({
-          type: "active",
-          symbol,
-          value: currentClose,
-          profitFactor: pf * 0.9,
-          confidence: conf * 0.9,
-          timestamp: now,
-          metadata: { direction: dir },
-        })
-        indications.push({
-          type: "optimal",
-          symbol,
-          value: currentClose,
-          profitFactor: Math.min(2.5, pf * 1.1),
-          confidence: Math.min(0.95, conf * 1.05),
-          timestamp: now,
-          metadata: { direction: dir },
-        })
+
+        // 2. Move — only when the candle body is meaningful vs ambient noise
+        if (rangePercent >= 0.15) {
+          indications.push({
+            type: "move",
+            symbol,
+            value: currentClose,
+            profitFactor: pf * (1 + Math.min(0.25, rangePercent / 40)),
+            confidence: conf * 0.95,
+            timestamp: now,
+            metadata: { direction: dir, rangePercent, primary: isPrimary },
+          })
+        }
+
+        // 3. Active — only when volume is elevated above the recent baseline
+        if (recentVolAvg > 0 && currentVolume >= recentVolAvg * 1.05) {
+          indications.push({
+            type: "active",
+            symbol,
+            value: currentClose,
+            profitFactor: pf * 0.92,
+            confidence: conf * 0.9,
+            timestamp: now,
+            metadata: {
+              direction: dir,
+              volumeRatio: currentVolume / recentVolAvg,
+              primary: isPrimary,
+            },
+          })
+        }
+
+        // 4. Optimal — gated on high confidence AND strong body. Only the
+        //    primary direction is ever optimal (hedge is never the "best" play).
+        if (isPrimary && conf >= 0.72 && bodyRatio >= 0.55) {
+          indications.push({
+            type: "optimal",
+            symbol,
+            value: currentClose,
+            profitFactor: Math.min(2.5, pf * 1.15),
+            confidence: Math.min(0.95, conf * 1.05),
+            timestamp: now,
+            metadata: { direction: dir, bodyRatio, primary: true },
+          })
+        }
+
+        // 5. Auto — step-based indicator alignment, primary direction only.
+        if (isPrimary && autoAlignment?.aligned) {
+          indications.push({
+            type: "auto",
+            symbol,
+            value: currentClose,
+            profitFactor: Math.min(2.3, pf * (1 + autoAlignment.strength * 0.35)),
+            confidence: autoAlignment.strength,
+            timestamp: now,
+            metadata: { direction: dir, alignment: "step_5_15_28", primary: true },
+          })
+        }
       }
 
       // Store indications
