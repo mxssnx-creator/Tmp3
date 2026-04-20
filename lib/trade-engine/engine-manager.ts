@@ -743,6 +743,10 @@ export class TradeEngineManager {
           pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
         }
       }
+      // Unregister the prior handle BEFORE overwriting it — otherwise the
+      // global `__engine_timers` Set grows by one entry every cycle and
+      // stale handles accumulate forever (memory leak + slow HMR reloads).
+      if (this.indicationTimer) unregisterEngineTimer(this.indicationTimer)
       this.indicationTimer = setTimeout(tick, pause)
       registerEngineTimer(this.indicationTimer)
     }
@@ -993,6 +997,9 @@ export class TradeEngineManager {
           pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
         }
       }
+      // See indication processor: unregister the previous handle so the
+      // global timer Set doesn't grow unbounded.
+      if (this.strategyTimer) unregisterEngineTimer(this.strategyTimer)
       this.strategyTimer = setTimeout(tick, pause)
       registerEngineTimer(this.strategyTimer)
     }
@@ -1174,6 +1181,9 @@ export class TradeEngineManager {
           pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
         }
       }
+      // See indication processor: unregister the previous handle so the
+      // global timer Set doesn't grow unbounded.
+      if (this.realtimeTimer) unregisterEngineTimer(this.realtimeTimer)
       this.realtimeTimer = setTimeout(tick, pause)
       registerEngineTimer(this.realtimeTimer)
     }
@@ -1379,7 +1389,7 @@ export class TradeEngineManager {
 
   private async getSymbols(): Promise<string[]> {
     const now = Date.now()
-    if (this._symbolsCache && now - this._symbolsCachedAt < EngineManager._SYMBOLS_TTL_MS) {
+    if (this._symbolsCache && now - this._symbolsCachedAt < TradeEngineManager._SYMBOLS_TTL_MS) {
       return this._symbolsCache
     }
 
