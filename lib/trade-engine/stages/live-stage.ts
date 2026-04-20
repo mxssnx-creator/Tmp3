@@ -102,9 +102,23 @@ async function savePosition(pos: LivePosition): Promise<void> {
   try {
     const client = getRedisClient()
     const key = `live:position:${pos.id}`
+    const indexKey = `live:positions:${pos.connectionId}`
+    const indexedMarker = `live:positions:${pos.connectionId}:indexed:${pos.id}`
+
     await client.setex(key, 604800, JSON.stringify(pos))
-    await client.lpush(`live:positions:${pos.connectionId}`, pos.id).catch(() => {})
-    await client.expire(`live:positions:${pos.connectionId}`, 604800).catch(() => {})
+
+    // Only register the id in the index list the first time we save this
+    // position. Subsequent saves (intermediate state updates, final snapshot
+    // after SL/TP) must not push the same id again — otherwise the index list
+    // bloats unboundedly and getLivePositions does redundant GETs.
+    const alreadyIndexed = await client.get(indexedMarker).catch(() => null)
+    if (!alreadyIndexed) {
+      await client.lpush(indexKey, pos.id).catch(() => {})
+      await client.setex(indexedMarker, 604800, "1").catch(() => {})
+      // Keep the index bounded — trim to the 2000 most recent ids.
+      await client.ltrim(indexKey, 0, 1999).catch(() => {})
+      await client.expire(indexKey, 604800).catch(() => {})
+    }
   } catch (err) {
     console.error(`${LOG_PREFIX} Failed to save position:`, err)
   }
