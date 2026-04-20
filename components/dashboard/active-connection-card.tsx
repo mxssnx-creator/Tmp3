@@ -928,6 +928,113 @@ export function ActiveConnectionCard({
                       </div>
                     )}
 
+                    {/* Live Exchange Execution — shown when any live-stage activity has occurred */}
+                    {prehistoricStats && (
+                      prehistoricStats.liveOrdersPlaced > 0 ||
+                      prehistoricStats.liveOrdersSimulated > 0 ||
+                      prehistoricStats.livePositionsCreated > 0
+                    ) && (
+                      <div className="space-y-1 border-t border-border/40 pt-2">
+                        <div className="flex items-center justify-between">
+                          <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Live Execution</div>
+                          {prehistoricStats.livePositionsOpen > 0 && (
+                            <div className="flex items-center gap-1 text-[9px]">
+                              <span className="relative flex h-1.5 w-1.5">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500" />
+                              </span>
+                              <span className="font-semibold text-green-600 dark:text-green-400 tabular-nums">
+                                {prehistoricStats.livePositionsOpen} open
+                              </span>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Orders row */}
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px]">
+                          <span className="text-muted-foreground">
+                            Orders <span className="text-foreground font-semibold tabular-nums">
+                              {prehistoricStats.liveOrdersPlaced}
+                            </span>
+                          </span>
+                          {prehistoricStats.liveOrdersFilled > 0 && (
+                            <span className="text-muted-foreground">
+                              filled <span className="text-green-600 dark:text-green-400 font-semibold tabular-nums">
+                                {prehistoricStats.liveOrdersFilled}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveOrdersRejected > 0 && (
+                            <span className="text-muted-foreground">
+                              rejected <span className="text-amber-600 dark:text-amber-400 font-semibold tabular-nums">
+                                {prehistoricStats.liveOrdersRejected}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveOrdersFailed > 0 && (
+                            <span className="text-muted-foreground">
+                              failed <span className="text-red-500 font-semibold tabular-nums">
+                                {prehistoricStats.liveOrdersFailed}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveOrdersSimulated > 0 && (
+                            <span className="text-muted-foreground">
+                              sim <span className="text-blue-600 dark:text-blue-400 font-semibold tabular-nums">
+                                {prehistoricStats.liveOrdersSimulated}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveFillRate > 0 && (
+                            <span className="ml-auto text-muted-foreground">
+                              fill <span className={`font-semibold ${prehistoricStats.liveFillRate >= 80 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveFillRate >= 50 ? "text-amber-600 dark:text-amber-400" : "text-foreground"}`}>
+                                {prehistoricStats.liveFillRate.toFixed(1)}%
+                              </span>
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Positions row */}
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px]">
+                          <span className="text-muted-foreground">
+                            Positions <span className="text-foreground font-semibold tabular-nums">
+                              {prehistoricStats.livePositionsCreated}
+                            </span>
+                          </span>
+                          {prehistoricStats.livePositionsClosed > 0 && (
+                            <span className="text-muted-foreground">
+                              closed <span className="text-foreground font-semibold tabular-nums">
+                                {prehistoricStats.livePositionsClosed}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveWins > 0 && (
+                            <span className="text-muted-foreground">
+                              wins <span className="text-green-600 dark:text-green-400 font-semibold tabular-nums">
+                                {prehistoricStats.liveWins}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveWinRate > 0 && (
+                            <span className="text-muted-foreground">
+                              WR <span className={`font-semibold ${prehistoricStats.liveWinRate >= 60 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveWinRate >= 40 ? "text-amber-600 dark:text-amber-400" : "text-red-500"}`}>
+                                {prehistoricStats.liveWinRate.toFixed(1)}%
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveVolumeUsdTotal > 0 && (
+                            <span className="ml-auto text-muted-foreground">
+                              vol <span className="text-foreground font-semibold tabular-nums">
+                                ${prehistoricStats.liveVolumeUsdTotal >= 1000
+                                  ? `${(prehistoricStats.liveVolumeUsdTotal / 1000).toFixed(1)}K`
+                                  : prehistoricStats.liveVolumeUsdTotal.toFixed(2)}
+                              </span>
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
                     {/* Missing intervals info */}
                     {prehistoricStats && prehistoricStats.missingIntervalsLoaded > 0 && (
                       <div className="text-[9px] text-muted-foreground">
