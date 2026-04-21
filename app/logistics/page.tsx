@@ -728,7 +728,9 @@ function LogisticsContent() {
     try {
       const [statsRes, queueRes, livePosRes] = await Promise.allSettled([
         fetch(`/api/trading/engine-stats?connection_id=${connId}`, { cache: "no-store" }),
-        fetch("/api/logistics/queue", { cache: "no-store" }),
+        // Forward the connectionId so the queue card focuses on the same
+        // exchange connection the sidebar exchange selector has chosen.
+        fetch(`/api/logistics/queue?connectionId=${encodeURIComponent(connId)}`, { cache: "no-store" }),
         fetch(`/api/trading/live-positions?connection_id=${connId}`, { cache: "no-store" }),
       ])
       if (statsRes.status === "fulfilled" && statsRes.value.ok)

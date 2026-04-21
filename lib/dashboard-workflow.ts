@@ -24,11 +24,21 @@ type WorkflowConnection = {
 
 
 const SNAPSHOT_TTL_MS = 1000
+// When a specific connectionId is requested (e.g. from the Logistics sidebar
+// page) we bypass the shared cache because different callers want different
+// focus connections.
 let cachedSnapshot: any | null = null
 let cachedSnapshotAt = 0
 let snapshotInFlight: Promise<any> | null = null
 
-export async function getDashboardWorkflowSnapshot() {
+export async function getDashboardWorkflowSnapshot(options?: { preferredConnectionId?: string }) {
+  const preferredConnectionId = options?.preferredConnectionId
+
+  if (preferredConnectionId) {
+    // Per-connection requests are uncached to avoid mixing focus connections.
+    return buildDashboardWorkflowSnapshot(preferredConnectionId)
+  }
+
   const now = Date.now()
   if (cachedSnapshot && now - cachedSnapshotAt < SNAPSHOT_TTL_MS) {
     return cachedSnapshot
@@ -50,7 +60,7 @@ export async function getDashboardWorkflowSnapshot() {
   }
 }
 
-async function buildDashboardWorkflowSnapshot() {
+async function buildDashboardWorkflowSnapshot(preferredConnectionId?: string) {
   await initRedis()
 
   const client = getRedisClient()
@@ -75,7 +85,15 @@ async function buildDashboardWorkflowSnapshot() {
   const eligibleConnections = allConnections.filter((connection: any) => isConnectionEligibleForEngine(connection))
   const eligibleIds = new Set(eligibleConnections.map((conn: any) => conn.id))
 
+  // When a preferredConnectionId is supplied (from a sidebar page that has a
+  // specific exchange selected), honor it instead of the heuristic pick — but
+  // still fall back to the heuristic if the preferred id isn't present.
+  const preferredFocus = preferredConnectionId
+    ? normalizedConnections.find((conn) => conn.id === preferredConnectionId)
+    : undefined
+
   const focusConnection =
+    preferredFocus ||
     normalizedConnections.find((conn) => eligibleIds.has(conn.id)) ||
     normalizedConnections.find((conn) => conn.isActivePanel && conn.isDashboardEnabled) ||
     normalizedConnections.find((conn) => conn.isActivePanel) ||
