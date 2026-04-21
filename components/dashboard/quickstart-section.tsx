@@ -195,7 +195,7 @@ function MiniStat({ label, value, sub }: { label: string; value: string; sub?: s
   )
 }
 
-// ─── main component ───────────────────────────────────────────────────────────
+// ─── main component ─���─────────────────────────────────────────────────────────
 
 export function QuickstartSection() {
   const { selectedConnectionId, selectedExchange } = useExchange()
@@ -970,25 +970,39 @@ export function QuickstartSection() {
               </div>
             </div>
 
-            {/* strategies breakdown */}
+            {/* strategies breakdown
+                Base → Main → Real → Live is a CASCADE FILTER (eval → filter →
+                adjust → promote). Each stage operates on the SURVIVORS of the
+                previous stage, so the four counters are NOT additive — each
+                ratio below is stage-over-previous pass rate. The header total
+                is the canonical strategy count = Real-stage output only. */}
             <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
               <div className="flex items-center gap-1.5 text-[11px] font-semibold">
                 <BarChart3 className="w-3.5 h-3.5 text-amber-500" />
                 Strategies
-                <span className="ml-auto text-[10px] text-muted-foreground font-normal">
-                  Total {fmt(stats.stratBase + stats.stratMain + stats.stratReal + stats.stratLive)}
+                <span
+                  className="ml-auto text-[10px] text-muted-foreground font-normal"
+                  title="Canonical total = Real-stage output. Base/Main are intermediate filter stages of the same strategy, not separate counts."
+                >
+                  Final (Real) {fmt(stats.stratReal)}
                 </span>
               </div>
+              <p className="text-[9px] text-muted-foreground/80 -mt-1 leading-tight">
+                Cascade filter — each stage filters the survivors of the previous stage. Counts are <em>not</em> added together.
+              </p>
               <div className="grid grid-cols-4 gap-1.5 text-center text-[10px]">
                 {[
-                  { label: "Base", value: stats.stratBase, color: "text-orange-600 dark:text-orange-400", ratio: null },
-                  { label: "Main", value: stats.stratMain, color: "text-yellow-600 dark:text-yellow-400", ratio: stats.stratBase > 0 ? `${((stats.stratMain / stats.stratBase) * 100).toFixed(0)}%` : null },
-                  { label: "Real", value: stats.stratReal, color: "text-green-600 dark:text-green-400",   ratio: stats.stratMain > 0 ? `${((stats.stratReal / stats.stratMain) * 100).toFixed(0)}%` : null },
-                  { label: "Live", value: stats.stratLive, color: "text-blue-600 dark:text-blue-400",     ratio: stats.stratReal > 0 ? `${((stats.stratLive / stats.stratReal) * 100).toFixed(0)}%` : null },
-                ].map(({ label, value, color, ratio }) => (
+                  { label: "Base",   sub: "eval",    value: stats.stratBase, color: "text-orange-600 dark:text-orange-400", ratio: null },
+                  { label: "Main",   sub: "filter",  value: stats.stratMain, color: "text-yellow-600 dark:text-yellow-400", ratio: stats.stratBase > 0 ? `${((stats.stratMain / stats.stratBase) * 100).toFixed(0)}% pass` : null },
+                  { label: "Real",   sub: "adjust",  value: stats.stratReal, color: "text-green-600 dark:text-green-400",   ratio: stats.stratMain > 0 ? `${((stats.stratReal / stats.stratMain) * 100).toFixed(0)}% pass` : null },
+                  { label: "Live",   sub: "promote", value: stats.stratLive, color: "text-blue-600 dark:text-blue-400",     ratio: stats.stratReal > 0 ? `${((stats.stratLive / stats.stratReal) * 100).toFixed(0)}% live` : null },
+                ].map(({ label, sub, value, color, ratio }) => (
                   <div key={label} className="rounded bg-muted/60 py-1.5 px-1">
                     <div className={`text-sm font-bold tabular-nums ${color}`}>{fmt(value)}</div>
-                    <div className="text-muted-foreground">{label}</div>
+                    <div className="text-muted-foreground">
+                      {label}
+                      <span className="text-[9px] text-muted-foreground/70"> ({sub})</span>
+                    </div>
                     {ratio && <div className="text-[9px] text-muted-foreground/70">{ratio}</div>}
                   </div>
                 ))}

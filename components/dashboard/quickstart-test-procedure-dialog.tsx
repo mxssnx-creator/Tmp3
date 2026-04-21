@@ -180,7 +180,10 @@ export function QuickstartTestProcedureDialog() {
           setLiveMonitor({
             cycles: data.indicationCycleCount || data.strategyCycleCount || data.cyclesCompleted || 0,
             indications: data.totalIndicationsCount || data.indications?.totalRecords || 0,
-            strategies: data.totalStrategyCount || (data.baseStrategyCount || 0) + (data.mainStrategyCount || 0) + (data.realStrategyCount || 0) + (data.liveStrategyCount || 0),
+            // Canonical strategies total = Real-stage count (the cascade
+            // filter's final output). Base/Main are intermediate stages of
+            // the SAME strategies and must NOT be summed with Real.
+            strategies: data.totalStrategyCount || data.realStrategyCount || 0,
             connections: 1,
             symbols: data.metadata?.symbolCount || data.symbolsProcessed || 0,
           })

@@ -1068,6 +1068,11 @@ export class TradeEngineManager {
         // See indication-processor comment above for counter taxonomy:
         //   strategy_cycle_count          = every tick (churn)
         //   strategy_live_cycle_count     = only ticks that evaluated at least 1 strategy
+        //   strategies_count              = canonical TOTAL strategies produced.
+        //     `evaluatedThisCycle` sums strategy-processor results across symbols,
+        //     where each result's `strategiesEvaluated` is the REAL-stage (final)
+        //     count only — Base/Main are intermediate filter stages of the SAME
+        //     pipeline and are NOT added here, so cross-symbol sums are safe.
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`

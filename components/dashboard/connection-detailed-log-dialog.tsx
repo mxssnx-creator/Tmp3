@@ -77,9 +77,12 @@ export function ConnectionDetailedLogDialog({ connection }: ConnectionDetailedLo
         averageCycleTime: metricsData.metrics?.cycleTimeMs || metricsData.progressionState?.cycleTimeMs || 0,
         indicationsTotal: metricsData.state?.indicationsCount || metricsData.progressionState?.indicationsCount || 
                           metricsData.metrics?.indicationsCount || 0,
-        strategiesEvaluated: metricsData.metrics?.totalStrategiesEvaluated || metricsData.progressionState?.strategyEvaluatedBase + 
-                            (metricsData.progressionState?.strategyEvaluatedMain || 0) + 
-                            (metricsData.progressionState?.strategyEvaluatedReal || 0) || 0,
+        // Canonical "strategies evaluated" = Real-stage count only.
+        // Base → Main → Real is a cascade filter of the SAME strategies;
+        // summing the three evaluated counters would multi-count them.
+        strategiesEvaluated: metricsData.metrics?.totalStrategiesEvaluated
+                          || metricsData.progressionState?.strategyEvaluatedReal
+                          || 0,
         prehistoricCandles: metricsData.metrics?.prehistoricCandlesProcessed || metricsData.progressionState?.prehistoricCandlesProcessed || 0,
         symbolsLoaded: metricsData.metrics?.prehistoricSymbolsProcessed || metricsData.progressionState?.prehistoricSymbolsProcessedCount || 0,
         cpuUsage: metricsData.monitoring?.cpu || 0,
