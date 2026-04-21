@@ -28,6 +28,7 @@ import { MonitoringAlerts } from "@/components/monitoring/monitoring-alerts"
 import { BackupManager } from "@/components/monitoring/backup-manager"
 import { EmergencyStopButton } from "@/components/emergency-stop-button"
 import { SystemVerificationPanel } from "@/components/system/system-verification-panel"
+import { PageHeader } from "@/components/page-header"
 
 type LogLevel = "info" | "warning" | "error" | "debug"
 type SystemState = "active" | "inactive" | "error" | "warning"
@@ -347,32 +348,40 @@ export default function MonitoringPage() {
     URL.revokeObjectURL(url)
   }
 
+  const anyLoading = isLoadingLogs || isLoadingSiteLogs || isLoadingSystem || isLoadingToasts
+
   return (
-    <div className="container mx-auto p-6 space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold">System Monitoring</h1>
-          <p className="text-muted-foreground">Real-time system states, logs, and error tracking</p>
-        </div>
+    <div className="p-4 space-y-4">
+      {/*
+        Swapped the bespoke `container mx-auto p-6` + `<h1>` pair for the
+        shared `PageHeader` pattern so the Monitoring page matches the rest
+        of the sidebar vertically. Action buttons shrunk to `size="sm"` to
+        match the new toolbar density.
+      */}
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <PageHeader
+          title="System Monitoring"
+          description="Real-time system states, logs, and error tracking"
+        />
         <div className="flex gap-2">
           <EmergencyStopButton />
           <Button
             variant="outline"
+            size="sm"
+            className="h-8 text-xs"
             onClick={() => {
               loadSystemStates()
               loadLogs()
               loadSiteLogs()
               loadToastLogs()
             }}
-            disabled={isLoadingLogs || isLoadingSiteLogs || isLoadingSystem || isLoadingToasts}
+            disabled={anyLoading}
           >
-            <RefreshCw
-              className={`h-4 w-4 mr-2 ${isLoadingLogs || isLoadingSiteLogs || isLoadingSystem || isLoadingToasts ? "animate-spin" : ""}`}
-            />
+            <RefreshCw className={`h-3 w-3 mr-1 ${anyLoading ? "animate-spin" : ""}`} />
             Refresh All
           </Button>
-          <Button variant="outline" onClick={() => downloadLogs("all")}>
-            <Download className="h-4 w-4 mr-2" />
+          <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => downloadLogs("all")}>
+            <Download className="h-3 w-3 mr-1" />
             Export Logs
           </Button>
         </div>

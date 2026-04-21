@@ -23,6 +23,13 @@ function getDefaultSettings(): Record<string, any> {
     main_symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
     forced_symbols: [],
     database_type: "redis",
+    // Canonical prehistoric range (1-50h, step 1, default 8). Must be seeded
+    // here so fresh installs pick it up on first GET /api/settings — otherwise
+    // the Settings UI would fall back to its own client default of 8 while
+    // the engine read would find no value and use its internal default,
+    // causing a brief off-by-one between what the UI shows and what the
+    // engine actually applies until the user hits Save.
+    prehistoric_range_hours: 8,
   }
 }
 

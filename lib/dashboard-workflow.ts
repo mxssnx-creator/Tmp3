@@ -24,11 +24,21 @@ type WorkflowConnection = {
 
 
 const SNAPSHOT_TTL_MS = 1000
+// When a specific connectionId is requested (e.g. from the Logistics sidebar
+// page) we bypass the shared cache because different callers want different
+// focus connections.
 let cachedSnapshot: any | null = null
 let cachedSnapshotAt = 0
 let snapshotInFlight: Promise<any> | null = null
 
-export async function getDashboardWorkflowSnapshot() {
+export async function getDashboardWorkflowSnapshot(options?: { preferredConnectionId?: string }) {
+  const preferredConnectionId = options?.preferredConnectionId
+
+  if (preferredConnectionId) {
+    // Per-connection requests are uncached to avoid mixing focus connections.
+    return buildDashboardWorkflowSnapshot(preferredConnectionId)
+  }
+
   const now = Date.now()
   if (cachedSnapshot && now - cachedSnapshotAt < SNAPSHOT_TTL_MS) {
     return cachedSnapshot
@@ -50,7 +60,7 @@ export async function getDashboardWorkflowSnapshot() {
   }
 }
 
-async function buildDashboardWorkflowSnapshot() {
+async function buildDashboardWorkflowSnapshot(preferredConnectionId?: string) {
   await initRedis()
 
   const client = getRedisClient()
@@ -75,7 +85,15 @@ async function buildDashboardWorkflowSnapshot() {
   const eligibleConnections = allConnections.filter((connection: any) => isConnectionEligibleForEngine(connection))
   const eligibleIds = new Set(eligibleConnections.map((conn: any) => conn.id))
 
+  // When a preferredConnectionId is supplied (from a sidebar page that has a
+  // specific exchange selected), honor it instead of the heuristic pick — but
+  // still fall back to the heuristic if the preferred id isn't present.
+  const preferredFocus = preferredConnectionId
+    ? normalizedConnections.find((conn) => conn.id === preferredConnectionId)
+    : undefined
+
   const focusConnection =
+    preferredFocus ||
     normalizedConnections.find((conn) => eligibleIds.has(conn.id)) ||
     normalizedConnections.find((conn) => conn.isActivePanel && conn.isDashboardEnabled) ||
     normalizedConnections.find((conn) => conn.isActivePanel) ||
@@ -98,63 +116,79 @@ async function buildDashboardWorkflowSnapshot() {
   }
 
   if (focusConnection) {
-    const [progression, positions, trades, logs, engineState] = await Promise.all([
-      ProgressionStateManager.getProgressionState(focusConnection.id),
-      getConnectionPositions(focusConnection.id),
-      getConnectionTrades(focusConnection.id),
-      getProgressionLogs(focusConnection.id),
-      getSettings(`trade_engine_state:${focusConnection.id}`),
+    const connId = focusConnection.id
+
+    const [progression, positions, trades, logs, engineState, progHash] = await Promise.all([
+      ProgressionStateManager.getProgressionState(connId),
+      getConnectionPositions(connId),
+      getConnectionTrades(connId),
+      getProgressionLogs(connId),
+      getSettings(`trade_engine_state:${connId}`),
+      // progression:{connId} is a raw hash updated EVERY cycle — primary source for live counts
+      client.hgetall(`progression:${connId}`).catch(() => ({})),
     ])
 
-    // Gather comprehensive stats for the focus connection
-    const connId = focusConnection.id
-    
-    // Get indications by type
-    const directionIndications = await client.scard(`indications:${connId}:direction`).catch(() => 0)
-    const moveIndications = await client.scard(`indications:${connId}:move`).catch(() => 0)
-    const activeIndications = await client.scard(`indications:${connId}:active`).catch(() => 0)
-    const optimalIndications = await client.scard(`indications:${connId}:optimal`).catch(() => 0)
-    const autoIndications = await client.scard(`indications:${connId}:auto`).catch(() => 0)
-    
-    // Get pseudo positions by type
-    const basePseudoPositions = await client.scard(`base_pseudo:${connId}`).catch(() => 0)
-    const mainPseudoPositions = await client.scard(`main_pseudo:${connId}`).catch(() => 0)
-    const realPseudoPositions = await client.scard(`real_pseudo:${connId}`).catch(() => 0)
-    
-    // Get live positions
-    const livePositionsCount = await client.scard(`positions:${connId}:live`).catch(() => 0)
-    
-    // Get prehistoric data info
+    const ph = (progHash || {}) as Record<string, string>
+
+    // Cycle counts: prefer live progression hash (updated every cycle) over engine state
+    // (engine state is only persisted every 50-100 cycles)
+    const indicationCycles =
+      parseInt(ph.indication_cycle_count || "0", 10) ||
+      Number((engineState as any)?.indication_cycle_count || 0)
+    const strategyCycles =
+      parseInt(ph.strategy_cycle_count || "0", 10) ||
+      Number((engineState as any)?.strategy_cycle_count || 0)
+    const realtimeCycles = Number((engineState as any)?.realtime_cycle_count || 0)
+
+    // Indication counts: use counter keys (engine writes incr counters, not sets)
+    const totalIndicationsCount = parseInt(ph.indications_count || "0", 10)
+    const directionIndications = parseInt(ph.indications_direction_count || "0", 10)
+    const moveIndications      = parseInt(ph.indications_move_count      || "0", 10)
+    const activeIndications    = parseInt(ph.indications_active_count    || "0", 10)
+    const optimalIndications   = parseInt(ph.indications_optimal_count   || "0", 10)
+    const autoIndications      = parseInt(ph.indications_auto_count      || "0", 10)
+
+    // Strategy set counts from settings:strategies:* hash keys
+    let baseSets = 0, mainSets = 0, realSets = 0
+    try {
+      const stratKeys = await client.keys(`settings:strategies:${connId}:*:sets`)
+      for (const k of stratKeys) {
+        const h = await client.hgetall(k).catch(() => ({})) || {}
+        const c = parseInt((h as Record<string, string>).count || "0", 10)
+        if (k.includes(":base:"))      baseSets += c
+        else if (k.includes(":main:")) mainSets += c
+        else if (k.includes(":real:")) realSets += c
+      }
+    } catch { /* non-critical */ }
+
+    // Prehistoric symbols from set (still uses sadd)
     const prehistoricSymbols = await client.scard(`prehistoric:${connId}:symbols`).catch(() => 0)
     let prehistoricDataSize = 0
     try {
       const keys = await client.keys(`prehistoric:${connId}:*`)
       prehistoricDataSize = keys.length
     } catch { /* ignore */ }
-    
-    // Get intervals processed
-    const intervalsProcessed = await client.scard(`intervals:${connId}:processed`).catch(() => 0)
-    
+
+    // Intervals processed: stored as string counter
+    const intervalsProcessed =
+      parseInt(await client.get(`intervals:${connId}:processed_count`).catch(() => "0") as string || "0", 10)
+
     connectionMetrics = {
       progression,
       positions: positions.length,
       trades: trades.length,
       logs: logs.slice(0, 50),
       engineCycles: {
-        indication: Number((engineState as any)?.indication_cycle_count || 0),
-        strategy: Number((engineState as any)?.strategy_cycle_count || 0),
-        realtime: Number((engineState as any)?.realtime_cycle_count || 0),
-        total:
-          Number((engineState as any)?.indication_cycle_count || 0) +
-          Number((engineState as any)?.strategy_cycle_count || 0) +
-          Number((engineState as any)?.realtime_cycle_count || 0),
+        indication: indicationCycles,
+        strategy: strategyCycles,
+        realtime: realtimeCycles,
+        total: indicationCycles + strategyCycles + realtimeCycles,
       },
       engineDurations: {
         indicationAvgMs: Number((engineState as any)?.indication_avg_duration_ms || 0),
         strategyAvgMs: Number((engineState as any)?.strategy_avg_duration_ms || 0),
         realtimeAvgMs: Number((engineState as any)?.realtime_avg_duration_ms || 0),
       },
-      // Comprehensive stats
       comprehensiveStats: {
         symbols: {
           prehistoricLoaded: prehistoricSymbols,
@@ -167,15 +201,15 @@ async function buildDashboardWorkflowSnapshot() {
           active: activeIndications,
           optimal: optimalIndications,
           auto: autoIndications,
-          total: directionIndications + moveIndications + activeIndications + optimalIndications + autoIndications,
+          total: totalIndicationsCount || (directionIndications + moveIndications + activeIndications + optimalIndications + autoIndications),
         },
         pseudoPositions: {
-          base: basePseudoPositions,
-          main: mainPseudoPositions,
-          real: realPseudoPositions,
-          total: basePseudoPositions + mainPseudoPositions + realPseudoPositions,
+          base: baseSets,
+          main: mainSets,
+          real: realSets,
+          total: baseSets + mainSets + realSets,
         },
-        livePositions: livePositionsCount,
+        livePositions: 0,
       },
     }
   }

@@ -17,11 +17,11 @@ export async function POST() {
       // Force disable dashboard execution without changing base/settings enable state.
       const updated = {
         ...conn,
-        is_enabled_dashboard: "0",      // NOT enabled by default
-        is_dashboard_inserted: conn.is_dashboard_inserted || "1", // Keep visible in Main panel
+        is_enabled_dashboard: "0",         // NOT enabled by default
+        is_dashboard_inserted: conn.is_dashboard_inserted ?? "0", // Preserve existing insertion
         is_enabled: conn.is_enabled || "1", // Preserve base settings state
-        is_active_inserted: conn.is_active_inserted || "1", // Preserve insertion state
-        is_active: "0",                 // NOT processing
+        is_active_inserted: conn.is_active_inserted ?? "0", // Preserve — never force to "1"
+        is_active: "0",                     // NOT processing
         updated_at: new Date().toISOString(),
       }
       

@@ -26,16 +26,13 @@ export async function GET() {
   try {
     await initRedis()
     const client = getRedisClient()
-    
-    // Ensure default connections exist before fetching stats
-    const allConnections = await getAllConnections()
-    if (allConnections.length === 0) {
-      console.log("[v0] [SystemStats] No connections, triggering seed...")
-      const { ensureDefaultExchangesExist } = await import("@/lib/default-exchanges-seeder")
-      await ensureDefaultExchangesExist()
-    }
-    
+
+    // STABILITY RULE: do NOT trigger default connection seeding from stats requests.
+    // Seeding is a startup-only concern; triggering it from polled endpoints causes
+    // user-deleted base connections to reappear and breaks the "stable assignment"
+    // contract. An empty list is a valid, respected state.
     const connections = await getAllConnections()
+    const allConnections = connections
     console.log(`[v0] [SystemStats] Analyzing ${connections.length} total connections`)
     
     // BASE CONNECTIONS = All base exchange connections (predefined or user-created)
@@ -57,9 +54,18 @@ export async function GET() {
     const workingAll = allConnections.filter((c: any) => isConnectionWorking(c))
     console.log(`[v0] [SystemStats] Working/tested: ${workingAll.length}`)
     
-    // Get total Redis keys count - same pattern as monitoring route
-    const allRedisKeys = await client.keys("*").catch(() => [])
-    const totalKeys = Array.isArray(allRedisKeys) ? allRedisKeys.length : 0
+    // PERF: use DBSIZE instead of KEYS("*") — KEYS is O(N) and blocks the Redis
+    // server. DBSIZE is O(1). Falls back to 0 if the client does not support it.
+    let totalKeys = 0
+    try {
+      const dbSizeFn = (client as any).dbsize || (client as any).dbSize
+      if (typeof dbSizeFn === "function") {
+        totalKeys = await dbSizeFn.call(client)
+      }
+    } catch (err) {
+      console.warn("[v0] [SystemStats] DBSIZE failed (falling back to 0):", err instanceof Error ? err.message : err)
+      totalKeys = 0
+    }
     console.log(`[v0] [SystemStats] Total DB keys: ${totalKeys}`)
 
     // Trade Engine Status from Redis (stored as hash, not string)
@@ -125,7 +131,51 @@ export async function GET() {
       baseConnections.length > 0 ? "partial" : "down"
 
     const workflow = await getDashboardWorkflowSnapshot()
-    
+
+    // ── Aggregate cycle/indication/strategy stats from ALL active-inserted connections ──
+    // The focusConnection in dashboard-workflow only tracks one connection; read all
+    // progression hashes directly to get the real totals across all running engines.
+    let totalIndicationCycles = 0
+    let totalStrategyCycles   = 0
+    let totalIndicationsCount = 0
+    let totalStrategiesCount  = 0
+
+    // PERF: iterate over connections we already have in memory and HGETALL each
+    // progression hash in parallel. Avoids a Redis-blocking KEYS("progression:*") scan
+    // which was O(total DB keys). Bounded to N connections (usually < 10).
+    try {
+      const relevantIds: string[] = connections
+        .map((c: any) => c?.id)
+        .filter((id: unknown): id is string => typeof id === "string" && id.length > 0)
+
+      const progressionHashes = await Promise.all(
+        relevantIds.map(async (id) => {
+          try {
+            return await client.hgetall(`progression:${id}`)
+          } catch {
+            return null
+          }
+        })
+      )
+
+      for (const ph of progressionHashes) {
+        if (ph && typeof ph === "object") {
+          totalIndicationCycles += parseInt((ph as any).indication_cycle_count || "0", 10)
+          totalStrategyCycles   += parseInt((ph as any).strategy_cycle_count   || "0", 10)
+          totalIndicationsCount += parseInt((ph as any).indications_count       || "0", 10)
+          totalStrategiesCount  += parseInt((ph as any).strategies_count        || "0", 10)
+        }
+      }
+    } catch (e) {
+      console.warn("[v0] [SystemStats] Error aggregating progression hashes:", e instanceof Error ? e.message : e)
+    }
+
+    // Fallback to focusConnection metrics if all progression hashes are empty
+    const focusCycles = workflow.connectionMetrics.engineCycles
+    const finalIndicationCycles = totalIndicationCycles || focusCycles?.indication || 0
+    const finalStrategyCycles   = totalStrategyCycles   || focusCycles?.strategy   || 0
+    const finalTotalCycles      = finalIndicationCycles + finalStrategyCycles
+
     console.log(`[v0] [SystemStats] Response: exchangeConnections.total=${insertedBaseConnections.length}, debug: base=${baseConnections.length}, enabled=${enabledBase.length}, inserted=${insertedBaseConnections.length}`)
     
     return NextResponse.json({
@@ -135,7 +185,7 @@ export async function GET() {
         mainStatus,
         mainCount: mainConnections.length,
         mainTotal: activeInsertedAll.length,
-        mainEnabled,  // Whether Main Engine is enabled
+        mainEnabled,
         liveTradeStatus,
         liveTradeCount: liveTradeConnections.length,
         liveTradeEnabled,
@@ -151,7 +201,6 @@ export async function GET() {
         totalKeys,
       },
       exchangeConnections: {
-        // Exchange connections = inserted base connections (independent of credentials)
         total: insertedBaseConnections.length,
         enabled: insertedBaseConnections.filter((c: any) => isTruthyFlag(c.is_enabled)).length,
         working: insertedBaseConnections.filter((c: any) => isConnectionWorking(c)).length,
@@ -159,34 +208,41 @@ export async function GET() {
         status: exchangeStatus,
       },
       activeConnections: {
-        // Active panel connections
-        total: workflow.overview.activePanelConnections,
-        active: workflow.overview.dashboardEnabledConnections,
+        // Count active-inserted connections — these are the ones with running engines
+        total: activeInsertedAll.length,
+        active: activeInsertedAll.length,
         liveTrade: workflow.overview.liveTradeConnections,
         presetTrade: workflow.overview.presetTradeConnections,
       },
-      // Available connections = enabled base connections NOT yet in Active panel
       availableConnections: enabledBase.filter((c: any) => !isConnectionInActivePanel(c)).length,
       liveTrades: {
         lastHour: 0,
         topConnections: [],
       },
       cycleStats: {
-        cycleCount: workflow.connectionMetrics.engineCycles?.total || workflow.connectionMetrics.progression?.cyclesCompleted || 0,
-        indicationCycles: workflow.connectionMetrics.engineCycles?.indication || 0,
-        strategyCycles: workflow.connectionMetrics.engineCycles?.strategy || 0,
+        cycleCount: finalTotalCycles,
+        indicationCycles: finalIndicationCycles,
+        strategyCycles: finalStrategyCycles,
+        indicationsCount: totalIndicationsCount,
+        strategiesCount: totalStrategiesCount,
         cycleDurationMs: workflow.connectionMetrics.engineDurations?.indicationAvgMs || 0,
       },
       totalPositions: workflow.connectionMetrics.positions,
       totalTrades: workflow.connectionMetrics.trades,
-      workflowOverview: workflow.overview,
+      workflowOverview: {
+        ...workflow.overview,
+        // Override with accurate active-inserted count
+        activePanelConnections: activeInsertedAll.length,
+        eligibleEngineConnections: Math.max(workflow.overview.eligibleEngineConnections, activeInsertedAll.length),
+      },
       workflowPhases: workflow.workflowPhases,
-      // DEBUG: Help understand what's being counted
       _debug: {
         baseConnectionsTotal: baseConnections.length,
         baseConnectionsEnabled: enabledBase.length,
         insertedBaseConnectionsCount: insertedBaseConnections.length,
         activeInsertedAllCount: activeInsertedAll.length,
+        totalIndicationCycles,
+        totalStrategyCycles,
       }
     })
   } catch (error) {

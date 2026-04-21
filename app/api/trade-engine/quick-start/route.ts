@@ -41,8 +41,8 @@ export const dynamic = "force-dynamic"
 const API_VERSION = API_VERSIONS.tradeEngine
 const LOG_PREFIX = `[v0] [QuickStart] ${API_VERSION}`
 
-// Default trading symbol (single symbol for quickstart)
-const DEFAULT_SYMBOLS = ["BTCUSDT"]
+// Default trading symbol (single symbol for quickstart - DRIFTUSDT for live testing)
+const DEFAULT_SYMBOLS = ["DRIFTUSDT"]
 
 /**
  * POST /api/trade-engine/quick-start
@@ -73,9 +73,26 @@ export async function POST(request: Request) {
       timestamp: new Date().toISOString(),
     })
     
-    // Find connections with credentials OR any base connection for setup
-    // PREFER BINGX - it's the primary exchange for quickstart
-    let connection = allConnections.find((c: any) => {
+    // CRITICAL: honour the connectionId sent by the UI first.
+    // Previously this route ignored body.connectionId entirely and always
+    // picked the first BingX connection, silently overriding the user's
+    // selection from the Exchange context. Now we prefer the requested
+    // connection when it exists and has credentials.
+    const requestedConnectionId: string | undefined = body.connectionId
+    let connection: any = requestedConnectionId
+      ? allConnections.find((c: any) => c.id === requestedConnectionId)
+      : null
+
+    // Fall back to auto-discovery only if the requested connection is
+    // missing or lacks credentials.
+    if (!connection || !(connection.api_key && connection.api_secret &&
+        connection.api_key.length >= 10 && connection.api_secret.length >= 10)) {
+      if (requestedConnectionId && connection) {
+        console.log(`${LOG_PREFIX}: Requested connection ${requestedConnectionId} has no credentials — falling back to auto-discovery`)
+      } else if (requestedConnectionId) {
+        console.log(`${LOG_PREFIX}: Requested connection ${requestedConnectionId} not found — falling back to auto-discovery`)
+      }
+      connection = allConnections.find((c: any) => {
       const exch = (c.exchange || "").toLowerCase()
       const hasCredentials = !!(c.api_key && c.api_secret && c.api_key.length >= 10 && c.api_secret.length >= 10)
       const isUserCreated = !(c.is_predefined === true || c.is_predefined === "1" || c.is_predefined === "true")
@@ -100,7 +117,8 @@ export async function POST(request: Request) {
       const isBase = exch === "bingx" || exch === "bybit" || exch === "pionex" || exch === "orangex"
       return isBase && isAssigned
     })
-    
+    }  // ← close the body.connectionId preference block
+
     if (!connection) {
       console.log(`${LOG_PREFIX}: No BingX/Bybit connections found in Main Connections`)
       
@@ -227,30 +245,57 @@ export async function POST(request: Request) {
       }
     }
     
-    // Step 2: Get symbols (single symbol for quickstart)
+    // Step 2: Get symbols (single most-volatile symbol for quickstart)
     console.log(`${LOG_PREFIX}: [2/4] Configuring symbol...`)
-    let symbols = body.symbols || [...DEFAULT_SYMBOLS]
-    
-    if (testPassed) {
+    let symbols: string[] = body.symbols || []
+
+    // PRIMARY: fetch most volatile symbol from public exchange API (no auth required)
+    if (symbols.length === 0) {
+      try {
+        const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"
+        const topRes = await fetch(
+          `${baseUrl}/api/exchange/${exchangeName}/top-symbols?t=${Date.now()}`,
+          { signal: AbortSignal.timeout(5000), cache: "no-store" }
+        )
+        if (topRes.ok) {
+          const topData = await topRes.json()
+          if (topData.symbol) {
+            symbols = [topData.symbol]
+            console.log(`${LOG_PREFIX}: [2/4] Most volatile symbol from public API: ${topData.symbol} (${(topData.priceChangePercent || 0).toFixed(2)}%)`)
+          }
+        }
+      } catch (e) {
+        console.warn(`${LOG_PREFIX}: [2/4] Public top-symbols fetch failed, trying exchange connector:`, e instanceof Error ? e.message : String(e))
+      }
+    }
+
+    // SECONDARY: use exchange connector's getTopSymbols (requires auth)
+    if (symbols.length === 0 && testPassed) {
       try {
         const connector = await createExchangeConnector(exchangeName, {
           apiKey: connection.api_key,
           apiSecret: connection.api_secret,
           isTestnet: false,
         })
-        
         if (typeof connector.getTopSymbols === "function") {
-          const topSymbols = await connector.getTopSymbols(1) // Get only 1 symbol
+          const topSymbols = await connector.getTopSymbols(1)
           if (topSymbols && topSymbols.length > 0) {
             symbols = topSymbols
-            console.log(`${LOG_PREFIX}: [2/4] Retrieved top symbol from exchange: ${symbols.join(", ")}`)
+            console.log(`${LOG_PREFIX}: [2/4] Top symbol from exchange connector: ${symbols.join(", ")}`)
           }
         }
       } catch {
-        // Use defaults if retrieval fails
+        // fall through to default
       }
     }
-    console.log(`${LOG_PREFIX}: [2/4] Symbol: ${symbols.join(", ")}`)
+
+    // FALLBACK: use default symbol
+    if (symbols.length === 0) {
+      symbols = [...DEFAULT_SYMBOLS]
+      console.log(`${LOG_PREFIX}: [2/4] Using default symbol: ${symbols.join(", ")}`)
+    }
+
+    console.log(`${LOG_PREFIX}: [2/4] Final symbol: ${symbols.join(", ")}`)
     
     await logProgressionEvent(connectionId, "quickstart_symbols", "info", "Trading symbols configured", {
       symbols,
@@ -278,14 +323,36 @@ export async function POST(request: Request) {
      await updateConnection(connectionId, updated)
      console.log(`${LOG_PREFIX}: [3/4] Connection state updated (assigned+enabled for quickstart).`)
     
-    // ALSO store in trade_engine_state for engine to find
+    // ALSO store in trade_engine_state for engine to find.
+    // IMPORTANT: record the user-selected symbol count under
+    // `config_set_symbols_total` so the /stats endpoint no longer defaults
+    // to the hard-coded "3" when the historical phase reports progress.
+    // Also reset the processed counter to 0 so progress starts correctly.
     await setSettings(`trade_engine_state:${connectionId}`, {
       connection_id: connectionId,
       symbols: symbols,
       active_symbols: symbols,
       status: "ready",
+      config_set_symbols_total: symbols.length,
+      config_set_symbols_processed: 0,
+      prehistoric_data_loaded: false,
       updated_at: new Date().toISOString(),
     })
+
+    // Also mirror the total onto the `prehistoric:{connId}` hash so the UI
+    // reads the canonical user-selected count from either source. The
+    // processor will overwrite this once it starts processing, but the
+    // initial value must already match what the user picked.
+    try {
+      await client.hset(`prehistoric:${connectionId}`, {
+        symbols_total: String(symbols.length),
+        symbols_processed: "0",
+        is_complete: "0",
+        started_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      await client.expire(`prehistoric:${connectionId}`, 86400)
+    } catch { /* non-critical */ }
     console.log(`${LOG_PREFIX}: [3/4] Stored symbols in trade_engine_state: ${symbols.join(", ")}`)
     
      const isAssigned = updated.is_assigned === "1" || updated.is_assigned === true

@@ -136,7 +136,16 @@ export class InlineLocalRedis {
   }
 
   private trackOperation(): void {
-    // Disabled for high performance - was causing event loop blocking at 80K+ ops/sec
+    // Lightweight: just increment the counter. Rate is computed lazily on read.
+    const stats = this.data.requestStats
+    const nowSec = Math.floor(Date.now() / 1000)
+    if (nowSec !== stats.lastSecond) {
+      // New second window: snapshot ops/sec from previous window and reset
+      stats.operationsPerSecond = stats.requestCount
+      stats.requestCount = 0
+      stats.lastSecond = nowSec
+    }
+    stats.requestCount++
   }
 
   async ping() {
@@ -149,11 +158,13 @@ export class InlineLocalRedis {
   }
 
   async get(key: string): Promise<string | null> {
+    this.trackOperation()
     if (this.isExpired(key)) return null
     return this.data.strings.get(key) ?? null
   }
 
   async set(key: string, value: string, options?: { EX?: number }): Promise<void> {
+    this.trackOperation()
     this.data.strings.set(key, value)
     if (options?.EX) {
       this.setKeyTTL(key, options.EX)
@@ -166,12 +177,16 @@ export class InlineLocalRedis {
   }
 
   async incr(key: string): Promise<number> {
+    return this.incrby(key, 1)
+  }
+
+  async incrby(key: string, increment: number): Promise<number> {
     if (this.isExpired(key)) {
-      this.data.strings.set(key, "1")
-      return 1
+      this.data.strings.set(key, String(increment))
+      return increment
     }
     const current = parseInt(this.data.strings.get(key) || "0", 10)
-    const newValue = current + 1
+    const newValue = current + increment
     this.data.strings.set(key, String(newValue))
     return newValue
   }
@@ -202,14 +217,22 @@ export class InlineLocalRedis {
     this.data.ttl?.clear()
   }
 
-  async hset(key: string, data: Record<string, string>): Promise<number> {
+  async hset(key: string, dataOrField: Record<string, string> | string, value?: string): Promise<number> {
+    this.trackOperation()
     const existing = this.data.hashes.get(key) || {}
+    // Support both hset(key, { field: value }) and hset(key, "field", "value")
+    if (typeof dataOrField === "string" && value !== undefined) {
+      this.data.hashes.set(key, { ...existing, [dataOrField]: value })
+      return 1
+    }
+    const data = dataOrField as Record<string, string>
     const updates = Object.keys(data).length
     this.data.hashes.set(key, { ...existing, ...data })
     return updates
   }
 
   async hmset(...args: string[]): Promise<void> {
+    this.trackOperation()
     if (args.length < 3) return
     const key = args[0]
     const obj: Record<string, string> = {}
@@ -220,6 +243,7 @@ export class InlineLocalRedis {
   }
 
   async hgetall(key: string): Promise<Record<string, string> | null> {
+    this.trackOperation()
     if (this.isExpired(key)) return null
     return this.data.hashes.get(key) ?? null
   }
@@ -270,6 +294,7 @@ export class InlineLocalRedis {
   }
 
   async sadd(key: string, ...members: string[]): Promise<number> {
+    this.trackOperation()
     const set = this.data.sets.get(key) || new Set()
     const sizeBefore = set.size
     for (const member of members) {
@@ -285,6 +310,7 @@ export class InlineLocalRedis {
   }
 
   async smembers(key: string): Promise<string[]> {
+    this.trackOperation()
     if (this.isExpired(key)) return []
     return Array.from(this.data.sets.get(key) || new Set())
   }
@@ -358,6 +384,74 @@ export class InlineLocalRedis {
   async llen(key: string): Promise<number> {
     if (this.isExpired(key)) return 0
     return this.data.lists.get(key)?.length ?? 0
+  }
+
+  /**
+   * Remove `count` occurrences of `value` from the list at `key`.
+   * Semantics match Redis `LREM`:
+   *   count > 0 — remove head→tail
+   *   count < 0 — remove tail→head
+   *   count = 0 — remove every occurrence
+   *
+   * Previously this method didn't exist on the in-memory adapter, which made
+   * `live-stage.savePosition()` throw `TypeError: client.lrem is not a function`
+   * on every position close and prevented the closed-index bookkeeping from
+   * running. That in turn made `getLivePositions` re-scan terminal rows
+   * forever and is visible in the server logs at live-stage.ts:156.
+   */
+  async lrem(key: string, count: number, value: string): Promise<number> {
+    if (this.isExpired(key)) return 0
+    const list = this.data.lists.get(key)
+    if (!list || list.length === 0) return 0
+    let removed = 0
+    const wantAll = count === 0
+    const target = Math.abs(count)
+    if (count >= 0) {
+      for (let i = 0; i < list.length; ) {
+        if (list[i] === value && (wantAll || removed < target)) {
+          list.splice(i, 1)
+          removed++
+        } else {
+          i++
+        }
+      }
+    } else {
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i] === value && (wantAll || removed < target)) {
+          list.splice(i, 1)
+          removed++
+        }
+      }
+    }
+    if (list.length === 0) {
+      this.data.lists.delete(key)
+    } else {
+      this.data.lists.set(key, list)
+    }
+    return removed
+  }
+
+  /**
+   * Pop and return the first element of the list at `key`. Returns null when
+   * the list is empty or missing. Added for parity with `lpush`/`rpush` so
+   * upstream callers that move items between queues don't blow up.
+   */
+  async lpop(key: string): Promise<string | null> {
+    if (this.isExpired(key)) return null
+    const list = this.data.lists.get(key)
+    if (!list || list.length === 0) return null
+    const head = list.shift() ?? null
+    if (list.length === 0) this.data.lists.delete(key)
+    return head
+  }
+
+  async rpop(key: string): Promise<string | null> {
+    if (this.isExpired(key)) return null
+    const list = this.data.lists.get(key)
+    if (!list || list.length === 0) return null
+    const tail = list.pop() ?? null
+    if (list.length === 0) this.data.lists.delete(key)
+    return tail
   }
 
   async dbSize(): Promise<number> {
@@ -631,24 +725,73 @@ export async function getConnection(id: string): Promise<any | null> {
   return parseHash(hash)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// PERF: in-memory TTL cache for `getAllConnections`.
+// The dashboard polls every ~8s and each active card fans out multiple
+// per-connection requests. Without this cache we issue N KEYS + N HGETALL
+// ops per poll per component. A short TTL (1.5s) dedupes bursts without
+// introducing user-visible staleness (all writes invalidate the cache
+// immediately via `invalidateConnectionsCache()`).
+// ────────────────────────────────────────────────────────────────────────────
+const __CONN_CACHE_TTL_MS = 1500
+let __connCache: { at: number; value: any[] } | null = null
+let __connInflight: Promise<any[]> | null = null
+
+export function invalidateConnectionsCache(): void {
+  __connCache = null
+  __connInflight = null
+}
+
 export async function getAllConnections(): Promise<any[]> {
-  await initRedis()
-  const client = getClient()
-  const keys = await client.keys("connection:*")
-  const connections: any[] = []
-  
-  for (const key of keys) {
-    // Skip special keys like connection:settings:*
-    if (key.includes(":settings:") || key.includes(":stats:") || key.includes(":logs:")) {
-      continue
-    }
-    const hash = await client.hgetall(key)
-    if (hash) {
-      connections.push(parseHash(hash))
-    }
+  const now = Date.now()
+  if (__connCache && now - __connCache.at < __CONN_CACHE_TTL_MS) {
+    return __connCache.value
   }
-  
-  return connections
+  if (__connInflight) return __connInflight
+
+  __connInflight = (async () => {
+    try {
+      await initRedis()
+      const client = getClient()
+      const keys = await client.keys("connection:*")
+
+      // Filter out special sibling keys up-front so we don't fan out HGETALLs
+      // for them (reduces Redis roundtrips in large deployments).
+      const realKeys = keys.filter(
+        (k) =>
+          !k.includes(":settings:") &&
+          !k.includes(":stats:") &&
+          !k.includes(":logs:")
+      )
+
+      // Parallelize HGETALL across all connection keys. Previously ran
+      // sequentially in a for-loop, which scaled linearly with connection count.
+      const hashes = await Promise.all(
+        realKeys.map(async (key) => {
+          try {
+            return await client.hgetall(key)
+          } catch (err) {
+            console.warn(
+              `[v0] [redis-db] getAllConnections: hgetall failed for ${key}`,
+              err instanceof Error ? err.message : err
+            )
+            return null
+          }
+        })
+      )
+
+      const connections = hashes
+        .filter((h): h is Record<string, any> => !!h && Object.keys(h).length > 0)
+        .map(parseHash)
+
+      __connCache = { at: Date.now(), value: connections }
+      return connections
+    } finally {
+      __connInflight = null
+    }
+  })()
+
+  return __connInflight
 }
 
 export async function saveConnection(connection: any): Promise<void> {
@@ -666,12 +809,14 @@ export async function saveConnection(connection: any): Promise<void> {
   })
   
   await client.hset(`connection:${id}`, data)
+  invalidateConnectionsCache()
 }
 
 export async function deleteConnection(id: string): Promise<void> {
   await initRedis()
   const client = getClient()
   await client.del(`connection:${id}`)
+  invalidateConnectionsCache()
 }
 
 // ========== Settings Operations ==========
@@ -973,10 +1118,16 @@ export async function closeRedis(): Promise<void> {
   isConnected = false
 }
 
-export async function getRedisRequestsPerSecond(): Promise<number> {
+export function getRedisRequestsPerSecond(): number {
   const data = globalForRedis.__redis_data
   if (!data || !data.requestStats) return 0
-  return data.requestStats.operationsPerSecond
+  const stats = data.requestStats
+  // If still within the current second, return running count; otherwise return last completed second
+  const nowSec = Math.floor(Date.now() / 1000)
+  if (nowSec === stats.lastSecond) {
+    return stats.requestCount
+  }
+  return stats.operationsPerSecond
 }
 
 export function getConnectionState(id: string): { isRunning: boolean } {
@@ -1054,6 +1205,18 @@ export async function getAllConnectionsWithStatus(): Promise<any[]> {
 // ========== Additional CRUD Operations ==========
 
 export async function createConnection(data: any): Promise<any> {
+  const client = getRedisClient()
+  const id = data.id || `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+  const connectionData = {
+    ...data,
+    id,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }
+  await client.hset(`connection:${id}`, connectionData)
+  invalidateConnectionsCache()
+  return connectionData
+}
    await initRedis()
    const client = getRedisClient()
    const id = data.id || `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
@@ -1094,6 +1257,7 @@ export async function updateConnection(id: string, updates: any): Promise<any> {
     updated_at: new Date().toISOString(),
   }
   await client.hset(`connection:${id}`, updated)
+  invalidateConnectionsCache()
   return updated
 }
 
@@ -1114,28 +1278,48 @@ export async function createPosition(data: any): Promise<any> {
 
 export async function getIndications(connectionId?: string, symbol?: string): Promise<any[]> {
   const client = getRedisClient()
-  let pattern: string
+  const indications: any[] = []
   
+  // First, try to get from the main key directly (storeIndications saves here)
+  if (connectionId) {
+    const mainKey = `indications:${connectionId}`
+    try {
+      const mainData = await client.get(mainKey)
+      if (mainData) {
+        const parsed = typeof mainData === "string" ? JSON.parse(mainData) : mainData
+        const arr = Array.isArray(parsed) ? parsed : [parsed]
+        
+        // Filter by symbol if provided
+        if (symbol) {
+          const filtered = arr.filter((ind: any) => ind.symbol === symbol)
+          if (filtered.length > 0) {
+            return filtered
+          }
+        } else {
+          return arr
+        }
+      }
+    } catch (e) {
+      console.warn(`[v0] Error reading main indication key ${mainKey}:`, e)
+    }
+  }
+  
+  // Fallback: search with pattern matching
+  let pattern: string
   if (connectionId && symbol) {
-    // Specific connection and symbol: look for both main key and per-type sets
     pattern = `indications:${connectionId}:${symbol}:*`
   } else if (connectionId) {
-    // All symbols for a connection
     pattern = `indications:${connectionId}:*`
   } else if (symbol) {
-    // All connections for a symbol (legacy support)
     pattern = `indication:${symbol}:*`
   } else {
-    // All indications
     pattern = `indications:*`
   }
   
   const keys = await client.keys(pattern)
-  const indications: any[] = []
   
   for (const key of keys) {
     try {
-      // Try to get as string first (indication-processor saves as JSON string)
       const stringData = await client.get(key)
       if (stringData) {
         try {
@@ -1148,13 +1332,16 @@ export async function getIndications(connectionId?: string, symbol?: string): Pr
         continue
       }
       
-      // Try as hash (fallback for legacy format)
       const hashData = await client.hgetall(key)
       if (hashData && Object.keys(hashData).length > 0) {
-        indications.push({
-          id: key.replace(/^indications?:/, ""),
-          ...hashData,
-        })
+        // Parse numeric fields from string — hgetall always returns strings
+        const parsed: Record<string, any> = { id: key.replace(/^indications?:/, ""), ...hashData }
+        if (typeof parsed.confidence === "string")    parsed.confidence    = parseFloat(parsed.confidence)
+        if (typeof parsed.profitFactor === "string")  parsed.profitFactor  = parseFloat(parsed.profitFactor)
+        if (typeof parsed.profit_factor === "string") parsed.profit_factor = parseFloat(parsed.profit_factor)
+        if (typeof parsed.value === "string")         parsed.value         = parseFloat(parsed.value)
+        if (typeof parsed.timestamp === "string")     parsed.timestamp     = parseInt(parsed.timestamp, 10)
+        indications.push(parsed)
       }
     } catch (e) {
       console.warn(`[v0] Error reading indication key ${key}:`, e)
@@ -1187,6 +1374,33 @@ export async function storeIndications(connectionId: string, symbol: string, ind
       }
     }
     
+    // Add new indications with metadata for per-config tracking
+    const newIndications = indications.map(ind => ({
+      ...ind,
+      symbol,
+      connectionId,
+      timestamp: new Date().toISOString(),
+      configSet: getConfigurationSet(ind.type, ind.value), // Track which config set this belongs to
+    }))
+    
+    existing.push(...newIndications)
+    
+    // Keep only latest 2500 indications per connection (250 per symbol × 10 symbols typical)
+    if (existing.length > 2500) {
+      existing = existing.slice(-2500)
+    }
+    
+    // Save to main key with 1-hour TTL
+    await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
+    
+    // Also maintain per-type independent sets for high-frequency lookups
+    for (const ind of indications) {
+      const typeKey = `indications:${connectionId}:${ind.type}`
+      const typeIndications = indications.filter(i => i.type === ind.type)
+      if (typeIndications.length > 0) {
+        await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
+      }
+    }
 // Add new indications with metadata for per-config tracking
      const newIndications = indications.map(ind => ({
        ...ind,

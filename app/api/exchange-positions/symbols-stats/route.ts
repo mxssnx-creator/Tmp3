@@ -45,8 +45,6 @@ export async function GET() {
       { symbol: "SEI/USDT", livePositions: 0, openPositions: 0, profitFactor250: 1.41, profitFactor50: 1.35 },
     ]
 
-    console.log(`[v0] Returning ${symbols.length} symbols`)
-    
     return NextResponse.json({
       symbols: symbols.slice(0, 22) // Return max 22 symbols as requested
     })

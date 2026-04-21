@@ -27,8 +27,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const testSymbols = symbols && symbols.length > 0 ? symbols : ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
     const configurations = await PresetConfigGenerator.generateAllConfigurations(testSymbols, indicatorConfigs, 500)
 
-    console.log(`[v0] Generated ${configurations.length} configurations to test`)
-
     // Initialize tester
     const tester = new PresetTester(connectionId)
 
@@ -42,8 +40,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       Number(preset.min_profit_factor),
       12, // max drawdown hours
     )
-
-    console.log(`[v0] Found ${validConfigs.length} valid configurations`)
 
     // Save results to database
     await tester.saveResults(id)

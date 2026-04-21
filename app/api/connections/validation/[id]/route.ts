@@ -7,8 +7,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     const { id } = await params
     const connectionId = id
 
-    console.log(`[v0] [IndicationValidation] Validating calculations for connection: ${connectionId}`)
-
     await initRedis()
     const connection = await getConnection(connectionId)
 
@@ -27,11 +25,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       live_trade: connection.is_live_trade === "1" || connection.is_live_trade === true,
     }
 
-    console.log(`[v0] [IndicationValidation] Connection state: ${JSON.stringify(connectionValid)}`)
-
     // Check 2: Try to fetch progression state to validate historic data retrieval
     const progressionKey = `progression:${connectionId}`
-    console.log(`[v0] [IndicationValidation] Checking progression state: ${progressionKey}`)
 
     // Check 3: Validate indication calculations are running
     const indicationSetKeys = [
@@ -71,11 +66,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     if (!connectionValid.dashboard_enabled && connectionValid.live_trade) {
       validationResults.errors.push("Live trading enabled but connection not active on dashboard")
     }
-
-    console.log(`[v0] [IndicationValidation] Validation complete for ${connection.name}:`)
-    console.log(`  - Errors: ${validationResults.errors.length}`)
-    console.log(`  - Warnings: ${validationResults.warnings.length}`)
-    console.log(`  - Metrics: ${JSON.stringify(validationResults.metrics)}`)
 
     return NextResponse.json({
       success: true,

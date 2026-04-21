@@ -10,7 +10,6 @@ function clearAllEngineTimers() {
   }
   
   if (engineGlobal.__engine_timers && engineGlobal.__engine_timers.size > 0) {
-    console.log(`[v0] [Trade Engine] Clearing ${engineGlobal.__engine_timers.size} engine timers...`)
     for (const timer of engineGlobal.__engine_timers) {
       try {
         clearInterval(timer)

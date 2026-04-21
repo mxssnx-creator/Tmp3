@@ -97,12 +97,13 @@ async function fetchRealMarketData(
     // Try each connection until we get data
     for (const conn of validConnections) {
       try {
+        // Pass the original api_type - connector factory handles normalization per-exchange
         const connector = await createExchangeConnector(
           conn.exchange,
           {
             apiKey: conn.api_key || conn.apiKey || "",
             apiSecret: conn.api_secret || conn.apiSecret || "",
-            apiType: (conn.api_type || "perpetual_futures") as "spot" | "perpetual_futures" | "unified",
+            apiType: (conn.api_type || "perpetual") as string,
             isTestnet: conn.is_testnet === "1" || conn.is_testnet === true,
           }
         )
@@ -189,8 +190,14 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
         }
 
         const key = `market_data:${symbol}:1m`
-        await client.set(key, JSON.stringify(marketData))
+        const jsonData = JSON.stringify(marketData)
+        console.log(`[v0] [MarketData] STORING to key=${key}, dataLength=${jsonData.length}`)
+        await client.set(key, jsonData)
         await client.expire(key, 86400) // 24 hour TTL
+        
+        // Verify storage worked by reading back immediately
+        const verifyRead = await client.get(key)
+        console.log(`[v0] [MarketData] VERIFY READ: ${verifyRead ? 'SUCCESS (' + verifyRead.length + ' chars)' : 'FAILED - NULL'}`)
 
         // Store raw candles array for indication processor historical access
         const candlesKey = `market_data:${symbol}:candles`
@@ -221,6 +228,7 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
           }
           await client.hmset(hashKey, ...flatArgs)
           await client.expire(hashKey, 86400)
+          console.log(`[v0] [MarketData] ✓ Stored hash ${hashKey} (${flatArgs.length / 2} fields)`)
           
           const priceStr = latestCandle.close.toFixed(2)
           const sourceLabel = source === "synthetic" ? "(synthetic)" : `(real: ${source})`

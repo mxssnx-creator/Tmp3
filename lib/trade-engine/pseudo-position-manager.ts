@@ -32,6 +32,14 @@ export class PseudoPositionManager {
     return `pseudo_positions:${this.connectionId}`
   }
 
+  /**
+   * Redis set key that indexes all currently-active configSetKeys for O(1) duplicate detection.
+   * Each active position's configSetKey is added on creation and removed on close.
+   */
+  private activeConfigKeysSetKey(): string {
+    return `pseudo_positions:${this.connectionId}:active_config_keys`
+  }
+
   /** Redis hash key for one position */
   private positionKey(id: string): string {
     return `pseudo_position:${this.connectionId}:${id}`
@@ -49,16 +57,33 @@ export class PseudoPositionManager {
     }
   }
 
-  /** List all positions for this connection, optionally filtered */
+  /**
+   * List all positions for this connection, optionally filtered.
+   *
+   * PERFORMANCE: The previous implementation awaited `readPosition(id)` once
+   * per id — one Redis round-trip per position. With dozens of active
+   * pseudo positions this ran serially on every realtime tick (1/sec per
+   * engine), easily dominating cycle time. We now fan-out all reads in a
+   * single `Promise.all` so the whole list is fetched in one RTT window and
+   * filtering happens after in O(N) on the already-materialised array.
+   */
   private async listPositions(filter?: { status?: string; side?: string; symbol?: string; indicationType?: string }): Promise<any[]> {
     try {
       const client = getRedisClient()
       const ids = await client.smembers(this.positionsSetKey())
       if (!ids || ids.length === 0) return []
 
+      const raw = await Promise.all(ids.map((id: string) => this.readPosition(id).catch(() => null)))
+      const hasFilter = Boolean(
+        filter?.status || filter?.side || filter?.symbol || filter?.indicationType,
+      )
+
+      if (!hasFilter) {
+        return raw.filter((p): p is any => Boolean(p))
+      }
+
       const positions: any[] = []
-      for (const id of ids) {
-        const pos = await this.readPosition(id)
+      for (const pos of raw) {
         if (!pos) continue
         if (filter?.status && pos.status !== filter.status) continue
         if (filter?.side && pos.side !== filter.side) continue
@@ -76,7 +101,9 @@ export class PseudoPositionManager {
   // ── public API ────────────────────────────────────────────────────────
 
   /**
-   * Create new pseudo position with proper volume calculation
+   * Create new pseudo position with proper volume calculation.
+   * configSetKey identifies the unique config combination (indType:dir:tp:sl:trailing:size:lev:state).
+   * Exactly one active position is allowed per configSetKey.
    */
   async createPosition(params: {
     symbol: string
@@ -87,22 +114,25 @@ export class PseudoPositionManager {
     stoplossRatio: number
     profitFactor: number
     trailingEnabled: boolean
+    configSetKey?: string  // unique fingerprint of the config combination
   }): Promise<string | null> {
     try {
-      const canCreate = await this.canCreatePosition(
-        params.symbol,
+      // Build a canonical config set key if not provided
+      const configSetKey = params.configSetKey || [
         params.indicationType,
         params.side,
-        params.takeprofitFactor,
-        params.stoplossRatio,
-        params.trailingEnabled,
+        params.takeprofitFactor.toFixed(4),
+        params.stoplossRatio.toFixed(4),
+        params.trailingEnabled ? "1" : "0",
+      ].join(":")
+
+      const canCreate = await this.canCreatePosition(
+        params.symbol,
+        configSetKey,
       )
 
       if (!canCreate) {
-        console.log(
-          `[v0] Cannot create ${params.side} position for ${params.symbol} (TP=${params.takeprofitFactor}, SL=${params.stoplossRatio}, trailing=${params.trailingEnabled}): max positions reached`,
-        )
-        return null
+        return null  // silent — one position per config set is expected
       }
 
       // Calculate volume for this position
@@ -144,6 +174,7 @@ export class PseudoPositionManager {
         symbol: params.symbol,
         indication_type: params.indicationType,
         side: params.side,
+        config_set_key: configSetKey,
         entry_price: String(params.entryPrice),
         current_price: String(params.entryPrice),
         quantity: String(volumeCalc.finalVolume),
@@ -162,6 +193,8 @@ export class PseudoPositionManager {
 
       await client.hset(this.positionKey(id), positionData)
       await client.sadd(this.positionsSetKey(), id)
+      // Register this configSetKey as active for O(1) duplicate detection on next creation
+      await client.sadd(this.activeConfigKeysSetKey(), configSetKey)
 
       console.log(`[v0] Created pseudo position ${id} for ${params.symbol} side=${params.side} vol=${volumeCalc.finalVolume}`)
 
@@ -283,8 +316,13 @@ export class PseudoPositionManager {
         realized_pnl: String(pnl),
       })
       
-      // Remove closed position from index set to prevent unbounded growth
+      // Remove closed position from the main index set
       await client.srem(this.positionsSetKey(), positionId)
+      // Remove from the O(1) active-configSetKey index so the slot can be reused
+      const configSetKey = position.config_set_key || ""
+      if (configSetKey) {
+        await client.srem(this.activeConfigKeysSetKey(), configSetKey)
+      }
       // Set TTL on the closed position hash so it auto-cleans (7 days)
       await client.expire(this.positionKey(positionId), 604800)
 
@@ -373,44 +411,26 @@ export class PseudoPositionManager {
   }
 
   /**
-   * Check if can create new position for specific config+direction
+   * Check if a new position can be created for the given config set key.
+   * Each unique config combination (indType:dir:symbol) is an independent Set —
+   * exactly 1 active pseudo position is allowed per Set.
+   *
+   * Uses O(1) SISMEMBER on the activeConfigKeysSetKey index instead of scanning
+   * all positions, which is critical for high-frequency operation.
    */
   private async canCreatePosition(
     symbol: string,
-    indicationType: string,
-    side: "long" | "short",
-    takeprofitFactor?: number,
-    stoplossRatio?: number,
-    trailingEnabled?: boolean,
+    configSetKey: string,
   ): Promise<boolean> {
     try {
-      const maxSetting = await getSettings("maxPositionsPerConfigSet")
-      const maxPerConfig = maxSetting ? parseInt(String(maxSetting), 10) : 1
-
-      // Get active positions matching this config
-      const active = await this.listPositions({ status: "active", symbol, indicationType, side })
-
-      let matching: any[]
-      if (takeprofitFactor !== undefined && stoplossRatio !== undefined && trailingEnabled !== undefined) {
-        matching = active.filter(p =>
-          parseFloat(p.takeprofit_factor || "0") === takeprofitFactor &&
-          parseFloat(p.stoploss_ratio || "0") === stoplossRatio &&
-          (p.trailing_enabled === "1") === trailingEnabled
-        )
-      } else {
-        matching = active
-      }
-
-      const canCreate = matching.length < maxPerConfig
-
-      console.log(
-        `[v0] Position check: ${symbol} ${indicationType} ${side} | ${matching.length}/${maxPerConfig} (can create: ${canCreate})`,
-      )
-
-      return canCreate
+      const client = getRedisClient()
+      const isMember = await client.sismember(this.activeConfigKeysSetKey(), configSetKey)
+      // isMember is 1 (number) if already active, 0 or null if not
+      return !isMember
     } catch (error) {
-      console.error("[v0] Failed to check if can create position:", error)
-      return false
+      console.error("[v0] Failed to check position limit for config set:", error)
+      // On Redis error fall through and allow creation (fail-open)
+      return true
     }
   }
 

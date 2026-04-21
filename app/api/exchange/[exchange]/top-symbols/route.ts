@@ -16,10 +16,22 @@ const FALLBACK: Record<string, string> = {
   orangex: "BTCUSDT",
 }
 
-async function fetchMostVolatileSymbol(exchange: string): Promise<{ symbol: string; priceChangePercent: number }> {
-  const cached = cache.get(exchange)
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    return { symbol: cached.symbol, priceChangePercent: cached.priceChangePercent }
+async function fetchMostVolatileSymbols(
+  exchange: string,
+  limit = 1,
+): Promise<{ symbol: string; priceChangePercent: number; symbols: { symbol: string; priceChangePercent: number }[] }> {
+  const safeLimit = Math.max(1, Math.min(10, Math.floor(limit) || 1))
+  // Cache only keeps the single top symbol — for limit > 1 we always fetch fresh
+  // (still cheap: one public REST call with 5s timeout) and return the sorted list.
+  if (safeLimit === 1) {
+    const cached = cache.get(exchange)
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      return {
+        symbol: cached.symbol,
+        priceChangePercent: cached.priceChangePercent,
+        symbols: [{ symbol: cached.symbol, priceChangePercent: cached.priceChangePercent }],
+      }
+    }
   }
 
   let tickers: { symbol: string; priceChangePercent: number }[] = []
@@ -92,7 +104,7 @@ async function fetchMostVolatileSymbol(exchange: string): Promise<{ symbol: stri
             }))
         }
       } catch (bybitErr) {
-        console.warn(`[v0] [TopSymbols] Bybit API error, using default:`, bybitErr instanceof Error ? bybitErr.message : bybitErr)
+        console.warn(`[TopSymbols] Bybit API error, using default:`, bybitErr instanceof Error ? bybitErr.message : bybitErr)
       }
 
     } else if (exchange === "bingx") {
@@ -136,22 +148,34 @@ async function fetchMostVolatileSymbol(exchange: string): Promise<{ symbol: stri
   if (tickers.length === 0) {
     // Fallback: return known safe default
     const fallback = FALLBACK[exchange] || "BTCUSDT"
-    return { symbol: fallback, priceChangePercent: 0 }
+    return { symbol: fallback, priceChangePercent: 0, symbols: [{ symbol: fallback, priceChangePercent: 0 }] }
   }
 
   // Sort by absolute price change % descending — highest volatility first
   tickers.sort((a, b) => b.priceChangePercent - a.priceChangePercent)
 
-  // Take top symbol
-  const top = tickers[0]
+  // De-duplicate (guards against any exchange returning the same symbol twice)
+  const seen = new Set<string>()
+  const unique = tickers.filter(t => {
+    if (seen.has(t.symbol)) return false
+    seen.add(t.symbol)
+    return true
+  })
+
+  const topN = unique.slice(0, safeLimit)
+  const top = topN[0]
   cache.set(exchange, { symbol: top.symbol, priceChangePercent: top.priceChangePercent, timestamp: Date.now() })
 
-  return { symbol: top.symbol, priceChangePercent: top.priceChangePercent }
+  return { symbol: top.symbol, priceChangePercent: top.priceChangePercent, symbols: topN }
 }
 
 /**
- * GET /api/exchange/[exchange]/top-symbols
- * Returns the single most volatile symbol on the exchange (by 24h price change %)
+ * GET /api/exchange/[exchange]/top-symbols?limit=N
+ * Returns the top N most volatile symbols on the exchange (by 24h price change %).
+ * - limit defaults to 1 and is clamped to [1,10]
+ * - `symbol` keeps the top-1 for backward-compatibility with existing callers
+ * - `symbols` is now a sorted list of objects: [{ symbol, priceChangePercent }, ...]
+ *   (older callers using `symbols: [string]` should switch to `symbol` or read `.symbol`).
  * Uses public exchange REST APIs — no auth required.
  */
 export async function GET(request: Request, { params }: { params: Promise<{ exchange: string }> }) {
@@ -159,14 +183,19 @@ export async function GET(request: Request, { params }: { params: Promise<{ exch
     const { exchange } = await params
     const normalised = (exchange || "").toLowerCase()
 
-    const { symbol, priceChangePercent } = await fetchMostVolatileSymbol(normalised)
+    const { searchParams } = new URL(request.url)
+    const limit = parseInt(searchParams.get("limit") || "1", 10) || 1
+
+    const { symbol, priceChangePercent, symbols } = await fetchMostVolatileSymbols(normalised, limit)
 
     return NextResponse.json({
       success: true,
       exchange: normalised,
       symbol,
       priceChangePercent,
-      symbols: [symbol], // keep backward-compat array field
+      symbols,                             // [{ symbol, priceChangePercent }]
+      symbolList: symbols.map(s => s.symbol), // plain string[] for convenience
+      count: symbols.length,
       timestamp: new Date().toISOString(),
     })
   } catch (error) {

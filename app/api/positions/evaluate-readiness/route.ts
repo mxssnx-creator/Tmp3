@@ -150,9 +150,7 @@ export async function GET() {
           issues,
           timestamp: Date.now(),
         })
-      } catch (err) {
-        console.warn(`[v0] Error evaluating position ${key}:`, err)
-      }
+      } catch { /* skip individual position errors */ }
     }
 
     // Sort by readiness score (highest first)
@@ -160,8 +158,6 @@ export async function GET() {
 
     const readyCount = evaluatedPositions.filter(p => p.readyForLiveTrading).length
     const totalCount = evaluatedPositions.length
-
-    console.log(`[v0] [PositionEvaluation] Evaluated ${totalCount} positions: ${readyCount} ready for live trading`)
 
     return NextResponse.json({
       success: true,

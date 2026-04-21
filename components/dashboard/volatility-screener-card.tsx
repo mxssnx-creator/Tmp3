@@ -53,7 +53,6 @@ export function VolatilityScreenerCard() {
       }
     } catch (err) {
       setError((err as Error).message)
-      console.error("[v0] Error screening symbols:", err)
     } finally {
       setScreening(false)
     }
@@ -76,8 +75,8 @@ export function VolatilityScreenerCard() {
         })
         setLiveTradeEnabled(prev => ({ ...prev, ...statusMap }))
       }
-    } catch (err) {
-      console.error("[v0] Error enabling live trading:", err)
+    } catch {
+      // non-critical
     } finally {
       setEnabling(false)
     }
@@ -99,9 +98,7 @@ export function VolatilityScreenerCard() {
           [symbol]: newStatus,
         }))
       }
-    } catch (err) {
-      console.error("[v0] Error toggling live trading:", err)
-    }
+    } catch { /* non-critical */ }
   }
 
   useEffect(() => {

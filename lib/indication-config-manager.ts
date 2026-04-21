@@ -130,6 +130,25 @@ export class IndicationConfigManager {
     await client.ltrim(key, 0, MAX_RESULTS - 1)
   }
 
+  /**
+   * Batch variant — pushes many results for a config with a single lpush and
+   * a single ltrim. Used by the prehistoric processor to cut per-result
+   * Redis round-trips by a factor of N.
+   */
+  async addResults(configId: string, results: IndicationResult[]): Promise<void> {
+    if (!results || results.length === 0) return
+    await initRedis()
+    const client = getRedisClient()
+
+    const key = this.getResultsKey(configId)
+    const entries = results.map(
+      (r) => `${r.timestamp}|${r.symbol}|${r.value}|${r.signal}`,
+    )
+    // lpush accepts varargs — spread once.
+    await client.lpush(key, ...entries)
+    await client.ltrim(key, 0, MAX_RESULTS - 1)
+  }
+
   async getResults(configId: string, limit = 50): Promise<IndicationResult[]> {
     await initRedis()
     const client = getRedisClient()

@@ -84,6 +84,32 @@ export interface ExchangeConnectorResult {
   logs: string[]
 }
 
+/**
+ * Optional per-order flags. Kept opt-in so existing callers and connector
+ * subclasses that only care about (symbol, side, qty, price, type) keep
+ * working unchanged.
+ *
+ *   reduceOnly    — force the order to only reduce an existing position
+ *                   (required for SL / TP / manual-close orders on perp
+ *                   exchanges; without it the order can open a NEW
+ *                   opposite-side position on hedge-mode accounts).
+ *   positionSide  — explicit hedge-mode side of the position this order
+ *                   applies to ("LONG" | "SHORT"). Must match the side
+ *                   of the opened position, NOT the side of the order.
+ *                   When omitted, the connector falls back to deriving
+ *                   it from the order `side`.
+ *   hedgeMode     — hint from the caller telling the connector whether
+ *                   the account is in hedge mode. When set to `false`
+ *                   the connector MUST NOT emit a `positionSide` that
+ *                   would be rejected on a one-way account.
+ */
+export interface PlaceOrderOptions {
+  reduceOnly?: boolean
+  positionSide?: "LONG" | "SHORT"
+  hedgeMode?: boolean
+  clientOrderId?: string
+}
+
 export abstract class BaseExchangeConnector {
   protected credentials: ExchangeCredentials
   protected logs: string[] = []
@@ -210,12 +236,17 @@ export abstract class BaseExchangeConnector {
   abstract getCapabilities(): string[]
 
   // Trading Methods (Order Management)
+  //
+  // NOTE: the 6th `options` param is optional; subclasses that don't yet
+  // understand reduce-only / positionSide / hedgeMode are free to ignore it
+  // (TS method parameter contravariance allows a narrower implementation).
   abstract placeOrder(
     symbol: string,
     side: "buy" | "sell",
     quantity: number,
     price?: number,
-    orderType?: "limit" | "market"
+    orderType?: "limit" | "market",
+    options?: PlaceOrderOptions
   ): Promise<{ success: boolean; orderId?: string; error?: string }>
 
   abstract cancelOrder(symbol: string, orderId: string): Promise<{ success: boolean; error?: string }>

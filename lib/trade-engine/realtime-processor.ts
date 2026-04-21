@@ -14,40 +14,99 @@ export class RealtimeProcessor {
   private priceCache: Map<string, { price: number; ts: number }> = new Map()
   private readonly PRICE_CACHE_TTL = 5000 // 5s
 
+  // Heartbeat throttling: the realtime loop ticks multiple times per second.
+  // Previously every tick performed a getSettings + setSettings round-trip on
+  // trade_engine_state just to refresh `last_realtime_run` / the position
+  // count. That was ~10+ Redis hits per second per engine with zero
+  // behavioural value. We now throttle the engine-state heartbeat to once per
+  // second and only re-read the full state hash when the position count
+  // actually changed.
+  private lastHeartbeatAt = 0
+  private lastPositionsCount = -1
+  private static readonly HEARTBEAT_INTERVAL_MS = 1000
+
   constructor(connectionId: string) {
     this.connectionId = connectionId
     this.positionManager = new PseudoPositionManager(connectionId)
   }
 
   /**
-   * Process real-time updates for all active positions
+   * Process real-time updates for all active positions.
+   * Returns the number of positions actually processed so callers can gate
+   * follow-up work (telemetry, backoff) without re-querying Redis.
    */
-  async processRealtimeUpdates(): Promise<void> {
+  async processRealtimeUpdates(): Promise<{ updates: number }> {
     try {
       const activePositions = await this.positionManager.getActivePositions()
+      const count = activePositions.length
+      const now = Date.now()
 
-      // Always update engine state, even with 0 positions (shows processor is running)
-      const stateKey = `trade_engine_state:${this.connectionId}`
-      const engineState = (await getSettings(stateKey)) || {}
-      await setSettings(stateKey, {
-        ...engineState,
-        active_positions_count: activePositions.length,
-        last_realtime_run: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        realtime_processor_active: true,
-      })
+      // Write the lightweight heartbeat at most once per second, and skip the
+      // preceding getSettings() unless the position count changed (which is
+      // when we need to merge with the persisted state hash).
+      const countChanged = count !== this.lastPositionsCount
+      const heartbeatDue = now - this.lastHeartbeatAt >= RealtimeProcessor.HEARTBEAT_INTERVAL_MS
 
-      if (activePositions.length === 0) {
-        return
+      if (countChanged || heartbeatDue) {
+        const stateKey = `trade_engine_state:${this.connectionId}`
+        try {
+          if (countChanged) {
+            // Only re-fetch the state hash when we actually need to merge a
+            // new count. The heartbeat-only path uses hset to touch two
+            // fields without read-modify-write.
+            const engineState = (await getSettings(stateKey)) || {}
+            await setSettings(stateKey, {
+              ...engineState,
+              active_positions_count: count,
+              last_realtime_run: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+              realtime_processor_active: true,
+            })
+          } else {
+            const client = getRedisClient()
+            await client.hset(stateKey, {
+              last_realtime_run: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+              realtime_processor_active: "true",
+            })
+          }
+          this.lastPositionsCount = count
+          this.lastHeartbeatAt = now
+        } catch (hbErr) {
+          // Heartbeat failures are non-critical — don't abort the cycle.
+          console.warn("[v0] [Realtime] Heartbeat write failed:", hbErr instanceof Error ? hbErr.message : String(hbErr))
+        }
       }
 
-      // Process each position in parallel
+      if (count === 0) {
+        return { updates: 0 }
+      }
+
+      // Pre-warm the price cache for every unique symbol in parallel before
+      // fanning out the per-position work. Previously every position paid
+      // its own `getMarketData` round-trip on the first cycle after the
+      // TTL expired (even though most positions share a symbol). Fetching
+      // the distinct set first collapses those N reads into M << N.
+      const uniqueSymbols = new Set<string>()
+      for (const p of activePositions) {
+        if (p?.symbol) uniqueSymbols.add(p.symbol)
+      }
+      if (uniqueSymbols.size > 0) {
+        await Promise.all(
+          Array.from(uniqueSymbols).map((sym) => this.getCurrentPrice(sym).catch(() => null)),
+        )
+      }
+
+      // Process each position in parallel — every call now hits the
+      // freshly-warmed price cache synchronously.
       await Promise.all(activePositions.map((position) => this.processPosition(position)))
+      return { updates: count }
     } catch (error) {
       console.error("[v0] Failed to process realtime updates:", error)
       await logProgressionEvent(this.connectionId, "realtime_error", "error", "Realtime processor failed", {
         error: error instanceof Error ? error.message : String(error),
       })
+      return { updates: 0 }
     }
   }
 

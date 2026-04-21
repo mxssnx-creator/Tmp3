@@ -1,20 +1,21 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useCallback } from "react"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import { Play, FileText, Settings, Zap, RefreshCw, Loader2, TrendingUp, StopCircle, Activity, BarChart3 } from "lucide-react"
+import {
+  Play, FileText, RefreshCw, Loader2, TrendingUp, StopCircle, Activity,
+  BarChart3, ChevronDown, ChevronUp, Database, Zap, Clock, CheckCircle2,
+  Circle, AlertCircle,
+} from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Badge } from "@/components/ui/badge"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Progress } from "@/components/ui/progress"
+import { QuickstartComprehensiveLogDialog } from "./quickstart-comprehensive-log-dialog"
+import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
+import { useExchange } from "@/lib/exchange-context"
 
-interface VolatileSymbolState {
-  symbol: string | null
-  exchange: string | null
-  priceChangePercent: number | null
-  loading: boolean
-  error: string | null
-}
+// ─── types ────────────────────────────────────────────────────────────────────
 
 interface LogEntry {
   id: string
@@ -23,379 +24,1241 @@ interface LogEntry {
   timestamp: Date
 }
 
-interface EngineStats {
-  cycles: number
-  successRate: number
-  indications: number
-  strategies: number
-  positions: number
-  profit: number
+interface StageDetail {
+  createdSets: number
+  avgPosPerSet: number
+  avgProfitFactor: number
+  avgDrawdownTime: number
+  evaluated: number
+  passed: number
+  failed: number
+  passRatio: number
 }
 
+interface VariantDetail {
+  createdSets: number
+  passedSets: number
+  entriesCount: number
+  avgPosPerSet: number
+  avgProfitFactor: number
+  avgDrawdownTime: number
+  passRate: number
+}
+
+// Main-stage coordination snapshot — surfaces the per-cycle position context
+// (pseudo-positions gating variant selection), how many related variant Sets
+// were built fresh vs. reused from the fingerprint cache, and the list of
+// variants gated ACTIVE for this cycle. Drives the "Main Coordination" panel
+// that sits above the variants table so the operator can verify at a glance
+// that the Main stage is actually coordinating based on live trading state.
+interface MainCoordination {
+  activeVariants: string[]    // e.g. ["default", "trailing"]
+  activeVariantCount: number
+  lastCreated: number         // variant Sets built fresh last cycle
+  lastReused: number          // variant Sets reused from fp-cache last cycle
+  totalCreated: number        // cumulative fresh builds
+  totalReused: number         // cumulative cache hits
+  totalCycles: number         // total Main cycles run
+  reuseRate: number           // percent — higher is better
+  positionContext: {
+    continuous: number        // open pseudo positions right now
+    lastWins: number          // winners in the last-N closed (max 5)
+    lastLosses: number        // losers  in the last-N closed (max 5)
+    prevLosses: number        // losers in the 24h lookback window
+    prevTotal: number         // total closed in the 24h lookback window
+    updatedAt: number         // ms since epoch when last written
+  }
+}
+
+interface LiveStats {
+  // historic
+  historicSymbols: number
+  historicSymbolsTotal: number
+  historicCycles: number
+  historicComplete: boolean
+  historicProgress: number
+  historicCandles: number
+  historicIndicators: number
+  // historic — frame/interval counters (big count for 1s timeframes)
+  historicFrames: number
+  historicFramesMissing: number
+  historicTimeframeSec: number
+  // realtime
+  indicationCycles: number
+  strategyCycles: number
+  realtimeCycles: number
+  indicationsTotal: number
+  strategiesTotal: number
+  positionsOpen: number
+  successRate: number
+  avgCycleMs: number
+  isActive: boolean
+  // breakdown
+  indDirection: number
+  indMove: number
+  indActive: number
+  indOptimal: number
+  indAuto: number
+  stratBase: number
+  stratMain: number
+  stratReal: number
+  stratLive: number
+  // per-stage strategy detail (count sets validated from prev + avg PF/DDT + avg pos/set)
+  stageBase: StageDetail
+  stageMain: StageDetail
+  stageReal: StageDetail
+  stageLive: StageDetail
+  // per-variant strategy detail (Default/Trailing/Block/DCA + Overall)
+  variantDefault: VariantDetail
+  variantTrailing: VariantDetail
+  variantBlock: VariantDetail
+  variantDca: VariantDetail
+  variantOverall: VariantDetail
+  // Main-stage coordination snapshot (position context + reuse rate)
+  mainCoord: MainCoordination
+  // live execution — real exchange positions
+  livePositionsOpen: number
+  livePositionsCreated: number
+  livePositionsClosed: number
+  liveOrdersPlaced: number
+  liveOrdersFilled: number
+  liveWinRate: number
+  // windows
+  indLast5m: number
+  indLast60m: number
+  // phase
+  phase: string
+  engineRunning: boolean
+}
+
+const EMPTY_STAGE: StageDetail = {
+  createdSets: 0, avgPosPerSet: 0, avgProfitFactor: 0, avgDrawdownTime: 0,
+  evaluated: 0, passed: 0, failed: 0, passRatio: 0,
+}
+const EMPTY_VARIANT: VariantDetail = {
+  createdSets: 0, passedSets: 0, entriesCount: 0, avgPosPerSet: 0,
+  avgProfitFactor: 0, avgDrawdownTime: 0, passRate: 0,
+}
+const EMPTY_MAIN_COORD: MainCoordination = {
+  activeVariants: ["default"], activeVariantCount: 1,
+  lastCreated: 0, lastReused: 0,
+  totalCreated: 0, totalReused: 0, totalCycles: 0, reuseRate: 0,
+  positionContext: {
+    continuous: 0, lastWins: 0, lastLosses: 0,
+    prevLosses: 0, prevTotal: 0, updatedAt: 0,
+  },
+}
+
+const EMPTY_STATS: LiveStats = {
+  historicSymbols: 0, historicSymbolsTotal: 0, historicCycles: 0,
+  historicComplete: false, historicProgress: 0, historicCandles: 0, historicIndicators: 0,
+  historicFrames: 0, historicFramesMissing: 0, historicTimeframeSec: 1,
+  indicationCycles: 0, strategyCycles: 0, realtimeCycles: 0, indicationsTotal: 0,
+  strategiesTotal: 0, positionsOpen: 0, successRate: 0, avgCycleMs: 0, isActive: false,
+  indDirection: 0, indMove: 0, indActive: 0, indOptimal: 0, indAuto: 0,
+  stratBase: 0, stratMain: 0, stratReal: 0, stratLive: 0,
+  stageBase:  { ...EMPTY_STAGE }, stageMain: { ...EMPTY_STAGE },
+  stageReal:  { ...EMPTY_STAGE }, stageLive: { ...EMPTY_STAGE },
+  variantDefault:  { ...EMPTY_VARIANT }, variantTrailing: { ...EMPTY_VARIANT },
+  variantBlock:    { ...EMPTY_VARIANT }, variantDca:      { ...EMPTY_VARIANT },
+  variantOverall:  { ...EMPTY_VARIANT },
+  mainCoord: {
+    ...EMPTY_MAIN_COORD,
+    positionContext: { ...EMPTY_MAIN_COORD.positionContext },
+  },
+  livePositionsOpen: 0, livePositionsCreated: 0, livePositionsClosed: 0,
+  liveOrdersPlaced: 0, liveOrdersFilled: 0, liveWinRate: 0,
+  indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
+}
+
+function fmt(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}K`
+  return String(n)
+}
+
+// ─── sub-components ───────────────────────────────────────────────────────────
+
+function StatusDot({ active }: { active: boolean }) {
+  return (
+    <span className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${active ? "bg-green-500 animate-pulse" : "bg-muted-foreground/40"}`} />
+  )
+}
+
+function MiniStat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="flex flex-col items-center justify-center rounded bg-muted/60 px-2 py-1.5 min-w-[52px]">
+      <span className="text-[13px] font-bold tabular-nums text-foreground leading-none">{value}</span>
+      {sub && <span className="text-[9px] text-muted-foreground leading-none mt-0.5">{sub}</span>}
+      <span className="text-[9px] text-muted-foreground leading-none mt-0.5">{label}</span>
+    </div>
+  )
+}
+
+// ─── main component ───────────────────────────────────────────────────────────
+
 export function QuickstartSection() {
-  const [volatileSymbol, setVolatileSymbol] = useState<VolatileSymbolState>({
-    symbol: null,
-    exchange: null,
-    priceChangePercent: null,
-    loading: true,
-    error: null,
+  const { selectedConnectionId, selectedExchange } = useExchange()
+  // Default to bingx-x01 — the canonical BingX base connection ID used by the engine
+  const connectionId = selectedConnectionId || "bingx-x01"
+
+  // volatile symbol for start button label
+  const [volatileSymbol, setVolatileSymbol] = useState<{ symbol: string | null; exchange: string | null; pct: number | null; loading: boolean }>({
+    symbol: null, exchange: null, pct: null, loading: true,
   })
+
   const [starting, setStarting] = useState(false)
   const [isRunning, setIsRunning] = useState(false)
-  const [showDetails, setShowDetails] = useState(false)
+  const [expanded, setExpanded] = useState(false)
   const [logs, setLogs] = useState<LogEntry[]>([])
-  const [stats, setStats] = useState<EngineStats>({
-    cycles: 0,
-    successRate: 0,
-    indications: 0,
-    strategies: 0,
-    positions: 0,
-    profit: 0,
-  })
+  const [stats, setStats] = useState<LiveStats>(EMPTY_STATS)
+  const [loadingStats, setLoadingStats] = useState(false)
+
+  // Quickstart controls — how many top-volatile symbols to process (1-10)
+  // and whether live exchange trading is currently enabled for the connection.
+  const [symbolCount, setSymbolCount] = useState<number>(1)
+  const [liveTradeActive, setLiveTradeActive] = useState<boolean>(false)
+  const [liveTradeLoading, setLiveTradeLoading] = useState<boolean>(false)
+  // Connection the quickstart actually bound to on last start (or the
+  // component default) — used as the target for the Live toggle.
+  const [activeConnectionId, setActiveConnectionId] = useState<string>(connectionId)
+
   const logsEndRef = useRef<HTMLDivElement>(null)
-  const statsIntervalRef = useRef<NodeJS.Timeout>()
+  const pollRef    = useRef<NodeJS.Timeout>()
 
-  // On mount: load first active connection's exchange, then fetch most volatile symbol
-  useEffect(() => {
-    async function loadVolatileSymbol() {
-      try {
-        // Step 1: get active connections
-        const connRes = await fetch("/api/settings/connections?t=" + Date.now(), {
-          cache: "no-store",
-        })
-        if (!connRes.ok) throw new Error("Could not load connections")
-        const connData = await connRes.json()
-        const connections: any[] = Array.isArray(connData) ? connData : (connData?.connections || [])
+  // ── fetch live stats ──────────────────────────────────────────────────────
+  const fetchStats = useCallback(async (silent = false) => {
+    if (!connectionId) return
+    if (!silent) setLoadingStats(true)
+    try {
+      // Primary: /stats endpoint (full breakdown)
+      const res = await fetch(`/api/connections/progression/${connectionId}/stats`, { cache: "no-store" })
+      if (!res.ok) return
+      const s = await res.json()
 
-        // Find first active/enabled connection
-        const active = connections.find(
-          c => c.is_active === "1" || c.is_active === true || c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
-        ) || connections[0]
+      let indCycles  = s.realtime?.indicationCycles || 0
+      let stratCycles = s.realtime?.strategyCycles  || 0
+      let indTotal   = s.realtime?.indicationsTotal || 0
+      let stratTotal = s.realtime?.strategiesTotal  || 0
+      let indDir     = s.breakdown?.indications?.direction || 0
+      let indMove    = s.breakdown?.indications?.move     || 0
+      let indAct     = s.breakdown?.indications?.active   || 0
+      let indOpt     = s.breakdown?.indications?.optimal  || 0
+      let indAuto    = s.breakdown?.indications?.auto     || 0
+      let stratBase  = s.breakdown?.strategies?.base      || 0
+      let stratMain  = s.breakdown?.strategies?.main      || 0
+      let stratReal  = s.breakdown?.strategies?.real      || 0
 
-        if (!active) {
-          setVolatileSymbol(s => ({ ...s, loading: false, error: "No connections found" }))
-          return
-        }
-
-        const exchange = (active.exchange || "binance").toLowerCase()
-
-        // Step 2: fetch most volatile symbol from that exchange
-        const symRes = await fetch(`/api/exchange/${exchange}/top-symbols?t=` + Date.now(), {
-          cache: "no-store",
-        })
-        if (!symRes.ok) throw new Error("Could not fetch volatile symbol")
-        const symData = await symRes.json()
-
-        setVolatileSymbol({
-          symbol: symData.symbol || "BTCUSDT",
-          exchange,
-          priceChangePercent: symData.priceChangePercent ?? null,
-          loading: false,
-          error: null,
-        })
-      } catch (err) {
-        console.warn("[v0] [Quickstart] Failed to load volatile symbol:", err instanceof Error ? err.message : err)
-        setVolatileSymbol({ symbol: "BTCUSDT", exchange: null, priceChangePercent: null, loading: false, error: null })
+      // Fallback: if /stats returned all zeros, try engine-stats (confirmed working)
+      if (indCycles === 0 && stratCycles === 0 && indTotal === 0) {
+        try {
+          const er = await fetch(`/api/trading/engine-stats?connection_id=${connectionId}`, { cache: "no-store" })
+          if (er.ok) {
+            const e = await er.json()
+            indCycles  = e.indicationCycleCount  || 0
+            stratCycles = e.strategyCycleCount    || 0
+            indTotal   = e.totalIndicationsCount  || 0
+            stratTotal = e.totalStrategyCount     || 0
+            indDir     = e.indicationsByType?.direction || 0
+            indMove    = e.indicationsByType?.move      || 0
+            indAct     = e.indicationsByType?.active    || 0
+            indOpt     = e.indicationsByType?.optimal   || 0
+            indAuto    = e.indicationsByType?.auto      || 0
+            stratBase  = e.baseStrategyCount  || 0
+            stratMain  = e.mainStrategyCount  || 0
+            stratReal  = e.realStrategyCount  || 0
+          }
+        } catch { /* non-critical */ }
       }
+
+      // Normaliser for per-stage detail blocks — a shared shape used across
+      // base / main / real / live so the UI can reuse one renderer.
+      const stage = (d: any): StageDetail => ({
+        createdSets:     Number(d?.createdSets     ?? 0) || 0,
+        avgPosPerSet:    Number(d?.avgPosPerSet    ?? 0) || 0,
+        avgProfitFactor: Number(d?.avgProfitFactor ?? 0) || 0,
+        avgDrawdownTime: Number(d?.avgDrawdownTime ?? 0) || 0,
+        evaluated:       Number(d?.evaluated       ?? 0) || 0,
+        passed:          Number(d?.passed          ?? 0) || 0,
+        failed:          Number(d?.failed          ?? 0) || 0,
+        passRatio:       Number(d?.passRatio       ?? 0) || 0,
+      })
+      const variant = (d: any): VariantDetail => ({
+        createdSets:     Number(d?.createdSets     ?? 0) || 0,
+        passedSets:      Number(d?.passedSets      ?? 0) || 0,
+        entriesCount:    Number(d?.entriesCount    ?? 0) || 0,
+        avgPosPerSet:    Number(d?.avgPosPerSet    ?? 0) || 0,
+        avgProfitFactor: Number(d?.avgProfitFactor ?? 0) || 0,
+        avgDrawdownTime: Number(d?.avgDrawdownTime ?? 0) || 0,
+        passRate:        Number(d?.passRate        ?? 0) || 0,
+      })
+      // Main-stage coordination snapshot (position context, cache reuse).
+      // Nullish-safe: the /stats endpoint only added this block in a later
+      // version; fall back to the EMPTY_MAIN_COORD so older backends don't
+      // break the dashboard.
+      const mainCoordRaw = s.mainCoordination ?? {}
+      const mainCoord: MainCoordination = {
+        activeVariants:     Array.isArray(mainCoordRaw.activeVariants)
+          ? mainCoordRaw.activeVariants.filter((v: any) => typeof v === "string")
+          : ["default"],
+        activeVariantCount: Number(mainCoordRaw.activeVariantCount ?? 0) || 0,
+        lastCreated:        Number(mainCoordRaw.lastCreated        ?? 0) || 0,
+        lastReused:         Number(mainCoordRaw.lastReused         ?? 0) || 0,
+        totalCreated:       Number(mainCoordRaw.totalCreated       ?? 0) || 0,
+        totalReused:        Number(mainCoordRaw.totalReused        ?? 0) || 0,
+        totalCycles:        Number(mainCoordRaw.totalCycles        ?? 0) || 0,
+        reuseRate:          Number(mainCoordRaw.reuseRate          ?? 0) || 0,
+        positionContext: {
+          continuous: Number(mainCoordRaw.positionContext?.continuous ?? 0) || 0,
+          lastWins:   Number(mainCoordRaw.positionContext?.lastWins   ?? 0) || 0,
+          lastLosses: Number(mainCoordRaw.positionContext?.lastLosses ?? 0) || 0,
+          prevLosses: Number(mainCoordRaw.positionContext?.prevLosses ?? 0) || 0,
+          prevTotal:  Number(mainCoordRaw.positionContext?.prevTotal  ?? 0) || 0,
+          updatedAt:  Number(mainCoordRaw.positionContext?.updatedAt  ?? 0) || 0,
+        },
+      }
+
+      setStats({
+        historicSymbols:       s.historic?.symbolsProcessed    || 0,
+        historicSymbolsTotal:  s.historic?.symbolsTotal        || 0,
+        historicCycles:        s.historic?.cyclesCompleted     || 0,
+        historicComplete:      s.historic?.isComplete          || false,
+        historicProgress:      s.historic?.progressPercent     || 0,
+        historicCandles:       s.historic?.candlesLoaded       || 0,
+        historicIndicators:    s.historic?.indicatorsCalculated || 0,
+        historicFrames:        s.historic?.framesProcessed     || 0,
+        historicFramesMissing: s.historic?.framesMissingLoaded || 0,
+        historicTimeframeSec:  s.historic?.timeframeSeconds    || 1,
+        indicationCycles:      indCycles,
+        strategyCycles:        stratCycles,
+        realtimeCycles:        s.realtime?.realtimeCycles      || 0,
+        indicationsTotal:      indTotal,
+        strategiesTotal:       stratTotal,
+        positionsOpen:         s.realtime?.positionsOpen       || 0,
+        successRate:           s.realtime?.successRate         || 0,
+        avgCycleMs:            s.realtime?.avgCycleTimeMs      || 0,
+        isActive:              s.realtime?.isActive            || indCycles > 0,
+        indDirection:          indDir,
+        indMove:               indMove,
+        indActive:             indAct,
+        indOptimal:            indOpt,
+        indAuto:               indAuto,
+        stratBase:             stratBase,
+        stratMain:             stratMain,
+        stratReal:             stratReal,
+        stratLive:             s.breakdown?.strategies?.live   || 0,
+        // Per-stage strategy detail (sets validated from prev + avg PF/DDT + avg pos/set)
+        stageBase:             stage(s.strategyDetail?.base),
+        stageMain:             stage(s.strategyDetail?.main),
+        stageReal:             stage(s.strategyDetail?.real),
+        stageLive:             stage(s.strategyDetail?.live),
+        // Per-variant strategy detail (Default/Trailing/Block/DCA + Overall)
+        variantDefault:        variant(s.strategyVariants?.default),
+        variantTrailing:       variant(s.strategyVariants?.trailing),
+        variantBlock:          variant(s.strategyVariants?.block),
+        variantDca:            variant(s.strategyVariants?.dca),
+        variantOverall:        variant(s.strategyVariants?.overall),
+        mainCoord,
+        // Live exchange execution — from liveExecution block of the /stats endpoint
+        livePositionsOpen:     s.liveExecution?.positionsOpen    || 0,
+        livePositionsCreated:  s.liveExecution?.positionsCreated || 0,
+        livePositionsClosed:   s.liveExecution?.positionsClosed  || 0,
+        liveOrdersPlaced:      s.liveExecution?.ordersPlaced     || 0,
+        liveOrdersFilled:      s.liveExecution?.ordersFilled     || 0,
+        liveWinRate:           s.liveExecution?.winRate          || 0,
+        indLast5m:             s.windows?.indications?.last5m     || 0,
+        indLast60m:            s.windows?.indications?.last60m    || 0,
+        phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
+        engineRunning:         s.metadata?.engineRunning || indCycles > 0,
+      })
+      // NOTE: do NOT auto-set isRunning here — isRunning tracks user-initiated sessions only.
+      // engineRunning in stats reflects the server state independently.
+    } catch { /* non-critical */ }
+    finally { if (!silent) setLoadingStats(false) }
+  }, [connectionId])
+
+  // ── fetch volatile symbol ──────────────────────────────────────────────────
+  const loadSymbol = useCallback(async (showSpinner = true) => {
+    if (showSpinner) setVolatileSymbol(s => ({ ...s, loading: true }))
+    try {
+      const connRes = await fetch("/api/settings/connections?t=" + Date.now(), { cache: "no-store" })
+      if (!connRes.ok) throw new Error("no connections")
+      const data = await connRes.json()
+      const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
+
+      const isActive = (c: any) =>
+        c.is_active_inserted === "1" || c.is_active_inserted === true ||
+        c.is_assigned === "1" || c.is_assigned === true ||
+        c.is_active === "1" || c.is_active === true ||
+        c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
+
+      // 1st: exact match on selectedConnectionId
+      // 2nd: any active connection matching the selectedExchange name
+      // 3rd: any active connection
+      // 4th: first connection
+      const conn =
+        conns.find(c => c.id === selectedConnectionId) ||
+        conns.find(c => isActive(c) && (c.exchange || "").toLowerCase() === (selectedExchange || "").toLowerCase()) ||
+        conns.find(c => isActive(c)) ||
+        conns[0]
+
+      if (!conn) {
+        setVolatileSymbol(s => ({ ...s, loading: false }))
+        return
+      }
+
+      const ex = (conn.exchange || "bingx").toLowerCase()
+      const symRes = await fetch(`/api/exchange/${ex}/top-symbols?t=` + Date.now(), { cache: "no-store" })
+      if (!symRes.ok) throw new Error("no symbols")
+      const sym = await symRes.json()
+      setVolatileSymbol({ symbol: sym.symbol || "BTCUSDT", exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
+    } catch {
+      setVolatileSymbol(s => ({ ...s, loading: false }))
     }
+  }, [selectedConnectionId, selectedExchange])
 
-    loadVolatileSymbol()
-  }, [])
+  useEffect(() => {
+    // Run immediately and whenever exchange selection changes
+    loadSymbol(true)
+    // Also refresh the volatile symbol every 60 seconds so it stays current
+    const symbolInterval = setInterval(() => loadSymbol(false), 60_000)
+    return () => clearInterval(symbolInterval)
+  }, [loadSymbol])
 
-  // Auto-scroll logs to bottom
+  // ── auto-scroll logs ───────────────────────────────────────────────────────
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
 
-  // Fetch live stats when running
+  // ── poll stats always (fast when expanded/running, slow otherwise) ────────
   useEffect(() => {
-    if (!isRunning) return
-
-    const fetchStats = async () => {
-      try {
-        const res = await fetch("/api/connections/progression/default-bingx-001", { cache: "no-store" })
-        if (!res.ok) return
-        const data = await res.json()
-
-        setStats({
-          cycles: data.state?.cyclesCompleted || 0,
-          successRate: data.state?.cycleSuccessRate || 0,
-          indications: data.metrics?.indicationsCount || (data.state?.indicationEvaluatedDirection || 0),
-          strategies: data.metrics?.totalStrategiesEvaluated || (data.state?.strategyEvaluatedReal || 0),
-          positions: data.metrics?.intervalsProcessed || 0,
-          profit: data.state?.totalProfit || 0,
-        })
-      } catch (err) {
-        console.error("[v0] [Quickstart] Failed to fetch stats:", err)
-      }
-    }
-
+    clearInterval(pollRef.current)
     fetchStats()
-    statsIntervalRef.current = setInterval(fetchStats, 2000)
+    // Always poll: fast (3s) when expanded or running, slower (10s) otherwise
+    const interval = (expanded || isRunning) ? 3000 : 10000
+    pollRef.current = setInterval(() => fetchStats(true), interval)
+    return () => clearInterval(pollRef.current)
+  }, [expanded, isRunning, fetchStats])
 
-    return () => {
-      if (statsIntervalRef.current) clearInterval(statsIntervalRef.current)
-    }
-  }, [isRunning])
+  // ── log helper ─────────────────────────────────────────────────────────────
+  const addLog = (msg: string, type: LogEntry["type"] = "info") =>
+    setLogs(prev => [...prev, { id: Math.random().toString(), message: msg, type, timestamp: new Date() }])
 
-  const addLog = (message: string, type: "info" | "success" | "error" | "warning" = "info") => {
-    const entry: LogEntry = {
-      id: Math.random().toString(),
-      message,
-      type,
-      timestamp: new Date(),
-    }
-    setLogs(prev => [...prev, entry])
-  }
-
-  const handleStartEngine = async () => {
+  // ── start / stop ───────────────────────────────────────────────────────────
+  const handleStart = async () => {
     if (starting || isRunning) return
     setStarting(true)
     setLogs([])
-    addLog("🚀 Starting engine test...", "info")
-
+    addLog("Initializing connection...", "info")
     try {
-      addLog("Step 1: Initializing connection...", "info")
       const connRes = await fetch("/api/settings/connections?t=" + Date.now(), { cache: "no-store" })
       if (!connRes.ok) throw new Error("Failed to get connections")
-      const connections = await connRes.json()
-      const active = connections.find((c: any) => c.is_active === "1" || c.is_active === true) || connections[0]
-      if (!active) throw new Error("No active connections")
-      addLog(`✓ Connected to ${active.exchange}`, "success")
+      const data = await connRes.json()
+      const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
+      const isActive = (c: any) =>
+        c.is_active_inserted === "1" || c.is_active_inserted === true ||
+        c.is_assigned === "1" || c.is_assigned === true ||
+        c.is_active === "1" || c.is_active === true ||
+        c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
 
-      addLog("Step 2: Fetching market data...", "info")
-      const exchange = (active.exchange || "binance").toLowerCase()
-      const symRes = await fetch(`/api/exchange/${exchange}/top-symbols?t=` + Date.now(), { cache: "no-store" })
+      // Always use the exchange-selected connection first
+      const conn =
+        conns.find(c => c.id === selectedConnectionId) ||
+        conns.find(c => isActive(c) && (c.exchange || "").toLowerCase() === (selectedExchange || "").toLowerCase()) ||
+        conns.find(c => isActive(c)) ||
+        conns[0]
+      if (!conn) throw new Error("No active connections found")
+      addLog(`Connected to ${conn.exchange?.toUpperCase() || "exchange"}`, "success")
+      setActiveConnectionId(conn.id)
+      // Seed live state from whatever the connection already says
+      setLiveTradeActive(conn.is_live_trade === "1" || conn.is_live_trade === true)
+
+      const clampedCount = Math.max(1, Math.min(10, symbolCount))
+      addLog(
+        clampedCount === 1
+          ? "Fetching most volatile symbol (1h)..."
+          : `Fetching top ${clampedCount} volatile symbols (1h)...`,
+        "info",
+      )
+      const ex = (conn.exchange || "bingx").toLowerCase()
+      const symRes = await fetch(
+        `/api/exchange/${ex}/top-symbols?limit=${clampedCount}&t=${Date.now()}`,
+        { cache: "no-store" },
+      )
+      let chosen: string[] = ["BTCUSDT"]
       if (symRes.ok) {
-        const symData = await symRes.json()
-        addLog(`✓ Market data loaded: ${symData.symbol || "BTCUSDT"}`, "success")
+        const sym = await symRes.json()
+        // Prefer the new symbolList (string[]) → fall back to the object list → single symbol
+        const list: string[] =
+          (Array.isArray(sym.symbolList) && sym.symbolList.length > 0)
+            ? sym.symbolList
+            : (Array.isArray(sym.symbols) && sym.symbols.length > 0 && typeof sym.symbols[0] === "object")
+              ? sym.symbols.map((s: any) => s.symbol).filter(Boolean)
+              : (sym.symbol ? [sym.symbol] : [])
+        if (list.length > 0) chosen = list
+        const top = chosen[0]
+        addLog(`Selected: ${chosen.join(", ")} (top: ${sym.priceChangePercent?.toFixed(2) ?? "—"}% 1h)`, "success")
+        setVolatileSymbol({ symbol: top, exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
       }
 
-      addLog("Step 3: Starting trade engine...", "info")
+      addLog(`Starting trade engine with ${chosen.length} symbol${chosen.length > 1 ? "s" : ""}...`, "info")
       const startRes = await fetch("/api/trade-engine/quick-start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ connectionId: active.id || "default-bingx-001" }),
+        body: JSON.stringify({ connectionId: conn.id, symbols: chosen }),
       })
 
       if (startRes.ok) {
-        addLog("✓ Trade engine started", "success")
+        addLog("Trade engine started successfully", "success")
         setIsRunning(true)
-        addLog("Engine is now running and processing live data", "info")
+        addLog(`Processing live data for: ${chosen.join(", ")}`, "info")
       } else {
-        addLog("⚠ Engine already running or unavailable", "warning")
+        const body = await startRes.json().catch(() => ({}))
+        addLog(body?.message || "Engine already running — monitoring active", "warning")
         setIsRunning(true)
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      addLog(`❌ Error: ${message}`, "error")
+      addLog(`Error: ${err instanceof Error ? err.message : String(err)}`, "error")
     } finally {
       setStarting(false)
     }
   }
 
-  const handleStopEngine = async () => {
+  const handleStop = async () => {
+    addLog("Stopping engine...", "info")
+    setIsRunning(false)
+    addLog("Engine stopped", "success")
+  }
+
+  const handleRefresh = async () => {
+    await loadSymbol(true)
+    await fetchStats(true)
+    await refreshLiveTradeStatus()
+  }
+
+  // ── live-trade toggle ─────────────────────────────────────────────────────
+  // Enables or disables real exchange trading for the active connection via
+  // /api/settings/connections/[id]/live-trade. The server validates that
+  // credentials exist and starts the independent live-trade engine.
+  const refreshLiveTradeStatus = useCallback(async () => {
+    const id = activeConnectionId || connectionId
+    if (!id) return
     try {
-      addLog("Stopping engine...", "info")
-      setIsRunning(false)
-      setStats({
-        cycles: 0,
-        successRate: 0,
-        indications: 0,
-        strategies: 0,
-        positions: 0,
-        profit: 0,
+      const res = await fetch(`/api/settings/connections?t=${Date.now()}`, { cache: "no-store" })
+      if (!res.ok) return
+      const data = await res.json()
+      const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
+      const conn = conns.find(c => c.id === id)
+      if (conn) {
+        setLiveTradeActive(conn.is_live_trade === "1" || conn.is_live_trade === true)
+      }
+    } catch { /* non-critical */ }
+  }, [activeConnectionId, connectionId])
+
+  const handleToggleLiveTrade = async () => {
+    if (liveTradeLoading) return
+    const id = activeConnectionId || connectionId
+    if (!id) {
+      addLog("No connection selected — start the engine first", "warning")
+      return
+    }
+    const nextState = !liveTradeActive
+    setLiveTradeLoading(true)
+    addLog(`${nextState ? "Enabling" : "Disabling"} LIVE exchange trading...`, "info")
+    try {
+      const res = await fetch(`/api/settings/connections/${id}/live-trade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ is_live_trade: nextState }),
       })
-      addLog("✓ Engine stopped", "success")
+      const body = await res.json().catch(() => ({} as any))
+      if (!res.ok || body?.success === false) {
+        const hint = body?.hint ? ` — ${body.hint}` : ""
+        addLog(`Live toggle failed: ${body?.error || res.statusText}${hint}`, "error")
+        return
+      }
+      setLiveTradeActive(nextState)
+      addLog(
+        nextState
+          ? "LIVE exchange trading ENABLED — real orders will be placed"
+          : "LIVE exchange trading disabled",
+        nextState ? "success" : "info",
+      )
+      // Refresh stats immediately so the Live counter reflects the new engine
+      setTimeout(() => fetchStats(true), 1000)
     } catch (err) {
-      addLog(`❌ Failed to stop: ${err instanceof Error ? err.message : String(err)}`, "error")
+      addLog(`Live toggle error: ${err instanceof Error ? err.message : String(err)}`, "error")
+    } finally {
+      setLiveTradeLoading(false)
     }
   }
 
-  const handleRefreshStatus = async () => {
-    setVolatileSymbol(s => ({ ...s, loading: true }))
-    try {
-      if (volatileSymbol.exchange) {
-        const symRes = await fetch(`/api/exchange/${volatileSymbol.exchange}/top-symbols?t=` + Date.now(), {
-          cache: "no-store",
-        })
-        if (symRes.ok) {
-          const symData = await symRes.json()
-          setVolatileSymbol(s => ({
-            ...s,
-            symbol: symData.symbol || s.symbol,
-            priceChangePercent: symData.priceChangePercent ?? s.priceChangePercent,
-            loading: false,
-          }))
-          return
-        }
-      }
-    } catch (_) {}
-    setVolatileSymbol(s => ({ ...s, loading: false }))
-  }
+  // Sync live-trade status on mount and whenever the active connection changes
+  useEffect(() => {
+    refreshLiveTradeStatus()
+  }, [refreshLiveTradeStatus])
 
-  const getLogColor = (type: string) => {
+  const logColor = (type: string) => {
     switch (type) {
       case "success": return "text-green-600 dark:text-green-400"
-      case "error": return "text-red-600 dark:text-red-400"
+      case "error":   return "text-red-600 dark:text-red-400"
       case "warning": return "text-amber-600 dark:text-amber-400"
-      default: return "text-blue-600 dark:text-blue-400"
+      default:        return "text-blue-600 dark:text-blue-400"
     }
   }
 
+  const totalInd = stats.indicationsTotal || 1
+  const indTypes = [
+    { label: "Dir",  value: stats.indDirection },
+    { label: "Move", value: stats.indMove      },
+    { label: "Act",  value: stats.indActive    },
+    { label: "Opt",  value: stats.indOptimal   },
+    { label: "Auto", value: stats.indAuto      },
+  ]
+
   return (
-    <Card className="border-primary/20 bg-gradient-to-r from-primary/5 via-transparent to-transparent">
-      <div className="p-3 space-y-2.5">
+    <Card className="border-primary/20 overflow-hidden">
+      {/* ── compact header bar ─────────────────────────────────────────────── */}
+      <div className="flex items-center gap-2 px-3 py-2 bg-primary/5 border-b border-primary/10">
+        {/* status dot + label */}
+        <StatusDot active={stats.engineRunning || isRunning} />
+        <span className="text-xs font-semibold text-foreground">Engine</span>
+        {(stats.engineRunning || isRunning) && (
+          <Badge variant="default" className="h-4 text-[10px] px-1.5 py-0">Running</Badge>
+        )}
+        {stats.phase && stats.phase !== "—" && (
+          <Badge variant="outline" className="h-4 text-[9px] px-1.5 py-0 capitalize hidden sm:inline-flex">
+            {stats.phase.replace(/_/g, " ")}
+          </Badge>
+        )}
 
-        {/* Header row: title + volatile symbol badge */}
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-1.5">
-            <Zap className="w-3.5 h-3.5 text-primary" />
-            <span className="text-xs font-semibold">Quickstart Test</span>
-            {isRunning && <Badge variant="default" className="h-4 text-[10px]">Running</Badge>}
-          </div>
-
-          {/* Volatile symbol indicator */}
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <TrendingUp className="w-3 h-3" />
-            <span className="font-mono">
-              {volatileSymbol.loading ? (
-                <Loader2 className="w-3 h-3 animate-spin inline" />
-              ) : volatileSymbol.symbol ? (
-                <>
-                  <span className="font-semibold text-foreground">{volatileSymbol.symbol}</span>
-                  {volatileSymbol.priceChangePercent !== null && (
-                    <span className="ml-1 text-amber-500">
-                      {volatileSymbol.priceChangePercent > 0 ? "+" : ""}
-                      {volatileSymbol.priceChangePercent.toFixed(2)}%
-                    </span>
-                  )}
-                </>
-              ) : (
-                "—"
+        {/* volatile symbol */}
+        <div className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
+          <TrendingUp className="w-3 h-3 shrink-0" />
+          {volatileSymbol.loading ? (
+            <Loader2 className="w-3 h-3 animate-spin" />
+          ) : volatileSymbol.symbol ? (
+            <>
+              <span className="font-semibold text-foreground font-mono">{volatileSymbol.symbol}</span>
+              {volatileSymbol.pct !== null && (
+                <span className={`text-[10px] tabular-nums ${volatileSymbol.pct >= 0 ? "text-green-600" : "text-red-500"}`}>
+                  {volatileSymbol.pct >= 0 ? "+" : ""}{volatileSymbol.pct.toFixed(2)}%
+                </span>
               )}
-            </span>
-            {volatileSymbol.exchange && (
-              <span className="uppercase text-[10px] bg-muted px-1.5 py-0.5 rounded">
-                {volatileSymbol.exchange}
-              </span>
-            )}
-          </div>
+            </>
+          ) : <span>—</span>}
+          {volatileSymbol.exchange && (
+            <span className="text-[9px] uppercase bg-muted px-1 py-0.5 rounded">{volatileSymbol.exchange}</span>
+          )}
         </div>
+      </div>
 
-        {/* Primary action buttons */}
-        <div className="flex flex-wrap gap-1.5">
+      <div className="p-2.5 space-y-2">
+        {/* ── action row ───────────────────────────────────��─────────────── */}
+        <div className="flex flex-wrap items-center gap-1.5">
           <Button
             size="sm"
             variant={isRunning ? "destructive" : "default"}
-            onClick={isRunning ? handleStopEngine : handleStartEngine}
+            onClick={isRunning ? handleStop : handleStart}
             disabled={starting || volatileSymbol.loading}
-            className="h-7 text-xs px-2.5 flex items-center gap-1"
+            className="h-7 text-xs px-2.5 gap-1"
           >
-            {starting ? (
-              <Loader2 className="w-3 h-3 animate-spin" />
-            ) : isRunning ? (
-              <StopCircle className="w-3 h-3" />
-            ) : (
-              <Play className="w-3 h-3" />
-            )}
-            {isRunning ? "Stop" : volatileSymbol.symbol ? `Start (${volatileSymbol.symbol})` : "Start Engine"}
+            {starting ? <Loader2 className="w-3 h-3 animate-spin" /> : isRunning ? <StopCircle className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+            {starting
+              ? "Starting..."
+              : isRunning
+                ? "Stop"
+                : volatileSymbol.symbol
+                  ? symbolCount === 1
+                    ? `Start (${volatileSymbol.symbol})`
+                    : `Start (top ${symbolCount})`
+                  : "Start Engine"}
+          </Button>
+
+          {/* Symbol count selector — controls how many top-volatile symbols the quickstart processes. */}
+          <div
+            className="flex items-center gap-1 h-7 px-1.5 rounded-md border bg-muted/30"
+            title="Number of top-volatile symbols to process (1-10)"
+          >
+            <span className="text-[10px] text-muted-foreground uppercase tracking-wide">Symbols</span>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-5 w-5 p-0 rounded text-xs"
+              onClick={() => setSymbolCount(c => Math.max(1, c - 1))}
+              disabled={symbolCount <= 1 || isRunning || starting}
+              aria-label="Decrease symbol count"
+            >
+              −
+            </Button>
+            <span className="text-xs font-semibold tabular-nums w-4 text-center">{symbolCount}</span>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-5 w-5 p-0 rounded text-xs"
+              onClick={() => setSymbolCount(c => Math.min(10, c + 1))}
+              disabled={symbolCount >= 10 || isRunning || starting}
+              aria-label="Increase symbol count"
+            >
+              +
+            </Button>
+          </div>
+
+          {/* Live exchange-trading toggle — fires /api/settings/connections/[id]/live-trade */}
+          <Button
+            size="sm"
+            variant={liveTradeActive ? "default" : "outline"}
+            onClick={handleToggleLiveTrade}
+            disabled={liveTradeLoading}
+            className={`h-7 text-xs px-2.5 gap-1 ${liveTradeActive ? "bg-green-600 hover:bg-green-700 text-white" : ""}`}
+            title={liveTradeActive ? "Live exchange trading is ON — click to disable" : "Enable live exchange trading"}
+            aria-pressed={liveTradeActive}
+          >
+            {liveTradeLoading
+              ? <Loader2 className="w-3 h-3 animate-spin" />
+              : (
+                <span className={`relative flex h-2 w-2 ${liveTradeActive ? "" : "opacity-40"}`}>
+                  {liveTradeActive && (
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-300 opacity-75" />
+                  )}
+                  <span className={`relative inline-flex rounded-full h-2 w-2 ${liveTradeActive ? "bg-white" : "bg-muted-foreground"}`} />
+                </span>
+              )
+            }
+            Live{liveTradeActive ? " ON" : ""}
           </Button>
 
           <Button
-            size="sm"
-            variant="outline"
-            onClick={handleRefreshStatus}
-            disabled={volatileSymbol.loading}
-            className="h-7 text-xs px-2.5 flex items-center gap-1"
+            size="sm" variant="outline"
+            onClick={handleRefresh}
+            disabled={volatileSymbol.loading || loadingStats}
+            className="h-7 text-xs px-2 gap-1"
           >
-            {volatileSymbol.loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+            {(volatileSymbol.loading || loadingStats)
+              ? <Loader2 className="w-3 h-3 animate-spin" />
+              : <RefreshCw className="w-3 h-3" />
+            }
             Refresh
           </Button>
 
-          <Button
-            size="sm"
-            variant={showDetails ? "default" : "outline"}
-            onClick={() => setShowDetails(!showDetails)}
-            className="h-7 text-xs px-2.5 flex items-center gap-1 ml-auto"
-          >
-            <Activity className="w-3 h-3" />
-            {showDetails ? "Hide" : "Show"} Details
-          </Button>
-        </div>
+          {/* dialog launchers */}
+          <QuickstartOverviewDialog />
+          <QuickstartComprehensiveLogDialog />
 
-        {/* Expanded details section */}
-        {showDetails && (
-          <Tabs defaultValue="logs" className="w-full">
-            <TabsList className="grid w-full grid-cols-2 h-7">
-              <TabsTrigger value="logs" className="text-xs h-6">Logs</TabsTrigger>
-              <TabsTrigger value="stats" className="text-xs h-6">Stats</TabsTrigger>
-            </TabsList>
-
-            <TabsContent value="logs" className="mt-2">
-              <ScrollArea className="h-[220px] border border-border rounded-md p-2 text-xs">
-                {logs.length === 0 ? (
-                  <p className="text-muted-foreground text-center py-8">Logs will appear here when engine is running</p>
-                ) : (
-                  <div className="space-y-1">
-                    {logs.map((log) => (
-                      <div key={log.id} className="flex gap-2 text-xs">
-                        <span className="text-muted-foreground flex-shrink-0 font-mono text-[10px]">
-                          {log.timestamp.toLocaleTimeString()}
-                        </span>
-                        <span className={`flex-1 ${getLogColor(log.type)}`}>{log.message}</span>
-                      </div>
-                    ))}
-                    <div ref={logsEndRef} />
-                  </div>
-                )}
-              </ScrollArea>
-            </TabsContent>
-
-            <TabsContent value="stats" className="mt-2">
-              <div className="grid grid-cols-3 gap-2">
-                {[
-                  { label: "Cycles", value: stats.cycles, icon: "🔄" },
-                  { label: "Indications", value: stats.indications, icon: "📊" },
-                  { label: "Strategies", value: stats.strategies, icon: "🎯" },
-                  { label: "Positions", value: stats.positions, icon: "📈" },
-                  { label: "Success %", value: stats.successRate.toFixed(1), icon: "✓" },
-                  { label: "Profit $", value: stats.profit.toFixed(2), icon: "$" },
-                ].map((stat) => (
-                  <Card key={stat.label} className="p-2 bg-muted/50">
-                    <div className="text-[10px] text-muted-foreground">{stat.label}</div>
-                    <div className="text-lg font-bold flex items-center gap-1">
-                      <span>{stat.icon}</span>
-                      <span>{stat.value}</span>
-                    </div>
-                  </Card>
-                ))}
-              </div>
-            </TabsContent>
-          </Tabs>
-        )}
-
-        {/* Log buttons — second row */}
-        <div className="flex flex-wrap gap-1.5 pt-1.5 border-t border-border/30">
+          {/* legacy event buttons */}
           {[
-            { label: "Logs", event: "open-logs-dialog" },
             { label: "Progression", event: "open-progression-logs" },
             { label: "Indications", event: "open-indications-logs" },
-            { label: "Strategies", event: "open-strategies-logs" },
+            { label: "Strategies",  event: "open-strategies-logs"  },
           ].map(({ label, event }) => (
             <Button
               key={event}
-              size="sm"
-              variant="ghost"
+              size="sm" variant="ghost"
               onClick={() => window.dispatchEvent(new CustomEvent(event))}
-              className="h-6 text-[11px] px-2 flex items-center gap-1"
+              className="h-7 text-[11px] px-2 gap-1"
             >
               <FileText className="w-2.5 h-2.5" />
               {label}
             </Button>
           ))}
+
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setExpanded(e => !e)}
+            className="h-7 text-[11px] px-2 gap-1 ml-auto"
+            aria-expanded={expanded}
+          >
+            <Activity className="w-3 h-3" />
+            {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+          </Button>
         </div>
 
+        {/* ── historical processing row (always visible, BEFORE live stats) ──
+            Shows prehistoric load status up-front so users can see how much
+            historical context the engine has behind it before we show any
+            realtime cycle counters. This mirrors the ordering the engine
+            itself follows: historic data is loaded first, then live loops
+            start — so the dashboard should read the same way top-to-bottom.
+         */}
+        <div
+          className={`flex flex-wrap items-center gap-1.5 rounded-md border px-2 py-1.5 ${
+            stats.historicComplete
+              ? "bg-green-50/50 dark:bg-green-950/20 border-green-500/20"
+              : "bg-blue-50/40 dark:bg-blue-950/20 border-blue-500/20"
+          }`}
+        >
+          <div className="flex items-center gap-1.5 shrink-0">
+            <Database className={`w-3.5 h-3.5 ${stats.historicComplete ? "text-green-600 dark:text-green-500" : "text-blue-600 dark:text-blue-500"}`} />
+            <span className="text-[11px] font-semibold text-foreground">Historical</span>
+            {stats.historicComplete ? (
+              <Badge className="bg-green-600 hover:bg-green-600 text-white h-4 text-[9px] px-1.5 py-0">Loaded</Badge>
+            ) : (
+              <Badge variant="secondary" className="h-4 text-[9px] px-1.5 py-0 tabular-nums">
+                {stats.historicProgress}%
+              </Badge>
+            )}
+          </div>
+
+          {/* inline progress bar when still loading — keeps the row slim */}
+          {!stats.historicComplete && (
+            <div className="flex-1 min-w-[80px] max-w-[160px] h-1 bg-muted rounded-full overflow-hidden">
+              <div
+                className="h-full bg-blue-500/70 rounded-full transition-all"
+                style={{ width: `${Math.min(100, Math.max(0, stats.historicProgress))}%` }}
+              />
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-1.5 ml-auto">
+            <MiniStat
+              label="Symbols"
+              value={`${stats.historicSymbols}/${stats.historicSymbolsTotal || "—"}`}
+            />
+            {/* Frames — the BIG count when timeframe=1s. Each frame = one
+                timeframe-interval tick processed by the config-set processor.
+                At 1s over 8h this is ~28,800 per symbol, which is the
+                "big number" the dashboard used to miss entirely. */}
+            {stats.historicFrames > 0 && (
+              <MiniStat
+                label={stats.historicTimeframeSec === 1 ? "Frames 1s" : `Frames ${stats.historicTimeframeSec}s`}
+                value={fmt(stats.historicFrames)}
+                sub={stats.historicFramesMissing > 0 ? `${fmt(stats.historicFramesMissing)} new` : undefined}
+              />
+            )}
+            {stats.historicCandles > 0 && (
+              <MiniStat label="Candles" value={fmt(stats.historicCandles)} />
+            )}
+            {stats.historicIndicators > 0 && (
+              <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
+            )}
+            <MiniStat label="P-Cycles" value={fmt(stats.historicCycles)} />
+          </div>
+        </div>
+
+        {/* ── live processing row (always visible, AFTER historical) ───── */}
+        <div className="flex flex-wrap gap-1.5">
+          <MiniStat label="Ind Cycles"   value={fmt(stats.indicationCycles)}  />
+          <MiniStat label="Indications"  value={fmt(stats.indicationsTotal)}   />
+          <MiniStat label="Strategies"   value={fmt(stats.strategiesTotal)}    />
+          <MiniStat label="Positions"    value={fmt(stats.positionsOpen)}      />
+          {/* Live positions — real exchange positions mirrored by the live engine.
+              Always shown (even at 0) so users can see the counter spin up. */}
+          <div
+            className={`flex flex-col items-center justify-center rounded px-2 py-1.5 min-w-[52px] border ${
+              stats.livePositionsOpen > 0
+                ? "bg-green-50 dark:bg-green-950/30 border-green-300 dark:border-green-900/50"
+                : "bg-muted/60 border-transparent"
+            }`}
+            title={`Live positions open on exchange · Filled ${stats.liveOrdersFilled}/${stats.liveOrdersPlaced} · WR ${stats.liveWinRate.toFixed(1)}%`}
+          >
+            <span className={`text-[13px] font-bold tabular-nums leading-none ${
+              stats.livePositionsOpen > 0 ? "text-green-700 dark:text-green-400" : "text-foreground"
+            }`}>
+              {fmt(stats.livePositionsOpen)}
+            </span>
+            <span className="text-[9px] text-muted-foreground leading-none mt-0.5 flex items-center gap-0.5">
+              {liveTradeActive && stats.livePositionsOpen > 0 && (
+                <span className="relative flex h-1.5 w-1.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500" />
+                </span>
+              )}
+              Live Pos
+            </span>
+          </div>
+          <MiniStat label="Success"      value={`${stats.successRate.toFixed(0)}%`} />
+          {stats.avgCycleMs > 0 && (
+            <MiniStat label="Avg Cycle"  value={`${stats.avgCycleMs}ms`}      />
+          )}
+          {stats.indLast5m > 0 && (
+            <MiniStat label="5m Ind"     value={fmt(stats.indLast5m)}          sub="last 5min" />
+          )}
+          {stats.indLast60m > 0 && (
+            <MiniStat label="60m Ind"    value={fmt(stats.indLast60m)}         sub="last 60min" />
+          )}
+        </div>
+
+        {/* ── expanded panel ─────────────────────────────────────────────── */}
+        {expanded && (
+          <div className="space-y-2 pt-1 border-t border-border/40">
+
+            {/* historic / prehistoric processing */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-2">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-foreground">
+                <Database className="w-3.5 h-3.5 text-blue-500" />
+                Prehistoric Processing
+                {stats.historicComplete
+                  ? <CheckCircle2 className="w-3 h-3 text-green-500 ml-auto" />
+                  : <Circle className="w-3 h-3 text-muted-foreground/40 ml-auto" />
+                }
+                <span className="text-muted-foreground font-normal ml-0.5">
+                  {stats.historicComplete ? "Loaded" : `${stats.historicProgress}%`}
+                </span>
+              </div>
+              {!stats.historicComplete && (
+                <Progress value={stats.historicProgress} className="h-1" />
+              )}
+              <div className="flex flex-wrap gap-1.5">
+                <MiniStat label="Symbols"    value={`${stats.historicSymbols}/${stats.historicSymbolsTotal}`} />
+                <MiniStat label="Preh Cycles" value={fmt(stats.historicCycles)} />
+                {stats.historicFrames > 0 && (
+                  <MiniStat
+                    label={`Frames ${stats.historicTimeframeSec}s`}
+                    value={fmt(stats.historicFrames)}
+                    sub={stats.historicFramesMissing > 0 ? `${fmt(stats.historicFramesMissing)} missing` : undefined}
+                  />
+                )}
+                {stats.historicCandles > 0 && (
+                  <MiniStat label="Candles" value={fmt(stats.historicCandles)} />
+                )}
+                {stats.historicIndicators > 0 && (
+                  <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
+                )}
+              </div>
+            </div>
+
+            {/* processing cycles overview */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <Activity className="w-3.5 h-3.5 text-blue-500" />
+                Processing Cycles
+                {stats.realtimeCycles > 0 && (
+                  <span className="ml-auto text-[10px] text-muted-foreground font-normal">
+                    Realtime {fmt(stats.realtimeCycles)}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                <MiniStat label="Ind Cycles"  value={fmt(stats.indicationCycles)} sub={stats.realtimeCycles > 0 ? `${((stats.indicationCycles / Math.max(stats.realtimeCycles, 1)) * 100).toFixed(0)}% rt` : undefined} />
+                <MiniStat label="Strat Cycles" value={fmt(stats.strategyCycles)}  sub={stats.indicationCycles > 0 ? `${((stats.strategyCycles / Math.max(stats.indicationCycles, 1)) * 100).toFixed(0)}% of ind` : undefined} />
+                {stats.realtimeCycles > 0 && (
+                  <MiniStat label="RT Cycles" value={fmt(stats.realtimeCycles)} />
+                )}
+                <MiniStat label="Indications" value={fmt(stats.indicationsTotal)} sub={stats.indicationCycles > 0 ? `${(stats.indicationsTotal / Math.max(stats.indicationCycles, 1)).toFixed(1)}/cyc` : undefined} />
+                <MiniStat label="Strategies"  value={fmt(stats.strategiesTotal)}  sub={stats.strategyCycles > 0 ? `${(stats.strategiesTotal / Math.max(stats.strategyCycles, 1)).toFixed(1)}/cyc` : undefined} />
+              </div>
+            </div>
+
+            {/* indications breakdown */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                  <Zap className="w-3.5 h-3.5 text-violet-500" />
+                  Indications
+                </div>
+                <span className="text-[10px] text-muted-foreground tabular-nums">
+                  Total {fmt(stats.indicationsTotal)}
+                  {stats.indLast5m > 0 ? ` · 5m: ${fmt(stats.indLast5m)}` : ""}
+                  {stats.indLast60m > 0 ? ` · 60m: ${fmt(stats.indLast60m)}` : ""}
+                </span>
+              </div>
+              <div className="space-y-1">
+                {indTypes.map(({ label, value }) => {
+                  const pct = Math.min(100, (value / totalInd) * 100)
+                  return (
+                    <div key={label} className="flex items-center gap-2 text-[10px]">
+                      <span className="w-7 text-muted-foreground shrink-0">{label}</span>
+                      <div className="flex-1 h-1 bg-muted rounded-full overflow-hidden">
+                        <div className="h-full bg-violet-500/70 rounded-full" style={{ width: `${pct}%` }} />
+                      </div>
+                      <span className="w-10 text-right tabular-nums font-medium">{fmt(value)}</span>
+                      <span className="w-8 text-right tabular-nums text-muted-foreground">{pct.toFixed(0)}%</span>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+
+            {/* strategies breakdown */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <BarChart3 className="w-3.5 h-3.5 text-amber-500" />
+                Strategies
+                <span className="ml-auto text-[10px] text-muted-foreground font-normal">
+                  Total {fmt(stats.stratBase + stats.stratMain + stats.stratReal + stats.stratLive)}
+                </span>
+              </div>
+              <div className="grid grid-cols-4 gap-1.5 text-center text-[10px]">
+                {[
+                  { label: "Base", value: stats.stratBase, color: "text-orange-600 dark:text-orange-400", ratio: null },
+                  { label: "Main", value: stats.stratMain, color: "text-yellow-600 dark:text-yellow-400", ratio: stats.stratBase > 0 ? `${((stats.stratMain / stats.stratBase) * 100).toFixed(0)}%` : null },
+                  { label: "Real", value: stats.stratReal, color: "text-green-600 dark:text-green-400",   ratio: stats.stratMain > 0 ? `${((stats.stratReal / stats.stratMain) * 100).toFixed(0)}%` : null },
+                  { label: "Live", value: stats.stratLive, color: "text-blue-600 dark:text-blue-400",     ratio: stats.stratReal > 0 ? `${((stats.stratLive / stats.stratReal) * 100).toFixed(0)}%` : null },
+                ].map(({ label, value, color, ratio }) => (
+                  <div key={label} className="rounded bg-muted/60 py-1.5 px-1">
+                    <div className={`text-sm font-bold tabular-nums ${color}`}>{fmt(value)}</div>
+                    <div className="text-muted-foreground">{label}</div>
+                    {ratio && <div className="text-[9px] text-muted-foreground/70">{ratio}</div>}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* ── Strategy Stages — detailed per-stage metrics ───────────
+                Shows sets validated from prev stage (passed count), avg
+                positions per Set, avg profit factor and avg drawdown time
+                for each stage of the BASE → MAIN → REAL → LIVE flow.
+
+                These values come from `strategy_detail:{connId}:{stage}`
+                Redis hashes, written by StrategyCoordinator after each
+                cycle. Missing columns render as "—" when the stage hasn't
+                produced work yet (e.g. Real before any Main set passes).
+             */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <BarChart3 className="w-3.5 h-3.5 text-green-600 dark:text-green-500" />
+                Strategy Stages — Validated Sets & Averages
+                <span className="ml-auto text-[10px] text-muted-foreground font-normal">
+                  From prev stage
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-[10px] tabular-nums">
+                  <thead>
+                    <tr className="text-muted-foreground border-b border-border/40">
+                      <th className="text-left py-1 pr-2 font-medium">Stage</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Sets that passed the filter from the previous stage">Valid/Prev</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Average config entries per Set (position coordinations)">Pos/Set</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Average profit factor across validated Sets">PF</th>
+                      <th className="text-right py-1 pl-1 font-medium" title="Average drawdown time in minutes">DDT m</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[
+                      { label: "Base", color: "text-orange-600 dark:text-orange-400", d: stats.stageBase, prev: 0 },
+                      { label: "Main", color: "text-yellow-600 dark:text-yellow-400", d: stats.stageMain, prev: stats.stageBase.createdSets },
+                      { label: "Real", color: "text-green-600 dark:text-green-400",   d: stats.stageReal, prev: stats.stageMain.createdSets },
+                      { label: "Live", color: "text-blue-600 dark:text-blue-400",     d: stats.stageLive, prev: stats.stageReal.createdSets },
+                    ].map(({ label, color, d, prev }) => (
+                      <tr key={label} className="border-b border-border/20 last:border-0">
+                        <td className={`py-1 pr-2 font-semibold ${color}`}>{label}</td>
+                        <td className="text-right py-1 px-1">
+                          {fmt(d.passed || d.createdSets)}
+                          <span className="text-muted-foreground">/{prev > 0 ? fmt(prev) : "—"}</span>
+                          {d.passRatio > 0 && (
+                            <span className="text-muted-foreground/70 text-[9px] ml-1">{d.passRatio.toFixed(0)}%</span>
+                          )}
+                        </td>
+                        <td className="text-right py-1 px-1">{d.avgPosPerSet > 0 ? d.avgPosPerSet.toFixed(1) : "—"}</td>
+                        <td className="text-right py-1 px-1">{d.avgProfitFactor > 0 ? d.avgProfitFactor.toFixed(2) : "—"}</td>
+                        <td className="text-right py-1 pl-1">{d.avgDrawdownTime > 0 ? Math.round(d.avgDrawdownTime) : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* ── Main-stage Coordination snapshot ────────────────────────
+                Shows how the Main stage is coordinating RIGHT NOW:
+                  • active variants gated ON by the live position context
+                  • cache reuse rate (higher = Main isn't re-expanding
+                    unchanged Base Sets every cycle = cheaper + faster)
+                  • the position-context snapshot (open positions, recent
+                    wins/losses) that drives which variants are active
+                This gives the operator an immediate yes/no answer to
+                "is the Main stage coordinating correctly?" without
+                having to read the variants table.
+             */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <Activity className="w-3.5 h-3.5 text-emerald-500" />
+                Main Coordination
+                <span className="ml-auto text-[10px] text-muted-foreground font-normal">
+                  {stats.mainCoord.totalCycles > 0 ? `${fmt(stats.mainCoord.totalCycles)} cycles` : "idle"}
+                </span>
+              </div>
+              {/* Active variants pills — green = active this cycle, muted = gated off */}
+              <div className="flex flex-wrap items-center gap-1 text-[10px]">
+                <span className="text-muted-foreground mr-1">Active variants:</span>
+                {(["default", "trailing", "block", "dca"] as const).map((v) => {
+                  const active = stats.mainCoord.activeVariants.includes(v)
+                  return (
+                    <span
+                      key={v}
+                      className={
+                        "rounded px-1.5 py-0.5 font-medium tabular-nums " +
+                        (active
+                          ? "bg-emerald-500/20 text-emerald-700 dark:text-emerald-400"
+                          : "bg-muted/60 text-muted-foreground/70")
+                      }
+                      title={active ? "Gated active this cycle" : "Gated off by position context"}
+                    >
+                      {v}
+                    </span>
+                  )
+                })}
+                <span className="ml-auto text-muted-foreground">
+                  {stats.mainCoord.activeVariantCount}/4
+                </span>
+              </div>
+
+              {/* Grid: reuse metrics | position context */}
+              <div className="grid grid-cols-2 gap-2 text-[10px]">
+                {/* Reuse / creation metrics */}
+                <div className="rounded bg-muted/40 p-1.5 space-y-0.5">
+                  <div className="text-muted-foreground text-[9px] uppercase tracking-wide">
+                    Related Sets
+                  </div>
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
+                      {fmt(stats.mainCoord.totalReused)}
+                    </span>
+                    <span className="text-muted-foreground">reused</span>
+                    <span className="ml-auto text-muted-foreground tabular-nums">
+                      {stats.mainCoord.reuseRate > 0 ? `${stats.mainCoord.reuseRate.toFixed(1)}%` : "—"}
+                    </span>
+                  </div>
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-semibold tabular-nums">
+                      {fmt(stats.mainCoord.totalCreated)}
+                    </span>
+                    <span className="text-muted-foreground">created</span>
+                    <span className="ml-auto text-muted-foreground tabular-nums">
+                      last: {stats.mainCoord.lastCreated}+{stats.mainCoord.lastReused}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Position context — drives variant gating */}
+                <div className="rounded bg-muted/40 p-1.5 space-y-0.5">
+                  <div className="text-muted-foreground text-[9px] uppercase tracking-wide">
+                    Position Context
+                  </div>
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-semibold tabular-nums">
+                      {stats.mainCoord.positionContext.continuous}
+                    </span>
+                    <span className="text-muted-foreground">open</span>
+                    <span className="ml-auto text-muted-foreground tabular-nums">
+                      <span className="text-emerald-600 dark:text-emerald-400">{stats.mainCoord.positionContext.lastWins}W</span>
+                      {" / "}
+                      <span className="text-rose-600 dark:text-rose-400">{stats.mainCoord.positionContext.lastLosses}L</span>
+                      <span className="text-muted-foreground/70"> last5</span>
+                    </span>
+                  </div>
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-semibold tabular-nums">
+                      {stats.mainCoord.positionContext.prevTotal}
+                    </span>
+                    <span className="text-muted-foreground">closed 24h</span>
+                    <span className="ml-auto text-muted-foreground tabular-nums">
+                      <span className="text-rose-600 dark:text-rose-400">{stats.mainCoord.positionContext.prevLosses}L</span>
+                      <span className="text-muted-foreground/70"> / total</span>
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* ── Strategy Variants — per-type breakdown ─────────────────
+                The Main stage now produces one DEDICATED Set per active
+                variant (linked to its Base parent via parentSetKey):
+                  Default  — always on: validates the Base Set
+                  Trailing — recent winners with no open position
+                  Block    — open position available to add to
+                  DCA      — recent losses to recover
+                Each row shows cumulative Sets containing that variant,
+                total position-coordination entries emitted, avg positions
+                per Set, and the weighted PF/DDT across entries of the
+                variant. The "Overall" row is a createdSets-weighted mean
+                across all four variants.
+             */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <BarChart3 className="w-3.5 h-3.5 text-sky-500" />
+                Strategy Variants — PF &amp; DDT per Type
+                <span className="ml-auto text-[10px] text-muted-foreground font-normal">
+                  Positions @ Main
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-[10px] tabular-nums">
+                  <thead>
+                    <tr className="text-muted-foreground border-b border-border/40">
+                      <th className="text-left py-1 pr-2 font-medium">Type</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Sets containing ≥1 entry of this variant">Sets</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Total position-coordination entries of this variant">Entries</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Average entries per Set for this variant">Pos/Set</th>
+                      <th className="text-right py-1 px-1 font-medium">PF</th>
+                      <th className="text-right py-1 pl-1 font-medium">DDT m</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[
+                      { label: "Default",  color: "text-slate-600  dark:text-slate-400",  d: stats.variantDefault  },
+                      { label: "Trailing", color: "text-cyan-600   dark:text-cyan-400",   d: stats.variantTrailing },
+                      { label: "Block",    color: "text-fuchsia-600 dark:text-fuchsia-400", d: stats.variantBlock   },
+                      { label: "DCA",      color: "text-amber-600  dark:text-amber-400",  d: stats.variantDca      },
+                    ].map(({ label, color, d }) => (
+                      <tr key={label} className="border-b border-border/20">
+                        <td className={`py-1 pr-2 font-semibold ${color}`}>{label}</td>
+                        <td className="text-right py-1 px-1">{fmt(d.createdSets)}</td>
+                        <td className="text-right py-1 px-1">{fmt(d.entriesCount)}</td>
+                        <td className="text-right py-1 px-1">{d.avgPosPerSet > 0 ? d.avgPosPerSet.toFixed(1) : "—"}</td>
+                        <td className="text-right py-1 px-1">{d.avgProfitFactor > 0 ? d.avgProfitFactor.toFixed(2) : "—"}</td>
+                        <td className="text-right py-1 pl-1">{d.avgDrawdownTime > 0 ? Math.round(d.avgDrawdownTime) : "—"}</td>
+                      </tr>
+                    ))}
+                    <tr className="border-t-2 border-border/40 font-semibold">
+                      <td className="py-1 pr-2 text-foreground">Overall</td>
+                      <td className="text-right py-1 px-1">{fmt(stats.variantOverall.createdSets)}</td>
+                      <td className="text-right py-1 px-1">{fmt(stats.variantOverall.entriesCount)}</td>
+                      <td className="text-right py-1 px-1">
+                        {stats.variantOverall.createdSets > 0
+                          ? (stats.variantOverall.entriesCount / Math.max(1, stats.variantOverall.createdSets)).toFixed(1)
+                          : "—"}
+                      </td>
+                      <td className="text-right py-1 px-1">{stats.variantOverall.avgProfitFactor > 0 ? stats.variantOverall.avgProfitFactor.toFixed(2) : "—"}</td>
+                      <td className="text-right py-1 pl-1">{stats.variantOverall.avgDrawdownTime > 0 ? Math.round(stats.variantOverall.avgDrawdownTime) : "—"}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* processing status pills */}
+            <div className="flex flex-wrap gap-1.5 text-[10px]">
+              {[
+                { label: "Prehistoric",  done: stats.historicComplete },
+                { label: "Indications",  done: stats.indicationCycles > 0 },
+                { label: "Strategies",   done: stats.strategyCycles > 0 },
+                { label: "Realtime",     done: stats.isActive },
+              ].map(({ label, done }) => (
+                <div key={label} className={`flex items-center gap-1 px-2 py-0.5 rounded-full border ${done ? "border-green-500/30 bg-green-500/10 text-green-700 dark:text-green-400" : "border-border bg-muted/30 text-muted-foreground"}`}>
+                  {done ? <CheckCircle2 className="w-2.5 h-2.5" /> : <AlertCircle className="w-2.5 h-2.5 opacity-40" />}
+                  {label}
+                </div>
+              ))}
+              {stats.avgCycleMs > 0 && (
+                <div className="flex items-center gap-1 px-2 py-0.5 rounded-full border border-border bg-muted/30 text-muted-foreground">
+                  <Clock className="w-2.5 h-2.5" />
+                  {stats.avgCycleMs}ms avg
+                </div>
+              )}
+            </div>
+
+            {/* startup logs */}
+            {logs.length > 0 && (
+              <div className="rounded-md border bg-muted/20">
+                <ScrollArea className="h-[120px] p-2">
+                  <div className="space-y-0.5">
+                    {logs.map(log => (
+                      <div key={log.id} className="flex gap-2 text-[10px]">
+                        <span className="text-muted-foreground shrink-0 font-mono">
+                          {log.timestamp.toLocaleTimeString()}
+                        </span>
+                        <span className={`flex-1 ${logColor(log.type)}`}>{log.message}</span>
+                      </div>
+                    ))}
+                    <div ref={logsEndRef} />
+                  </div>
+                </ScrollArea>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </Card>
   )

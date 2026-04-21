@@ -75,7 +75,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
        const coordinator = getGlobalTradeEngineCoordinator()
        if (coordinator) {
          isEngineRunning = coordinator.isEngineRunning(connectionId)
-         console.log(`[v0] [ProgressionAPI] ${connectionId}: Coordinator reports engine running = ${isEngineRunning}`)
        }
      } catch (e) {
        console.warn(`[v0] [ProgressionAPI] ${connectionId}: Failed to check coordinator state, falling back to Redis flag`)
@@ -95,33 +94,34 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       return ProgressionStateManager.getDefaultState(connectionId)
     })
     
-    // Count indications processed for this connection
-    let indicationsCount = 0
-    let strategiesCount = 0
+    // Read live progression hash (written EVERY cycle) for real-time counts
+    // This is more current than engineState which persists only every 50-100 cycles
+    let progHash: Record<string, string> = {}
     try {
-      if (client) {
-        indicationsCount =
-          toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0)) ||
-          (await client.keys(`indications:${connectionId}:*`).catch(() => [])).length
+      progHash = (await client.hgetall(`progression:${connectionId}`)) || {}
+    } catch { /* non-critical */ }
 
-        strategiesCount =
-          toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0)) ||
-          (await client.keys(`strategies:${connectionId}:*`).catch(() => [])).length
-      }
-    } catch {
-      indicationsCount = 0
-      strategiesCount = 0
+    let indicationsCount = parseInt(progHash.indications_count || "0", 10)
+    let strategiesCount  = parseInt(progHash.strategies_count  || "0", 10)
+
+    // Fallback to string counter keys written by statistics-tracker
+    if (indicationsCount === 0) {
+      indicationsCount = toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0))
     }
-    
-    // Check for actual running evidence from cycle counts in engine state
-    const indicationCycleCount = toNumber(engineState?.indication_cycle_count)
-    const strategyCycleCount = toNumber(engineState?.strategy_cycle_count)
+    if (strategiesCount === 0) {
+      strategiesCount = toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0))
+    }
+
+    // Cycle counts: prefer live progression hash over engineState (more current)
+    const indicationCycleCount =
+      parseInt(progHash.indication_cycle_count || "0", 10) ||
+      toNumber(engineState?.indication_cycle_count)
+    const strategyCycleCount =
+      parseInt(progHash.strategy_cycle_count || "0", 10) ||
+      toNumber(engineState?.strategy_cycle_count)
     const hasRecentActivity = engineState?.last_indication_run 
       ? (Date.now() - new Date(engineState.last_indication_run).getTime()) < 60000 // Active in last 60s
       : false
-    
-    // DEBUG: Log what we're reading (production safe)
-    console.log(`[v0] [ProgressionAPI] ${connectionId}: cycleCount=${indicationCycleCount}, stratCount=${strategyCycleCount}, recent=${hasRecentActivity}, engineState.status=${engineState?.status}, running=${isEngineRunning}`)
     
     // Engine is running only when there is current runtime evidence
     const engineRunning = isEngineRunning || 
@@ -139,18 +139,15 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       phase = "live_trading"
       progress = 100
       detail = `Live trading active - ${Math.max(indicationCycleCount, progressionState.cyclesCompleted)} cycles`
-      console.log(`[v0] [Phase] ${connectionId}: Strong cycles evidence → live_trading`)
     } else if (indicationCycleCount > 20 || progressionState.cyclesCompleted > 20 || indicationsCount > 50) {
       phase = "live_trading"
       progress = 90 + Math.min(10, indicationCycleCount / 100)
       detail = `Live trading - ${Math.max(indicationCycleCount, progressionState.cyclesCompleted)} cycles`
-      console.log(`[v0] [Phase] ${connectionId}: Moderate cycles (${indicationCycleCount}) OR indications (${indicationsCount}) → live_trading`)
     } else if (indicationCycleCount > 0 || indicationsCount > 0 || progressionState.cyclesCompleted > 0) {
       const totalCycles = Math.max(progressionState.cyclesCompleted, indicationCycleCount)
       phase = "realtime"
       progress = 80 + Math.min(20, totalCycles / 10)
       detail = `Processing - ${totalCycles} cycles`
-      console.log(`[v0] [Phase] ${connectionId}: Initial cycles (${indicationCycleCount}) OR keys (${indicationsCount}) → realtime`)
     } else if (progression?.phase && !["ready", "idle", "initializing"].includes(progression.phase)) {
       phase = progression.phase
       progress = Number(progression.progress) || 50
@@ -199,28 +196,74 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     
     try {
       if (client) {
-        // Check for prehistoric progress tracking in Redis
-        const prehistoricData = await client.hgetall(`prehistoric:${connectionId}`).catch(() => ({}))
-        if (prehistoricData && Object.keys(prehistoricData).length > 0) {
+        // Check for prehistoric progress tracking in Redis. All three sources
+        // are read in parallel — the hash holds the canonical state written by
+        // EngineManager / ConfigSetProcessor, the SADD set is the source of
+        // truth for the list of processed symbols, and the `:done` marker
+        // lets us flip to 100% even if the hash's `is_complete` field was
+        // written before a hot reload.
+        const [prehistoricDataRaw, prehistoricSymbolsSet, doneMarker] = await Promise.all([
+          client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
+          client.smembers(`prehistoric:${connectionId}:symbols`).catch(() => [] as string[]),
+          client.get(`prehistoric:${connectionId}:done`).catch(() => null),
+        ])
+        const prehistoricData = (prehistoricDataRaw as Record<string, string> | null) || {}
+        const processedSet = Array.isArray(prehistoricSymbolsSet) ? prehistoricSymbolsSet : []
+
+        if (Object.keys(prehistoricData).length > 0 || processedSet.length > 0 || doneMarker) {
           prehistoricProgress.currentSymbol = prehistoricData.current_symbol || ""
           prehistoricProgress.candlesLoaded = Number(prehistoricData.candles_loaded || 0)
           prehistoricProgress.candlesTotal = Number(prehistoricData.candles_total || 0)
           prehistoricProgress.indicatorsCalculated = Number(prehistoricData.indicators_calculated || 0)
-          prehistoricProgress.duration = Number(prehistoricData.duration || 0)
-          
-          // Count symbols processed based on completed prehistoric phases tracked in engine state
-          const prehistoricSymbols = await client.keys(`prehistoric:${connectionId}:*:completed`).catch(() => [])
-          prehistoricProgress.symbolsProcessed = Math.min(prehistoricSymbols.length, prehistoricProgress.symbolsTotal)
-          
-          // If no completed symbols tracked yet, infer from current activity
-          if (prehistoricProgress.symbolsProcessed === 0 && prehistoricProgress.currentSymbol) {
-            prehistoricProgress.symbolsProcessed = 1
+          prehistoricProgress.duration = Number(
+            prehistoricData.total_duration_ms || prehistoricData.duration || 0,
+          )
+
+          // symbolsTotal from the hash wins over the hard-coded 3 default so
+          // multi-symbol quick-starts render the correct denominator.
+          const hashSymbolsTotal = Number(prehistoricData.symbols_total || 0)
+          if (hashSymbolsTotal > 0) {
+            prehistoricProgress.symbolsTotal = hashSymbolsTotal
           }
-          
-          // Calculate percentage (symbols based, since that's the main progress unit)
-          prehistoricProgress.percentComplete = prehistoricProgress.symbolsTotal > 0
-            ? Math.round((prehistoricProgress.symbolsProcessed / prehistoricProgress.symbolsTotal) * 100)
-            : 0
+
+          // symbolsProcessed — canonical source of truth, in priority order:
+          //   1. Hash field `symbols_processed` (written by engine-manager /
+          //      config-set-processor on each symbol completion)
+          //   2. SCARD of the `prehistoric:{id}:symbols` SADD set
+          //   3. Legacy `:*:completed` key scan (never written since v5 but
+          //      kept for back-compat during migrations)
+          //   4. Fall back to 1 if currently processing a symbol
+          const hashProcessed = Number(prehistoricData.symbols_processed || 0)
+          const setProcessed = processedSet.length
+          let processed = Math.max(hashProcessed, setProcessed)
+          if (processed === 0) {
+            const legacyCompleted = await client
+              .keys(`prehistoric:${connectionId}:*:completed`)
+              .catch(() => [] as string[])
+            processed = Array.isArray(legacyCompleted) ? legacyCompleted.length : 0
+          }
+          if (processed === 0 && prehistoricProgress.currentSymbol) processed = 1
+          prehistoricProgress.symbolsProcessed = Math.min(
+            processed,
+            prehistoricProgress.symbolsTotal,
+          )
+
+          // isComplete → either explicit flag, `:done` marker, or all symbols processed.
+          const isComplete =
+            prehistoricData.is_complete === "1" ||
+            prehistoricData.is_complete === "true" ||
+            doneMarker === "1" ||
+            doneMarker === 1 ||
+            (prehistoricProgress.symbolsTotal > 0 &&
+              prehistoricProgress.symbolsProcessed >= prehistoricProgress.symbolsTotal)
+
+          prehistoricProgress.percentComplete = isComplete
+            ? 100
+            : prehistoricProgress.symbolsTotal > 0
+              ? Math.round(
+                  (prehistoricProgress.symbolsProcessed / prehistoricProgress.symbolsTotal) * 100,
+                )
+              : 0
         }
       }
     } catch (e) {
@@ -242,14 +285,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // Derive detailed step flags from phase progression
     const phaseOrder = ["idle", "initializing", "prehistoric_data", "indications", "strategies", "realtime", "live_trading"]
     const currentIdx = phaseOrder.indexOf(phase)
-
-    console.log(`[v0] [Progression] Phase analysis for ${connName}:`, {
-      phase,
-      progress,
-      message,
-      phaseIndex: currentIdx,
-      running: engineRunning,
-    })
 
     // Get recent logs for this connection
     const recentLogs = await getProgressionLogs(connectionId)

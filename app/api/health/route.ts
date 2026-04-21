@@ -38,13 +38,13 @@ export async function GET() {
     for (const connection of connections) {
       try {
         const stateKey = `trade_engine_state:${connection.id}`
-        const state = await (client as any).hGetAll(stateKey)
+        const state = await client.hgetall(stateKey)
         if (state?.is_running === "1") {
           runningEngines++
         }
 
-        const trades = await (client as any).sMembers(`trades:${connection.id}`) || []
-        const positions = await (client as any).sMembers(`positions:${connection.id}`) || []
+        const trades = await client.smembers(`trades:${connection.id}`) || []
+        const positions = await client.smembers(`positions:${connection.id}`) || []
         totalTrades += trades.length
         totalPositions += positions.length
       } catch (error) {

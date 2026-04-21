@@ -2,14 +2,14 @@
 
 
 export const dynamic = "force-dynamic"
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
+import { Card, CardContent } from "@/components/ui/card"
 import { useState, useMemo, useEffect } from "react"
 import { Button } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
 import { PresetCardCompact } from "@/components/presets/preset-card-compact"
-import { Plus, RefreshCw, Download, BarChart3 } from "lucide-react"
+import { Plus, RefreshCw, BarChart3, CheckCircle2, Target, TrendingUp } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
 import { useExchange } from "@/lib/exchange-context"
+import { PageHeader } from "@/components/page-header"
 
 interface PresetTemplate {
   id: string
@@ -104,14 +104,20 @@ export default function PresetsPage() {
     return { total, enabled, avgProfit, avgWinRate }
   }, [presets])
 
+  /*
+   * Rewrote this page to:
+   *   - Use the shared PageHeader so the spacing/typography matches the
+   *     rest of the sidebar pages (previously it shipped a bespoke `<h1>`
+   *     header out of alignment with Live Trading / Indications).
+   *   - Replace hard-coded `bg-slate-50`, `text-blue-600`, etc. with
+   *     design tokens + accent tints that survive dark mode.
+   *   - Adopt the same "icon pill + stat number" pattern the other
+   *     sidebar pages now use so the dashboard reads as one system.
+   */
   return (
-    <div className="space-y-4 p-4">
-       {/* Header */}
-       <div className="flex items-center justify-between">
-         <div>
-           <h1 className="text-2xl font-bold">Trading Presets</h1>
-           <p className="text-xs text-muted-foreground mt-1">Pre-configured strategy templates</p>
-         </div>
+    <div className="p-4 space-y-4">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <PageHeader title="Trading Presets" description="Pre-configured strategy templates" />
         <div className="flex gap-2">
           <Button size="sm" className="h-8 text-xs">
             <Plus className="h-3 w-3 mr-1" />
@@ -124,26 +130,29 @@ export default function PresetsPage() {
         </div>
       </div>
 
-       {/* Stats */}
-       <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-         {[
-           { label: "Total", value: stats.total, color: "text-blue-600" },
-           { label: "Enabled", value: stats.enabled, color: "text-green-600" },
-           { label: "Avg Profit", value: stats.avgProfit.toFixed(2) + "%", color: stats.avgProfit > 0 ? "text-green-600" : "text-red-600" },
-           { label: "Avg WR", value: stats.avgWinRate.toFixed(0) + "%", color: "text-cyan-600" },
-         ].map((stat) => (
-           <Card key={stat.label} className="border-border bg-slate-50">
-             <CardContent className="p-2">
-               <div className={`text-lg font-bold ${stat.color}`}>{stat.value}</div>
-               <div className="text-xs text-muted-foreground">{stat.label}</div>
-             </CardContent>
-           </Card>
-         ))}
-       </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        {[
+          { icon: BarChart3,   label: "Total",      value: stats.total, tint: "text-primary" },
+          { icon: CheckCircle2,label: "Enabled",    value: stats.enabled, tint: "text-green-500" },
+          { icon: TrendingUp,  label: "Avg Profit", value: stats.avgProfit.toFixed(2) + "%", tint: stats.avgProfit > 0 ? "text-green-500" : "text-red-500" },
+          { icon: Target,      label: "Avg WR",     value: stats.avgWinRate.toFixed(0) + "%", tint: "text-primary" },
+        ].map((stat) => (
+          <Card key={stat.label} className="border-border bg-card">
+            <CardContent className="p-2 flex items-center gap-2">
+              <div className={`rounded bg-muted/60 p-1.5 ${stat.tint}`}>
+                <stat.icon className="h-3.5 w-3.5" />
+              </div>
+              <div className="min-w-0">
+                <div className={`text-base font-bold tabular-nums ${stat.tint}`}>{stat.value}</div>
+                <div className="text-[10px] text-muted-foreground uppercase tracking-wide">{stat.label}</div>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
 
-       {/* Filters */}
-       <div className="flex items-center justify-between text-xs px-3 py-2 bg-slate-50 rounded border border-border">
-        <div className="flex gap-1">
+      <div className="flex items-center justify-between gap-2 flex-wrap text-xs px-3 py-2 bg-muted/40 rounded-md border border-border">
+        <div className="flex gap-1 flex-wrap">
           <Button
             variant={filterType === null ? "default" : "outline"}
             size="sm"
@@ -165,34 +174,24 @@ export default function PresetsPage() {
           ))}
         </div>
         <div className="flex gap-1">
-          <Button
-            variant={sortBy === "profit" ? "default" : "outline"}
-            size="sm"
-            onClick={() => setSortBy("profit")}
-            className="h-7 text-xs"
-          >
-            Profit
-          </Button>
-          <Button
-            variant={sortBy === "winrate" ? "default" : "outline"}
-            size="sm"
-            onClick={() => setSortBy("winrate")}
-            className="h-7 text-xs"
-          >
-            Win Rate
-          </Button>
-          <Button
-            variant={sortBy === "name" ? "default" : "outline"}
-            size="sm"
-            onClick={() => setSortBy("name")}
-            className="h-7 text-xs"
-          >
-            Name
-          </Button>
+          {([
+            { k: "profit",  label: "Profit" },
+            { k: "winrate", label: "Win Rate" },
+            { k: "name",    label: "Name" },
+          ] as const).map(({ k, label }) => (
+            <Button
+              key={k}
+              variant={sortBy === k ? "default" : "outline"}
+              size="sm"
+              onClick={() => setSortBy(k)}
+              className="h-7 text-xs"
+            >
+              {label}
+            </Button>
+          ))}
         </div>
       </div>
 
-      {/* Presets list */}
       <div className="space-y-1.5 max-h-[calc(100vh-300px)] overflow-y-auto">
         {filteredAndSorted.length > 0 ? (
           filteredAndSorted.map((preset) => (
@@ -202,7 +201,7 @@ export default function PresetsPage() {
               onToggle={(id, enabled) => {
                 setPresets((prev) => prev.map((p) => (p.id === id ? { ...p, enabled } : p)))
               }}
-              onStart={(id) => {
+              onStart={() => {
                 toast.success("Preset started")
               }}
               onDelete={(id) => {
@@ -212,15 +211,18 @@ export default function PresetsPage() {
               onDuplicate={(id) => {
                 const preset = presets.find((p) => p.id === id)
                 if (preset) {
-                  setPresets((prev) => [...prev, { ...preset, id: `${preset.id}-copy`, name: `${preset.name} (Copy)` }])
+                  setPresets((prev) => [
+                    ...prev,
+                    { ...preset, id: `${preset.id}-copy`, name: `${preset.name} (Copy)` },
+                  ])
                   toast.success("Preset duplicated")
                 }
               }}
             />
           ))
         ) : (
-          <div className="text-center py-12 text-slate-500">
-            <div className="text-sm">No presets found</div>
+          <div className="text-center py-12 text-muted-foreground text-sm">
+            No presets found
           </div>
         )}
       </div>

@@ -8,19 +8,38 @@
  * @lastUpdate 2026-04-05T18:00:00Z - Restored original filename with fixed code
  */
 
-const _INDICATION_BUILD_VERSION = "5.0.0"
-const _BUILD_TIMESTAMP = 1712361600000 // Fixed timestamp to avoid constant rebuilds
+const _INDICATION_BUILD_VERSION = "5.0.1"
+const _BUILD_TIMESTAMP = 1712361660000 // Updated to force rebuild at 13:21
 
 // Log immediately on module load to confirm new code is running
 console.log(`[v0] IndicationProcessor v${_INDICATION_BUILD_VERSION} loaded at ${_BUILD_TIMESTAMP}`)
 
 // CRITICAL: Create a shared Map that will be used by ALL instances
 // This fixes the issue where class field initialization fails in cached bundles
+//
+// MEMORY: The engine loop runs ~10-15 cycles/sec across every tracked symbol.
+// Without a cap, this Map grows per unique symbol-variation forever and drives
+// the Node heap into OOM after ~30 min of continuous running. Cap at 256
+// entries with FIFO eviction — well above the active symbol set (≤ 10) plus
+// headroom for alt-interval lookups.
+const MARKET_DATA_CACHE_MAX_ENTRIES = 256
 const SHARED_MARKET_DATA_CACHE = new Map<string, { data: any; timestamp: number }>()
 const SHARED_SETTINGS_CACHE = { data: null as any, timestamp: 0 }
 // High-frequency TTL: 200ms matches the batch-prefetch window in market-data-cache.ts
 // so processIndication always reads from the same fresh batch within each 1s cycle
 const SHARED_CACHE_TTL = 200
+
+/**
+ * Bounded setter for the shared market data cache — evicts the oldest entry
+ * (insertion order of a Map) whenever the cap is hit.
+ */
+function sharedCacheSet(key: string, value: { data: any; timestamp: number }) {
+  if (SHARED_MARKET_DATA_CACHE.size >= MARKET_DATA_CACHE_MAX_ENTRIES && !SHARED_MARKET_DATA_CACHE.has(key)) {
+    const oldestKey = SHARED_MARKET_DATA_CACHE.keys().next().value
+    if (oldestKey !== undefined) SHARED_MARKET_DATA_CACHE.delete(oldestKey)
+  }
+  SHARED_MARKET_DATA_CACHE.set(key, value)
+}
 
 // CRITICAL FIX: Monkey-patch the Map prototype to handle undefined 'this' context
 // This ensures that even if 'this.marketDataCache' is undefined, calling .get() won't crash
@@ -57,7 +76,8 @@ import { getMarketDataCached, getSettingsCached } from "./market-data-cache"
 const redisHelpers = {
   initRedis,
   getRedisClient,
-  getMarketData: getMarketData ?? (async (_s: string) => null),
+  // getMarketData requires (symbol, interval) - default to "1m" for trading
+  getMarketData: getMarketData ?? (async (_s: string, _i?: string) => null),
   saveIndication: saveIndication ?? (async (_d: any) => ""),
   getSettings,
 }
@@ -71,8 +91,17 @@ function getProgressionManager() {
 }
 
 // MODULE-LEVEL caches - guaranteed to exist, avoids `this` context issues entirely
+// Same 256-entry bound as the shared cache — see SHARED_MARKET_DATA_CACHE comment.
 const MODULE_MARKET_DATA_CACHE = new Map<string, { data: any; timestamp: number }>()
 const MODULE_CACHE_TTL = 200 // 200ms matches the batch-prefetch window
+
+function moduleCacheSet(key: string, value: { data: any; timestamp: number }) {
+  if (MODULE_MARKET_DATA_CACHE.size >= MARKET_DATA_CACHE_MAX_ENTRIES && !MODULE_MARKET_DATA_CACHE.has(key)) {
+    const oldestKey = MODULE_MARKET_DATA_CACHE.keys().next().value
+    if (oldestKey !== undefined) MODULE_MARKET_DATA_CACHE.delete(oldestKey)
+  }
+  MODULE_MARKET_DATA_CACHE.set(key, value)
+}
 
 // Module-level settings cache
 let MODULE_SETTINGS_CACHE: { data: any; timestamp: number } | null = null
@@ -91,7 +120,8 @@ async function getMarketDataCachedModule(symbol: string): Promise<any> {
 
   try {
     await initRedis()
-    const rawData = await getMarketData(symbol)
+    // CRITICAL: getMarketData requires (symbol, interval) - use "1m" for real-time trading
+    const rawData = await getMarketData(symbol, "1m")
 
     if (!rawData) {
       return null
@@ -100,7 +130,7 @@ async function getMarketDataCachedModule(symbol: string): Promise<any> {
     const latest = Array.isArray(rawData) ? rawData[0] : rawData
 
     if (latest) {
-      MODULE_MARKET_DATA_CACHE.set(symbol, { data: latest, timestamp: now })
+      moduleCacheSet(symbol, { data: latest, timestamp: now })
       return latest
     }
     return null
@@ -192,7 +222,8 @@ export class IndicationProcessor {
       }
 
       // Priority 3: hash (single latest data point from redis-db.saveMarketData / getMarketData)
-      const rawData = await getMarketData(symbol)
+      // CRITICAL: getMarketData requires (symbol, interval) - use "1m" for trading
+      const rawData = await getMarketData(symbol, "1m")
       if (rawData) {
         const arr = Array.isArray(rawData) ? rawData : [rawData]
         console.log(`[v0] [PrehistoricIndication] Using hash fallback for ${symbol}: ${arr.length} data point(s)`)
@@ -324,329 +355,307 @@ export class IndicationProcessor {
    * Process real-time indication - delegates to independent sets processor
    * Now calculates step-based indicators for all position cost steps (3-30)
    * Returns array of active indications for strategy processing
+   * REBUILD FIX v4: 2026-04-10 13:10 - Ensures indications always generated
    */
   async processIndication(symbol: string): Promise<any[]> {
     try {
-      // Defensive initialization - ensure cache exists even if constructor failed
+      // Defensive initialization
       if (!this.marketDataCache) {
         this.marketDataCache = new Map()
       }
       
       let marketData = await this.getLatestMarketDataCached(symbol)
       if (!marketData) {
-        // Try to load market data if not available
-        const redis = await getRedisHelpers()
-        await redis.initRedis()
-
-        // Force load market data for this symbol
+        await initRedis()
+        const client = getRedisClient()
         const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
         await loadMarketDataForEngine([symbol])
-
-        // Retry getting market data
-        const retryMarketData = await this.getLatestMarketDataCached(symbol)
-        if (!retryMarketData) {
-          console.log(`[v0] [IndicationProcessor] No market data available for ${symbol} after loading attempt`)
+        SHARED_MARKET_DATA_CACHE.delete(symbol)
+        
+        const directData = await client.get(`market_data:${symbol}:1m`)
+        if (directData) {
+          try {
+            const parsed = typeof directData === 'string' ? JSON.parse(directData) : directData
+            if (parsed && parsed.candles && parsed.candles.length > 0) {
+              const latestCandle = parsed.candles[parsed.candles.length - 1]
+              marketData = {
+                symbol,
+                price: latestCandle.close,
+                open: latestCandle.open,
+                high: latestCandle.high,
+                low: latestCandle.low,
+                close: latestCandle.close,
+                volume: latestCandle.volume,
+                timestamp: new Date(latestCandle.timestamp).toISOString(),
+              }
+              sharedCacheSet(symbol, { data: marketData, timestamp: Date.now() })
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
+        
+        if (!marketData) {
+          const hashData = await client.hgetall(`market_data:${symbol}`)
+          if (hashData && Object.keys(hashData).length > 0) {
+            marketData = hashData
+            sharedCacheSet(symbol, { data: marketData, timestamp: Date.now() })
+          }
+        }
+        
+        if (!marketData) {
           return []
         }
-        console.log(`[v0] [IndicationProcessor] Market data loaded on-demand for ${symbol}`)
-        // Continue with the loaded market data
-        marketData = retryMarketData
       }
 
-      // Get historical candles for step-based calculations
+      // Get candles
       const candles = await this.getHistoricalCandles(symbol)
       if (candles.length === 0) {
-        // Fallback to single candle if no history
         candles.push(marketData)
       }
 
-      // Calculate STEP-BASED indicators (3-30 steps)
-      const stepRange = Array.from({ length: 28 }, (_, i) => i + 3) // Steps 3 through 30
+      // Calculate step-based indicators
+      const stepRange = Array.from({ length: 28 }, (_, i) => i + 3)
       const stepIndicators = StepBasedIndicators.calculateAll(candles, stepRange)
 
-      console.log(`[v0] [IndicationProcessor] Step-based indicators calculated for ${symbol}: ${stepRange.length} steps analyzed`)
-
-      // Market data is a single candle object with fields: price, open, high, low, close, volume, timestamp
-      // Extract price information from the single candle
-      const currentClose = Number.parseFloat(marketData.close || marketData.price || "0")
-      const currentOpen = Number.parseFloat(marketData.open || currentClose)
-      const currentHigh = Number.parseFloat(marketData.high || currentClose)
-      const currentLow = Number.parseFloat(marketData.low || currentClose)
-      const currentVolume = Number.parseFloat(marketData.volume || "0")
+      // Extract prices safely
+      let priceSource = marketData
+      if (marketData.candles && Array.isArray(marketData.candles) && marketData.candles.length > 0) {
+        priceSource = marketData.candles[marketData.candles.length - 1]
+      }
+      
+      const currentClose = Number.parseFloat(String(priceSource?.close || priceSource?.c || priceSource?.price || marketData?.close || marketData?.price || "0"))
+      const currentOpen = Number.parseFloat(String(priceSource?.open || priceSource?.o || marketData?.open || currentClose))
+      const currentHigh = Number.parseFloat(String(priceSource?.high || priceSource?.h || marketData?.high || currentClose))
+      const currentLow = Number.parseFloat(String(priceSource?.low || priceSource?.l || marketData?.low || currentClose))
+      const currentVolume = Number.parseFloat(String(priceSource?.volume || priceSource?.v || marketData?.volume || "0"))
       
       if (currentClose === 0 || isNaN(currentClose)) {
-        // Disabled logging - runs per symbol per cycle
         return []
       }
 
-      // Generate indication from current candle data
-      // Since we only have 1 candle, use OHLC to create artificial price history
-      const prices = [currentOpen, currentLow, currentClose, currentHigh, currentClose] // Simple 5-point history
-      
-      // Disabled logging - runs per symbol per cycle
-      const direction = currentClose >= currentOpen ? "long" : "short"
-      const priceChange = ((currentClose - currentOpen) / currentOpen) * 100
-      const directionConfidence = Math.min(0.95, 0.5 + Math.abs(priceChange) / 100)
-      
-      // Calculate comprehensive indications from current candle OHLC
-      const indications: any[] = []
-      
-      // CORE INDICATIONS (4):
-      // 1. DIRECTION Indication
-      const stepDirections: any = {}
-      for (const [step, indicators] of Object.entries(stepIndicators)) {
-        const ma = indicators.ma as number
-        if (!ma || ma === 0) continue
-        const signal = currentClose > ma ? 1 : -1
-        stepDirections[step] = { signal, ma, confidence: 0.5 + Math.abs((currentClose - ma) / ma) * 0.45 }
-      }
-      
-      indications.push({
-        type: "direction",
-        symbol,
-        value: direction === "long" ? 1 : -1,
-        profitFactor: 1.0 + Math.abs(priceChange) / 100,
-        drawdownTime: 0,
-        confidence: directionConfidence,
-        positionState: "new",
-        continuousPosition: false,
-        stepIndicators: stepDirections,
-        metadata: {
-          direction,
-          priceChange,
-          open: currentOpen,
-          close: currentClose,
-          high: currentHigh,
-          low: currentLow,
-        }
-      })
-      
-      // 2. MOVE Indication: based on high-low range AND step-based RSI
-      const range = currentHigh - currentLow
-      const rangePercent = (range / currentClose) * 100
-      const moveConfidence = Math.min(0.95, 0.5 + Math.min(rangePercent, 10) / 20)
-      
-      const stepRSI: any = {}
-      for (const [step, indicators] of Object.entries(stepIndicators)) {
-        const rsi = indicators.rsi as number
-        if (rsi === undefined || rsi === null) continue
-        stepRSI[step] = { rsi, isOversold: rsi < 30, isOverbought: rsi > 70, confidence: Math.abs(50 - rsi) / 50 }
-      }
-      
-      indications.push({
-        type: "move",
-        symbol,
-        value: rangePercent > 2 ? 1 : 0,
-        profitFactor: 1.0 + rangePercent / 100,
-        drawdownTime: 0,
-        confidence: moveConfidence,
-        positionState: "new",
-        continuousPosition: false,
-        stepIndicators: stepRSI,
-        metadata: {
-          range,
-          rangePercent,
-          volatility: rangePercent,
-        }
-      })
-      
-      // 3. ACTIVE Indication: based on volume AND step-based MACD
-      const activeConfidence = Math.min(0.95, 0.5 + Math.min(currentVolume, 1000) / 2000)
-      
-      const stepMACD: any = {}
-      for (const [step, indicators] of Object.entries(stepIndicators)) {
-        const macd = indicators.macd as any
-        if (!macd || macd.macd === undefined || macd.signal === undefined) continue
-        const macdSignal = macd.macd > macd.signal ? 1 : -1
-        const histogram = macd.macd - macd.signal
-        stepMACD[step] = { macd: macd.macd, signal: macd.signal, histogram, direction: macdSignal, confidence: Math.abs(histogram) / Math.max(Math.abs(macd.signal), 0.001) }
-      }
-      
-      indications.push({
-        type: "active",
-        symbol,
-        value: currentVolume > 0 ? 1 : 0,
-        profitFactor: 1.0 + Math.min(currentVolume, 1000) / 1000,
-        drawdownTime: 0,
-        confidence: activeConfidence,
-        positionState: "new",
-        continuousPosition: false,
-        stepIndicators: stepMACD,
-        metadata: {
-          volume: currentVolume,
-          volumeActive: currentVolume > 0,
-        }
-      })
-      
-      // 4. OPTIMAL Indication: step-based Bollinger Bands
-      const stepBB: any = {}
-      for (const [step, indicators] of Object.entries(stepIndicators)) {
-        const bb = indicators.bb as any
-        if (!bb || bb.upper === undefined) continue
-        const bbRange = bb.upper - bb.lower
-        const isNearUpper = currentClose > (bb.upper * 0.95)
-        const isNearLower = currentClose < (bb.lower * 1.05)
-        const bbPosition = bbRange > 0 ? (currentClose - bb.lower) / bbRange : 0.5
-        stepBB[step] = { upper: bb.upper, middle: bb.middle, lower: bb.lower, nearUpper: isNearUpper, nearLower: isNearLower, confidence: Math.min(0.95, 0.5 + bbPosition) }
-      }
-      
-      indications.push({
-        type: "optimal",
-        symbol,
-        value: currentClose > currentOpen ? 1 : -1,
-        profitFactor: 1.0 + Math.abs(priceChange) / 100,
-        drawdownTime: 0,
-        confidence: directionConfidence,
-        positionState: "new",
-        continuousPosition: false,
-        stepIndicators: stepBB,
-        metadata: {
-          allStepsAnalyzed: stepRange.length,
-          stepRange: { min: 3, max: 30 },
-        }
-      })
-      
-      // ADVANCED INDICATIONS (8+ per symbol for comprehensive analysis):
-      // 5. RSI-based Indication (Overbought/Oversold signals)
-      const avgRSI = Object.values(stepRSI).reduce((sum: number, item: any) => sum + (item.rsi || 50), 0) / Object.keys(stepRSI).length
-      indications.push({
-        type: "rsi_signal",
-        symbol,
-        value: avgRSI < 30 ? 1 : (avgRSI > 70 ? -1 : 0),
-        confidence: Math.abs(avgRSI - 50) / 50,
-        metadata: { avgRSI, isOversold: avgRSI < 30, isOverbought: avgRSI > 70 }
-      })
-      
-      // 6. MACD-based Indication
-      const avgMACD = Object.values(stepMACD).reduce((sum: number, item: any) => sum + (item.macd || 0), 0) / Object.keys(stepMACD).length
-      const avgSignal = Object.values(stepMACD).reduce((sum: number, item: any) => sum + (item.signal || 0), 0) / Object.keys(stepMACD).length
-      indications.push({
-        type: "macd_signal",
-        symbol,
-        value: avgMACD > avgSignal ? 1 : -1,
-        confidence: Math.abs(avgMACD - avgSignal) / Math.max(Math.abs(avgSignal), 0.001),
-        metadata: { avgMACD, avgSignal, histogram: avgMACD - avgSignal }
-      })
-      
-      // 7. Volatility Indication
-      indications.push({
-        type: "volatility",
-        symbol,
-        value: rangePercent > 3 ? 1 : 0,
-        confidence: Math.min(1, rangePercent / 5),
-        metadata: { rangePercent, isHighVolatility: rangePercent > 3 }
-      })
-      
-      // 8. Trend Strength Indication
-      const avgMA = Object.values(stepDirections).reduce((sum: number, item: any) => sum + (item.ma || 0), 0) / Object.keys(stepDirections).length
-      const distanceFromMA = Math.abs(currentClose - avgMA) / avgMA * 100
-      indications.push({
-        type: "trend_strength",
-        symbol,
-        value: distanceFromMA > 2 ? 1 : 0,
-        confidence: Math.min(1, distanceFromMA / 5),
-        metadata: { distanceFromMA, avgMA, strongTrend: distanceFromMA > 2 }
-      })
-      
-      // 9. Volume-based Indication
-      indications.push({
-        type: "volume_signal",
-        symbol,
-        value: currentVolume > 100 ? 1 : 0,
-        confidence: Math.min(1, currentVolume / 1000),
-        metadata: { volume: currentVolume, volumeStrength: currentVolume / 1000 }
-      })
-      
-      // 10. Price Action Indication
-      indications.push({
-        type: "price_action",
-        symbol,
-        value: priceChange > 0 ? 1 : -1,
-        confidence: Math.abs(priceChange) / 2,
-        metadata: { priceChange, direction, momentum: priceChange }
-      })
-      
-      // 11. Support/Resistance from BB
-      const avgBBLower = Object.values(stepBB).reduce((sum: number, item: any) => sum + (item.lower || 0), 0) / Object.keys(stepBB).length
-      const avgBBUpper = Object.values(stepBB).reduce((sum: number, item: any) => sum + (item.upper || 0), 0) / Object.keys(stepBB).length
-      indications.push({
-        type: "support_resistance",
-        symbol,
-        value: currentClose < avgBBLower * 1.02 ? 1 : (currentClose > avgBBUpper * 0.98 ? -1 : 0),
-        confidence: currentClose < avgBBLower * 1.02 || currentClose > avgBBUpper * 0.98 ? 0.8 : 0.5,
-        metadata: { support: avgBBLower, resistance: avgBBUpper, nearSupport: currentClose < avgBBLower * 1.02, nearResistance: currentClose > avgBBUpper * 0.98 }
-      })
-      
-      // 12. Multi-timeframe Confirmation
-      const indicationTypes = indications.slice(0, 4).filter(ind => ind.value !== 0).length
-      indications.push({
-        type: "multi_tf_confirmation",
-        symbol,
-        value: indicationTypes > 2 ? 1 : 0,
-        confidence: indicationTypes / 4,
-        metadata: { confirmingIndicators: indicationTypes, isConfirmed: indicationTypes > 2 }
-      })
-      
-      // Disabled per-cycle logging - only store and return
+      // Determine direction from real price data:
+      // Use close vs open to set bullish/bearish direction for this candle.
+      // Also generate the opposite direction as a hedge indication.
+      const isBullish = currentClose >= currentOpen
+      const primaryDir = isBullish ? "long" : "short"
+      const secondaryDir = isBullish ? "short" : "long"
 
-      // Store indications in Redis for progression tracking (batch save)
-      try {
-        // Save ALL indications to the main indication storage key for strategy processor
-        const mainKey = `indications:${this.connectionId}`
-        
-        // Get existing indications or create new array — must call initRedis then get client
-        await initRedis()
-        const client = getRedisClient()
-        
-        if (!client) {
-          console.error(`[v0] [IndicationProcessor] Redis client not available for ${symbol}`)
-          return indications
+      // Derive confidence from candle body vs wick ratio (stronger body = higher confidence)
+      const range = currentHigh - currentLow
+      const body = Math.abs(currentClose - currentOpen)
+      const bodyRatio = range > 0 ? Math.min(0.99, body / range) : 0.5
+      const primaryConf = 0.5 + bodyRatio * 0.4  // 0.5 – 0.9
+      const secondaryConf = 0.5 + (1 - bodyRatio) * 0.25 // 0.5 – 0.75 (weaker)
+
+      // Profit factor proportional to confidence
+      const primaryPF = 1.0 + primaryConf * 0.5
+      const secondaryPF = 1.0 + secondaryConf * 0.3
+
+      // ── Indication emission with differentiated semantics ────────────────
+      //
+      // Before this fix, every cycle pushed exactly one of every type per
+      // direction (4 types × 2 dirs = 8 flat), so the dashboard showed
+      // Dir=Move=Act=Opt in perfect lockstep and Auto was always 0.
+      //
+      // Each type now only fires when its own criterion is satisfied, so the
+      // per-type counts naturally diverge and reflect real market structure:
+      //
+      //   direction — always emitted (2/cycle): primary + hedge trend signal
+      //   move      — body size exceeds ambient noise (rangePercent ≥ 0.15%)
+      //   active    — candle volume > recent-volume average (elevated activity)
+      //   optimal   — strong confidence + strong body (conf ≥ 0.72 AND body-ratio ≥ 0.55)
+      //   auto      — step-based indicator alignment across short/mid/long windows
+      //
+      // The scoring below is derived from the real candle data already in scope
+      // (currentOpen/High/Low/Close/Volume, candles[], stepIndicators), so we
+      // don't incur any extra fetches.
+
+      const indications: any[] = []
+      const now = Date.now()
+
+      // Range-percent of the current candle (used by move threshold)
+      const rangePercent = currentClose > 0 ? (range / currentClose) * 100 : 0
+
+      // Recent-volume baseline: mean volume of the last ~20 candles (or fewer
+      // if the window is smaller). Falls back to currentVolume so the first
+      // warm-up ticks don't spuriously fire "active".
+      let recentVolAvg = 0
+      {
+        const window = candles.slice(-20)
+        let sum = 0
+        let n = 0
+        for (const c of window) {
+          const v = Number(c?.volume ?? c?.v ?? 0)
+          if (Number.isFinite(v) && v > 0) { sum += v; n++ }
         }
-        
-        console.log(`[v0] [IndicationProcessor] Processing ${indications.length} indications for ${symbol}`)
-        
-        // Log detailed indicator breakdown
-        const indicatorTypes = indications.map(i => i.type).join(", ")
-        console.log(`[v0] [IndicationProcessor] ✓ ${symbol}: ${indications.length} indicators generated [${indicatorTypes}]`)
-        
-        // Save back to Redis using unified storage function (handles independent configuration sets)
-        await storeIndications(this.connectionId, symbol, indications)
-        console.log(`[v0] [IndicationProcessor] ✓ Stored ${indications.length} indications for ${symbol}`)
-        
-        // Track each indication to database for statistics and historical analysis
-        for (const indication of indications) {
-          try {
-            await trackIndicationStats(
+        recentVolAvg = n > 0 ? sum / n : currentVolume
+      }
+
+      // Auto-alignment: derived from the step-based indicator suite
+      // (MA + RSI + MACD) across short / mid / long windows. Each step
+      // indicator exposes `{ ma, rsi, macd: { macd, signal }, bb }`, so we
+      // project each to a direction:
+      //   * RSI  > 50 → long, RSI < 50 → short
+      //   * MACD histogram > 0 (macd > signal) → long, else short
+      //   * Price vs MA: close > ma → long, else short
+      // A window is "aligned" when at least 2 of those 3 sub-signals agree;
+      // we fire "auto" for the primary direction when ≥ 2 of the 3 windows
+      // (steps 5 / 15 / 28) align in that direction.
+      const autoAlignment = (() => {
+        try {
+          const projectWindow = (step: number): { dir: "long" | "short" | null; strength: number } => {
+            const s = (stepIndicators as any)?.[step]
+            if (!s) return { dir: null, strength: 0 }
+            const rsi = Number(s.rsi) || 50
+            const macdHist = (Number(s?.macd?.macd) || 0) - (Number(s?.macd?.signal) || 0)
+            const ma = Number(s.ma) || 0
+            const votes: Array<"long" | "short"> = []
+            if (rsi !== 50) votes.push(rsi > 50 ? "long" : "short")
+            if (macdHist !== 0) votes.push(macdHist > 0 ? "long" : "short")
+            if (ma > 0) votes.push(currentClose >= ma ? "long" : "short")
+            if (votes.length < 2) return { dir: null, strength: 0 }
+            const longs = votes.filter((v) => v === "long").length
+            const shorts = votes.length - longs
+            if (longs === shorts) return { dir: null, strength: 0 }
+            const dir: "long" | "short" = longs > shorts ? "long" : "short"
+            // Strength = RSI distance from 50 (0–1) blended with vote majority.
+            const rsiStrength = Math.min(1, Math.abs(rsi - 50) / 40)
+            const voteStrength = Math.max(longs, shorts) / votes.length
+            return { dir, strength: rsiStrength * 0.5 + voteStrength * 0.5 }
+          }
+
+          const windows = [projectWindow(5), projectWindow(15), projectWindow(28)]
+          const alignedWindows = windows.filter((w) => w.dir === primaryDir)
+          if (alignedWindows.length < 2) return null
+          const avgStrength =
+            alignedWindows.reduce((a, b) => a + b.strength, 0) / alignedWindows.length
+          return { aligned: true, strength: Math.min(0.95, 0.5 + avgStrength * 0.45) }
+        } catch {
+          return null
+        }
+      })()
+
+      // Loop over primary + hedge directions. Each condition is independent
+      // so in a calm market only `direction` fires; on a big bullish candle
+      // with elevated volume, all five fire.
+      const pairs: Array<["long" | "short", number, number, boolean]> = [
+        [primaryDir,   primaryConf,   primaryPF,   true],   // primary
+        [secondaryDir, secondaryConf, secondaryPF, false],  // hedge
+      ]
+
+      for (const [dir, conf, pf, isPrimary] of pairs) {
+        // 1. Direction — always emitted
+        indications.push({
+          type: "direction",
+          symbol,
+          value: currentClose,
+          profitFactor: pf,
+          confidence: conf,
+          timestamp: now,
+          metadata: { direction: dir, primary: isPrimary },
+        })
+
+        // 2. Move — only when the candle body is meaningful vs ambient noise
+        if (rangePercent >= 0.15) {
+          indications.push({
+            type: "move",
+            symbol,
+            value: currentClose,
+            profitFactor: pf * (1 + Math.min(0.25, rangePercent / 40)),
+            confidence: conf * 0.95,
+            timestamp: now,
+            metadata: { direction: dir, rangePercent, primary: isPrimary },
+          })
+        }
+
+        // 3. Active — only when volume is elevated above the recent baseline
+        if (recentVolAvg > 0 && currentVolume >= recentVolAvg * 1.05) {
+          indications.push({
+            type: "active",
+            symbol,
+            value: currentClose,
+            profitFactor: pf * 0.92,
+            confidence: conf * 0.9,
+            timestamp: now,
+            metadata: {
+              direction: dir,
+              volumeRatio: currentVolume / recentVolAvg,
+              primary: isPrimary,
+            },
+          })
+        }
+
+        // 4. Optimal — gated on high confidence AND strong body. Only the
+        //    primary direction is ever optimal (hedge is never the "best" play).
+        if (isPrimary && conf >= 0.72 && bodyRatio >= 0.55) {
+          indications.push({
+            type: "optimal",
+            symbol,
+            value: currentClose,
+            profitFactor: Math.min(2.5, pf * 1.15),
+            confidence: Math.min(0.95, conf * 1.05),
+            timestamp: now,
+            metadata: { direction: dir, bodyRatio, primary: true },
+          })
+        }
+
+        // 5. Auto — step-based indicator alignment, primary direction only.
+        if (isPrimary && autoAlignment?.aligned) {
+          indications.push({
+            type: "auto",
+            symbol,
+            value: currentClose,
+            profitFactor: Math.min(2.3, pf * (1 + autoAlignment.strength * 0.35)),
+            confidence: autoAlignment.strength,
+            timestamp: now,
+            metadata: { direction: dir, alignment: "step_5_15_28", primary: true },
+          })
+        }
+      }
+
+      // Store indication payloads (raw JSON list, per-type TTL keys).
+      await storeIndications(this.connectionId, symbol, indications)
+
+      // ── Increment the per-type counters that the dashboard reads ─────────
+      //
+      // `storeIndications` only persists the *raw* indication payloads; it
+      // does NOT bump the `indications:{connId}:{type}:count` keys nor the
+      // `indications_{type}_count` fields on the `progression:{connId}` hash.
+      //
+      // The dashboard ("Indications by Type" breakdown on the main connection
+      // card) reads exclusively from those counters, so without this call
+      // every counter stays at zero even when the engine is generating real
+      // indications every cycle — which is what made the per-type counts
+      // look identical (and Auto stuck at 0) in recent versions.
+      //
+      // We fan out one `trackIndicationStats` call per indication in parallel
+      // so a busy cycle (10–12 indications) pays a single Redis round-trip
+      // window instead of N sequential ones.
+      if (indications.length > 0) {
+        await Promise.all(
+          indications.map((ind) =>
+            trackIndicationStats(
               this.connectionId,
               symbol,
-              indication.type,
-              indication.value,
-              indication.confidence
-            )
-          } catch (e) {
-            console.warn(`[v0] [IndicationProcessor] Failed to track indication:`, e)
-          }
-        }
-      } catch (redisErr) {
-        console.error(`[v0] [IndicationProcessor] Redis error saving indications:`, redisErr)
+              ind.type,
+              Number(ind.value) || 0,
+              Number(ind.confidence) || 0,
+            ).catch(() => { /* non-critical stats path */ }),
+          ),
+        )
       }
 
       return indications
     } catch (error) {
-      console.error(`[v0] [RealtimeIndication] ERROR:`, error)
+      console.error(`[v0] [IndicationProcessor] Error in processIndication for ${symbol}:`, error)
       return []
     }
   }
 
-  /**
-   * Get latest market data with caching to avoid repeated Redis calls
-   * CRITICAL: This method MUST NOT use this.marketDataCache - it may be undefined in cached webpack bundles
-   * Instead, we use a completely inline implementation with module-level cache
-   */
   private async getLatestMarketDataCached(symbol: string): Promise<any> {
     // CRITICAL FIX: Use module-level SHARED_MARKET_DATA_CACHE directly, never this.marketDataCache
-    const cache = SHARED_MARKET_DATA_CACHE
-    const cached = cache.get(symbol)
+    const cached = SHARED_MARKET_DATA_CACHE.get(symbol)
     const now = Date.now()
     
     if (cached && (now - cached.timestamp) < SHARED_CACHE_TTL) {
@@ -655,13 +664,42 @@ export class IndicationProcessor {
     
     // Fetch fresh data from Redis using dynamic import to avoid any stale references
     try {
-      const { getMarketData } = await import("@/lib/redis-db")
-      const data = await getMarketData(symbol)
+      const { getMarketData, getClient, initRedis } = await import("@/lib/redis-db")
+      // getMarketData requires both symbol and interval - use 1m as default for real-time trading
+      const data = await getMarketData(symbol, "1m")
+      
+      // If no data from interval key, try direct Redis access as fallback
+      if (!data) {
+        await initRedis()
+        const client = getClient()
+        // Try the full MarketData object key
+        const rawData = await client.get(`market_data:${symbol}:1m`)
+        if (rawData) {
+          try {
+            const parsed = JSON.parse(rawData)
+            if (parsed && parsed.candles && parsed.candles.length > 0) {
+              sharedCacheSet(symbol, { data: parsed, timestamp: now })
+              return parsed
+            }
+          } catch (parseErr) {
+            console.warn(`[v0] [IndicationProcessor] Failed to parse market data for ${symbol}`)
+          }
+        }
+        
+        // Try hash key as last resort
+        const hashData = await client.hgetall(`market_data:${symbol}`)
+        if (hashData && Object.keys(hashData).length > 0) {
+          sharedCacheSet(symbol, { data: hashData, timestamp: now })
+          return hashData
+        }
+      }
+      
       if (data) {
-        cache.set(symbol, { data, timestamp: now })
+        sharedCacheSet(symbol, { data, timestamp: now })
       }
       return data
     } catch (e) {
+      console.error(`[v0] [IndicationProcessor] Error fetching market data for ${symbol}:`, e)
       return cached?.data || null
     }
   }
