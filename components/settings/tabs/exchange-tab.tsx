@@ -42,8 +42,31 @@ export function ExchangeTab({
   connections,
 }: ExchangeTabProps) {
   const { selectedExchange, selectedConnectionId, setSelectedConnectionId } = useExchange()
-  
-  const mainConnections = connections.filter((c: any) => c.is_active_inserted === "1" || c.is_active_inserted === true)
+
+  /*
+   * IMPORTANT — this filter must match lib/exchange-context.tsx exactly.
+   *
+   * Previously this tab used `c.is_active_inserted === "1" || === true`, a
+   * strict equality check that silently dropped connections whose flag was
+   * stored as the numeric `1`, the string `"true"`, or any of the three
+   * alternate "inserted" signals the rest of the app honors
+   * (is_dashboard_inserted, is_assigned, is_enabled_dashboard).
+   *
+   * Symptom: a user would toggle a connection into Main Connections on the
+   * dashboard, it would appear there, but the "Active Connection" dropdown
+   * on Settings > Exchange would not list it — breaking the per-connection
+   * settings flow entirely. The same toBoolean helper below is already the
+   * source of truth used by ExchangeProvider.loadActiveConnections.
+   */
+  const toBoolean = (v: unknown) => v === true || v === 1 || v === "1" || v === "true"
+  const mainConnections = connections.filter((c: any) => {
+    const isInserted =
+      toBoolean(c.is_active_inserted) ||
+      toBoolean(c.is_dashboard_inserted) ||
+      toBoolean(c.is_assigned)
+    const isDashboardActive = toBoolean(c.is_enabled_dashboard)
+    return isInserted || isDashboardActive
+  })
   
   return (
     <Tabs defaultValue="exchange">
@@ -80,11 +103,19 @@ export function ExchangeTab({
       <TabsContent value="exchange" className="space-y-4">
         {selectedExchange && (
           <div className="bg-muted/50 border rounded-lg p-3">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="text-sm font-medium">Active Exchange:</span>
               <Badge variant="secondary">{selectedExchange.toUpperCase()}</Badge>
+              {/*
+                Scope note — the fields on this page are saved via PUT
+                /api/settings as a single global blob (app_settings hash in
+                Redis). Truly per-connection fields (API keys, leverage,
+                cost %) live in the Connection Edit dialog, not here. This
+                copy was previously misleading (“Settings below apply to
+                this exchange”), which caused repeated confusion.
+              */}
               <span className="text-xs text-muted-foreground ml-auto">
-                Settings below apply to this exchange
+                Global trading defaults &mdash; per-connection overrides in connection edit dialog
               </span>
             </div>
           </div>
