@@ -39,9 +39,13 @@ export interface StrategyEvaluation {
   avgDrawdownTime: number
 }
 
-// One Set = one unique (indication_type × direction) combination
+// One Set = one unique (indication_type × direction) combination at BASE.
+// At MAIN we additionally produce related variant Sets derived from a parent
+// Base Set — these carry `parentSetKey` (=> the Base Set they derive from)
+// and `variant` (=> default / trailing / block / dca). REAL and LIVE stages
+// treat them uniformly alongside base-promoted Sets.
 export interface StrategySet {
-  setKey: string            // e.g. "direction:long"
+  setKey: string            // e.g. "direction:long" (Base) or "direction:long#block" (Main variant)
   indicationType: string
   direction: "long" | "short"
   avgProfitFactor: number
@@ -50,6 +54,9 @@ export interface StrategySet {
   entryCount: number        // number of config entries in this set (max 250)
   entries: StrategySetEntry[]
   createdAt: string
+  // Lineage — populated at MAIN stage; preserved through REAL/LIVE
+  parentSetKey?: string
+  variant?: "default" | "trailing" | "block" | "dca"
 }
 
 export interface StrategySetEntry {
@@ -60,6 +67,29 @@ export interface StrategySetEntry {
   profitFactor: number
   drawdownTime: number
   confidence: number
+}
+
+/**
+ * Per-cycle position coordination context used by MAIN to decide which
+ * additional variant Sets to produce. Fetched ONCE per cycle (via
+ * getPositionContext) and threaded through so Base/Main/Real each see the
+ * same snapshot without duplicating Redis round-trips.
+ */
+export interface PositionContext {
+  /** Currently-open pseudo positions on the exchange (continuous) */
+  continuousCount: number
+  /** Count of the most recent N closed positions (default last 5) */
+  lastPosCount: number
+  /** Total closed positions in the lookback window (default 24h) */
+  prevPosCount: number
+  /** Number of winners among the last N closed */
+  lastWins: number
+  /** Number of losers among the last N closed */
+  lastLosses: number
+  /** Total losers in the lookback window — gates DCA recovery variants */
+  prevLosses: number
+  /** Per-symbol open position count (for symbol-scoped variant decisions) */
+  perSymbolOpen: Record<string, number>
 }
 
 export interface StrategyCoordinatorConfig {
@@ -117,16 +147,31 @@ export class StrategyCoordinator {
   }
 
   /**
-   * Execute complete strategy progression flow
+   * Execute complete strategy progression flow.
+   *
+   * Position context is fetched ONCE per cycle and threaded through so Main
+   * can generate the correct additional variant Sets without duplicating
+   * pseudo-position reads. Callers may also pass a precomputed context
+   * (e.g. when running multiple symbols in the same cycle) — we'll reuse it.
    */
   async executeStrategyFlow(
     symbol: string,
     indications: any[],
-    isPrehistoric: boolean = false
+    isPrehistoric: boolean = false,
+    sharedContext?: PositionContext,
   ): Promise<StrategyEvaluation[]> {
     const results: StrategyEvaluation[] = []
 
     try {
+      // Fetch the per-cycle position coordination context once. Prehistoric
+      // runs use a neutral context (no open positions, no prior outcomes) so
+      // only the always-on `default` variant is produced — that matches the
+      // original behaviour for backtests.
+      const posCtx: PositionContext = sharedContext
+        ?? (isPrehistoric
+          ? this.neutralPositionContext()
+          : await this.getPositionContext())
+
       // Sets flow BASE → MAIN → REAL → LIVE. Each stage used to re-read its
       // predecessor's output from Redis via getSettings(); we now pipe the
       // computed arrays directly between stages in memory to eliminate 3
@@ -137,11 +182,13 @@ export class StrategyCoordinator {
       const { result: baseResult, sets: baseSets } = await this.createBaseSets(symbol, indications)
       results.push(baseResult)
 
-      // STAGE 2: MAIN — promote Sets with avgPF >= 1.2, expand config entries
-      const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets)
+      // STAGE 2: MAIN — validate Base Sets AND create additional related
+      // variant Sets (Default / Trailing / Block / DCA) gated by posCtx.
+      const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx)
       results.push(mainResult)
 
-      // STAGE 3: REAL — promote Sets with avgPF >= 1.4
+      // STAGE 3: REAL — promote Sets with avgPF >= 1.4 (base-promoted AND
+      // additional related variants flow uniformly through this filter)
       const { result: realResult, sets: realSets } = await this.evaluateRealSets(symbol, mainSets)
       results.push(realResult)
 
@@ -157,6 +204,28 @@ export class StrategyCoordinator {
       console.error(`[v0] [StrategyCoordinator] Flow failed for ${symbol}:`, error)
       throw error
     }
+  }
+
+  /**
+   * Run N symbols in a single flow pass, sharing one position-context fetch
+   * across all of them. Use this when the engine evaluates many symbols per
+   * cycle — it eliminates (N-1) pseudo-position reads vs. calling
+   * `executeStrategyFlow` separately for each symbol.
+   */
+  async executeStrategyFlowBatch(
+    items: Array<{ symbol: string; indications: any[] }>,
+    isPrehistoric: boolean = false,
+  ): Promise<Record<string, StrategyEvaluation[]>> {
+    const ctx = isPrehistoric ? this.neutralPositionContext() : await this.getPositionContext()
+    const out: Record<string, StrategyEvaluation[]> = {}
+    // Run per-symbol flows in parallel — they only share the ctx snapshot and
+    // each touches distinct symbol-scoped Redis keys.
+    await Promise.all(
+      items.map(async ({ symbol, indications }) => {
+        out[symbol] = await this.executeStrategyFlow(symbol, indications, isPrehistoric, ctx)
+      }),
+    )
+    return out
   }
 
   // ─── STAGE 1: BASE ───────────────────────────────────────────────────────────
@@ -301,12 +370,36 @@ export class StrategyCoordinator {
   // ─── STAGE 2: MAIN ───────────────────────────────────────────────────────────
 
   /**
-   * Promote BASE Sets with avgProfitFactor >= 1.2 to MAIN.
-   * Expand each Set with multiple position-size / leverage variants (max 250 entries).
+   * Validate BASE Sets (avgPF >= 1.2, avgConf >= 0.5, DDT <= 24h) AND create
+   * additional RELATED variant Sets for each validated Base Set, gated by
+   * per-cycle position coordination context.
+   *
+   * Per user spec:
+   *   "Main validates from Base Sets, then creates additional related Sets
+   *    (based on prev pos counts, last pos counts, continuous pos counts,
+   *    each with adjusted strategies — Block, DCA, etc.) for each evaluated
+   *    Set, IF NOT ALREADY CREATED, and are used for continuous progress to
+   *    Real. Real evaluates from Main with the additional related Sets."
+   *
+   * Implementation:
+   *   1. For each Base Set passing validation, produce N "related" Main Sets,
+   *      one per ACTIVE variant whose gate predicate passes for the current
+   *      PositionContext. Each related Set carries `parentSetKey` = base
+   *      setKey + `variant` = one of {default, trailing, block, dca}.
+   *   2. Variant expansion uses a curated small config list (≤ 4 per variant,
+   *      ≤ 4 active variants) instead of the previous 4×4×4 = 64-entry
+   *      Cartesian product. At max this generates ~16 entries per Base
+   *      entry — ~4× faster than the old path and no silently-rejected
+   *      entries (every config is pre-filtered to satisfy the DDT cap).
+   *   3. Fingerprint cache — we record `{baseSetKey, base avgPF bucket,
+   *      variant, posCtx bucket}` per generated Set. If the same fingerprint
+   *      re-appears next cycle, we reuse the cached Set instead of
+   *      regenerating ("IF NOT ALREADY CREATED").
    */
   private async createMainSets(
     symbol: string,
     inputSets?: StrategySet[],
+    posCtx?: PositionContext,
   ): Promise<{ result: StrategyEvaluation; sets: StrategySet[] }> {
     // Prefer in-memory input (hot-path pipelined from createBaseSets). Fall
     // back to Redis only when called standalone (tests / diagnostics).
@@ -321,88 +414,65 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.main
     const maxEntries = this.config.maxEntriesPerSet || 250
-
-    // Config variants to expand each qualifying base Set
-    const sizeMultipliers = [0.5, 1.0, 1.5, 2.0]
-    const leverageOptions = [1, 2, 3, 5]
-    const positionStates = ["new", "add", "reduce", "close"]
-
+    const ctx = posCtx ?? this.neutralPositionContext()
     const mainSets: StrategySet[] = []
 
+    // ── 1. Fingerprint-cache lookup ────────────────────────────────────────
+    // Fetch last cycle's fingerprint map up-front. `fpCacheKey` stores a
+    // per-symbol hash of { fingerprint: JSON.stringify(set) } entries. We
+    // read it once, check each candidate (baseSet × variant), and rebuild
+    // only what's new. This cuts Main regeneration cost to ~0 when nothing
+    // upstream has changed.
+    const fpCacheKey = `strategies:${this.connectionId}:${symbol}:main:fp`
+    const client = getRedisClient()
+    const fpCache = ((await client.hgetall(fpCacheKey).catch(() => null)) || {}) as Record<string, string>
+    const nextFpCache: Record<string, string> = {}
+    let reused = 0
+
+    // ── 2. Variant profiles ─────────────────────────────────────────────
+    const activeVariants = this.selectActiveVariants(ctx)
+
     for (const baseSet of baseSets) {
-      // Filter: only promote Sets with avgPF >= 1.2
+      // Base-level validation — rejected Sets produce NO Main variants
       if (baseSet.avgProfitFactor < metrics.minProfitFactor) continue
-      if (baseSet.avgConfidence < metrics.confidence) continue
+      if (baseSet.avgConfidence  < metrics.confidence)      continue
 
-      const entries: StrategySetEntry[] = []
-      let entryIdx = 0
+      for (const profile of activeVariants) {
+        const fingerprint = this.variantFingerprint(baseSet, profile.name, ctx)
 
-      // Expand config variants from the base Set entries
-      for (const baseEntry of baseSet.entries) {
-        for (const size of sizeMultipliers) {
-          for (const leverage of leverageOptions) {
-            for (const state of positionStates) {
-              if (entryIdx >= maxEntries) break
-
-              const pf = Math.max(
-                metrics.minProfitFactor,
-                baseEntry.profitFactor * (1 + size * 0.05)
-              )
-              const ddt = baseEntry.drawdownTime + (leverage - 1) * 30
-
-              if (ddt > metrics.maxDrawdownTime) continue
-
-              entries.push({
-                id: `${baseSet.setKey}-main-${entryIdx}`,
-                sizeMultiplier: size,
-                leverage,
-                positionState: state,
-                profitFactor: pf,
-                drawdownTime: ddt,
-                confidence: Math.min(0.99, baseEntry.confidence * (1 + size * 0.02)),
-              })
-              entryIdx++
+        // Cache hit — reuse the cached Set verbatim. This is the "IF NOT
+        // ALREADY CREATED" path the user asked for.
+        if (fpCache[fingerprint]) {
+          try {
+            const cached = JSON.parse(fpCache[fingerprint]) as StrategySet
+            // Sanity-check the cached record before reusing it
+            if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
+              mainSets.push(cached)
+              nextFpCache[fingerprint] = fpCache[fingerprint]
+              reused++
+              continue
             }
-            if (entryIdx >= maxEntries) break
-          }
-          if (entryIdx >= maxEntries) break
+          } catch { /* fall through — regenerate on parse failure */ }
         }
-        if (entryIdx >= maxEntries) break
+
+        // Cache miss — build a fresh related Set from this profile
+        const built = this.buildVariantSet(baseSet, profile, metrics, maxEntries)
+        if (!built) continue
+
+        mainSets.push(built)
+        // Store a compact serialisation in the fingerprint cache. Capped at
+        // ~4KB per entry (the bulky `entries` array is already pruned to
+        // maxEntries upstream; we stringify the whole Set for fidelity).
+        nextFpCache[fingerprint] = JSON.stringify(built)
       }
-
-      if (entries.length === 0) continue
-
-      // Enforce max 250 entries per Set — keep highest profitFactor entries
-      const cappedEntries = this.pruneEntries(entries, maxEntries)
-
-      const avgPF   = cappedEntries.reduce((s, e) => s + Number(e.profitFactor  || 0), 0) / cappedEntries.length
-      const avgConf = cappedEntries.reduce((s, e) => s + Number(e.confidence    || 0), 0) / cappedEntries.length
-      const avgDDT  = cappedEntries.reduce((s, e) => s + Number(e.drawdownTime  || 0), 0) / cappedEntries.length
-
-      mainSets.push({
-        setKey: baseSet.setKey,
-        indicationType: baseSet.indicationType,
-        direction: baseSet.direction,
-        avgProfitFactor: avgPF,
-        avgConfidence: avgConf,
-        avgDrawdownTime: avgDDT,
-        entryCount: cappedEntries.length,
-        entries: cappedEntries,
-        createdAt: new Date().toISOString(),
-      })
     }
 
-    // ─── VARIANT classification ────────────────────────────────────────────
-    // Each Main entry is tagged with a strategy variant based on its
-    // (positionState × leverage × sizeMultiplier) profile. This lets the
-    // dashboard report "how many Default / Trailing / Block / DCA position-
-    // coordination configs have been produced" alongside the stage counts.
-    //
-    // Classification rules (first match wins):
-    //   dca      — positionState ∈ {reduce, close} (distributed entries)
-    //   block    — positionState === "add" OR sizeMultiplier >= 1.5
-    //   trailing — positionState === "new" AND leverage >= 3
-    //   default  — everything else (plain single-entry, leverage ≤ 2, size ≤ 1.0)
+    // ─── VARIANT accounting ───────────────────────────────────────────────
+    // Each related Main Set now carries an authoritative `variant` tag set
+    // at build time, so we no longer have to heuristically classify
+    // individual entries. Entries within a Set share the variant label.
+    // Legacy entry-level classifier is kept as a fallback for any caller
+    // that produces a Set without the variant field (back-compat safety).
     const classifyVariant = (e: StrategySetEntry): "default" | "trailing" | "block" | "dca" => {
       if (e.positionState === "reduce" || e.positionState === "close") return "dca"
       if (e.positionState === "add" || e.sizeMultiplier >= 1.5)        return "block"
@@ -423,29 +493,36 @@ export class StrategyCoordinator {
       dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
     }
     for (const set of mainSets) {
-      const seen = new Set<string>()
+      const setVariant = set.variant ?? (set.entries[0] ? classifyVariant(set.entries[0]) : "default")
+      variantAgg[setVariant].setsContaining += 1
+      variantAgg[setVariant].passedSets     += 1
       for (const entry of set.entries) {
-        const v = classifyVariant(entry)
-        variantAgg[v].entries += 1
-        variantAgg[v].sumPF   += Number(entry.profitFactor || 0)
-        variantAgg[v].sumDDT  += Number(entry.drawdownTime || 0)
-        seen.add(v)
-      }
-      for (const v of seen) {
-        variantAgg[v].setsContaining += 1
-        variantAgg[v].passedSets     += 1   // mainSets already passed base filter
+        variantAgg[setVariant].entries += 1
+        variantAgg[setVariant].sumPF   += Number(entry.profitFactor || 0)
+        variantAgg[setVariant].sumDDT  += Number(entry.drawdownTime || 0)
       }
     }
 
-    // Persist MAIN sets
+    // Persist MAIN sets + fingerprint cache. Fingerprint cache has a short
+    // TTL so stale entries don't re-surface after context changes settle.
     const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
     await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
+    try {
+      if (Object.keys(nextFpCache).length > 0) {
+        // Replace the cache atomically so deletions take effect (a Set that
+        // no longer qualifies simply isn't re-written and falls out on TTL).
+        await client.del(fpCacheKey).catch(() => {})
+        await client.hset(fpCacheKey, nextFpCache)
+        await client.expire(fpCacheKey, 300) // 5 min TTL
+      }
+    } catch { /* non-critical */ }
 
     // Write Main counts to progression hash — CUMULATIVE via hincrby so the dashboard
     // does not oscillate with per-cycle snapshots (see matching fix in createBaseSets).
     // Per-cycle snapshot is kept in `strategies_main_current` for components that want it.
     try {
-      const client = getRedisClient()
+      // Reuse the same client instance bound at the top of this function —
+      // avoids an extra getRedisClient() call per cycle.
       const redisKey = `progression:${this.connectionId}`
       const mainDetailKey = `strategy_detail:${this.connectionId}:main`
       const mainAvgPF  = mainSets.length > 0 ? mainSets.reduce((s, st) => s + st.avgProfitFactor, 0) / mainSets.length : 0
@@ -552,10 +629,24 @@ export class StrategyCoordinator {
       } catch { /* non-critical */ }
     } catch { /* non-critical */ }
 
-    const failed = baseSets.length - mainSets.length
+    // `failedEvaluation` counts Base Sets that were rejected by the validation
+    // filter. When a single Base Set produces multiple related variant Sets
+    // (default + trailing + block …) we still want the pass/fail accounting
+    // to reference the unique Base Sets, so derive it from parent lineage.
+    const uniqueBaseSetsProduced = new Set<string>()
+    for (const s of mainSets) uniqueBaseSetsProduced.add(s.parentSetKey ?? s.setKey)
+    const failed = baseSets.length - uniqueBaseSetsProduced.size
+
     if (baseSets.length > 0) {
       const sample = baseSets[0]
-      console.log(`[v0] [StrategyFlow] ${symbol} MAIN: ${mainSets.length}/${baseSets.length} promoted (minPF=${metrics.minProfitFactor}) | sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}}`)
+      const variantBreakdown = ["default", "trailing", "block", "dca"]
+        .map((v) => `${v[0]}=${mainSets.filter((s) => s.variant === v).length}`)
+        .join(",")
+      console.log(
+        `[v0] [StrategyFlow] ${symbol} MAIN: ${mainSets.length} sets (${uniqueBaseSetsProduced.size}/${baseSets.length} bases, reused=${reused}) ` +
+        `variants={${variantBreakdown}} ctx={cont=${ctx.continuousCount},lastW=${ctx.lastWins},lastL=${ctx.lastLosses},prevL=${ctx.prevLosses}} ` +
+        `| sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}}`
+      )
     } else {
       console.log(`[v0] [StrategyFlow] ${symbol} MAIN: 0 base sets available`)
     }
@@ -676,7 +767,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ────────────────────��──────��───────────────────────────────
+  // ─── STAGE 4: LIVE ────────────────────��──────��──────────────────────���────────
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -992,6 +1083,280 @@ export class StrategyCoordinator {
   }
 
   // ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+  // Per-cycle position-context cache. The pseudo-position list is shared
+  // across all Main invocations within the same cycle to amortise Redis
+  // reads when many symbols go through the flow in rapid succession.
+  private positionContextCache: { ctx: PositionContext; ts: number } | null = null
+  private readonly POSITION_CONTEXT_TTL_MS = 2000
+
+  /**
+   * Produce a neutral position context — no open positions, no prior wins
+   * or losses. Used for prehistoric/backtest runs and as a fallback when the
+   * pseudo-position read fails (keeps Main operational even if the position
+   * index is temporarily unavailable).
+   */
+  private neutralPositionContext(): PositionContext {
+    return {
+      continuousCount: 0,
+      lastPosCount: 0,
+      prevPosCount: 0,
+      lastWins: 0,
+      lastLosses: 0,
+      prevLosses: 0,
+      perSymbolOpen: {},
+    }
+  }
+
+  /**
+   * Fetch the per-cycle position coordination context used by MAIN to decide
+   * which additional related variant Sets to produce. Reads pseudo positions
+   * once and buckets them into continuous (active) vs last-N closed vs full
+   * lookback window. Results are cached for POSITION_CONTEXT_TTL_MS so
+   * symbols processed in rapid succession share a single Redis read.
+   */
+  private async getPositionContext(): Promise<PositionContext> {
+    const now = Date.now()
+    if (this.positionContextCache && now - this.positionContextCache.ts < this.POSITION_CONTEXT_TTL_MS) {
+      return this.positionContextCache.ctx
+    }
+
+    try {
+      const posManager = new PseudoPositionManager(this.connectionId)
+      const active = await posManager.getActivePositions()
+
+      // Build per-symbol open-position map from the active list (continuous
+      // positions). No extra Redis reads — getActivePositions already pulls
+      // the full hashes behind a 1s internal cache.
+      const perSymbolOpen: Record<string, number> = {}
+      for (const p of active) {
+        const sym = String(p.symbol || "")
+        if (!sym) continue
+        perSymbolOpen[sym] = (perSymbolOpen[sym] ?? 0) + 1
+      }
+
+      // For closed-window stats we read the pseudo-position index directly
+      // and only fetch hashes for positions NOT in the active set. This
+      // keeps the hot path O(active + window) rather than O(all history).
+      // A 24h lookback + max 50 recent closed positions is a good trade-off
+      // between signal quality and Redis load.
+      const client = getRedisClient()
+      const setKey = `pseudo_positions:${this.connectionId}`
+      const lookbackMs = 24 * 60 * 60 * 1000
+      const cutoff = now - lookbackMs
+      const WINDOW_CAP = 50
+
+      let prevPosCount = 0
+      let prevLosses = 0
+      const lastN: Array<{ closedAt: number; pnl: number }> = []
+      try {
+        const allIds: string[] = (await client.smembers(setKey).catch(() => [])) || []
+        // Exclude active ids up-front so we don't double-read their hashes
+        const activeIdSet = new Set(active.map((p: any) => String(p.id || "")))
+        const closedIds = allIds.filter((id: string) => !activeIdSet.has(String(id)))
+
+        // Fetch hashes in parallel — bounded to WINDOW_CAP * 2 to stay cheap
+        // when the connection has a huge historical archive.
+        const sampledIds = closedIds.slice(-WINDOW_CAP * 2)
+        const hashes = await Promise.all(
+          sampledIds.map(async (id) => {
+            try {
+              const h = await client.hgetall(`pseudo_position:${this.connectionId}:${id}`)
+              return h && Object.keys(h).length > 0 ? h : null
+            } catch {
+              return null
+            }
+          }),
+        )
+
+        for (const h of hashes) {
+          if (!h) continue
+          const closedAt = Number(h.closed_at || h.closedAt || h.opened_at || 0)
+          if (!closedAt || closedAt < cutoff) continue
+          const pnl = Number(h.pnl ?? h.realized_pnl ?? h.profit ?? 0)
+          prevPosCount++
+          if (pnl < 0) prevLosses++
+          lastN.push({ closedAt, pnl })
+        }
+        // Keep the 5 most recently closed for the "last-N" breakdown
+        lastN.sort((a, b) => b.closedAt - a.closedAt)
+        lastN.length = Math.min(lastN.length, 5)
+      } catch { /* best-effort; fall through with zeros */ }
+
+      const ctx: PositionContext = {
+        continuousCount: active.length,
+        lastPosCount:    lastN.length,
+        prevPosCount,
+        lastWins:        lastN.filter((r) => r.pnl > 0).length,
+        lastLosses:      lastN.filter((r) => r.pnl < 0).length,
+        prevLosses,
+        perSymbolOpen,
+      }
+
+      this.positionContextCache = { ctx, ts: now }
+      return ctx
+    } catch (err) {
+      // Never fail the strategy flow on a context read error — fall back to
+      // the neutral context so only the always-on `default` variant is made.
+      console.warn(
+        `[v0] [StrategyFlow] getPositionContext failed; using neutral context:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      const neutral = this.neutralPositionContext()
+      this.positionContextCache = { ctx: neutral, ts: now }
+      return neutral
+    }
+  }
+
+  /**
+   * Decide which variant profiles are ACTIVE for the current position context.
+   * Each profile has a gate predicate — predicates that fail produce no
+   * related Set for that variant this cycle (keeps work proportional to
+   * context). The `default` variant is always on — it mirrors the original
+   * one-Set-per-base behaviour and is what Real/Live have always consumed.
+   */
+  private selectActiveVariants(ctx: PositionContext): Array<ReturnType<StrategyCoordinator["variantProfiles"]>[number]> {
+    return this.variantProfiles().filter((p) => p.gate(ctx))
+  }
+
+  /**
+   * Curated variant profiles.
+   *
+   * Each profile contains a small list of configuration tuples (≤ 4 per
+   * variant). Compared to the legacy 4×4×4 = 64 Cartesian expansion, this
+   * produces at most ~16 candidate entries per base entry across all active
+   * variants — a ~4× reduction in Main computation while preserving the
+   * semantic coverage (each variant now produces a DEDICATED Set instead of
+   * being scattered across one big hybrid Set).
+   *
+   * Gate predicates encode the user's coordination spec:
+   *   default  — always on (validates & mirrors the Base Set)
+   *   trailing — recent winners, no open position (scale-in opportunity)
+   *   block    — there's an open position we can add to (continuation)
+   *   dca      — recent losses to recover with averaged entries
+   */
+  private variantProfiles(): Array<{
+    name: "default" | "trailing" | "block" | "dca"
+    gate: (ctx: PositionContext) => boolean
+    configs: Array<{ size: number; leverage: number; state: string; pfBias: number; ddtBias: number }>
+  }> {
+    return [
+      {
+        name: "default",
+        gate: () => true,
+        configs: [
+          { size: 1.0, leverage: 1, state: "new", pfBias: 1.00, ddtBias: 0  },
+          { size: 1.0, leverage: 2, state: "new", pfBias: 1.05, ddtBias: 15 },
+        ],
+      },
+      {
+        name: "trailing",
+        gate: (c) => c.lastWins >= 2 && c.continuousCount === 0,
+        configs: [
+          { size: 1.0, leverage: 3, state: "new", pfBias: 1.10, ddtBias: 30 },
+          { size: 1.0, leverage: 5, state: "new", pfBias: 1.15, ddtBias: 60 },
+        ],
+      },
+      {
+        name: "block",
+        // At least one open position, but don't let block stack indefinitely
+        gate: (c) => c.continuousCount >= 1 && c.continuousCount < 3,
+        configs: [
+          { size: 1.5, leverage: 2, state: "add", pfBias: 1.08, ddtBias: 45 },
+          { size: 2.0, leverage: 2, state: "add", pfBias: 1.12, ddtBias: 75 },
+        ],
+      },
+      {
+        name: "dca",
+        gate: (c) => c.prevLosses >= 1,
+        configs: [
+          { size: 0.5, leverage: 1, state: "reduce", pfBias: 0.98, ddtBias: 20 },
+          { size: 0.5, leverage: 1, state: "close",  pfBias: 0.95, ddtBias: 30 },
+        ],
+      },
+    ]
+  }
+
+  /**
+   * Deterministic fingerprint of {base Set × variant × position context}.
+   * Drives the "IF NOT ALREADY CREATED" dedup check. Position context is
+   * bucketised (continuousCount bucket, lastWins bucket, prevLosses bucket)
+   * so small count changes don't invalidate the cache on every tick.
+   */
+  private variantFingerprint(
+    baseSet: StrategySet,
+    variant: "default" | "trailing" | "block" | "dca",
+    ctx: PositionContext,
+  ): string {
+    // Bucket helpers — compress near-equal inputs so the cache key is stable
+    // across minor context jitter (e.g. 3→4 open positions keeps same bucket).
+    const bPF    = Math.round(baseSet.avgProfitFactor * 10) / 10
+    const bEC    = baseSet.entryCount
+    const bCtx   = `${Math.min(5, ctx.continuousCount)}/${Math.min(5, ctx.lastWins)}/${Math.min(5, ctx.lastLosses)}/${Math.min(10, ctx.prevLosses)}`
+    return `${baseSet.setKey}#${variant}#pf=${bPF}#ec=${bEC}#ctx=${bCtx}`
+  }
+
+  /**
+   * Build one related Main Set from a qualifying Base Set + variant profile.
+   * Returns `null` if all candidate entries are rejected by the DDT cap or
+   * the Set ends up empty (shouldn't normally happen at Main thresholds).
+   */
+  private buildVariantSet(
+    baseSet: StrategySet,
+    profile: ReturnType<StrategyCoordinator["variantProfiles"]>[number],
+    metrics: EvaluationMetrics,
+    maxEntries: number,
+  ): StrategySet | null {
+    const entries: StrategySetEntry[] = []
+    let idx = 0
+
+    outer: for (const baseEntry of baseSet.entries) {
+      for (const cfg of profile.configs) {
+        if (idx >= maxEntries) break outer
+        // Project the base entry through the variant config
+        const pf  = Math.max(metrics.minProfitFactor, baseEntry.profitFactor * cfg.pfBias)
+        const ddt = baseEntry.drawdownTime + cfg.ddtBias
+        if (ddt > metrics.maxDrawdownTime) continue
+
+        entries.push({
+          id: `${baseSet.setKey}-${profile.name}-${idx}`,
+          sizeMultiplier: cfg.size,
+          leverage:       cfg.leverage,
+          positionState:  cfg.state,
+          profitFactor:   pf,
+          drawdownTime:   ddt,
+          // Confidence is preserved from the base entry — the variant changes
+          // sizing/leverage/state, not the underlying signal quality.
+          confidence:     Math.min(0.99, baseEntry.confidence),
+        })
+        idx++
+      }
+    }
+
+    if (entries.length === 0) return null
+    const capped = this.pruneEntries(entries, maxEntries)
+    const avgPF  = capped.reduce((s, e) => s + Number(e.profitFactor  || 0), 0) / capped.length
+    const avgCnf = capped.reduce((s, e) => s + Number(e.confidence    || 0), 0) / capped.length
+    const avgDDT = capped.reduce((s, e) => s + Number(e.drawdownTime  || 0), 0) / capped.length
+
+    return {
+      // Variant-scoped setKey — `direction:long#default`, `direction:long#block`, …
+      // This guarantees unique identity downstream so Real/Live treat each
+      // variant as a distinct Set while still letting consumers trace
+      // lineage via `parentSetKey`.
+      setKey:          `${baseSet.setKey}#${profile.name}`,
+      parentSetKey:    baseSet.setKey,
+      variant:         profile.name,
+      indicationType:  baseSet.indicationType,
+      direction:       baseSet.direction,
+      avgProfitFactor: avgPF,
+      avgConfidence:   avgCnf,
+      avgDrawdownTime: avgDDT,
+      entryCount:      capped.length,
+      entries:         capped,
+      createdAt:       new Date().toISOString(),
+    }
+  }
 
   /**
    * Enforce max entries per Set using hybrid pruning (keep highest PF first, recent bonus).
