@@ -96,8 +96,16 @@ export function ExchangeTab({
             ))}
           </SelectContent>
         </Select>
+        {/*
+          Scope hint — the fields on this page are part of the global
+          app_settings blob and apply to every connection. This selector only
+          picks which exchange's per-connection overrides (API keys, leverage,
+          cost %) are surfaced in the Connection Edit dialog below. The
+          previous copy ("Isolated settings for this connection only")
+          contradicted the global-scope banner and caused user confusion.
+        */}
         <p className="text-xs text-muted-foreground mt-2">
-          Isolated settings for this connection only
+          Select which connection&apos;s per-exchange overrides to surface below &mdash; trading defaults shown further down are global.
         </p>
       </div>
       <TabsContent value="exchange" className="space-y-4">
