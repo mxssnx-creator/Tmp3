@@ -313,8 +313,14 @@ async function pollOrderFill(
 }
 
 /**
- * Place a protection order (SL or TP) as a limit order at triggerPrice.
- * Returns order id on success, null on failure.
+ * Place a protection order (SL or TP) as a reduce-only limit order at
+ * `triggerPrice` that *closes* (never opens) a position.
+ *
+ * On hedge-mode perp accounts the connector needs to know the positionSide
+ * of the OPEN position (LONG/SHORT), which is independent of the order's
+ * close side. Passing `reduceOnly=true` + the correct `positionSide` is
+ * what prevents the exchange from treating this as a new opposite-side
+ * entry and hedging against the real position.
  */
 async function placeProtectionOrder(
   connector: any,
@@ -322,11 +328,22 @@ async function placeProtectionOrder(
   closeSide: "buy" | "sell",
   quantity: number,
   triggerPrice: number,
-  orderLabel: string
+  orderLabel: string,
+  positionDirection: "long" | "short",
 ): Promise<string | null> {
   try {
     if (typeof connector.placeOrder !== "function") return null
-    const result = await connector.placeOrder(symbol, closeSide, quantity, triggerPrice, "limit")
+    const result = await connector.placeOrder(
+      symbol,
+      closeSide,
+      quantity,
+      triggerPrice,
+      "limit",
+      {
+        reduceOnly: true,
+        positionSide: positionDirection === "long" ? "LONG" : "SHORT",
+      },
+    )
     if (result?.success && (result.orderId || result.id)) {
       console.log(`${LOG_PREFIX} ${orderLabel} placed: ${result.orderId || result.id} @ ${triggerPrice}`)
       return result.orderId || result.id
@@ -567,8 +584,22 @@ export async function executeLivePosition(
       )} @ ${currentPrice}`
     )
 
+    // For perp entries we pass the explicit positionSide matching the real
+    // position direction so hedge-mode accounts route correctly. Connectors
+    // that don't care about the options object simply ignore the 6th arg.
+    // BingX's one-way-mode accounts auto-retry without positionSide if the
+    // exchange rejects it (code 80014), so this is safe for both modes.
     const orderResult: any = await retry(
-      () => exchangeConnector.placeOrder(realPosition.symbol, exchangeSide, computedVolume, undefined, "market"),
+      () => exchangeConnector.placeOrder(
+        realPosition.symbol,
+        exchangeSide,
+        computedVolume,
+        undefined,
+        "market",
+        {
+          positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
+        },
+      ),
       r => !!r?.success && !!(r.orderId || r.id),
       "placeOrder"
     )
@@ -674,7 +705,8 @@ export async function executeLivePosition(
         sideClose,
         livePosition.executedQuantity,
         slPrice,
-        "StopLoss"
+        "StopLoss",
+        realPosition.direction,
       )
       const tpOrderId = await placeProtectionOrder(
         exchangeConnector,
@@ -682,7 +714,8 @@ export async function executeLivePosition(
         sideClose,
         livePosition.executedQuantity,
         tpPrice,
-        "TakeProfit"
+        "TakeProfit",
+        realPosition.direction,
       )
       if (slOrderId) livePosition.stopLossOrderId = slOrderId
       if (tpOrderId) livePosition.takeProfitOrderId = tpOrderId

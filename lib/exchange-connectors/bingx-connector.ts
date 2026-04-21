@@ -1,5 +1,9 @@
 import * as crypto from "crypto"
-import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-connector"
+import {
+  BaseExchangeConnector,
+  type ExchangeConnectorResult,
+  type PlaceOrderOptions,
+} from "./base-connector"
 import { safeParseResponse } from "@/lib/safe-response-parser"
 
 /**
@@ -290,7 +294,8 @@ export class BingXConnector extends BaseExchangeConnector {
     side: "buy" | "sell",
     quantity: number,
     price?: number,
-    orderType: "limit" | "market" = "limit"
+    orderType: "limit" | "market" = "limit",
+    options: PlaceOrderOptions = {},
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
       // ── Quantity sanity & formatting ─────────────────────────────────────
@@ -321,7 +326,33 @@ export class BingXConnector extends BaseExchangeConnector {
       const isSpot = this.credentials.apiType === "spot"
       const bingxSymbol = this.toBingXSymbol(symbol)
 
-      this.log(`Placing ${orderType} ${side} order: ${qtyStr} ${bingxSymbol} (raw=${symbol})`)
+      // ── Position-side & reduce-only handling ─────────────────────────────
+      // BingX perp accepts positionSide = LONG | SHORT only when the account
+      // is in **hedge mode**. In one-way mode the same parameter will be
+      // rejected and the whole order fails. Resolution order:
+      //   1. Caller passed an explicit options.positionSide — trust it (only
+      //      valid when the caller also indicates hedge mode, else we drop it).
+      //   2. Caller told us hedgeMode=false — emit no positionSide (one-way).
+      //   3. Fallback (legacy behaviour) — derive from order side, which is
+      //      only correct for OPENING orders. For reduce-only orders this
+      //      would silently open a new opposite-side position, which is why
+      //      callers should always pass options.positionSide for SL/TP/close.
+      const hedgeMode = options.hedgeMode !== false
+      const explicitPositionSide = options.positionSide
+      const derivedPositionSide: "LONG" | "SHORT" = side === "buy" ? "LONG" : "SHORT"
+      const effectivePositionSide = explicitPositionSide
+        || (options.reduceOnly
+          // Reduce-only + no explicit side → infer the position side from the
+          // close side (a SELL-to-close is closing a LONG, a BUY-to-close is
+          // closing a SHORT).
+          ? (side === "sell" ? "LONG" : "SHORT")
+          : derivedPositionSide)
+
+      this.log(
+        `Placing ${orderType} ${side} order: ${qtyStr} ${bingxSymbol} (raw=${symbol})` +
+        `${options.reduceOnly ? " [reduceOnly]" : ""}` +
+        `${hedgeMode ? ` posSide=${effectivePositionSide}` : " [one-way]"}`
+      )
 
       // Trade endpoints live under /openApi/swap/v2/* for perpetual futures
       // and /openApi/spot/v1/* for spot.
@@ -335,10 +366,17 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: Date.now(),
       }
 
-      // BingX perpetual futures requires positionSide. Sending LONG/SHORT
-      // works in both hedge and one-way mode; omit for spot.
       if (!isSpot) {
-        params.positionSide = side === "buy" ? "LONG" : "SHORT"
+        if (hedgeMode) {
+          params.positionSide = effectivePositionSide
+        }
+        // reduceOnly is only meaningful on perp endpoints.
+        if (options.reduceOnly) {
+          params.reduceOnly = "true"
+        }
+        if (options.clientOrderId) {
+          params.clientOrderId = options.clientOrderId
+        }
       }
 
       if (price && orderType === "limit") {
@@ -364,6 +402,32 @@ export class BingXConnector extends BaseExchangeConnector {
       const data = await response.json()
 
       if (!this.isBingXSuccess(data.code)) {
+        // Special-case: 80014 "position side does not match" — the account is
+        // in one-way mode but we sent a hedge-mode positionSide. Retry once
+        // without positionSide so the order still goes through rather than
+        // being silently dropped.
+        const sideMismatch = String(data.code) === "80014"
+          || /position.*side/i.test(String(data.msg || ""))
+        if (sideMismatch && !isSpot && hedgeMode) {
+          this.log("Retrying order without positionSide (detected one-way account)")
+          delete params.positionSide
+          params.timestamp = Date.now()
+          const retrySig = this.getSignature(params)
+          const retryQs = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${retrySig}`
+          const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}`
+          const retryResp = await this.rateLimitedFetch(retryUrl, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const retryData = await retryResp.json()
+          if (this.isBingXSuccess(retryData.code)) {
+            const info = retryData.data?.order || retryData.data || {}
+            const id = info.orderId || info.id || retryData.data?.orderId
+            this.log(`✓ Order placed on retry (one-way): ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined }
+          }
+          throw new Error(`BingX API error (code=${retryData.code}): ${retryData.msg || "Unknown error"}`)
+        }
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
@@ -659,9 +723,35 @@ export class BingXConnector extends BaseExchangeConnector {
         return { success: false, error: "Position not found" }
       }
 
-      // Place opposite order to close
-      const side = position.side === "LONG" ? "sell" : "buy"
-      const result = await this.placeOrder(symbol, side as "buy" | "sell", position.contracts, position.currentPrice, "market")
+      // Determine the effective side of the *position* we are closing so the
+      // reduce-only close order carries the correct `positionSide` on hedge
+      // accounts. When the caller tells us explicitly, trust it; otherwise
+      // infer from the exchange response.
+      const posSideNormalised = (positionSide
+        ? positionSide.toUpperCase()
+        : String(position.side || position.positionSide || "LONG").toUpperCase()) as "LONG" | "SHORT"
+
+      // Close side is the OPPOSITE of the position side:
+      //   LONG position  → SELL to close
+      //   SHORT position → BUY to close
+      const closeSide = posSideNormalised === "LONG" ? "sell" : "buy"
+      const qty = Number(position.contracts || position.positionAmt || position.quantity || 0)
+      if (!qty || qty <= 0) {
+        return { success: false, error: "Position size is zero or invalid — nothing to close" }
+      }
+
+      const result = await this.placeOrder(
+        symbol,
+        closeSide as "buy" | "sell",
+        qty,
+        undefined,
+        "market",
+        {
+          reduceOnly: true,
+          positionSide: posSideNormalised,
+          hedgeMode: true,
+        },
+      )
 
       if (!result.success) {
         return result
@@ -781,35 +871,50 @@ export class BingXConnector extends BaseExchangeConnector {
   async setLeverage(symbol: string, leverage: number): Promise<{ success: boolean; error?: string }> {
     try {
       const bingxSymbol = this.toBingXSymbol(symbol)
-      this.log(`Setting leverage to ${leverage}x for ${bingxSymbol}`)
+      this.log(`Setting leverage to ${leverage}x for ${bingxSymbol} on both sides`)
 
-      // BingX perpetual requires a `side` param on leverage changes; LONG is a
-      // sensible default for initial position opening. If you need SHORT
-      // leverage configured independently, call this again with the opposite.
-      const params: Record<string, string> = {
-        symbol: bingxSymbol,
-        side: "LONG",
-        leverage: String(leverage),
-        timestamp: String(Date.now()),
+      // Previously this method always sent `side: "LONG"`, which meant any
+      // SHORT position opened afterwards was stuck on the default leverage
+      // (often 5x) regardless of what the engine requested — and in some
+      // accounts caused the subsequent SHORT entry to be rejected for
+      // leverage-mismatch. Fire both LONG and SHORT side updates in parallel
+      // so hedge-mode accounts have matching leverage on both sides.
+      const updateForSide = async (side: "LONG" | "SHORT") => {
+        const params: Record<string, string> = {
+          symbol: bingxSymbol,
+          side,
+          leverage: String(leverage),
+          timestamp: String(Date.now()),
+        }
+        const signature = this.getSignature(params)
+        const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
+        const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${queryString}`
+        const response = await this.rateLimitedFetch(url, {
+          method: "POST",
+          headers: { "X-BX-APIKEY": this.credentials.apiKey },
+        })
+        const data = await response.json()
+        return { side, ok: this.isBingXSuccess(data.code), data }
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      // Perp: /openApi/swap/v2/trade/leverage (not v3).
-      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${queryString}`
+      const [longResult, shortResult] = await Promise.all([
+        updateForSide("LONG").catch((err) => ({ side: "LONG", ok: false, data: { msg: String(err) } })),
+        updateForSide("SHORT").catch((err) => ({ side: "SHORT", ok: false, data: { msg: String(err) } })),
+      ])
 
-      const response = await this.rateLimitedFetch(url, {
-        method: "POST",
-        headers: { "X-BX-APIKEY": this.credentials.apiKey },
-      })
+      // Accept the call as successful if at least one side was configured.
+      // On one-way-mode accounts BingX rejects the `side` param with code
+      // 80012 / 80014; treat those as non-fatal — the engine still proceeds.
+      const ok = longResult.ok || shortResult.ok ||
+        String(longResult.data?.code) === "80014" ||
+        String(shortResult.data?.code) === "80014"
 
-      const data = await response.json()
-
-      if (!this.isBingXSuccess(data.code)) {
-        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      if (!ok) {
+        const reason = longResult.data?.msg || shortResult.data?.msg || "Unknown error"
+        throw new Error(`BingX leverage API error: ${reason}`)
       }
 
-      this.log(`✓ Leverage set to ${leverage}x`)
+      this.log(`✓ Leverage set to ${leverage}x (long=${longResult.ok}, short=${shortResult.ok})`)
       return { success: true }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
