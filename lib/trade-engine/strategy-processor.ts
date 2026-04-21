@@ -48,26 +48,40 @@ export class StrategyProcessor {
       const coordinator = new StrategyCoordinator(this.connectionId)
       const results = await coordinator.executeStrategyFlow(symbol, indications, false)
 
-      // Calculate totals across all stages + fan out stats tracking.
-      // The original loop awaited `trackStrategyStats` sequentially once per
-      // stage (typically 4 awaits per symbol per cycle). Since the stats
-      // trackers are independent per stage, we compute totals synchronously
-      // and fire all stage writes in a single Promise.all.
-      let totalEvaluated = 0
-      let totalLiveReady = 0
+      // ── Pipeline-aware counting ────────────────────────────────────────
+      // BASE → MAIN → REAL → LIVE is a CASCADE FILTER, not four independent
+      // categories. Each stage technically performs the SAME operation
+      // (evaluate → filter → adjust) on the output of the previous stage, so
+      // a single logical "strategy" flows through all stages. Summing stage
+      // counts (`base + main + real + live`) would count the same strategy
+      // up to 4 times — a bug.
+      //
+      // The canonical "strategies evaluated this cycle" is therefore the
+      // FINAL-stage output. We use REAL (`result.totalCreated`) as the
+      // authoritative count because Real is the last evaluation stage that
+      // runs for every symbol (Live is skipped in prehistoric/backtest mode).
+      // `liveReady` = strategies that passed the REAL filter and are eligible
+      // to promote to exchange orders.
+      let realEvaluated = 0
+      let realLiveReady = 0
       const stageSummary: Record<string, any> = {}
       const statsWrites: Promise<any>[] = []
 
       for (const result of results) {
-        totalEvaluated += result.totalCreated
-        totalLiveReady += result.passedEvaluation
-
         stageSummary[result.type] = {
           setsEvaluated: result.totalCreated,
           setsPassed: result.passedEvaluation,
           setsFailed: result.failedEvaluation,
           avgProfitFactor: result.avgProfitFactor.toFixed(2),
           avgDrawdownTime: `${Math.round(result.avgDrawdownTime)}min`,
+        }
+
+        // Anchor the canonical "strategies this cycle" count on the REAL
+        // stage — Base/Main are intermediate filter steps of the same
+        // pipeline and MUST NOT be summed together with Real.
+        if (result.type === "real") {
+          realEvaluated = result.totalCreated
+          realLiveReady = result.passedEvaluation
         }
 
         console.log(
@@ -91,18 +105,22 @@ export class StrategyProcessor {
       // Await all stats writes together — no per-stage blocking.
       if (statsWrites.length > 0) await Promise.all(statsWrites)
 
-      if (totalLiveReady > 0) {
-        console.log(`[v0] [StrategyFlow] ${symbol}: READY FOR TRADING - ${totalLiveReady} live Sets selected`)
-        
+      if (realLiveReady > 0) {
+        console.log(`[v0] [StrategyFlow] ${symbol}: READY FOR TRADING - ${realLiveReady} live Sets selected`)
+
         await logProgressionEvent(this.connectionId, `strategies_realtime`, "info", `Strategy flow completed for ${symbol}`, {
           stageSummary,
-          totalCreated: totalEvaluated,
-          totalLiveReady,
+          realEvaluated,
+          realLiveReady,
           indicationsProcessed: indications.length,
         })
       }
 
-      return { strategiesEvaluated: totalEvaluated, liveReady: totalLiveReady }
+      // `strategiesEvaluated` here is the REAL-stage count, NOT a sum across
+      // stages. Callers (engine-manager, stats routes) aggregate this value
+      // across SYMBOLS per cycle, which is correct — cross-symbol sums of
+      // the final-stage count are meaningful totals.
+      return { strategiesEvaluated: realEvaluated, liveReady: realLiveReady }
     } catch (error) {
       console.error(
         `[v0] [Strategy] Failed for ${symbol}:`,
