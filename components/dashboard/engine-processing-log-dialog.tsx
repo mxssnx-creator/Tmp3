@@ -84,6 +84,11 @@ export function EngineProcessingLogDialog({ connectionId: propConnectionId }: { 
         addLog("error", `Failed to fetch stats (HTTP ${statsRes.status})`)
         return
       }
+      const [monitorRes, connLogRes, engineRes] = await Promise.all([
+        fetch('/api/system/monitoring', { cache: 'no-store' }),
+        fetch(`/api/connections/progression/${activeConnectionId}/logs`, { cache: 'no-store' }),
+        fetch('/api/engine/verify', { cache: 'no-store' })
+      ])
 
       const s = await statsRes.json()
 
@@ -124,6 +129,12 @@ export function EngineProcessingLogDialog({ connectionId: propConnectionId }: { 
           isActive,
           cycleTimeMs,
           successRate,
+          intervalsProcessed: connLog.summary?.enginePerformance?.cyclesCompleted || 0,
+          indicationsGenerated: Object.values(connLog.summary?.indicationsCounts || {}).reduce((a: number, b: unknown) => a + Number(b || 0), 0),
+          strategiesEvaluated: Object.values(connLog.summary?.strategyCounts || {}).reduce((a: number, b: any) => a + Number(b?.evaluated || 0), 0),
+          positionsCreated: connLog.summary?.enginePerformance?.totalTrades || 0,
+          isActive: engine.components?.[0]?.phases?.realtime?.processing || false,
+          lastCycleTime: connLog.summary?.enginePerformance?.cycleTimeMs || 0
         },
         performance: {
           avgCycleTimeMs:     cycleTimeMs,

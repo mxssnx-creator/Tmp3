@@ -178,8 +178,117 @@ async function routeQuery(queryText: string, params: any[] = []): Promise<{ rows
       return { rows: parsed, rowCount: parsed.length }
     }
 
-    // ---- SELECT COUNT ----
-    if (upper.includes("SELECT COUNT")) {
+    // ---- AGGREGATE QUERIES (COUNT, SUM, AVG, GROUP BY) ----
+    if ((upper.includes("SELECT COUNT") || upper.includes("SUM(") || upper.includes("AVG(") || upper.includes("GROUP BY")) && !upper.includes("*")) {
+      const tableMatch = upper.match(/FROM\s+(\w+)/i)
+      const groupByMatch = upper.match(/GROUP BY\s+(\w+)/i)
+      
+      if (tableMatch) {
+        const client = getRedisClient()
+        const table = tableMatch[1].toLowerCase()
+        const groupByField = groupByMatch ? groupByMatch[1].toLowerCase() : null
+        
+        // Extract aggregate functions
+        const aggregates: {fn: string, field: string, alias: string}[] = []
+        const aggregateMatches = q.matchAll(/(COUNT|SUM|AVG)\(([^)]+)\)\s*(?:AS\s+(\w+))?/gi)
+        for (const match of aggregateMatches) {
+          aggregates.push({
+            fn: match[1].toUpperCase(),
+            field: match[2].trim(),
+            alias: match[3] || match[2].trim()
+          })
+        }
+        
+        // Get all items from table
+        const ids = await client.smembers(table)
+        const items: any[] = []
+        for (const id of ids) {
+          const item = await client.hgetall(`${table}:${id}`)
+          if (item && Object.keys(item).length > 0) {
+            // Parse numeric values
+            const parsed: any = { id }
+            for (const [k, v] of Object.entries(item)) {
+              if (typeof v === 'string' && !isNaN(Number(v))) {
+                parsed[k] = Number(v)
+              } else {
+                parsed[k] = v
+              }
+            }
+            items.push(parsed)
+          }
+        }
+        
+        // Apply WHERE date filter if present
+        let filteredItems = items
+        const dateFilterMatch = upper.match(/(\w+)\s*>\s*datetime\('now',\s*\?\)/i)
+        if (dateFilterMatch && params.length > 0) {
+          const dateField = dateFilterMatch[1].toLowerCase()
+          const timeDelta = params[params.length - 1] as string
+          
+          // Parse time delta like "-24 hours"
+          const hoursMatch = timeDelta.match(/-(\d+)\s+hours?/i)
+          if (hoursMatch) {
+            const hoursBack = parseInt(hoursMatch[1])
+            const cutoffTime = Date.now() - (hoursBack * 60 * 60 * 1000)
+            
+            filteredItems = items.filter(item => {
+              if (!item[dateField]) return false
+              const itemTime = new Date(item[dateField]).getTime()
+              return itemTime > cutoffTime
+            })
+          }
+        }
+        
+        // Apply connection_id filter if present
+        const connFilterMatch = upper.match(/connection_id\s*=\s*\?/i)
+        if (connFilterMatch && params.length > 0) {
+          const connectionId = params[0]
+          filteredItems = filteredItems.filter(item => item.connection_id === connectionId)
+        }
+        
+        // Group items if GROUP BY is specified
+        const groups: Record<string, any[]> = {}
+        if (groupByField) {
+          for (const item of filteredItems) {
+            const key = item[groupByField] || 'unknown'
+            if (!groups[key]) groups[key] = []
+            groups[key].push(item)
+          }
+        } else {
+          groups['all'] = filteredItems
+        }
+        
+        // Calculate aggregates for each group
+        const results: any[] = []
+        for (const [groupKey, groupItems] of Object.entries(groups)) {
+          const result: any = {}
+          
+          if (groupByField) {
+            result[groupByField] = groupKey
+          }
+          
+          for (const agg of aggregates) {
+            if (agg.fn === 'COUNT') {
+              result[agg.alias] = groupItems.length
+            } else if (agg.fn === 'SUM' && agg.field !== '*') {
+              result[agg.alias] = groupItems.reduce((sum, item) => sum + (Number(item[agg.field]) || 0), 0)
+            } else if (agg.fn === 'AVG' && agg.field !== '*') {
+              const sum = groupItems.reduce((sum, item) => sum + (Number(item[agg.field]) || 0), 0)
+              result[agg.alias] = groupItems.length > 0 ? sum / groupItems.length : 0
+            }
+          }
+          
+          results.push(result)
+        }
+        
+        return { rows: results, rowCount: results.length }
+      }
+      
+      return { rows: [{ count: 0 }], rowCount: 1 }
+    }
+    
+    // ---- SELECT COUNT * ----
+    if (upper.includes("SELECT COUNT(*)")) {
       const tableMatch = upper.match(/FROM\s+(\w+)/i)
       if (tableMatch) {
         const client = getRedisClient()
@@ -195,7 +304,7 @@ async function routeQuery(queryText: string, params: any[] = []): Promise<{ rows
       const tableMatch = upper.match(/INTO\s+(\w+)/i)
       if (tableMatch) {
         const table = tableMatch[1].toLowerCase()
-        const id = params[0] || nanoid()
+        const id = nanoid()
         const client = getRedisClient()
         
         if (table === "settings" || table === "config") {
@@ -204,6 +313,31 @@ async function routeQuery(queryText: string, params: any[] = []): Promise<{ rows
           }
         } else {
           await client.sadd(table, String(id))
+          
+          // Extract column names from INSERT statement
+          const columnsMatch = q.match(/\(([^)]+)\)/i)
+          if (columnsMatch && params.length > 0) {
+            const columns = columnsMatch[1].split(',').map(c => c.trim().toLowerCase())
+            const data: Record<string, any> = { id }
+            
+            // Map params to columns (skip VALUES placeholder positions)
+            params.forEach((value, index) => {
+              if (index < columns.length) {
+                const col = columns[index]
+                // Handle datetime('now')
+                if (typeof value === 'string' && value.includes('datetime')) {
+                  data[col] = new Date().toISOString()
+                } else {
+                  data[col] = value
+                }
+              }
+            })
+            
+            // Store all fields as hash
+            await client.hset(`${table}:${id}`, Object.fromEntries(
+              Object.entries(data).map(([k, v]) => [k, typeof v === 'object' ? JSON.stringify(v) : String(v)])
+            ))
+          }
         }
         return { rows: [{ id, created_at: new Date().toISOString() }], rowCount: 1 }
       }

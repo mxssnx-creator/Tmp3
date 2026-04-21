@@ -118,9 +118,9 @@ export async function GET(request: NextRequest) {
           enabled: enabledConnectionsCount,
         },
         statistics: {
-          total_keys: actualKeyCount || stats.keyCount || stats.total_keys || stats.dbSize || 0,
-          memory_used: stats.memory_used || "N/A",
-          uptime_seconds: stats.uptime_seconds || stats.uptimeSeconds || 0,
+          total_keys: actualKeyCount || stats.keyCount || 0,
+          memory_used: stats.memoryUsage || "N/A",
+          uptime_seconds: stats.uptime || 0,
         },
         system: {
           version: "3.2",

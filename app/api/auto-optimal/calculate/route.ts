@@ -201,7 +201,7 @@ function simulateTrades(historicalData: Map<string, any[]>, params: any): Trade[
       const entrySignal = checkEntrySignal(candles, i)
       
       if (entrySignal) {
-        const trade = simulateTrade(symbol, candles, i, params)
+      const trade = simulateTrade(symbol, candles, i, params)
         if (trade) {
           trades.push(trade)
           i += Math.min(120, candles.length - i - 1)

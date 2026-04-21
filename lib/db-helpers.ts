@@ -31,16 +31,20 @@ export async function getActiveIndications(
     
     const indications = await Promise.all(
       ids.map(async (id) => {
-        const data = await client.hgetall(`indication:${id}`)
-        if (data && Object.keys(data).length > 0) {
-          return {
-            id,
-            ...data,
-            profit_factor: parseFloat(data.profit_factor) || 0,
-            confidence: parseFloat(data.confidence) || 0,
+        try {
+          const data = await client.hgetall(`indication:${id}`)
+          if (data && Object.keys(data).length > 0) {
+            return {
+              id,
+              ...data,
+              profit_factor: parseFloat(data.profit_factor) || 0,
+              confidence: parseFloat(data.confidence) || 0,
+            }
           }
+          return null
+        } catch {
+          return null
         }
-        return null
       })
     )
     
@@ -54,7 +58,8 @@ export async function getActiveIndications(
     return filtered
   } catch (error) {
     console.error("[v0] [DB-Helpers] Error getting active indications:", error)
-    return []
+    // DO NOT return empty array on failure - rethrow with proper context
+    throw new Error(`Database query failed: ${(error as Error).message}`)
   }
 }
 
@@ -113,16 +118,20 @@ export async function getActiveStrategies(
     
     const strategies = await Promise.all(
       ids.map(async (id) => {
-        const data = await client.hgetall(`strategy:${id}`)
-        if (data && Object.keys(data).length > 0) {
-          return {
-            id,
-            ...data,
-            profit_factor: parseFloat(data.profit_factor) || 0,
-            win_rate: parseFloat(data.win_rate) || 0,
+        try {
+          const data = await client.hgetall(`strategy:${id}`)
+          if (data && Object.keys(data).length > 0) {
+            return {
+              id,
+              ...data,
+              profit_factor: parseFloat(data.profit_factor) || 0,
+              win_rate: parseFloat(data.win_rate) || 0,
+            }
           }
+          return null
+        } catch {
+          return null
         }
-        return null
       })
     )
     
@@ -136,7 +145,8 @@ export async function getActiveStrategies(
     return filtered
   } catch (error) {
     console.error("[v0] [DB-Helpers] Error getting active strategies:", error)
-    return []
+    // DO NOT return empty array on failure - rethrow with proper context
+    throw new Error(`Database query failed: ${(error as Error).message}`)
   }
 }
 
@@ -191,26 +201,31 @@ export async function getAllPositions(connectionId?: string) {
     
     const positions = await Promise.all(
       ids.map(async (id) => {
-        const data = await client.hgetall(`position:${id}`)
-        if (data && Object.keys(data).length > 0) {
-          return {
-            id,
-            ...data,
-            entry_price: parseFloat(data.entry_price) || 0,
-            exit_price: parseFloat(data.exit_price) || 0,
-            quantity: parseFloat(data.quantity) || 0,
-            realized_pnl: parseFloat(data.realized_pnl) || 0,
-            unrealized_pnl: parseFloat(data.unrealized_pnl) || 0,
+        try {
+          const data = await client.hgetall(`position:${id}`)
+          if (data && Object.keys(data).length > 0) {
+            return {
+              id,
+              ...data,
+              entry_price: parseFloat(data.entry_price) || 0,
+              exit_price: parseFloat(data.exit_price) || 0,
+              quantity: parseFloat(data.quantity) || 0,
+              realized_pnl: parseFloat(data.realized_pnl) || 0,
+              unrealized_pnl: parseFloat(data.unrealized_pnl) || 0,
+            }
           }
+          return null
+        } catch {
+          return null
         }
-        return null
       })
     )
     
     return positions.filter(Boolean)
   } catch (error) {
     console.error("[v0] [DB-Helpers] Error getting positions:", error)
-    return []
+    // DO NOT return empty array on failure - rethrow with proper context
+    throw new Error(`Database query failed: ${(error as Error).message}`)
   }
 }
 
