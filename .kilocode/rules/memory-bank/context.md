@@ -38,6 +38,9 @@
 - Fixed duplicate `createConnection` function in `lib/redis-db.ts:1207` (merged duplicate implementations, added invalidateConnectionsCache() call to all branches)
 - Fixed duplicate `newIndications` variable redeclaration in `lib/redis-db.ts:1368` (removed orphaned duplicate block from storeIndications)
 - Fixed missing `Tabs` import in `app/structure/page.tsx` (added missing import from @/components/ui/tabs)
-- Updated `deploy.sh` to use bun for dependency resolution, skip non-blocking typecheck/lint gates, and use correct port 3002 for health check
+- Fixed hardcoded port 3002 in `package.json:16` (removed `-p 3002` so Next.js respects PORT env var for deployment platforms)
+- Updated `deploy.sh:34` health check to respect PORT environment variable when running health checks
+- Updated `deploy.sh` to use bun for dependency resolution, skip non-blocking typecheck/lint gates
 - All build-blocking syntax errors fixed; Next.js production build succeeds
 - Deployment script runs fully and passes health check
+- Deployment platform PORT env var now properly respected (fixes "Internal Server Error" on Vercel/Netlify/Render)

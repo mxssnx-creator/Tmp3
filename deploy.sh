@@ -30,11 +30,11 @@ npm run build
 # Run health check if in development
 if [ "$NODE_ENV" != "production" ]; then
     echo -e "${YELLOW}🏥 Running health check...${NC}"
-    timeout 30 npm start &
+    PORT=${PORT:-3000} timeout 30 npm start &
     SERVER_PID=$!
     sleep 5
 
-    if curl -f http://localhost:3002/health > /dev/null 2>&1; then
+    if curl -f http://localhost:${PORT:-3000}/health > /dev/null 2>&1; then
         echo -e "${GREEN}✅ Health check passed${NC}"
     else
         echo -e "${RED}❌ Health check failed${NC}"
