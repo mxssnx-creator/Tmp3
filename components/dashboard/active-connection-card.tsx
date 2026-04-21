@@ -208,11 +208,15 @@ export function ActiveConnectionCard({
   } | null>(null)
   const details = connection.details
 
-  // Sync local toggle states from connection details
+  // Sync local toggle states and volume factors from connection details
   useEffect(() => {
     if (details) {
       setLiveTrade(toBoolean(details.is_live_trade))
       setPresetMode(toBoolean(details.is_preset_trade))
+      setLiveVolumeFactor(Number(details.live_volume_factor) || 1.0)
+      setPresetVolumeFactor(Number(details.preset_volume_factor) || 1.0)
+      setOrderType(details.order_type as "market" | "limit" || "market")
+      setVolumeType(details.volume_type as "usdt" | "contract" || "usdt")
     }
   }, [details])
 
@@ -265,6 +269,32 @@ export function ActiveConnectionCard({
       clearTimeout(timeoutId)
     }
   }, [connection.connectionId, connection.isActive])
+  // Save volume factor changes to backend
+  const handleLiveVolumeChange = useCallback(async (value: number) => {
+    setLiveVolumeFactor(value)
+    try {
+      await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ live_volume_factor: value }),
+      })
+    } catch (error) {
+      console.error("[v0] Failed to save live volume factor:", error)
+    }
+  }, [connection.connectionId])
+
+  const handlePresetVolumeChange = useCallback(async (value: number) => {
+    setPresetVolumeFactor(value)
+    try {
+      await fetch(`/api/settings/connections/${connection.connectionId}/volume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preset_volume_factor: value }),
+      })
+    } catch (error) {
+      console.error("[v0] Failed to save preset volume factor:", error)
+    }
+  }, [connection.connectionId])
 
   // Poll progression
   const fetchProgression = useCallback(async () => {
@@ -317,6 +347,11 @@ export function ActiveConnectionCard({
     if (typeof window !== "undefined") {
       window.addEventListener("connection-toggled", handleConnectionToggled)
       window.addEventListener("live-trade-toggled", handleLiveTradeToggled)
+    
+    if (typeof window !== 'undefined') {
+      window.addEventListener('connection-toggled', handleConnectionToggled)
+      window.addEventListener('live-trade-toggled', handleLiveTradeToggled)
+      window.addEventListener('engine-state-changed', handleConnectionToggled)
     }
 
     return () => {
@@ -327,6 +362,14 @@ export function ActiveConnectionCard({
       }
     }
   }, [fetchProgression, connection.connectionId])
+      clearInterval(interval)
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('connection-toggled', handleConnectionToggled)
+        window.removeEventListener('live-trade-toggled', handleLiveTradeToggled)
+        window.removeEventListener('engine-state-changed', handleConnectionToggled)
+      }
+    }
+  }, [fetchProgression, progression?.phase, globalEngineRunning, connection.isActive])
 
   // Fetch live stats every 4s from the canonical /stats endpoint (per-connection, cumulative)
   useEffect(() => {
@@ -1281,12 +1324,14 @@ export function ActiveConnectionCard({
               <VolumeConfigurationPanel
                 liveVolumeFactor={liveVolumeFactor}
                 presetVolumeFactor={presetVolumeFactor}
-                onLiveVolumeChange={setLiveVolumeFactor}
-                onPresetVolumeChange={setPresetVolumeFactor}
+                onLiveVolumeChange={handleLiveVolumeChange}
+                onPresetVolumeChange={handlePresetVolumeChange}
                 orderType={orderType}
                 onOrderTypeChange={setOrderType}
                 volumeType={volumeType}
                 onVolumeTypeChange={setVolumeType}
+                enginePhase={phase}
+                globalEngineRunning={globalEngineRunning}
               />
 
               <Separator />

@@ -94,12 +94,72 @@ export function ConnectionLogDialog({ open, onOpenChange, connectionId, connecti
     try {
       setLoading(true)
 
-      const response = await fetch(`/api/settings/connections/${connectionId}/log`)
+      const response = await fetch(`/api/connections/progression/${connectionId}/logs`)
       if (!response.ok) throw new Error("Failed to load logs")
 
       const data = await response.json()
       setLogs(data.logs || [])
-      setSummary(data.summary || null)
+      
+      // Map the actual API response to the expected summary format
+      setSummary({
+        total: data.logsCount || 0,
+        errors: data.logs?.filter((l: any) => l.level === "error").length || 0,
+        warnings: data.logs?.filter((l: any) => l.level === "warn").length || 0,
+        info: data.logs?.filter((l: any) => l.level === "info").length || 0,
+        debug: data.logs?.filter((l: any) => l.level === "debug").length || 0,
+        latestTimestamp: data.logs?.[0]?.timestamp || null,
+        oldestTimestamp: data.logs?.[data.logs.length - 1]?.timestamp || null,
+        
+        prehistoricData: {
+          cyclesCompleted: data.progressionState?.prehistoricCyclesCompleted || 0,
+          symbolsProcessed: data.progressionState?.prehistoricSymbolsProcessed || 0,
+          candlesProcessed: data.progressionState?.prehistoricCandlesProcessed || 0,
+          phaseActive: data.progressionState?.prehistoricPhaseActive || false,
+          lastUpdate: data.progressionState?.lastCycleTime || null
+        },
+        
+        indicationsCounts: {
+          direction: data.progressionState?.indicationEvaluatedDirection || 0,
+          move: data.progressionState?.indicationEvaluatedMove || 0,
+          active: data.progressionState?.indicationEvaluatedActive || 0,
+          optimal: data.progressionState?.indicationEvaluatedOptimal || 0,
+          auto: data.progressionState?.indicationsCount || 0
+        },
+        
+        strategyCounts: {
+          base: {
+            total: data.progressionState?.setsBaseCount || 0,
+            evaluated: data.progressionState?.strategyEvaluatedBase || 0,
+            pending: Math.max(0, (data.progressionState?.setsBaseCount || 0) - (data.progressionState?.strategyEvaluatedBase || 0))
+          },
+          main: {
+            total: data.progressionState?.setsMainCount || 0,
+            evaluated: data.progressionState?.strategyEvaluatedMain || 0,
+            pending: Math.max(0, (data.progressionState?.setsMainCount || 0) - (data.progressionState?.strategyEvaluatedMain || 0))
+          },
+          real: {
+            total: data.progressionState?.setsRealCount || 0,
+            evaluated: data.progressionState?.strategyEvaluatedReal || 0,
+            pending: Math.max(0, (data.progressionState?.setsRealCount || 0) - (data.progressionState?.strategyEvaluatedReal || 0))
+          }
+        },
+        
+        enginePerformance: {
+          cycleTimeMs: data.progressionState?.cycleTimeMs || 0,
+          cyclesCompleted: data.progressionState?.cyclesCompleted || 0,
+          successfulCycles: data.progressionState?.successfulCycles || 0,
+          failedCycles: data.progressionState?.failedCycles || 0,
+          cycleSuccessRate: data.progressionState?.cycleSuccessRate || 0,
+          totalTrades: data.progressionState?.totalTrades || 0,
+          successfulTrades: data.progressionState?.successfulTrades || 0,
+          tradeSuccessRate: data.progressionState?.tradeSuccessRate || 0,
+          totalProfit: data.progressionState?.totalProfit || 0,
+          lastCycleTime: data.progressionState?.lastCycleTime || null,
+          intervalsProcessed: data.progressionState?.intervalsProcessed || 0,
+          indicationsCount: data.progressionState?.indicationsCount || 0,
+          strategiesCount: data.progressionState?.strategiesCount || 0
+        }
+      })
     } catch (error) {
       console.error("[v0] Failed to load connection logs:", error)
       toast.error("Error loading logs", {

@@ -19,6 +19,8 @@ interface VolumeConfigurationPanelProps {
   onOrderTypeChange: (type: "market" | "limit") => void
   volumeType: "usdt" | "contract"
   onVolumeTypeChange: (type: "usdt" | "contract") => void
+  enginePhase?: string
+  globalEngineRunning?: boolean
 }
 
 const PRESET_MULTIPLIERS = [0.5, 1.0, 1.5, 2.0]
@@ -32,8 +34,12 @@ export function VolumeConfigurationPanel({
   onOrderTypeChange,
   volumeType,
   onVolumeTypeChange,
+  enginePhase,
+  globalEngineRunning = false,
 }: VolumeConfigurationPanelProps) {
   const [expandedSection, setExpandedSection] = useState<"live" | "preset" | "order" | null>(null)
+  
+  const slidersDisabled = !globalEngineRunning || enginePhase === "idle" || enginePhase === "stopped" || enginePhase === "error"
 
   return (
     <div className="space-y-4">
@@ -58,6 +64,7 @@ export function VolumeConfigurationPanel({
           max={10}
           step={0.1}
           className="w-full"
+          disabled={slidersDisabled}
         />
         <div className="flex gap-2 flex-wrap">
           {PRESET_MULTIPLIERS.map((mult) => (
@@ -67,6 +74,7 @@ export function VolumeConfigurationPanel({
               size="sm"
               className="text-xs"
               onClick={() => onLiveVolumeChange(mult)}
+              disabled={slidersDisabled}
             >
               {mult}x
             </Button>
@@ -89,6 +97,7 @@ export function VolumeConfigurationPanel({
           max={10}
           step={0.1}
           className="w-full"
+          disabled={slidersDisabled}
         />
         <div className="flex gap-2 flex-wrap">
           {PRESET_MULTIPLIERS.map((mult) => (
@@ -98,6 +107,7 @@ export function VolumeConfigurationPanel({
               size="sm"
               className="text-xs"
               onClick={() => onPresetVolumeChange(mult)}
+              disabled={slidersDisabled}
             >
               {mult}x
             </Button>

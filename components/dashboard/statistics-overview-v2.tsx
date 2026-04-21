@@ -69,6 +69,33 @@ export function StatisticsOverviewV2() {
         // and `strategyDetail.live` (extra fields) by the /stats endpoint.
         const liveExec   = d.liveExecution       || {}
         const liveDetail = d.strategyDetail?.live || {}
+    loadStats()
+    const interval = setInterval(loadStats, 5000) // Reduced to 5s for real-time updates
+    
+    // Listen for engine state changes to refresh immediately
+    const handleEngineStateChanged = () => loadStats()
+    
+    if (typeof window !== 'undefined') {
+      window.addEventListener('engine-state-changed', handleEngineStateChanged)
+      window.addEventListener('connection-toggled', handleEngineStateChanged)
+      window.addEventListener('live-trade-toggled', handleEngineStateChanged)
+    }
+    
+    return () => {
+      clearInterval(interval)
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('engine-state-changed', handleEngineStateChanged)
+        window.removeEventListener('connection-toggled', handleEngineStateChanged)
+        window.removeEventListener('live-trade-toggled', handleEngineStateChanged)
+      }
+    }
+  }, [])
+
+  const loadStats = async () => {
+    try {
+      const res = await fetch("/api/monitoring/stats", { cache: "no-store" })
+      if (res.ok) {
+        const data = await res.json()
         setStats({
           indicationCycles: d.realtime?.indicationCycles || 0,
           indicationsTotal: d.realtime?.indicationsTotal || 0,
