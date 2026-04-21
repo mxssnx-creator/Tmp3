@@ -36,8 +36,17 @@ interface VolumeCalculationResult {
 
 export class VolumeCalculator {
   /**
-   * Calculate position volume with risk management (pure math, no DB)
-   * CRITICAL: If exchange minimum > calculated volume, REJECT position (don't force increase)
+   * Calculate position volume with risk management (pure math, no DB).
+   *
+   * BEHAVIOR (updated): if the coordination-derived volume falls below the
+   * exchange's minimum order size, we CLAMP UP to that minimum instead of
+   * rejecting the position. The live engine should still be able to submit
+   * the order at the minimum allowed size rather than silently dropping a
+   * valid signal because the USDT-cost sizing produced a sub-dust qty.
+   *
+   * The result is still flagged `volumeAdjusted: true` with an
+   * `adjustmentReason` explaining the clamp so that UI + logs can show
+   * the user exactly why the quantity doesn't match the pure math.
    */
   static calculatePositionVolume(params: VolumeCalculationParams): VolumeCalculationResult {
     const {
@@ -52,32 +61,21 @@ export class VolumeCalculator {
       exchangeMinVolume = 0,
     } = params
 
-    let finalVolume: number
-    let volumeAdjusted = false
-    let adjustmentReason: string | undefined
-
     if (positionCost) {
       const positionSizeUsd = accountBalance * positionCost
       const calculatedVolume = positionSizeUsd / currentPrice
-      finalVolume = calculatedVolume
 
-      // CRITICAL: Check minimum volume constraint BEFORE accepting
+      let finalVolume = calculatedVolume
+      let volumeAdjusted = false
+      let adjustmentReason: string | undefined
+
+      // Clamp up to the exchange minimum rather than rejecting.
       if (exchangeMinVolume > 0 && calculatedVolume < exchangeMinVolume) {
-        // Position too small - REJECT instead of forcing. Include finalVolume: 0 so
-        // downstream callers reading `finalVolume` get a defined number (not undefined).
-        return {
-          calculatedVolume,
-          finalVolume: 0,
-          volume: 0,
-          volumeUsd: 0,
-          leverage,
-          volumeAdjusted: true,
-          adjustmentReason: `Calculated volume ${calculatedVolume.toFixed(8)} is below exchange minimum ${exchangeMinVolume}. Position rejected.`,
-        }
+        finalVolume = exchangeMinVolume
+        volumeAdjusted = true
+        adjustmentReason = `Calculated volume ${calculatedVolume.toFixed(8)} was below exchange minimum ${exchangeMinVolume} — clamped up to minimum order size.`
       }
 
-      // Return both `volume` (legacy) and `finalVolume` (new canonical) so all
-      // callers work regardless of which field they read.
       return {
         calculatedVolume,
         finalVolume,
@@ -87,41 +85,40 @@ export class VolumeCalculator {
         volumeAdjusted,
         adjustmentReason,
       }
-    } else {
-      if (!riskPercentage || !positionsAverage) {
-        throw new Error("riskPercentage and positionsAverage are required when positionCost is not provided")
-      }
+    }
 
-      const calculatedLeverage = maxLeverage || leverage
-      const totalRiskAmount = accountBalance * (riskPercentage / 100)
-      const riskPerPosition = totalRiskAmount / positionsAverage
-      const adjustedRisk = riskPerPosition * (baseVolumeFactor || 1)
-      const positionSize = adjustedRisk / (riskPercentage / 100)
-      finalVolume = positionSize / (currentPrice * calculatedLeverage)
+    if (!riskPercentage || !positionsAverage) {
+      throw new Error("riskPercentage and positionsAverage are required when positionCost is not provided")
+    }
 
-      // CRITICAL: Check minimum volume constraint BEFORE accepting
-      if (exchangeMinVolume > 0 && finalVolume < exchangeMinVolume) {
-        // Position too small - REJECT instead of forcing
-        return {
-          calculatedVolume: finalVolume,
-          finalVolume: 0,
-          leverage: calculatedLeverage,
-          positionSize,
-          volumeAdjusted: true,
-          adjustmentReason: `Calculated volume ${finalVolume.toFixed(8)} is below exchange minimum ${exchangeMinVolume}. Position rejected.`,
-          riskAmount: adjustedRisk,
-        }
-      }
+    const calculatedLeverage = maxLeverage || leverage
+    const totalRiskAmount = accountBalance * (riskPercentage / 100)
+    const riskPerPosition = totalRiskAmount / positionsAverage
+    const adjustedRisk = riskPerPosition * (baseVolumeFactor || 1)
+    const positionSize = adjustedRisk / (riskPercentage / 100)
+    const rawVolume = positionSize / (currentPrice * calculatedLeverage)
 
-      return {
-        calculatedVolume: finalVolume,
-        finalVolume,
-        leverage: calculatedLeverage,
-        positionSize,
-        volumeAdjusted,
-        adjustmentReason,
-        riskAmount: adjustedRisk,
-      }
+    let finalVolume = rawVolume
+    let volumeAdjusted = false
+    let adjustmentReason: string | undefined
+
+    // Clamp up to the exchange minimum rather than rejecting.
+    if (exchangeMinVolume > 0 && rawVolume < exchangeMinVolume) {
+      finalVolume = exchangeMinVolume
+      volumeAdjusted = true
+      adjustmentReason = `Calculated volume ${rawVolume.toFixed(8)} was below exchange minimum ${exchangeMinVolume} — clamped up to minimum order size.`
+    }
+
+    return {
+      calculatedVolume: rawVolume,
+      finalVolume,
+      volume: finalVolume,
+      volumeUsd: finalVolume * currentPrice,
+      leverage: calculatedLeverage,
+      positionSize,
+      volumeAdjusted,
+      adjustmentReason,
+      riskAmount: adjustedRisk,
     }
   }
 
