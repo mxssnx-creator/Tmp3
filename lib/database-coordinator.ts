@@ -33,11 +33,22 @@ export const SchemaValidators = {
   },
 
   trade: (data: any) => {
-    const required = ["id", "connectionId", "symbol", "entryPrice", "side"]
+    // `entryPrice` is only present for opening trades; closing trades record
+    // `exitPrice` instead. Require id/connectionId/symbol/side on every trade
+    // and insist that at least one of entryPrice/exitPrice is present.
+    const required = ["id", "connectionId", "symbol", "side"]
     for (const field of required) {
       if (data[field] === undefined) throw new Error(`Missing required field: ${field}`)
     }
-    if (!["long", "short"].includes(data.side)) throw new Error(`Invalid side: ${data.side}`)
+    if (data.entryPrice === undefined && data.exitPrice === undefined) {
+      throw new Error("Trade must have either entryPrice or exitPrice")
+    }
+    // Accept "close" as a pseudo-side used by the sell-signal flow when it
+    // records the position-closing trade. It gets resolved back to long/short
+    // downstream via the related position record.
+    if (!["long", "short", "close"].includes(data.side)) {
+      throw new Error(`Invalid side: ${data.side}`)
+    }
     return true
   },
 }
@@ -86,11 +97,22 @@ export class DatabaseCoordinator {
         }
       }
 
+      // TTL NOTE: the previous 1-hour TTL was dramatically shorter than any
+      // real open-position lifetime and it diverged from the `positions:{id}`
+      // index set (which had no TTL at all). That combination produced ghost
+      // entries — the hash expired but the symbol stayed in the index, which
+      // made `validateConsistency` always report orphans. Align both under a
+      // 7-day window (same as trades) and refresh on every write so an actively
+      // updated position never disappears mid-lifecycle.
+      const POSITION_TTL_SECONDS = 7 * 24 * 60 * 60
       await (client as any).hset(key, hashData)
-      await (client as any).expire(key, 3600) // 1 hour TTL
+      await (client as any).expire(key, POSITION_TTL_SECONDS)
 
-      // Track in positions set for quick lookup
-      await (client as any).sadd(`positions:${connectionId}`, symbol)
+      // Track in positions set for quick lookup. Keep the set TTL in lock-step
+      // with the hash TTL so cleanup falls through automatically on inactivity.
+      const indexKey = `positions:${connectionId}`
+      await (client as any).sadd(indexKey, symbol)
+      await (client as any).expire(indexKey, POSITION_TTL_SECONDS)
       this.log(`✓ Position stored: ${key}`)
 
       return true
@@ -270,22 +292,56 @@ export class DatabaseCoordinator {
   }
 
   /**
-   * Get all trades for a connection
+   * Get all trades for a connection.
+   *
+   * Fetches hashes in parallel and JSON-parses any nested fields that were
+   * stringified at write time (via `storeTrade`/`recordTrade`). The previous
+   * implementation awaited every `hgetall` sequentially and returned raw
+   * string-hash data, so consumers that expected the original object shape
+   * (e.g. nested `metadata`, `progression` arrays) received strings.
    */
   async getTrades(connectionId: string, limit: number = 100): Promise<any[]> {
     try {
       await initRedis()
       const client = getRedisClient()
 
-      const tradeIds = (await (client as any).smembers(`trades:${connectionId}`)) || []
-      const trades: any[] = []
+      const tradeIds: string[] =
+        (await (client as any).smembers(`trades:${connectionId}`)) || []
+      const slice = tradeIds.slice(0, limit)
+      if (slice.length === 0) return []
 
-      for (const tradeId of tradeIds.slice(0, limit)) {
-        const key = `trade:${connectionId}:${tradeId}`
-        const data = await (client as any).hgetall(key)
-        if (data) {
-          trades.push(data)
+      const hashes = await Promise.all(
+        slice.map((tradeId) =>
+          (client as any)
+            .hgetall(`trade:${connectionId}:${tradeId}`)
+            .catch(() => null as any),
+        ),
+      )
+
+      const trades: any[] = []
+      for (let i = 0; i < hashes.length; i++) {
+        const data = hashes[i]
+        if (!data || Object.keys(data).length === 0) {
+          // Orphan index entry — drop it opportunistically so the set doesn't
+          // grow unbounded with expired references.
+          try {
+            await (client as any).srem(`trades:${connectionId}`, slice[i])
+          } catch { /* non-critical */ }
+          continue
         }
+        const parsed: Record<string, any> = {}
+        for (const [k, v] of Object.entries(data)) {
+          if (typeof v === "string" && (v.startsWith("{") || v.startsWith("["))) {
+            try {
+              parsed[k] = JSON.parse(v)
+            } catch {
+              parsed[k] = v
+            }
+          } else {
+            parsed[k] = v
+          }
+        }
+        trades.push(parsed)
       }
 
       return trades
@@ -296,32 +352,59 @@ export class DatabaseCoordinator {
   }
 
   /**
-   * Clean up closed positions
+   * Clean up closed positions.
+   *
+   * Hardened against missing/invalid `updated_at` fields (previously an
+   * `undefined`/non-ISO value produced `Invalid Date`, making the cutoff
+   * comparison always false so stale closed positions leaked forever) and
+   * also removes the symbol from the `positions:{id}` set when the hash has
+   * already expired (orphan entry).
    */
   async cleanupClosedPositions(connectionId: string, retentionHours: number = 24): Promise<number> {
     try {
-      const cutoff = new Date(Date.now() - retentionHours * 60 * 60 * 1000)
+      const cutoffMs = Date.now() - retentionHours * 60 * 60 * 1000
       let cleaned = 0
 
       await initRedis()
       const client = getRedisClient()
 
-      const positions = await this.getPositions(connectionId)
+      // Work from the index set directly so we can also prune orphan
+      // references (index entries whose hash has already expired).
+      const symbols: string[] = (await (client as any).smembers(`positions:${connectionId}`)) || []
 
-      for (const [symbol, position] of Object.entries(positions)) {
-        if (position.status === "closed") {
-          const updatedAt = new Date(position.updated_at)
-          if (updatedAt < cutoff) {
-            const key = `position:${connectionId}:${symbol}`
-            await (client as any).del(key)
+      for (const symbol of symbols) {
+        const position = await this.getPosition(connectionId, symbol)
+        if (!position) {
+          // Orphan index entry — drop it so it stops polluting
+          // `validateConsistency` reports.
+          try {
             await (client as any).srem(`positions:${connectionId}`, symbol)
             cleaned++
-          }
+          } catch { /* non-critical */ }
+          continue
+        }
+        if (position.status !== "closed") continue
+
+        // Robust updated_at parsing: accept ISO strings, numeric timestamps,
+        // and fall back to created_at when updated_at is missing/invalid.
+        const rawUpdated = position.updated_at ?? position.updatedAt ?? position.created_at
+        const updatedMs = (() => {
+          if (rawUpdated == null) return 0
+          if (typeof rawUpdated === "number") return rawUpdated
+          const parsed = Date.parse(String(rawUpdated))
+          return Number.isFinite(parsed) ? parsed : 0
+        })()
+
+        if (updatedMs > 0 && updatedMs < cutoffMs) {
+          const key = `position:${connectionId}:${symbol}`
+          await (client as any).del(key)
+          await (client as any).srem(`positions:${connectionId}`, symbol)
+          cleaned++
         }
       }
 
       if (cleaned > 0) {
-        this.log(`Cleaned up ${cleaned} closed positions`)
+        this.log(`Cleaned up ${cleaned} closed/orphan positions`)
       }
 
       return cleaned

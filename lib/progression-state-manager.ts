@@ -309,31 +309,106 @@ export class ProgressionStateManager {
 
   /**
    * Record a trade execution
+   *
+   * CRITICAL FIX: the previous implementation used the classic read-modify-write
+   * pattern (`getProgressionState` → mutate locally → `hset`). When trades
+   * complete for multiple symbols concurrently (e.g. the strategy coordinator
+   * fans out live-set execution in parallel) this silently dropped counter
+   * updates because the two in-flight writers each read the same `total_trades`
+   * value and wrote `+1` on top of the other's write.
+   *
+   * We now use atomic Redis primitives (`hincrby` / `hincrbyfloat`) so every
+   * trade is counted exactly once regardless of concurrency. The derived
+   * `trade_success_rate` is computed from the freshly-incremented counters
+   * rather than from stale in-memory snapshots.
+   *
+   * `total_profit` is stored as a float via `hincrbyfloat`. On the mock Redis
+   * adapter this call falls through to `hincrby` (which rejects non-integer
+   * deltas); we detect that path and fall back to a safe snapshot update.
    */
   static async recordTrade(connectionId: string, successful: boolean, profit: number = 0): Promise<void> {
     try {
       const client = getRedisClient()
+      if (!client) {
+        console.warn(`[v0] Redis client not available for recordTrade`)
+        return
+      }
       const key = `progression:${connectionId}`
 
-      // Get current state
-      const current = await this.getProgressionState(connectionId)
+      // Atomic counter increments. Kick off both counters concurrently — hincrby
+      // returns the post-increment value so we can derive the success rate from
+      // authoritative data rather than a read-then-write snapshot.
+      const totalTradesP = client.hincrby(key, "total_trades", 1)
+      const successfulTradesP = successful
+        ? client.hincrby(key, "successful_trades", 1)
+        : Promise.resolve(null as any)
 
-      // Update trade metrics
-      const totalTrades = current.totalTrades + 1
-      const successfulTrades = successful ? current.successfulTrades + 1 : current.successfulTrades
-      const totalProfit = current.totalProfit + profit
-      const tradeSuccessRate = totalTrades > 0 ? (successfulTrades / totalTrades) * 100 : 0
+      // Profit is a float. Prefer hincrbyfloat; if the adapter doesn't support
+      // it (e.g. mock / older inline client) fall back to a read-modify-write
+      // on `total_profit` only — the counters above remain atomic either way.
+      let totalProfitP: Promise<any>
+      const hincrbyfloat = (client as any).hincrbyfloat as
+        | ((k: string, f: string, d: number) => Promise<string | number>)
+        | undefined
+      if (typeof hincrbyfloat === "function" && profit !== 0) {
+        totalProfitP = hincrbyfloat.call(client, key, "total_profit", profit).catch(async () => {
+          // Fallback: read current, add, write. Best-effort only — racy vs
+          // other profit updates but the counter integrity is preserved.
+          try {
+            const cur = Number((await client.hget(key, "total_profit")) || "0") || 0
+            await client.hset(key, { total_profit: String(cur + profit) })
+          } catch { /* ignore */ }
+        })
+      } else if (profit !== 0) {
+        totalProfitP = (async () => {
+          try {
+            const cur = Number((await client.hget(key, "total_profit")) || "0") || 0
+            await client.hset(key, { total_profit: String(cur + profit) })
+          } catch { /* ignore */ }
+        })()
+      } else {
+        totalProfitP = Promise.resolve()
+      }
 
-      // Save to Redis
-      await client.hset(key, {
-        total_trades: String(totalTrades),
-        successful_trades: String(successfulTrades),
-        total_profit: String(totalProfit),
-        trade_success_rate: String(tradeSuccessRate),
-        last_update: new Date().toISOString(),
-      })
+      const [totalTradesRaw, successfulTradesRaw] = await Promise.all([
+        totalTradesP,
+        successfulTradesP,
+        totalProfitP,
+      ])
 
-      console.log(`[v0] [Progression] Trade recorded: ${successful ? "✓ Win" : "✗ Loss"} | Profit: ${profit.toFixed(2)} | Success Rate: ${tradeSuccessRate.toFixed(1)}%`)
+      const newTotalTrades = Number(totalTradesRaw) || 0
+      // If this trade was unsuccessful we didn't increment `successful_trades`
+      // — read it so the success rate math is still correct.
+      let newSuccessfulTrades: number
+      if (successful) {
+        newSuccessfulTrades = Number(successfulTradesRaw) || 0
+      } else {
+        try {
+          newSuccessfulTrades = Number((await client.hget(key, "successful_trades")) || "0") || 0
+        } catch {
+          newSuccessfulTrades = 0
+        }
+      }
+
+      const tradeSuccessRate =
+        newTotalTrades > 0 ? (newSuccessfulTrades / newTotalTrades) * 100 : 0
+
+      // Metadata + rate write in parallel with the expire refresh.
+      const nowIso = new Date().toISOString()
+      await Promise.all([
+        client.hset(key, {
+          trade_success_rate: String(tradeSuccessRate.toFixed(2)),
+          last_update: nowIso,
+          last_trade_time: nowIso,
+        }),
+        client.expire(key, 7 * 24 * 60 * 60),
+      ]).catch(() => { /* non-critical */ })
+
+      console.log(
+        `[v0] [Progression] Trade recorded: ${successful ? "✓ Win" : "✗ Loss"} | ` +
+          `Profit: ${profit.toFixed(2)} | Trades: ${newSuccessfulTrades}/${newTotalTrades} | ` +
+          `Success Rate: ${tradeSuccessRate.toFixed(1)}%`,
+      )
     } catch (error) {
       console.error(`[v0] Failed to record trade for ${connectionId}:`, error)
     }
