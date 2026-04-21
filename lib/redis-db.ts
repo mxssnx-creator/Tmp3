@@ -1205,8 +1205,25 @@ export async function getAllConnectionsWithStatus(): Promise<any[]> {
 // ========== Additional CRUD Operations ==========
 
 export async function createConnection(data: any): Promise<any> {
+  await initRedis()
   const client = getRedisClient()
   const id = data.id || `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+
+  // Check if connection already exists to prevent duplicates
+  const existingConnection = await client.hgetall(`connection:${id}`)
+  if (existingConnection && Object.keys(existingConnection).length > 0) {
+    console.log(`[v0] [Redis] Connection already exists with id ${id}, updating instead of creating duplicate`)
+    // Update existing connection
+    const connectionData = {
+      ...data,
+      id,
+      updated_at: new Date().toISOString(),
+    }
+    await client.hset(`connection:${id}`, connectionData)
+    invalidateConnectionsCache()
+    return connectionData
+  }
+
   const connectionData = {
     ...data,
     id,
@@ -1217,33 +1234,6 @@ export async function createConnection(data: any): Promise<any> {
   invalidateConnectionsCache()
   return connectionData
 }
-   await initRedis()
-   const client = getRedisClient()
-   const id = data.id || `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-   
-   // Check if connection already exists to prevent duplicates
-   const existingConnection = await client.hgetall(`connection:${id}`)
-   if (existingConnection && Object.keys(existingConnection).length > 0) {
-     console.log(`[v0] [Redis] Connection already exists with id ${id}, updating instead of creating duplicate`)
-     // Update existing connection
-     const connectionData = {
-       ...data,
-       id,
-       updated_at: new Date().toISOString(),
-     }
-     await client.hset(`connection:${id}`, connectionData)
-     return connectionData
-   }
-   
-   const connectionData = {
-     ...data,
-     id,
-     created_at: new Date().toISOString(),
-     updated_at: new Date().toISOString(),
-   }
-   await client.hset(`connection:${id}`, connectionData)
-   return connectionData
- }
 
 export async function updateConnection(id: string, updates: any): Promise<any> {
   const client = getRedisClient()
@@ -1394,43 +1384,16 @@ export async function storeIndications(connectionId: string, symbol: string, ind
     await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
     
     // Also maintain per-type independent sets for high-frequency lookups
-    for (const ind of indications) {
-      const typeKey = `indications:${connectionId}:${ind.type}`
-      const typeIndications = indications.filter(i => i.type === ind.type)
-      if (typeIndications.length > 0) {
-        await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
-      }
-    }
-// Add new indications with metadata for per-config tracking
-     const newIndications = indications.map(ind => ({
-       ...ind,
-       symbol,
-       connectionId,
-       timestamp: new Date().toISOString(),
-       configSet: getConfigurationSet(ind.type, ind.value), // Track which config set this belongs to
-     }))
-     
-     existing.push(...newIndications)
-     
-     // Keep only latest 2500 indications per connection (250 per symbol × 10 symbols typical)
-     if (existing.length > 2500) {
-       existing = existing.slice(-2500)
-     }
-     
-     // Save to main key with 1-hour TTL
-     await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
-     
-     // Also maintain per-type independent sets for high-frequency lookups
-     await Promise.all(
-       indications.map(async (indication) => {
-         const typeKey = `indications:${connectionId}:${indication.type}`
-         const typeIndications = indications.filter(i => i.type === indication.type)
-         if (typeIndications.length > 0) {
-           await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
-         }
-       })
-     )
-    
+    await Promise.all(
+      indications.map(async (indication) => {
+        const typeKey = `indications:${connectionId}:${indication.type}`
+        const typeIndications = indications.filter(i => i.type === indication.type)
+        if (typeIndications.length > 0) {
+          await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
+        }
+      })
+    )
+
   } catch (error) {
     console.error(`[v0] Error storing indications for ${connectionId}:`, error)
   }
