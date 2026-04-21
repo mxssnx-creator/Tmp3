@@ -304,6 +304,78 @@ class LocalRedis {
     return 0
   }
 
+  /**
+   * Redis LREM semantics — see `redis-db.ts` for full docs. Added so the
+   * live-stage.savePosition() path (moves position ids between open and
+   * closed index lists) works on whichever adapter the runtime picks.
+   */
+  async lrem(key: string, count: number, value: string): Promise<number> {
+    if (this.isExpired(key)) return 0
+    const raw = this.data[key]
+    if (typeof raw !== "string") return 0
+    let arr: string[]
+    try {
+      arr = JSON.parse(raw)
+    } catch {
+      return 0
+    }
+    if (!Array.isArray(arr) || arr.length === 0) return 0
+
+    let removed = 0
+    const wantAll = count === 0
+    const target = Math.abs(count)
+    if (count >= 0) {
+      for (let i = 0; i < arr.length; ) {
+        if (arr[i] === value && (wantAll || removed < target)) {
+          arr.splice(i, 1)
+          removed++
+        } else {
+          i++
+        }
+      }
+    } else {
+      for (let i = arr.length - 1; i >= 0; i--) {
+        if (arr[i] === value && (wantAll || removed < target)) {
+          arr.splice(i, 1)
+          removed++
+        }
+      }
+    }
+    this.data[key] = JSON.stringify(arr)
+    return removed
+  }
+
+  async ltrim(key: string, start: number, stop: number): Promise<void> {
+    if (this.isExpired(key)) return
+    const raw = this.data[key]
+    if (typeof raw !== "string") return
+    try {
+      const arr = JSON.parse(raw)
+      if (!Array.isArray(arr)) return
+      const len = arr.length
+      const normStart = start < 0 ? Math.max(0, len + start) : start
+      const normStop = stop < 0 ? len + stop : stop
+      this.data[key] = JSON.stringify(arr.slice(normStart, normStop + 1))
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async lpop(key: string): Promise<string | null> {
+    if (this.isExpired(key)) return null
+    const raw = this.data[key]
+    if (typeof raw !== "string") return null
+    try {
+      const arr = JSON.parse(raw)
+      if (!Array.isArray(arr) || arr.length === 0) return null
+      const head = arr.shift()
+      this.data[key] = JSON.stringify(arr)
+      return head ?? null
+    } catch {
+      return null
+    }
+  }
+
   // Other operations
   async ping(): Promise<"PONG"> {
     return "PONG"
