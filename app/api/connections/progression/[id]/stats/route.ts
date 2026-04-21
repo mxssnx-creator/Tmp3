@@ -628,6 +628,45 @@ export async function GET(
         overall:  variantOverall,
       },
 
+      // ── Main-stage COORDINATION snapshot ─────────────────────────────────
+      // Answers "is the Main stage coordinating correctly?" at a glance:
+      //   • activeVariants           — names of variants gated ACTIVE this cycle
+      //                                (default is always on; trailing/block/dca
+      //                                require matching position context).
+      //   • lastCreated / lastReused — how many variant Sets were built fresh
+      //                                vs. reused from the fingerprint cache
+      //                                last cycle. High reuse = cache working.
+      //   • totalCreated / totalReused — cumulative counters over the run.
+      //   • reuseRate                — totalReused / (totalCreated + totalReused)
+      //                                as a percent. Higher is better.
+      //   • positionContext          — live snapshot of the pseudo-position
+      //                                state that gates variant selection.
+      mainCoordination: (() => {
+        const activeVariantsStr = progHash.strategies_main_active_variants || "default"
+        const totalCreated = n(progHash.strategies_main_related_created)
+        const totalReused  = n(progHash.strategies_main_related_reused)
+        const totalCycles  = n(progHash.strategies_main_cycles)
+        const reuseDenom   = totalCreated + totalReused
+        return {
+          activeVariants:       activeVariantsStr.split(",").filter(Boolean),
+          activeVariantCount:   n(progHash.strategies_main_active_variant_count),
+          lastCreated:          n(progHash.strategies_main_last_created),
+          lastReused:           n(progHash.strategies_main_last_reused),
+          totalCreated,
+          totalReused,
+          totalCycles,
+          reuseRate: reuseDenom > 0 ? Math.round((totalReused / reuseDenom) * 1000) / 10 : 0,
+          positionContext: {
+            continuous:  n(progHash.strategies_main_ctx_continuous),
+            lastWins:    n(progHash.strategies_main_ctx_last_wins),
+            lastLosses:  n(progHash.strategies_main_ctx_last_losses),
+            prevLosses:  n(progHash.strategies_main_ctx_prev_losses),
+            prevTotal:   n(progHash.strategies_main_ctx_prev_total),
+            updatedAt:   n(progHash.strategies_main_ctx_updated_at),
+          },
+        }
+      })(),
+
       // ── Live Exchange Execution metrics ─────────────────────────────────
       // Read directly from progression hash counters written by the live-stage
       // pipeline (see lib/trade-engine/stages/live-stage.ts). Every stage of

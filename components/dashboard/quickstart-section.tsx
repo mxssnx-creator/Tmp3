@@ -45,6 +45,31 @@ interface VariantDetail {
   passRate: number
 }
 
+// Main-stage coordination snapshot — surfaces the per-cycle position context
+// (pseudo-positions gating variant selection), how many related variant Sets
+// were built fresh vs. reused from the fingerprint cache, and the list of
+// variants gated ACTIVE for this cycle. Drives the "Main Coordination" panel
+// that sits above the variants table so the operator can verify at a glance
+// that the Main stage is actually coordinating based on live trading state.
+interface MainCoordination {
+  activeVariants: string[]    // e.g. ["default", "trailing"]
+  activeVariantCount: number
+  lastCreated: number         // variant Sets built fresh last cycle
+  lastReused: number          // variant Sets reused from fp-cache last cycle
+  totalCreated: number        // cumulative fresh builds
+  totalReused: number         // cumulative cache hits
+  totalCycles: number         // total Main cycles run
+  reuseRate: number           // percent — higher is better
+  positionContext: {
+    continuous: number        // open pseudo positions right now
+    lastWins: number          // winners in the last-N closed (max 5)
+    lastLosses: number        // losers  in the last-N closed (max 5)
+    prevLosses: number        // losers in the 24h lookback window
+    prevTotal: number         // total closed in the 24h lookback window
+    updatedAt: number         // ms since epoch when last written
+  }
+}
+
 interface LiveStats {
   // historic
   historicSymbols: number
@@ -89,6 +114,8 @@ interface LiveStats {
   variantBlock: VariantDetail
   variantDca: VariantDetail
   variantOverall: VariantDetail
+  // Main-stage coordination snapshot (position context + reuse rate)
+  mainCoord: MainCoordination
   // live execution — real exchange positions
   livePositionsOpen: number
   livePositionsCreated: number
@@ -112,6 +139,15 @@ const EMPTY_VARIANT: VariantDetail = {
   createdSets: 0, passedSets: 0, entriesCount: 0, avgPosPerSet: 0,
   avgProfitFactor: 0, avgDrawdownTime: 0, passRate: 0,
 }
+const EMPTY_MAIN_COORD: MainCoordination = {
+  activeVariants: ["default"], activeVariantCount: 1,
+  lastCreated: 0, lastReused: 0,
+  totalCreated: 0, totalReused: 0, totalCycles: 0, reuseRate: 0,
+  positionContext: {
+    continuous: 0, lastWins: 0, lastLosses: 0,
+    prevLosses: 0, prevTotal: 0, updatedAt: 0,
+  },
+}
 
 const EMPTY_STATS: LiveStats = {
   historicSymbols: 0, historicSymbolsTotal: 0, historicCycles: 0,
@@ -126,6 +162,10 @@ const EMPTY_STATS: LiveStats = {
   variantDefault:  { ...EMPTY_VARIANT }, variantTrailing: { ...EMPTY_VARIANT },
   variantBlock:    { ...EMPTY_VARIANT }, variantDca:      { ...EMPTY_VARIANT },
   variantOverall:  { ...EMPTY_VARIANT },
+  mainCoord: {
+    ...EMPTY_MAIN_COORD,
+    positionContext: { ...EMPTY_MAIN_COORD.positionContext },
+  },
   livePositionsOpen: 0, livePositionsCreated: 0, livePositionsClosed: 0,
   liveOrdersPlaced: 0, liveOrdersFilled: 0, liveWinRate: 0,
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
@@ -252,6 +292,31 @@ export function QuickstartSection() {
         avgDrawdownTime: Number(d?.avgDrawdownTime ?? 0) || 0,
         passRate:        Number(d?.passRate        ?? 0) || 0,
       })
+      // Main-stage coordination snapshot (position context, cache reuse).
+      // Nullish-safe: the /stats endpoint only added this block in a later
+      // version; fall back to the EMPTY_MAIN_COORD so older backends don't
+      // break the dashboard.
+      const mainCoordRaw = s.mainCoordination ?? {}
+      const mainCoord: MainCoordination = {
+        activeVariants:     Array.isArray(mainCoordRaw.activeVariants)
+          ? mainCoordRaw.activeVariants.filter((v: any) => typeof v === "string")
+          : ["default"],
+        activeVariantCount: Number(mainCoordRaw.activeVariantCount ?? 0) || 0,
+        lastCreated:        Number(mainCoordRaw.lastCreated        ?? 0) || 0,
+        lastReused:         Number(mainCoordRaw.lastReused         ?? 0) || 0,
+        totalCreated:       Number(mainCoordRaw.totalCreated       ?? 0) || 0,
+        totalReused:        Number(mainCoordRaw.totalReused        ?? 0) || 0,
+        totalCycles:        Number(mainCoordRaw.totalCycles        ?? 0) || 0,
+        reuseRate:          Number(mainCoordRaw.reuseRate          ?? 0) || 0,
+        positionContext: {
+          continuous: Number(mainCoordRaw.positionContext?.continuous ?? 0) || 0,
+          lastWins:   Number(mainCoordRaw.positionContext?.lastWins   ?? 0) || 0,
+          lastLosses: Number(mainCoordRaw.positionContext?.lastLosses ?? 0) || 0,
+          prevLosses: Number(mainCoordRaw.positionContext?.prevLosses ?? 0) || 0,
+          prevTotal:  Number(mainCoordRaw.positionContext?.prevTotal  ?? 0) || 0,
+          updatedAt:  Number(mainCoordRaw.positionContext?.updatedAt  ?? 0) || 0,
+        },
+      }
 
       setStats({
         historicSymbols:       s.historic?.symbolsProcessed    || 0,
@@ -293,6 +358,7 @@ export function QuickstartSection() {
         variantBlock:          variant(s.strategyVariants?.block),
         variantDca:            variant(s.strategyVariants?.dca),
         variantOverall:        variant(s.strategyVariants?.overall),
+        mainCoord,
         // Live exchange execution — from liveExecution block of the /stats endpoint
         livePositionsOpen:     s.liveExecution?.positionsOpen    || 0,
         livePositionsCreated:  s.liveExecution?.positionsCreated || 0,
@@ -984,13 +1050,115 @@ export function QuickstartSection() {
               </div>
             </div>
 
+            {/* ── Main-stage Coordination snapshot ────────────────────────
+                Shows how the Main stage is coordinating RIGHT NOW:
+                  • active variants gated ON by the live position context
+                  • cache reuse rate (higher = Main isn't re-expanding
+                    unchanged Base Sets every cycle = cheaper + faster)
+                  • the position-context snapshot (open positions, recent
+                    wins/losses) that drives which variants are active
+                This gives the operator an immediate yes/no answer to
+                "is the Main stage coordinating correctly?" without
+                having to read the variants table.
+             */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <Activity className="w-3.5 h-3.5 text-emerald-500" />
+                Main Coordination
+                <span className="ml-auto text-[10px] text-muted-foreground font-normal">
+                  {stats.mainCoord.totalCycles > 0 ? `${fmt(stats.mainCoord.totalCycles)} cycles` : "idle"}
+                </span>
+              </div>
+              {/* Active variants pills — green = active this cycle, muted = gated off */}
+              <div className="flex flex-wrap items-center gap-1 text-[10px]">
+                <span className="text-muted-foreground mr-1">Active variants:</span>
+                {(["default", "trailing", "block", "dca"] as const).map((v) => {
+                  const active = stats.mainCoord.activeVariants.includes(v)
+                  return (
+                    <span
+                      key={v}
+                      className={
+                        "rounded px-1.5 py-0.5 font-medium tabular-nums " +
+                        (active
+                          ? "bg-emerald-500/20 text-emerald-700 dark:text-emerald-400"
+                          : "bg-muted/60 text-muted-foreground/70")
+                      }
+                      title={active ? "Gated active this cycle" : "Gated off by position context"}
+                    >
+                      {v}
+                    </span>
+                  )
+                })}
+                <span className="ml-auto text-muted-foreground">
+                  {stats.mainCoord.activeVariantCount}/4
+                </span>
+              </div>
+
+              {/* Grid: reuse metrics | position context */}
+              <div className="grid grid-cols-2 gap-2 text-[10px]">
+                {/* Reuse / creation metrics */}
+                <div className="rounded bg-muted/40 p-1.5 space-y-0.5">
+                  <div className="text-muted-foreground text-[9px] uppercase tracking-wide">
+                    Related Sets
+                  </div>
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
+                      {fmt(stats.mainCoord.totalReused)}
+                    </span>
+                    <span className="text-muted-foreground">reused</span>
+                    <span className="ml-auto text-muted-foreground tabular-nums">
+                      {stats.mainCoord.reuseRate > 0 ? `${stats.mainCoord.reuseRate.toFixed(1)}%` : "—"}
+                    </span>
+                  </div>
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-semibold tabular-nums">
+                      {fmt(stats.mainCoord.totalCreated)}
+                    </span>
+                    <span className="text-muted-foreground">created</span>
+                    <span className="ml-auto text-muted-foreground tabular-nums">
+                      last: {stats.mainCoord.lastCreated}+{stats.mainCoord.lastReused}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Position context — drives variant gating */}
+                <div className="rounded bg-muted/40 p-1.5 space-y-0.5">
+                  <div className="text-muted-foreground text-[9px] uppercase tracking-wide">
+                    Position Context
+                  </div>
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-semibold tabular-nums">
+                      {stats.mainCoord.positionContext.continuous}
+                    </span>
+                    <span className="text-muted-foreground">open</span>
+                    <span className="ml-auto text-muted-foreground tabular-nums">
+                      <span className="text-emerald-600 dark:text-emerald-400">{stats.mainCoord.positionContext.lastWins}W</span>
+                      {" / "}
+                      <span className="text-rose-600 dark:text-rose-400">{stats.mainCoord.positionContext.lastLosses}L</span>
+                      <span className="text-muted-foreground/70"> last5</span>
+                    </span>
+                  </div>
+                  <div className="flex items-baseline gap-2">
+                    <span className="font-semibold tabular-nums">
+                      {stats.mainCoord.positionContext.prevTotal}
+                    </span>
+                    <span className="text-muted-foreground">closed 24h</span>
+                    <span className="ml-auto text-muted-foreground tabular-nums">
+                      <span className="text-rose-600 dark:text-rose-400">{stats.mainCoord.positionContext.prevLosses}L</span>
+                      <span className="text-muted-foreground/70"> / total</span>
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             {/* ── Strategy Variants — per-type breakdown ─────────────────
-                The Main stage classifies each position-coordination entry
-                into one of four variants based on its configuration:
-                  Default  — plain, leverage ≤ 2, size ≤ 1.0
-                  Trailing — leverage ≥ 3 (needs trailing stop)
-                  Block    — size ≥ 1.5 OR positionState=add (block sizing)
-                  DCA      — positionState in {reduce, close}
+                The Main stage now produces one DEDICATED Set per active
+                variant (linked to its Base parent via parentSetKey):
+                  Default  — always on: validates the Base Set
+                  Trailing — recent winners with no open position
+                  Block    — open position available to add to
+                  DCA      — recent losses to recover
                 Each row shows cumulative Sets containing that variant,
                 total position-coordination entries emitted, avg positions
                 per Set, and the weighted PF/DDT across entries of the

@@ -564,6 +564,35 @@ export class StrategyCoordinator {
       if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", baseSets.length))
       if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", mainSets.length))
 
+      // ── Main-stage COORDINATION metrics (per-cycle snapshot + cumulative) ─
+      // These let the stats API answer the user's question "is the Main stage
+      // coordinating correctly?" at a glance — how many related variant Sets
+      // were generated vs. reused from the fingerprint cache, which variants
+      // were gated active by the current position context, and the live
+      // position-context snapshot (continuous / last-N wins / prev losses).
+      const relatedCreated = mainSets.length - reused
+      const activeVariantNames = activeVariants.map((p) => p.name)
+
+      writes.push(
+        // Cumulative counters (lifetime)
+        client.hincrby(redisKey, "strategies_main_related_created", relatedCreated),
+        client.hincrby(redisKey, "strategies_main_related_reused",  reused),
+        client.hincrby(redisKey, "strategies_main_cycles",          1),
+        // Per-cycle snapshot fields (overwrite every cycle — "what happened now")
+        client.hset(redisKey, {
+          strategies_main_active_variants:   activeVariantNames.join(","),
+          strategies_main_active_variant_count: String(activeVariantNames.length),
+          strategies_main_last_reused:       String(reused),
+          strategies_main_last_created:      String(relatedCreated),
+          strategies_main_ctx_continuous:    String(ctx.continuousCount),
+          strategies_main_ctx_last_wins:     String(ctx.lastWins),
+          strategies_main_ctx_last_losses:   String(ctx.lastLosses),
+          strategies_main_ctx_prev_losses:   String(ctx.prevLosses),
+          strategies_main_ctx_prev_total:    String(ctx.prevPosCount),
+          strategies_main_ctx_updated_at:    String(Date.now()),
+        }),
+      )
+
       // ── Variant persistence (cumulative over the lifetime of the run) ──
       // For each variant we accumulate:
       //   entries_count   — total entries classified under this variant (incr)
