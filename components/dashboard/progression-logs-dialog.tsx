@@ -383,15 +383,24 @@ export function ProgressionLogsDialog({
                   </div>
                 </div>
 
-                {/* Strategies by stage — from /stats breakdown.strategies */}
+                {/* Strategies by stage — from /stats breakdown.strategies
+                    Base → Main → Real → Live is a CASCADE FILTER (eval → filter
+                    → adjust). Each stage counts the SAME logical strategy as it
+                    survives the previous filter. The header "Total" shows the
+                    Real-stage output only (the canonical strategy count) —
+                    never Base+Main+Real summed. */}
                 <div className="rounded-lg border p-4 space-y-3">
                   <div className="flex items-center gap-2">
                     <Zap className="w-4 h-4 text-amber-500" />
-                    <h3 className="font-semibold">Strategies by Stage</h3>
+                    <h3 className="font-semibold">Strategies — Pipeline Stages</h3>
                     <span className="ml-auto text-xs text-muted-foreground">
-                      Total: {fmt(bd?.strategies.total || rt?.strategiesTotal || 0)}
+                      Final (Real): {fmt(bd?.strategies.total || rt?.strategiesTotal || 0)}
                     </span>
                   </div>
+                  <p className="text-[10px] text-muted-foreground -mt-1">
+                    Cascade filter: Base → Main → Real → Live. Stages are NOT added together —
+                    each value is the count of the SAME strategies that survived the previous filter.
+                  </p>
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-center text-xs">
                     {[
                       { label: "Base", value: bd?.strategies.base || 0, eval: bd?.strategies.baseEvaluated || 0, cls: "text-orange-700 dark:text-orange-400", bg: "bg-orange-50 dark:bg-orange-950" },

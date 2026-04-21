@@ -8,10 +8,12 @@
  *   strategy_cycle_count     — HINCRBY 1
  *   indications_count        — HINCRBY N
  *   indications_{type}_count — HINCRBY 1 per type
- *   strategies_base_total    — HINCRBY N
- *   strategies_main_total    — HINCRBY N
- *   strategies_real_total    — HINCRBY N
- *   strategies_count         — HINCRBY total
+ *   strategies_base_total    — HINCRBY N (Base stage: initial strategy Sets)
+ *   strategies_main_total    — HINCRBY M (Main stage: Base Sets that passed PF filter)
+ *   strategies_real_total    — HINCRBY R (Real stage: Main Sets that passed strict filter)
+ *   strategies_count         — HINCRBY R (= final-stage Real count; the pipeline
+ *                              stages are a cascade filter of the SAME logical
+ *                              strategy so they are NOT summed together)
  *   cycle_success_rate       — HSET (rolling %)
  *   last_update              — HSET (ISO timestamp)
  */
@@ -295,7 +297,13 @@ async function generateIndicationsForConnection(
     await client.hincrby(progKey, "strategies_base_total", baseGenerated)
     await client.hincrby(progKey, "strategies_main_total", mainGenerated)
     await client.hincrby(progKey, "strategies_real_total", realGenerated)
-    await client.hincrby(progKey, "strategies_count", baseGenerated + mainGenerated + realGenerated)
+    // `strategies_count` is the canonical "total strategies" for the UI.
+    // Base → Main → Real is a CASCADE FILTER pipeline — the same logical
+    // strategy flows through each stage — so summing the three stages would
+    // triple-count every strategy. The correct semantic is the FINAL-stage
+    // output (Real), which equals the number of strategies that survived
+    // both filter passes and are eligible for live promotion.
+    await client.hincrby(progKey, "strategies_count", realGenerated)
     await client.hincrby(progKey, "strategy_cycle_count", 1)
 
     // Also write flat counter keys for backward compat

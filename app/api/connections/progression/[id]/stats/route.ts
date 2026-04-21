@@ -246,7 +246,18 @@ export async function GET(
         stratEvaluated[type] = Math.max(evalFromHash, evalFromKey)
       })
     )
-    const stratTotal = Object.values(stratCounts).reduce((s, v) => s + v, 0) || strategiesTotal
+    // ── Pipeline-aware "total strategies" ────────────────────────────────
+    // Base → Main → Real → Live is a CASCADE FILTER (eval → filter → adjust).
+    // Each stage operates on the output of the previous stage, so the SAME
+    // logical strategy exists at every stage it survives. Summing the four
+    // stage counters would triple/quadruple-count the same strategy.
+    //
+    // The canonical total is the REAL-stage count (the final filtered output
+    // before live promotion). Live is a runtime-only subset derived from Real
+    // and is shown separately in the breakdown; it is NOT part of the total.
+    // Fall back to `strategies_count` (which is written with the same
+    // pipeline-aware semantic by the engine & cron) if Real is zero.
+    const stratTotal = stratCounts.real || strategiesTotal
 
     // ── STRATEGY VARIANT breakdown ───────────────────────────────────────────
     // The Main stage expands each promoted Base Set into position-variant
@@ -566,7 +577,11 @@ export async function GET(
           base:  stratCounts.base  || 0,
           main:  stratCounts.main  || 0,
           real:  stratCounts.real  || 0,
-          total: (stratCounts.base || 0) + (stratCounts.main || 0) + (stratCounts.real || 0),
+          // `total` is the pipeline's final-stage output (Real), NOT a sum of
+          // Base+Main+Real. See `stratTotal` derivation above — Base and Main
+          // are intermediate filter stages of the SAME logical strategy, so
+          // they must not be summed with Real.
+          total: stratCounts.real || 0,
         },
         positions: {
           opened:    n(progHash.live_positions_created_count),

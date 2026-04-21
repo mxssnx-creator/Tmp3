@@ -403,13 +403,16 @@ export function SystemDetailPanel() {
 
                 <Separator className="my-1" />
 
-                {/* Processing - Strategies */}
+                {/* Processing - Strategies
+                    Header count = Real-stage only (canonical total). Base/Main
+                    are intermediate filter stages of the SAME pipeline and
+                    should not be added to Real. */}
                 <div className="space-y-1.5">
-                  <SectionHeader icon={<GitBranch className="h-3.5 w-3.5" />} label="Strategies" count={systemData?.processing.strategies.total} color="emerald" />
+                  <SectionHeader icon={<GitBranch className="h-3.5 w-3.5" />} label="Strategies (Real)" count={systemData?.processing.strategies.total} color="emerald" />
                   <div className="grid grid-cols-3 gap-1.5">
-                    <StatTile label="Base Sets" value={systemData?.processing.strategies.base ?? 0} color="emerald" />
-                    <StatTile label="Main Sets" value={systemData?.processing.strategies.main ?? 0} color="emerald" />
-                    <StatTile label="Real Sets" value={systemData?.processing.strategies.real ?? 0} color="emerald" />
+                    <StatTile label="Base (eval)"   value={systemData?.processing.strategies.base ?? 0} color="emerald" />
+                    <StatTile label="Main (filter)" value={systemData?.processing.strategies.main ?? 0} color="emerald" />
+                    <StatTile label="Real (adjust)" value={systemData?.processing.strategies.real ?? 0} color="emerald" />
                   </div>
                 </div>
 

@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@esbuild/linux-x64':
+        specifier: ^0.28.0
+        version: 0.28.0
       '@hookform/resolvers':
         specifier: ^3.10.0
         version: 3.10.0(react-hook-form@7.71.2(react@19.2.0))
@@ -340,6 +343,12 @@ packages:
 
   '@esbuild/linux-x64@0.27.7':
     resolution: {integrity: sha512-hzznmADPt+OmsYzw1EE33ccA+HPdIqiCRq7cQeL1Jlq2gb1+OyWBkMCrYGBJ+sxVzve2ZJEVeePbLM2iEIZSxA==}
+    engines: {node: '>=18'}
+    cpu: [x64]
+    os: [linux]
+
+  '@esbuild/linux-x64@0.28.0':
+    resolution: {integrity: sha512-us0dSb9iFxIi8srnpl931Nvs65it/Jd2a2K3qs7fz2WfGPHqzfzZTfec7oxZJRNPXPnNYZtanmRc4AL/JwVzHQ==}
     engines: {node: '>=18'}
     cpu: [x64]
     os: [linux]
@@ -3441,6 +3450,8 @@ snapshots:
 
   '@esbuild/linux-x64@0.27.7':
     optional: true
+
+  '@esbuild/linux-x64@0.28.0': {}
 
   '@esbuild/netbsd-arm64@0.27.7':
     optional: true

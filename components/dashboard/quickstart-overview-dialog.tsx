@@ -562,8 +562,11 @@ export function QuickstartOverviewDialog() {
                   <span className="text-muted-foreground">Strategy Cycles</span>
                   <span className="font-medium tabular-nums">{fmt(rt?.strategyCycles || 0)}</span>
                 </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Total Strategies</span>
+                <div
+                  className="flex justify-between"
+                  title="Canonical 'total strategies' = Real-stage output. Base → Main → Real is a cascade filter of the same logical strategy — stages are NOT summed together."
+                >
+                  <span className="text-muted-foreground">Strategies (Real)</span>
                   <span className="font-medium tabular-nums">{fmt(bd?.strategies.total || 0)}</span>
                 </div>
                 {(bd?.strategies.live || 0) > 0 && (

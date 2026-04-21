@@ -335,7 +335,7 @@ function MainSystemTab({ stats }: { stats: EngineStats | null }) {
           <Block icon={LineChart} title="Pseudo Positions" sub="virtual tracking — no real capital" accent="green">
             <Row label="Active positions" value={<span className="text-emerald-400 font-bold">{fmt(s?.positionsCount || 0)}</span>} />
             <Row label="Creation filter" value="PF ≥ 0.6 at any stage" />
-            <Row label="Max per config" value="250" />
+            <Row label="Set DB capacity" value="250 positions / Set (tunable 50–750)" />
             <Row label="Storage" mono value={`pseudo_positions:{connId}`} />
           </Block>
 
