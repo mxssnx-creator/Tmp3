@@ -246,6 +246,11 @@ export class StrategyCoordinator {
       const detailKey  = `strategy_detail:${this.connectionId}:base`
       const baseAvgPF  = baseSets.length > 0 ? baseSets.reduce((s, st) => s + st.avgProfitFactor, 0) / baseSets.length : 0
       const baseAvgDDT = baseSets.length > 0 ? baseSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / baseSets.length : 0
+      // Average config entries per Set — the canonical "positions per Set"
+      // metric the dashboard surfaces for each stage. At Base, each entry is
+      // one raw indication slot ready for position coordination at Main.
+      const baseEntriesTotal  = baseSets.reduce((s, st) => s + (st.entryCount || 0), 0)
+      const baseAvgPosPerSet  = baseSets.length > 0 ? baseEntriesTotal / baseSets.length : 0
 
       // Fan-out all independent writes. The awaited chain used to add ~8 Redis
       // round-trips to every BASE cycle even when nothing had changed; issuing
@@ -257,8 +262,10 @@ export class StrategyCoordinator {
           created_sets:      String(baseSets.length),
           avg_profit_factor: String(baseAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(baseAvgDDT)),
+          avg_pos_per_set:   String(baseAvgPosPerSet.toFixed(2)),
           evaluated:         String(baseSets.length),
           passed_sets:       "0",   // will be updated by createMainSets
+          entries_total:     String(baseEntriesTotal),
           updated_at:        String(Date.now()),
         }),
         client.expire(detailKey, 86400),
@@ -385,6 +392,51 @@ export class StrategyCoordinator {
       })
     }
 
+    // ─── VARIANT classification ────────────────────────────────────────────
+    // Each Main entry is tagged with a strategy variant based on its
+    // (positionState × leverage × sizeMultiplier) profile. This lets the
+    // dashboard report "how many Default / Trailing / Block / DCA position-
+    // coordination configs have been produced" alongside the stage counts.
+    //
+    // Classification rules (first match wins):
+    //   dca      — positionState ∈ {reduce, close} (distributed entries)
+    //   block    — positionState === "add" OR sizeMultiplier >= 1.5
+    //   trailing — positionState === "new" AND leverage >= 3
+    //   default  — everything else (plain single-entry, leverage ≤ 2, size ≤ 1.0)
+    const classifyVariant = (e: StrategySetEntry): "default" | "trailing" | "block" | "dca" => {
+      if (e.positionState === "reduce" || e.positionState === "close") return "dca"
+      if (e.positionState === "add" || e.sizeMultiplier >= 1.5)        return "block"
+      if (e.positionState === "new"  && e.leverage       >= 3)         return "trailing"
+      return "default"
+    }
+
+    // Per-variant aggregates accumulated over all main sets in THIS cycle.
+    // We write the per-variant totals with hincrby so they remain cumulative
+    // across cycles (mirrors the per-stage hincrby pattern used elsewhere).
+    type VariantAgg = {
+      sumPF: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
+    }
+    const variantAgg: Record<string, VariantAgg> = {
+      default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+      trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+      block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+      dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+    }
+    for (const set of mainSets) {
+      const seen = new Set<string>()
+      for (const entry of set.entries) {
+        const v = classifyVariant(entry)
+        variantAgg[v].entries += 1
+        variantAgg[v].sumPF   += Number(entry.profitFactor || 0)
+        variantAgg[v].sumDDT  += Number(entry.drawdownTime || 0)
+        seen.add(v)
+      }
+      for (const v of seen) {
+        variantAgg[v].setsContaining += 1
+        variantAgg[v].passedSets     += 1   // mainSets already passed base filter
+      }
+    }
+
     // Persist MAIN sets
     const mainKey = `strategies:${this.connectionId}:${symbol}:main:sets`
     await setSettings(mainKey, { sets: mainSets, count: mainSets.length, created: new Date() })
@@ -399,6 +451,12 @@ export class StrategyCoordinator {
       const mainAvgPF  = mainSets.length > 0 ? mainSets.reduce((s, st) => s + st.avgProfitFactor, 0) / mainSets.length : 0
       const mainAvgDDT = mainSets.length > 0 ? mainSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / mainSets.length : 0
       const passRatioMain = baseSets.length > 0 ? mainSets.length / baseSets.length : 0
+      // Avg positions per Set at Main = avg of expanded entryCount values.
+      // Each entry represents one (size × leverage × positionState) config
+      // ready for downstream coordination, so this figure is the canonical
+      // "how many positions does each validated Main Set hold?" metric.
+      const mainEntriesTotal = mainSets.reduce((s, st) => s + (st.entryCount || 0), 0)
+      const mainAvgPosPerSet = mainSets.length > 0 ? mainEntriesTotal / mainSets.length : 0
 
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_main_current", String(mainSets.length)),
@@ -407,9 +465,11 @@ export class StrategyCoordinator {
           created_sets:      String(mainSets.length),
           avg_profit_factor: String(mainAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(mainAvgDDT)),
+          avg_pos_per_set:   String(mainAvgPosPerSet.toFixed(2)),
           evaluated:         String(baseSets.length),
           passed_sets:       String(mainSets.length),
           pass_rate:         String(passRatioMain.toFixed(4)),
+          entries_total:     String(mainEntriesTotal),
           updated_at:        String(Date.now()),
         }),
         client.expire(mainDetailKey, 86400),
@@ -426,7 +486,70 @@ export class StrategyCoordinator {
       ]
       if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", baseSets.length))
       if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", mainSets.length))
+
+      // ── Variant persistence (cumulative over the lifetime of the run) ──
+      // For each variant we accumulate:
+      //   entries_count   — total entries classified under this variant (incr)
+      //   created_sets    — total Sets containing ≥1 entry of variant (incr)
+      //   passed_sets     — same as created_sets at Main stage (all passed)
+      //   sum_pf          — running sum of profitFactor for weighted avg
+      //   sum_ddt         — running sum of drawdownTime for weighted avg
+      //   avg_profit_factor / avg_drawdown_time / avg_pos_per_set — derived
+      //
+      // Using hincrby for the counters keeps them append-only and crash-safe.
+      // The derived averages are rewritten as hset after each accumulation so
+      // the stats API can read them directly without recomputing on the fly.
+      for (const variant of ["default", "trailing", "block", "dca"] as const) {
+        const agg = variantAgg[variant]
+        if (agg.entries === 0) continue
+
+        const vKey = `strategy_variant:${this.connectionId}:${variant}`
+        writes.push(
+          client.hincrby(vKey, "entries_count",  agg.entries),
+          client.hincrby(vKey, "created_sets",   agg.setsContaining),
+          client.hincrby(vKey, "passed_sets",    agg.passedSets),
+          // Scaled integer sums (×1000 for PF, ×10 for DDT minutes) so we can
+          // use hincrby atomically. We reconstruct the floats on read.
+          client.hincrby(vKey, "sum_pf_x1000",   Math.round(agg.sumPF * 1000)),
+          client.hincrby(vKey, "sum_ddt_x10",    Math.round(agg.sumDDT * 10)),
+          client.hset(vKey, { updated_at: new Date().toISOString() }),
+          client.expire(vKey, 7 * 24 * 60 * 60),
+        )
+      }
       await Promise.all(writes)
+
+      // After the atomic counter writes finalise, rewrite the derived averages
+      // in a follow-up pass (one more round-trip per variant worst-case). Read
+      // the freshly-incremented counters so the averages always reflect the
+      // full lifetime of the run rather than just the current cycle.
+      try {
+        const recompute: Promise<any>[] = []
+        for (const variant of ["default", "trailing", "block", "dca"] as const) {
+          const agg = variantAgg[variant]
+          if (agg.entries === 0) continue
+          const vKey = `strategy_variant:${this.connectionId}:${variant}`
+          recompute.push(
+            (async () => {
+              const h = ((await client.hgetall(vKey).catch(() => null)) || {}) as Record<string, string>
+              const entriesCount = Number(h.entries_count  || "0")
+              const createdSets  = Number(h.created_sets   || "0")
+              const sumPfX1000   = Number(h.sum_pf_x1000   || "0")
+              const sumDdtX10    = Number(h.sum_ddt_x10    || "0")
+              const avgPF  = entriesCount > 0 ? (sumPfX1000  / 1000) / entriesCount : 0
+              const avgDDT = entriesCount > 0 ? (sumDdtX10   / 10)   / entriesCount : 0
+              const avgPosPerSet = createdSets > 0 ? entriesCount / createdSets : 0
+              const passRate = createdSets > 0 ? (Number(h.passed_sets || "0") / createdSets) : 0
+              await client.hset(vKey, {
+                avg_profit_factor: avgPF.toFixed(4),
+                avg_drawdown_time: avgDDT.toFixed(2),
+                avg_pos_per_set:   avgPosPerSet.toFixed(2),
+                pass_rate:         passRate.toFixed(4),
+              })
+            })(),
+          )
+        }
+        await Promise.all(recompute)
+      } catch { /* non-critical */ }
     } catch { /* non-critical */ }
 
     const failed = baseSets.length - mainSets.length
@@ -498,6 +621,8 @@ export class StrategyCoordinator {
       const realAvgDDT  = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / realSets.length : 0
       const realAvgConf = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgConfidence || 0), 0) / realSets.length : 0
       const passRatioReal = mainSets.length > 0 ? realSets.length / mainSets.length : 0
+      const realEntriesTotal  = realSets.reduce((s, st) => s + (st.entryCount || 0), 0)
+      const realAvgPosPerSet  = realSets.length > 0 ? realEntriesTotal / realSets.length : 0
 
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),
@@ -507,10 +632,12 @@ export class StrategyCoordinator {
           avg_profit_factor:  String(realAvgPF.toFixed(4)),
           avg_drawdown_time:  String(Math.round(realAvgDDT)),
           avg_pos_eval_real:  String(realAvgConf.toFixed(4)),
+          avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
           evaluated:          String(mainSets.length),
           passed_sets:        String(realSets.length),
           pass_rate:          String(passRatioReal.toFixed(4)),
           count_pos_eval:     String(realSets.length),
+          entries_total:      String(realEntriesTotal),
           updated_at:         String(Date.now()),
         }),
         client.expire(realDetailKey, 86400),

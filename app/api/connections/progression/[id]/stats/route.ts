@@ -95,9 +95,32 @@ export async function GET(
       n(progHash.prehistoric_symbols_processed_count),
       n(es.config_set_symbols_processed)
     )
+
+    // Total user-selected symbols: canonical source is
+    //   prehistoric:{id}.symbols_total  (written by quickstart + engine)
+    //   trade_engine_state:{id}.config_set_symbols_total
+    //   length of the symbols array actually stored for the engine
+    // We DO NOT default to a magic "3" anymore — that caused the UI to
+    // display misleading totals (e.g. "1/3") when the user selected 1
+    // symbol in the Quickstart slot. Fall back to `processed || 1` only
+    // when we genuinely have no other source.
+    let symbolsFromArray = 0
+    if (Array.isArray((es as any).symbols)) {
+      symbolsFromArray = (es as any).symbols.length
+    } else if (Array.isArray((es as any).active_symbols)) {
+      symbolsFromArray = (es as any).active_symbols.length
+    } else if (typeof (es as any).active_symbols === "string") {
+      try {
+        const parsed = JSON.parse((es as any).active_symbols)
+        if (Array.isArray(parsed)) symbolsFromArray = parsed.length
+      } catch { /* ignore */ }
+    }
     const historicSymbolsTotal = Math.max(
       historicSymbolsProcessed,
-      n(es.config_set_symbols_total) || 3   // default minimum of 3 if unknown
+      n(prehistoricHash.symbols_total),
+      n(es.config_set_symbols_total),
+      symbolsFromArray,
+      1
     )
     const historicCandlesLoaded = pick(
       n(prehistoricHash.candles_loaded),
@@ -224,6 +247,75 @@ export async function GET(
       })
     )
     const stratTotal = Object.values(stratCounts).reduce((s, v) => s + v, 0) || strategiesTotal
+
+    // ── STRATEGY VARIANT breakdown ───────────────────────────────────────────
+    // The Main stage expands each promoted Base Set into position-variant
+    // entries (default / trailing / block / dca). StrategyCoordinator writes
+    // per-variant aggregates to `strategy_variant:{connId}:{variant}` hash
+    // fields:
+    //   created_sets, passed_sets, entries_count, avg_profit_factor,
+    //   avg_drawdown_time, avg_pos_per_set, pass_rate, updated_at
+    //
+    // We surface these alongside the stage-level detail so the dashboard can
+    // show "Avg PF / Avg DDT per variant" over the lifetime of the run.
+    const variantKeys = ["default", "trailing", "block", "dca"] as const
+    const variantDetail: Record<string, Record<string, number>> = {}
+    await Promise.all(
+      variantKeys.map(async (variant) => {
+        const h = ((await client.hgetall(`strategy_variant:${connectionId}:${variant}`).catch(() => null)) || {}) as Record<string, string>
+        const createdSets      = n(h.created_sets)
+        const passedSets       = n(h.passed_sets)
+        const entriesCount     = n(h.entries_count)
+        const avgPosPerSet     = parseFloat(h.avg_pos_per_set   || "0")
+        const avgProfitFactor  = parseFloat(h.avg_profit_factor || "0")
+        const avgDrawdownTime  = parseFloat(h.avg_drawdown_time || "0")
+        const passRateRaw      = parseFloat(h.pass_rate         || "0")
+        variantDetail[variant] = {
+          createdSets,
+          passedSets,
+          entriesCount,
+          avgPosPerSet:     isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100      : 0,
+          avgProfitFactor:  isFinite(avgProfitFactor) ? Math.round(avgProfitFactor * 1000) / 1000 : 0,
+          avgDrawdownTime:  isFinite(avgDrawdownTime) ? Math.round(avgDrawdownTime * 10) / 10     : 0,
+          passRate:         passRateRaw > 0
+            ? Math.round(passRateRaw * 1000) / 10
+            : createdSets > 0
+              ? Math.round((passedSets / createdSets) * 1000) / 10
+              : 0,
+        }
+      })
+    )
+    // Totals across variants for an "Overall" row
+    const variantTotals = variantKeys.reduce(
+      (acc, v) => {
+        acc.createdSets     += variantDetail[v].createdSets
+        acc.passedSets      += variantDetail[v].passedSets
+        acc.entriesCount    += variantDetail[v].entriesCount
+        // Weighted averages across variants using createdSets as the weight
+        const w = variantDetail[v].createdSets
+        if (w > 0) {
+          acc.weightedPF  += variantDetail[v].avgProfitFactor * w
+          acc.weightedDDT += variantDetail[v].avgDrawdownTime * w
+          acc.weightSum   += w
+        }
+        return acc
+      },
+      { createdSets: 0, passedSets: 0, entriesCount: 0, weightedPF: 0, weightedDDT: 0, weightSum: 0 },
+    )
+    const variantOverall = {
+      createdSets:    variantTotals.createdSets,
+      passedSets:     variantTotals.passedSets,
+      entriesCount:   variantTotals.entriesCount,
+      avgProfitFactor: variantTotals.weightSum > 0
+        ? Math.round((variantTotals.weightedPF / variantTotals.weightSum) * 1000) / 1000
+        : 0,
+      avgDrawdownTime: variantTotals.weightSum > 0
+        ? Math.round((variantTotals.weightedDDT / variantTotals.weightSum) * 10) / 10
+        : 0,
+      passRate: variantTotals.createdSets > 0
+        ? Math.round((variantTotals.passedSets / variantTotals.createdSets) * 1000) / 10
+        : 0,
+    }
 
     // ── STRATEGY DETAIL fields ───────────────────────────────────────────────
     // Per-stage avg positions per set, created sets, avg profit factor, avg processing time
@@ -440,6 +532,15 @@ export async function GET(
         isComplete:             historicIsComplete,
         progressPercent:        historicProgressPercent,
 
+        // Frame/interval counters — at 1-second timeframes the source market
+        // data only holds ~480 candles per 8-hour window, so `candlesLoaded`
+        // stays small. The real "processed data units" count lives under
+        // `framesProcessed` (= intervalsProcessed from the config-set
+        // processor, one frame per timeframe tick across the range).
+        framesProcessed:        n(prehistoricMeta.intervalsProcessed),
+        framesMissingLoaded:    n(prehistoricMeta.missingIntervalsLoaded),
+        timeframeSeconds:       n(prehistoricMeta.timeframeSeconds) || 1,
+
         // Prehistoric-processing churn counters — tick every time the engine spins
         // through its evaluation loop, incl. idle/warmup ticks. Kept here so the UI
         // can hide them from the primary live-progression display while still
@@ -449,6 +550,7 @@ export async function GET(
           strategyChurnCycles:   churnStrategyCycles,
         },
       },
+
 
       realtime: {
         indicationCycles: realtimeIndicationCycles,
@@ -511,6 +613,19 @@ export async function GET(
         // 4th tier — computed from local Redis (progression + closed archive).
         // Mirrors Real's shape but reflects true exchange-side outcomes.
         live: stratDetail.live,
+      },
+
+      // Per-variant strategy breakdown (Default / Trailing / Block / DCA).
+      // Written by StrategyCoordinator.createMainSets based on each entry's
+      // positionState + leverage + size profile. The `overall` row is a
+      // weighted aggregate so the UI can show one canonical PF/DDT alongside
+      // the four variant rows. These counts are cumulative since run start.
+      strategyVariants: {
+        default:  variantDetail.default,
+        trailing: variantDetail.trailing,
+        block:    variantDetail.block,
+        dca:      variantDetail.dca,
+        overall:  variantOverall,
       },
 
       // ── Live Exchange Execution metrics ─────────────────────────────────

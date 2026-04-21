@@ -24,6 +24,27 @@ interface LogEntry {
   timestamp: Date
 }
 
+interface StageDetail {
+  createdSets: number
+  avgPosPerSet: number
+  avgProfitFactor: number
+  avgDrawdownTime: number
+  evaluated: number
+  passed: number
+  failed: number
+  passRatio: number
+}
+
+interface VariantDetail {
+  createdSets: number
+  passedSets: number
+  entriesCount: number
+  avgPosPerSet: number
+  avgProfitFactor: number
+  avgDrawdownTime: number
+  passRate: number
+}
+
 interface LiveStats {
   // historic
   historicSymbols: number
@@ -33,6 +54,10 @@ interface LiveStats {
   historicProgress: number
   historicCandles: number
   historicIndicators: number
+  // historic — frame/interval counters (big count for 1s timeframes)
+  historicFrames: number
+  historicFramesMissing: number
+  historicTimeframeSec: number
   // realtime
   indicationCycles: number
   strategyCycles: number
@@ -53,6 +78,17 @@ interface LiveStats {
   stratMain: number
   stratReal: number
   stratLive: number
+  // per-stage strategy detail (count sets validated from prev + avg PF/DDT + avg pos/set)
+  stageBase: StageDetail
+  stageMain: StageDetail
+  stageReal: StageDetail
+  stageLive: StageDetail
+  // per-variant strategy detail (Default/Trailing/Block/DCA + Overall)
+  variantDefault: VariantDetail
+  variantTrailing: VariantDetail
+  variantBlock: VariantDetail
+  variantDca: VariantDetail
+  variantOverall: VariantDetail
   // live execution — real exchange positions
   livePositionsOpen: number
   livePositionsCreated: number
@@ -68,13 +104,28 @@ interface LiveStats {
   engineRunning: boolean
 }
 
+const EMPTY_STAGE: StageDetail = {
+  createdSets: 0, avgPosPerSet: 0, avgProfitFactor: 0, avgDrawdownTime: 0,
+  evaluated: 0, passed: 0, failed: 0, passRatio: 0,
+}
+const EMPTY_VARIANT: VariantDetail = {
+  createdSets: 0, passedSets: 0, entriesCount: 0, avgPosPerSet: 0,
+  avgProfitFactor: 0, avgDrawdownTime: 0, passRate: 0,
+}
+
 const EMPTY_STATS: LiveStats = {
   historicSymbols: 0, historicSymbolsTotal: 0, historicCycles: 0,
   historicComplete: false, historicProgress: 0, historicCandles: 0, historicIndicators: 0,
+  historicFrames: 0, historicFramesMissing: 0, historicTimeframeSec: 1,
   indicationCycles: 0, strategyCycles: 0, realtimeCycles: 0, indicationsTotal: 0,
   strategiesTotal: 0, positionsOpen: 0, successRate: 0, avgCycleMs: 0, isActive: false,
   indDirection: 0, indMove: 0, indActive: 0, indOptimal: 0, indAuto: 0,
   stratBase: 0, stratMain: 0, stratReal: 0, stratLive: 0,
+  stageBase:  { ...EMPTY_STAGE }, stageMain: { ...EMPTY_STAGE },
+  stageReal:  { ...EMPTY_STAGE }, stageLive: { ...EMPTY_STAGE },
+  variantDefault:  { ...EMPTY_VARIANT }, variantTrailing: { ...EMPTY_VARIANT },
+  variantBlock:    { ...EMPTY_VARIANT }, variantDca:      { ...EMPTY_VARIANT },
+  variantOverall:  { ...EMPTY_VARIANT },
   livePositionsOpen: 0, livePositionsCreated: 0, livePositionsClosed: 0,
   liveOrdersPlaced: 0, liveOrdersFilled: 0, liveWinRate: 0,
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
@@ -180,6 +231,28 @@ export function QuickstartSection() {
         } catch { /* non-critical */ }
       }
 
+      // Normaliser for per-stage detail blocks — a shared shape used across
+      // base / main / real / live so the UI can reuse one renderer.
+      const stage = (d: any): StageDetail => ({
+        createdSets:     Number(d?.createdSets     ?? 0) || 0,
+        avgPosPerSet:    Number(d?.avgPosPerSet    ?? 0) || 0,
+        avgProfitFactor: Number(d?.avgProfitFactor ?? 0) || 0,
+        avgDrawdownTime: Number(d?.avgDrawdownTime ?? 0) || 0,
+        evaluated:       Number(d?.evaluated       ?? 0) || 0,
+        passed:          Number(d?.passed          ?? 0) || 0,
+        failed:          Number(d?.failed          ?? 0) || 0,
+        passRatio:       Number(d?.passRatio       ?? 0) || 0,
+      })
+      const variant = (d: any): VariantDetail => ({
+        createdSets:     Number(d?.createdSets     ?? 0) || 0,
+        passedSets:      Number(d?.passedSets      ?? 0) || 0,
+        entriesCount:    Number(d?.entriesCount    ?? 0) || 0,
+        avgPosPerSet:    Number(d?.avgPosPerSet    ?? 0) || 0,
+        avgProfitFactor: Number(d?.avgProfitFactor ?? 0) || 0,
+        avgDrawdownTime: Number(d?.avgDrawdownTime ?? 0) || 0,
+        passRate:        Number(d?.passRate        ?? 0) || 0,
+      })
+
       setStats({
         historicSymbols:       s.historic?.symbolsProcessed    || 0,
         historicSymbolsTotal:  s.historic?.symbolsTotal        || 0,
@@ -188,6 +261,9 @@ export function QuickstartSection() {
         historicProgress:      s.historic?.progressPercent     || 0,
         historicCandles:       s.historic?.candlesLoaded       || 0,
         historicIndicators:    s.historic?.indicatorsCalculated || 0,
+        historicFrames:        s.historic?.framesProcessed     || 0,
+        historicFramesMissing: s.historic?.framesMissingLoaded || 0,
+        historicTimeframeSec:  s.historic?.timeframeSeconds    || 1,
         indicationCycles:      indCycles,
         strategyCycles:        stratCycles,
         realtimeCycles:        s.realtime?.realtimeCycles      || 0,
@@ -206,6 +282,17 @@ export function QuickstartSection() {
         stratMain:             stratMain,
         stratReal:             stratReal,
         stratLive:             s.breakdown?.strategies?.live   || 0,
+        // Per-stage strategy detail (sets validated from prev + avg PF/DDT + avg pos/set)
+        stageBase:             stage(s.strategyDetail?.base),
+        stageMain:             stage(s.strategyDetail?.main),
+        stageReal:             stage(s.strategyDetail?.real),
+        stageLive:             stage(s.strategyDetail?.live),
+        // Per-variant strategy detail (Default/Trailing/Block/DCA + Overall)
+        variantDefault:        variant(s.strategyVariants?.default),
+        variantTrailing:       variant(s.strategyVariants?.trailing),
+        variantBlock:          variant(s.strategyVariants?.block),
+        variantDca:            variant(s.strategyVariants?.dca),
+        variantOverall:        variant(s.strategyVariants?.overall),
         // Live exchange execution — from liveExecution block of the /stats endpoint
         livePositionsOpen:     s.liveExecution?.positionsOpen    || 0,
         livePositionsCreated:  s.liveExecution?.positionsCreated || 0,
@@ -662,6 +749,17 @@ export function QuickstartSection() {
               label="Symbols"
               value={`${stats.historicSymbols}/${stats.historicSymbolsTotal || "—"}`}
             />
+            {/* Frames — the BIG count when timeframe=1s. Each frame = one
+                timeframe-interval tick processed by the config-set processor.
+                At 1s over 8h this is ~28,800 per symbol, which is the
+                "big number" the dashboard used to miss entirely. */}
+            {stats.historicFrames > 0 && (
+              <MiniStat
+                label={stats.historicTimeframeSec === 1 ? "Frames 1s" : `Frames ${stats.historicTimeframeSec}s`}
+                value={fmt(stats.historicFrames)}
+                sub={stats.historicFramesMissing > 0 ? `${fmt(stats.historicFramesMissing)} new` : undefined}
+              />
+            )}
             {stats.historicCandles > 0 && (
               <MiniStat label="Candles" value={fmt(stats.historicCandles)} />
             )}
@@ -738,6 +836,13 @@ export function QuickstartSection() {
               <div className="flex flex-wrap gap-1.5">
                 <MiniStat label="Symbols"    value={`${stats.historicSymbols}/${stats.historicSymbolsTotal}`} />
                 <MiniStat label="Preh Cycles" value={fmt(stats.historicCycles)} />
+                {stats.historicFrames > 0 && (
+                  <MiniStat
+                    label={`Frames ${stats.historicTimeframeSec}s`}
+                    value={fmt(stats.historicFrames)}
+                    sub={stats.historicFramesMissing > 0 ? `${fmt(stats.historicFramesMissing)} missing` : undefined}
+                  />
+                )}
                 {stats.historicCandles > 0 && (
                   <MiniStat label="Candles" value={fmt(stats.historicCandles)} />
                 )}
@@ -821,6 +926,127 @@ export function QuickstartSection() {
                     {ratio && <div className="text-[9px] text-muted-foreground/70">{ratio}</div>}
                   </div>
                 ))}
+              </div>
+            </div>
+
+            {/* ── Strategy Stages — detailed per-stage metrics ───────────
+                Shows sets validated from prev stage (passed count), avg
+                positions per Set, avg profit factor and avg drawdown time
+                for each stage of the BASE → MAIN → REAL → LIVE flow.
+
+                These values come from `strategy_detail:{connId}:{stage}`
+                Redis hashes, written by StrategyCoordinator after each
+                cycle. Missing columns render as "—" when the stage hasn't
+                produced work yet (e.g. Real before any Main set passes).
+             */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <BarChart3 className="w-3.5 h-3.5 text-green-600 dark:text-green-500" />
+                Strategy Stages — Validated Sets & Averages
+                <span className="ml-auto text-[10px] text-muted-foreground font-normal">
+                  From prev stage
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-[10px] tabular-nums">
+                  <thead>
+                    <tr className="text-muted-foreground border-b border-border/40">
+                      <th className="text-left py-1 pr-2 font-medium">Stage</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Sets that passed the filter from the previous stage">Valid/Prev</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Average config entries per Set (position coordinations)">Pos/Set</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Average profit factor across validated Sets">PF</th>
+                      <th className="text-right py-1 pl-1 font-medium" title="Average drawdown time in minutes">DDT m</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[
+                      { label: "Base", color: "text-orange-600 dark:text-orange-400", d: stats.stageBase, prev: 0 },
+                      { label: "Main", color: "text-yellow-600 dark:text-yellow-400", d: stats.stageMain, prev: stats.stageBase.createdSets },
+                      { label: "Real", color: "text-green-600 dark:text-green-400",   d: stats.stageReal, prev: stats.stageMain.createdSets },
+                      { label: "Live", color: "text-blue-600 dark:text-blue-400",     d: stats.stageLive, prev: stats.stageReal.createdSets },
+                    ].map(({ label, color, d, prev }) => (
+                      <tr key={label} className="border-b border-border/20 last:border-0">
+                        <td className={`py-1 pr-2 font-semibold ${color}`}>{label}</td>
+                        <td className="text-right py-1 px-1">
+                          {fmt(d.passed || d.createdSets)}
+                          <span className="text-muted-foreground">/{prev > 0 ? fmt(prev) : "—"}</span>
+                          {d.passRatio > 0 && (
+                            <span className="text-muted-foreground/70 text-[9px] ml-1">{d.passRatio.toFixed(0)}%</span>
+                          )}
+                        </td>
+                        <td className="text-right py-1 px-1">{d.avgPosPerSet > 0 ? d.avgPosPerSet.toFixed(1) : "—"}</td>
+                        <td className="text-right py-1 px-1">{d.avgProfitFactor > 0 ? d.avgProfitFactor.toFixed(2) : "—"}</td>
+                        <td className="text-right py-1 pl-1">{d.avgDrawdownTime > 0 ? Math.round(d.avgDrawdownTime) : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* ── Strategy Variants — per-type breakdown ─────────────────
+                The Main stage classifies each position-coordination entry
+                into one of four variants based on its configuration:
+                  Default  — plain, leverage ≤ 2, size ≤ 1.0
+                  Trailing — leverage ≥ 3 (needs trailing stop)
+                  Block    — size ≥ 1.5 OR positionState=add (block sizing)
+                  DCA      — positionState in {reduce, close}
+                Each row shows cumulative Sets containing that variant,
+                total position-coordination entries emitted, avg positions
+                per Set, and the weighted PF/DDT across entries of the
+                variant. The "Overall" row is a createdSets-weighted mean
+                across all four variants.
+             */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <BarChart3 className="w-3.5 h-3.5 text-sky-500" />
+                Strategy Variants — PF &amp; DDT per Type
+                <span className="ml-auto text-[10px] text-muted-foreground font-normal">
+                  Positions @ Main
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-[10px] tabular-nums">
+                  <thead>
+                    <tr className="text-muted-foreground border-b border-border/40">
+                      <th className="text-left py-1 pr-2 font-medium">Type</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Sets containing ≥1 entry of this variant">Sets</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Total position-coordination entries of this variant">Entries</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Average entries per Set for this variant">Pos/Set</th>
+                      <th className="text-right py-1 px-1 font-medium">PF</th>
+                      <th className="text-right py-1 pl-1 font-medium">DDT m</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[
+                      { label: "Default",  color: "text-slate-600  dark:text-slate-400",  d: stats.variantDefault  },
+                      { label: "Trailing", color: "text-cyan-600   dark:text-cyan-400",   d: stats.variantTrailing },
+                      { label: "Block",    color: "text-fuchsia-600 dark:text-fuchsia-400", d: stats.variantBlock   },
+                      { label: "DCA",      color: "text-amber-600  dark:text-amber-400",  d: stats.variantDca      },
+                    ].map(({ label, color, d }) => (
+                      <tr key={label} className="border-b border-border/20">
+                        <td className={`py-1 pr-2 font-semibold ${color}`}>{label}</td>
+                        <td className="text-right py-1 px-1">{fmt(d.createdSets)}</td>
+                        <td className="text-right py-1 px-1">{fmt(d.entriesCount)}</td>
+                        <td className="text-right py-1 px-1">{d.avgPosPerSet > 0 ? d.avgPosPerSet.toFixed(1) : "—"}</td>
+                        <td className="text-right py-1 px-1">{d.avgProfitFactor > 0 ? d.avgProfitFactor.toFixed(2) : "—"}</td>
+                        <td className="text-right py-1 pl-1">{d.avgDrawdownTime > 0 ? Math.round(d.avgDrawdownTime) : "—"}</td>
+                      </tr>
+                    ))}
+                    <tr className="border-t-2 border-border/40 font-semibold">
+                      <td className="py-1 pr-2 text-foreground">Overall</td>
+                      <td className="text-right py-1 px-1">{fmt(stats.variantOverall.createdSets)}</td>
+                      <td className="text-right py-1 px-1">{fmt(stats.variantOverall.entriesCount)}</td>
+                      <td className="text-right py-1 px-1">
+                        {stats.variantOverall.createdSets > 0
+                          ? (stats.variantOverall.entriesCount / Math.max(1, stats.variantOverall.createdSets)).toFixed(1)
+                          : "—"}
+                      </td>
+                      <td className="text-right py-1 px-1">{stats.variantOverall.avgProfitFactor > 0 ? stats.variantOverall.avgProfitFactor.toFixed(2) : "—"}</td>
+                      <td className="text-right py-1 pl-1">{stats.variantOverall.avgDrawdownTime > 0 ? Math.round(stats.variantOverall.avgDrawdownTime) : "—"}</td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </div>
 
