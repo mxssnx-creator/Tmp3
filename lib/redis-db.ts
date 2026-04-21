@@ -366,6 +366,74 @@ export class InlineLocalRedis {
     return this.data.lists.get(key)?.length ?? 0
   }
 
+  /**
+   * Remove `count` occurrences of `value` from the list at `key`.
+   * Semantics match Redis `LREM`:
+   *   count > 0 — remove head→tail
+   *   count < 0 — remove tail→head
+   *   count = 0 — remove every occurrence
+   *
+   * Previously this method didn't exist on the in-memory adapter, which made
+   * `live-stage.savePosition()` throw `TypeError: client.lrem is not a function`
+   * on every position close and prevented the closed-index bookkeeping from
+   * running. That in turn made `getLivePositions` re-scan terminal rows
+   * forever and is visible in the server logs at live-stage.ts:156.
+   */
+  async lrem(key: string, count: number, value: string): Promise<number> {
+    if (this.isExpired(key)) return 0
+    const list = this.data.lists.get(key)
+    if (!list || list.length === 0) return 0
+    let removed = 0
+    const wantAll = count === 0
+    const target = Math.abs(count)
+    if (count >= 0) {
+      for (let i = 0; i < list.length; ) {
+        if (list[i] === value && (wantAll || removed < target)) {
+          list.splice(i, 1)
+          removed++
+        } else {
+          i++
+        }
+      }
+    } else {
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i] === value && (wantAll || removed < target)) {
+          list.splice(i, 1)
+          removed++
+        }
+      }
+    }
+    if (list.length === 0) {
+      this.data.lists.delete(key)
+    } else {
+      this.data.lists.set(key, list)
+    }
+    return removed
+  }
+
+  /**
+   * Pop and return the first element of the list at `key`. Returns null when
+   * the list is empty or missing. Added for parity with `lpush`/`rpush` so
+   * upstream callers that move items between queues don't blow up.
+   */
+  async lpop(key: string): Promise<string | null> {
+    if (this.isExpired(key)) return null
+    const list = this.data.lists.get(key)
+    if (!list || list.length === 0) return null
+    const head = list.shift() ?? null
+    if (list.length === 0) this.data.lists.delete(key)
+    return head
+  }
+
+  async rpop(key: string): Promise<string | null> {
+    if (this.isExpired(key)) return null
+    const list = this.data.lists.get(key)
+    if (!list || list.length === 0) return null
+    const tail = list.pop() ?? null
+    if (list.length === 0) this.data.lists.delete(key)
+    return tail
+  }
+
   async dbSize(): Promise<number> {
     return this.data.strings.size + this.data.hashes.size + this.data.sets.size + this.data.lists.size + this.data.sorted_sets.size
   }

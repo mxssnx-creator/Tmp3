@@ -37,9 +37,41 @@ export class BingXConnector extends BaseExchangeConnector {
   }
 
   private getSignature(params: Record<string, any>): string {
+    // Kept only for the one remaining helper that doesn't need the query
+    // string back (balance query). Prefer signParams() for everything else.
     const sortedKeys = Object.keys(params).sort()
-    const queryString = sortedKeys.map(key => `${key}=${params[key]}`).join('&')
+    const queryString = sortedKeys.map((key) => `${key}=${params[key]}`).join("&")
     return crypto.createHmac("sha256", this.credentials.apiSecret).update(queryString).digest("hex")
+  }
+
+  /**
+   * CRITICAL: BingX rejects every signed request unless the signature is
+   * computed over the EXACT query string that is transmitted. The previous
+   * implementation used `getSignature(params)` (sorted alphabetically) to
+   * produce the signature, then built the URL with
+   * `new URLSearchParams(params).toString()` (insertion order) — two
+   * different strings, which is why every `placeOrder`, `cancelOrder`,
+   * `setLeverage`, `setMarginType` and `setPositionMode` call came back with
+   * `code=100001: Signature verification failed` in the server logs.
+   *
+   * `signParams` returns the canonical (alphabetically-sorted) query string
+   * along with its signature so callers can use both for the URL and have
+   * them guaranteed to match. Values are stringified identically in both
+   * the signed payload and the URL, so no URL-encoding skew is possible.
+   *
+   * Characters relevant to our trading payloads (`-`, alphanumerics, digits,
+   * `.`) are all URL-unreserved per RFC 3986, so we can safely concatenate
+   * without `encodeURIComponent`. Keeping the signed and transmitted strings
+   * byte-identical is the important invariant.
+   */
+  private signParams(params: Record<string, any>): { signature: string; queryString: string } {
+    const sortedKeys = Object.keys(params).sort()
+    const queryString = sortedKeys.map((key) => `${key}=${params[key]}`).join("&")
+    const signature = crypto
+      .createHmac("sha256", this.credentials.apiSecret)
+      .update(queryString)
+      .digest("hex")
+    return { signature, queryString }
   }
 
   private toStringParams(params: Record<string, any>): Record<string, string> {
@@ -385,10 +417,10 @@ export class BingXConnector extends BaseExchangeConnector {
         params.price = priceRounded.toFixed(8).replace(/\.?0+$/, "")
       }
 
-      const signature = this.getSignature(params)
-      const stringParams = this.toStringParams(params)
-      const queryString = `${new URLSearchParams(stringParams).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+      // Sign and build URL from the SAME sorted query string so BingX's
+      // signature check succeeds (see `signParams` comment for context).
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -412,9 +444,8 @@ export class BingXConnector extends BaseExchangeConnector {
           this.log("Retrying order without positionSide (detected one-way account)")
           delete params.positionSide
           params.timestamp = Date.now()
-          const retrySig = this.getSignature(params)
-          const retryQs = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${retrySig}`
-          const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}`
+          const { signature: retrySig, queryString: retryQs } = this.signParams(params)
+          const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}&signature=${retrySig}`
           const retryResp = await this.rateLimitedFetch(retryUrl, {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
@@ -462,9 +493,8 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: Date.now(),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method,
@@ -506,9 +536,8 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: Date.now(),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "GET",
@@ -544,9 +573,8 @@ export class BingXConnector extends BaseExchangeConnector {
         params.symbol = this.toBingXSymbol(symbol)
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
@@ -584,9 +612,8 @@ export class BingXConnector extends BaseExchangeConnector {
         params.symbol = this.toBingXSymbol(symbol)
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
@@ -633,16 +660,15 @@ export class BingXConnector extends BaseExchangeConnector {
         params.symbol = this.toBingXSymbol(symbol)
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      
+      const { signature, queryString: signedQs } = this.signParams(params)
+
       // Use different endpoint based on contract type
       let endpoint = "/openApi/swap/v3/user/positions" // USDT Perpetual
       if (effectiveContractType === "coin-perpetual") {
         endpoint = "/openApi/cswap/v1/user/positions" // Coin-M Perpetual
       }
-      
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
       this.log(`Using endpoint: ${endpoint}`)
 
       const response = await this.rateLimitedFetch(url, {
@@ -689,10 +715,9 @@ export class BingXConnector extends BaseExchangeConnector {
         params.marginType = marginType === "cross" ? "CROSSED" : "ISOLATED"
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
+      const { signature, queryString: signedQs } = this.signParams(params)
       // Perp: /openApi/swap/v2/trade/positionSide/dual — v3 path does not exist.
-      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/positionSide/dual?${queryString}`
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/positionSide/dual?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -775,9 +800,8 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(Date.now()),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/wallet/v1/query_address?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/wallet/v1/query_address?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
@@ -811,9 +835,8 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(Date.now()),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/wallet/v1/withdraw?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/wallet/v1/withdraw?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -846,9 +869,8 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(Date.now()),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/wallet/v1/query_withdraw_list?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/wallet/v1/query_withdraw_list?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
@@ -886,9 +908,8 @@ export class BingXConnector extends BaseExchangeConnector {
           leverage: String(leverage),
           timestamp: String(Date.now()),
         }
-        const signature = this.getSignature(params)
-        const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-        const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${queryString}`
+        const { signature, queryString: signedQs } = this.signParams(params)
+        const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${signedQs}&signature=${signature}`
         const response = await this.rateLimitedFetch(url, {
           method: "POST",
           headers: { "X-BX-APIKEY": this.credentials.apiKey },
@@ -934,10 +955,9 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(Date.now()),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
+      const { signature, queryString: signedQs } = this.signParams(params)
       // Perp: /openApi/swap/v2/trade/marginType (not v3).
-      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${queryString}`
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -973,10 +993,9 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(Date.now()),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
+      const { signature, queryString: signedQs } = this.signParams(params)
       // Perp: /openApi/swap/v2/trade/positionSide/dual — v3 and /set do not exist.
-      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/positionSide/dual?${queryString}`
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/positionSide/dual?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
