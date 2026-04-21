@@ -200,12 +200,9 @@ export default function OverviewPage() {
           }
         />
         <div className="flex items-center gap-2">
-          {selectedConnection && (
-            <Badge variant="secondary" className="h-7 gap-1 font-mono text-[10px] uppercase">
-              <Target className="h-3 w-3" />
-              {selectedConnection.exchange}
-            </Badge>
-          )}
+          {/* The scoped-connection chip is now rendered globally by PageHeader
+              (see components/page-header.tsx), so we only keep the system
+              health status badge + refresh action here to avoid duplication. */}
           <Badge variant="outline" className="h-7 gap-1">
             <Activity className="h-3 w-3" />
             {systemHealth >= 90 ? "System Healthy" : systemHealth >= 70 ? "System Degraded" : "System Critical"}
