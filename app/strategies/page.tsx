@@ -191,22 +191,34 @@ export default function StrategiesPage() {
      )
    }
 
+  /*
+   * Rewrote this page shell to fix three bugs:
+   *   - An empty `<div className="flex gap-2"></div>` sibling left behind
+   *     an orphan toolbar slot (the previous author removed the left-side
+   *     buttons but forgot to delete the wrapper).
+   *   - The outer `p-4 space-y-4` wrapper was closed too early, orphaning
+   *     the stats and filter grid from its padding.
+   *   - Hard-coded tailwind color classes for stat cards that broke dark
+   *     mode — now using design tokens + accent tints.
+   */
   return (
-    <div className="space-y-4">
-      {/* Warning banner */}
+    <div className="p-4 space-y-4">
       {isDemo && (
-        <div className="bg-amber-500/10 border border-amber-500/20 rounded p-3 mx-4 mt-4">
+        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3">
           <div className="flex items-center gap-2 text-sm">
-            <Activity className="h-4 w-4 text-amber-400 flex-shrink-0" />
-            <span className="text-amber-200">Using demo data - switch to a real exchange connection to see live strategies</span>
+            <Activity className="h-4 w-4 text-amber-500 flex-shrink-0" />
+            <span className="text-foreground">
+              Using demo data &mdash; switch to a real exchange connection to see live strategies
+            </span>
           </div>
         </div>
       )}
 
-      <PageHeader title="Strategies" description="Advanced filtering, coordination analysis, and performance metrics" />
-      <div className="p-4 space-y-4">
-      <div className="flex gap-2">
-         </div>
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <PageHeader
+          title="Strategies"
+          description="Advanced filtering, coordination analysis, and performance metrics"
+        />
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={() => window.location.reload()} className="h-8 text-xs">
             <RefreshCw className="h-3 w-3 mr-1" />
@@ -219,72 +231,61 @@ export default function StrategiesPage() {
         </div>
       </div>
 
-       {/* Stats cards - compact */}
-       <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
-         {[
-           { icon: BarChart3, label: "Total", value: stats.total, color: "text-blue-600" },
-           { icon: Activity, label: "Active", value: stats.active, color: "text-green-600" },
-           { icon: Target, label: "Valid", value: stats.valid, color: "text-purple-600" },
-           { icon: TrendingUp, label: "Profitable", value: stats.profitable, color: "text-orange-600" },
-           { icon: Settings, label: "Avg PF", value: stats.avgProfitFactor.toFixed(2), color: "text-cyan-600" },
-         ].map((stat) => (
-           <Card key={stat.label} className="border-border bg-slate-50">
-             <CardContent className="p-2">
-               <div className="flex items-center gap-2">
-                 <stat.icon className={`h-3 w-3 ${stat.color}`} />
-                 <div className="min-w-0">
-                   <div className={`text-lg font-bold ${stat.color}`}>{stat.value}</div>
-                   <div className="text-xs text-muted-foreground">{stat.label}</div>
-                 </div>
-               </div>
-             </CardContent>
-           </Card>
-         ))}
-       </div>
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+        {[
+          { icon: BarChart3,  label: "Total",      value: stats.total, tint: "text-primary" },
+          { icon: Activity,   label: "Active",     value: stats.active, tint: "text-green-500" },
+          { icon: Target,     label: "Valid",      value: stats.valid, tint: "text-indigo-500" },
+          { icon: TrendingUp, label: "Profitable", value: stats.profitable, tint: "text-amber-500" },
+          { icon: Settings,   label: "Avg PF",     value: stats.avgProfitFactor.toFixed(2), tint: "text-primary" },
+        ].map((stat) => (
+          <Card key={stat.label} className="border-border bg-card">
+            <CardContent className="p-2 flex items-center gap-2">
+              <div className={`rounded bg-muted/60 p-1.5 ${stat.tint}`}>
+                <stat.icon className="h-3.5 w-3.5" />
+              </div>
+              <div className="min-w-0">
+                <div className={`text-base font-bold tabular-nums ${stat.tint}`}>{stat.value}</div>
+                <div className="text-[10px] text-muted-foreground uppercase tracking-wide">{stat.label}</div>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
 
-      {/* Main content - filters and results */}
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-        {/* Filters sidebar */}
         <div className="lg:col-span-1">
           <StrategyFiltersAdvanced filters={filters} onFiltersChange={setFilters} />
         </div>
 
-         {/* Results */}
-         <div className="lg:col-span-4 space-y-3">
-           {/* Results header */}
-           <div className="flex items-center justify-between text-xs">
-             <div className="text-muted-foreground">
-               Showing <span className="font-semibold text-cyan-600">{filteredAndSortedStrategies.length}</span> of <span className="font-semibold">{strategies.length}</span> strategies
-             </div>
-            <div className="flex gap-2">
-              <Button
-                variant={sortBy === "profit" ? "default" : "outline"}
-                size="sm"
-                onClick={() => setSortBy("profit")}
-                className="h-7 text-xs"
-              >
-                Profit
-              </Button>
-              <Button
-                variant={sortBy === "trades" ? "default" : "outline"}
-                size="sm"
-                onClick={() => setSortBy("trades")}
-                className="h-7 text-xs"
-              >
-                Trades/Day
-              </Button>
-              <Button
-                variant={sortBy === "active" ? "default" : "outline"}
-                size="sm"
-                onClick={() => setSortBy("active")}
-                className="h-7 text-xs"
-              >
-                Active
-              </Button>
+        <div className="lg:col-span-4 space-y-3">
+          <div className="flex items-center justify-between gap-2 flex-wrap text-xs px-3 py-2 bg-muted/40 rounded-md border border-border">
+            <div className="text-muted-foreground">
+              Showing{" "}
+              <span className="font-semibold text-foreground tabular-nums">{filteredAndSortedStrategies.length}</span>{" "}
+              of{" "}
+              <span className="font-semibold tabular-nums">{strategies.length}</span>{" "}
+              strategies
+            </div>
+            <div className="flex gap-1">
+              {([
+                { k: "profit", label: "Profit" },
+                { k: "trades", label: "Trades/Day" },
+                { k: "active", label: "Active" },
+              ] as const).map(({ k, label }) => (
+                <Button
+                  key={k}
+                  variant={sortBy === k ? "default" : "outline"}
+                  size="sm"
+                  onClick={() => setSortBy(k)}
+                  className="h-7 text-xs"
+                >
+                  {label}
+                </Button>
+              ))}
             </div>
           </div>
 
-          {/* Results list */}
           <div className="space-y-1.5 max-h-[calc(100vh-300px)] overflow-y-auto">
             {filteredAndSortedStrategies.length > 0 ? (
               filteredAndSortedStrategies.map((strategy, index) => (
@@ -302,9 +303,14 @@ export default function StrategiesPage() {
                 />
               ))
             ) : (
-              <div className="text-center py-12 text-slate-500">
+              <div className="text-center py-12 text-muted-foreground">
                 <div className="text-sm mb-2">No strategies match your filters</div>
-                <Button variant="outline" size="sm" onClick={() => setFilters(initialAdvancedFilters)} className="text-xs h-7">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setFilters(initialAdvancedFilters)}
+                  className="text-xs h-7"
+                >
                   Reset Filters
                 </Button>
               </div>
