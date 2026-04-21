@@ -1,16 +1,54 @@
-import { NextResponse } from "next/server"
+import { type NextRequest, NextResponse } from "next/server"
 import { query, queryOne, getDatabaseType } from "@/lib/db"
 import { getDashboardWorkflowSnapshot } from "@/lib/dashboard-workflow"
 import { buildLogisticsQueuePayload } from "@/lib/logistics-workflow"
+import { getActiveIndications, getActiveStrategies, getAllPositions } from "@/lib/db-helpers"
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
+    // Scope metrics to a specific exchange connection when the sidebar page
+    // has one selected. When omitted, we report globally (previous behavior).
+    const connectionId = request.nextUrl.searchParams.get("connectionId")
+    const isScoped = !!connectionId && connectionId !== "demo-mode" && !connectionId.startsWith("demo")
+
     const workflowSnapshot = await getDashboardWorkflowSnapshot().catch(() => null)
     const logistics = workflowSnapshot ? buildLogisticsQueuePayload(workflowSnapshot) : null
     const dbType = getDatabaseType()
     const isSQLite = dbType === "sqlite"
 
-    const result = await queryOne(`
+    // Per-connection metrics derived from Redis — works regardless of SQL shim.
+    const perConnection = isScoped
+      ? await (async () => {
+          const [indications, strategies, positions] = await Promise.all([
+            getActiveIndications(connectionId!).catch(() => []),
+            getActiveStrategies(connectionId!).catch(() => []),
+            getAllPositions(connectionId!).catch(() => []),
+          ])
+          const activePositions = (positions as any[]).filter(
+            (p: any) => p?.status === "open" || p?.status === "active",
+          )
+          const activeSymbols = new Set(activePositions.map((p: any) => p.symbol).filter(Boolean)).size
+          return {
+            active_connections: 1,
+            total_indications: indications.length,
+            active_indications: indications.length,
+            total_strategies: strategies.length,
+            active_strategies: strategies.length,
+            total_positions: positions.length,
+            active_positions: activePositions.length,
+            active_symbols: activeSymbols,
+            total_volume_24h: activePositions.reduce(
+              (sum: number, p: any) => sum + (Number(p.entry_price) || 0) * (Number(p.quantity) || 0),
+              0,
+            ),
+            trades_per_hour: 0,
+          }
+        })()
+      : null
+
+    const result =
+      perConnection ||
+      (await queryOne(`
       SELECT 
         COUNT(DISTINCT ec.id) as active_connections,
         COUNT(DISTINCT i.id) as total_indications,
@@ -30,7 +68,7 @@ export async function GET() {
       LEFT JOIN pseudo_positions pp ON pp.connection_id = ec.id AND pp.status = 'open'
       LEFT JOIN preset_strategies ps ON ps.connection_id = ec.id
       WHERE ec.${isSQLite ? "is_enabled = 1" : "is_enabled = true"}
-    `)
+    `))
 
     // Note: pseudo_positions table doesn't have a 'type' column in the current schema
     // Using indication_type as a proxy for categorization
@@ -111,6 +149,8 @@ export async function GET() {
 
     return NextResponse.json({
       success: true,
+      scope: isScoped ? "connection" : "global",
+      connectionId: isScoped ? connectionId : null,
       data: {
         systemMetrics: {
           cpu_usage: Math.round(cpuUsage),

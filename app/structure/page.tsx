@@ -24,6 +24,7 @@ import {
   Target,
 } from "lucide-react"
 import { PageHeader } from "@/components/page-header"
+import { useExchange } from "@/lib/exchange-context"
 
 interface SystemMetrics {
   cpu_usage: number
@@ -57,6 +58,7 @@ interface ModuleStatus {
 }
 
 export default function OverviewPage() {
+  const { selectedConnectionId, selectedConnection } = useExchange()
   const [activeTab, setActiveTab] = useState("system")
   const [systemMetrics, setSystemMetrics] = useState<SystemMetrics>({
     cpu_usage: 35,
@@ -94,9 +96,18 @@ export default function OverviewPage() {
   ])
 
   useEffect(() => {
+    // When the user picks a connection in the sidebar exchange selector the
+    // Structure page is re-scoped to that connection's Redis metrics so the
+    // system/trading/module widgets always mirror the "live" exchange the
+    // rest of the sidebar is working against.
+    const qs =
+      selectedConnectionId && !selectedConnectionId.startsWith("demo")
+        ? `?connectionId=${encodeURIComponent(selectedConnectionId)}`
+        : ""
+
     const fetchMetrics = async () => {
       try {
-        const response = await fetch("/api/structure/metrics")
+        const response = await fetch(`/api/structure/metrics${qs}`, { cache: "no-store" })
         const result = await response.json()
         if (result.success) {
           setSystemMetrics(result.data.systemMetrics)
@@ -109,7 +120,7 @@ export default function OverviewPage() {
 
     const fetchModules = async () => {
       try {
-        const response = await fetch("/api/structure/modules")
+        const response = await fetch(`/api/structure/modules${qs}`, { cache: "no-store" })
         const result = await response.json()
         if (result.success) {
           setModules(result.data)
@@ -130,7 +141,7 @@ export default function OverviewPage() {
     }, 5000)
 
     return () => clearInterval(interval)
-  }, [])
+  }, [selectedConnectionId])
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -182,9 +193,19 @@ export default function OverviewPage() {
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <PageHeader
           title="System Overview"
-          description="Comprehensive system workability, logistics, and functionality status"
+          description={
+            selectedConnection
+              ? `Workability, logistics, and module status — scoped to ${selectedConnection.name || selectedConnection.exchange}`
+              : "Comprehensive system workability, logistics, and functionality status (all connections)"
+          }
         />
         <div className="flex items-center gap-2">
+          {selectedConnection && (
+            <Badge variant="secondary" className="h-7 gap-1 font-mono text-[10px] uppercase">
+              <Target className="h-3 w-3" />
+              {selectedConnection.exchange}
+            </Badge>
+          )}
           <Badge variant="outline" className="h-7 gap-1">
             <Activity className="h-3 w-3" />
             {systemHealth >= 90 ? "System Healthy" : systemHealth >= 70 ? "System Degraded" : "System Critical"}

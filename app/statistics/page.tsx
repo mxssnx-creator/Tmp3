@@ -105,7 +105,7 @@ interface ComprehensiveAnalytics {
 }
 
 export default function StatisticsPage() {
-  const { selectedExchange } = useExchange()
+  const { selectedExchange, selectedConnectionId } = useExchange()
   const [activeTab, setActiveTab] = useState("overview")
   const [analyticsEngine, setAnalyticsEngine] = useState<AnalyticsEngine | null>(null)
   const [hasRealConnections, setHasRealConnections] = useState(false)
@@ -157,6 +157,8 @@ export default function StatisticsPage() {
         }
 
         if (activeConnections.length === 0) {
+          // No real connections configured — fall back to demo positions so
+          // the analytics views remain explorable on a fresh install.
           const tradingEngine = new TradingEngine()
           const connections = ["bybit-x03", "bingx-x01", "pionex-x01"]
           const positions: TradingPosition[] = []
@@ -171,6 +173,72 @@ export default function StatisticsPage() {
           const engine = new AnalyticsEngine(positions)
           setAnalyticsEngine(engine)
           updateAnalytics(engine, filter)
+        } else {
+          // Real connections exist — pull the actual positions for the
+          // currently-selected exchange connection (or merge all active ones
+          // if the user hasn't picked one yet) and feed them into the
+          // analytics engine. This was the last page still running on
+          // fabricated mock data even when the user had live connections.
+          try {
+            const scopeIds: string[] = selectedConnectionId
+              ? [selectedConnectionId]
+              : activeConnections.map((c: any) => c.id).filter(Boolean)
+
+            const responses = await Promise.all(
+              scopeIds.map((id: string) =>
+                fetch(`/api/data/positions?connectionId=${encodeURIComponent(id)}`, { cache: "no-store" })
+                  .then((r) => (r.ok ? r.json() : null))
+                  .catch(() => null),
+              ),
+            )
+
+            const merged: TradingPosition[] = []
+            for (const payload of responses) {
+              if (payload && payload.success && Array.isArray(payload.data)) {
+                for (const p of payload.data) {
+                  // Shape payload from /api/data/positions (camelCase) into the
+                  // snake_case TradingPosition the AnalyticsEngine consumes.
+                  const entryPrice = Number(p.entryPrice) || 0
+                  const currentPrice = Number(p.currentPrice) || 0
+                  const quantity = Number(p.quantity) || 0
+                  const leverage = Number(p.leverage) || 1
+                  const unrealized = Number(p.unrealizedPnl) || 0
+                  merged.push({
+                    id: p.id,
+                    connection_id: payload.connectionId || "",
+                    symbol: p.symbol,
+                    strategy_type: "real",
+                    volume: quantity,
+                    entry_price: entryPrice,
+                    current_price: currentPrice,
+                    takeprofit: p.takeProfitPrice ? Number(p.takeProfitPrice) : undefined,
+                    stoploss: p.stopLossPrice ? Number(p.stopLossPrice) : undefined,
+                    profit_loss: unrealized,
+                    status: p.status === "closed" ? "closed" : "open",
+                    opened_at: p.createdAt || new Date().toISOString(),
+                    closed_at: p.status === "closed" ? p.createdAt : undefined,
+                    position_side: String(p.side || "LONG").toLowerCase() as "long" | "short",
+                    leverage,
+                    indication_type: "direction",
+                    unrealized_pnl: unrealized,
+                    realized_pnl: 0,
+                    margin_used: entryPrice * quantity / Math.max(leverage, 1),
+                    fees_paid: 0,
+                    hold_time: 0,
+                    max_profit: Math.max(0, unrealized),
+                    max_loss: Math.min(0, unrealized),
+                  } as TradingPosition)
+                }
+              }
+            }
+
+            setMockPositions(merged)
+            const engine = new AnalyticsEngine(merged)
+            setAnalyticsEngine(engine)
+            updateAnalytics(engine, filter)
+          } catch (err) {
+            console.error("[v0] [Statistics] Failed to load real positions:", err)
+          }
         }
       } catch (error) {
         console.error("Failed to check connections:", error)
@@ -180,7 +248,7 @@ export default function StatisticsPage() {
     }
 
     initialize()
-  }, [selectedExchange])
+  }, [selectedExchange, selectedConnectionId])
 
   const updateAnalytics = (engine: AnalyticsEngine, currentFilter: AnalyticsFilter) => {
     const strategies = engine.generateStrategyAnalytics(currentFilter)
