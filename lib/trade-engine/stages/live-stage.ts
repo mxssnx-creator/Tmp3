@@ -515,11 +515,21 @@ export async function executeLivePosition(
     livePosition.remainingQuantity = computedVolume
     livePosition.volumeUsd = computedVolume * currentPrice
     livePosition.leverage = volumeResult.leverage || livePosition.leverage
+
+    // If the volume calculator clamped the quantity UP to the exchange
+    // minimum (new behavior — see VolumeCalculator.calculatePositionVolume),
+    // surface that in the progression step so the UI / logs show *why* the
+    // executed qty differs from the coordination-derived qty rather than
+    // just a bare number. We still mark the step as successful because the
+    // order itself is valid.
+    const clampNote = volumeResult.volumeAdjusted && volumeResult.adjustmentReason
+      ? ` [clamped-to-min: ${volumeResult.adjustmentReason}]`
+      : ""
     pushStep(
       livePosition,
       "volume_calc",
       true,
-      `qty=${computedVolume.toFixed(6)} usd=${livePosition.volumeUsd.toFixed(2)} lev=${livePosition.leverage}x`
+      `qty=${computedVolume.toFixed(6)} usd=${livePosition.volumeUsd.toFixed(2)} lev=${livePosition.leverage}x${clampNote}`
     )
     await VolumeCalculator.logVolumeCalculation(connectionId, realPosition.symbol, volumeResult).catch(() => {})
 
