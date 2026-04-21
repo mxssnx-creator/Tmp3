@@ -1,12 +1,14 @@
 /**
- * Trade Engine Manager V10
+ * Trade Engine Manager V11
  * Manages asynchronous processing for symbols, indications, pseudo positions, and strategies
  * V10: Define totalStrategiesEvaluated globally to prevent stale closure ReferenceError
- * @version 10.0.0
- * @lastUpdate 2026-04-06T04:01:00Z - Global variable fallback for stale closures
+ * V11: Self-scheduling setTimeout loops with configurable cycle pause
+ *      (app_settings.cyclePauseMs, default 50 ms) to fix 4 s+ cycle hang.
+ * @version 11.0.0
+ * @lastUpdate 2026-04-20 — self-scheduling cycle loops
  */
 
-const _ENGINE_BUILD_VERSION = "10.0.0"
+const _ENGINE_BUILD_VERSION = "11.0.0"
 
 // CRITICAL FIX: Define totalStrategiesEvaluated in global scope as fallback
 // This allows stale closures from old code to continue without ReferenceError
@@ -62,6 +64,61 @@ function registerEngineTimer(timer: ReturnType<typeof setInterval>): void {
 function unregisterEngineTimer(timer: ReturnType<typeof setInterval>): void {
   engineGlobal.__engine_timers?.delete(timer)
 }
+
+/**
+ * Configurable pause (ms) between engine cycles.
+ *
+ * Value comes from the `app_settings.cyclePauseMs` key in Redis, clamped to
+ * [10, 200]. Default 50 ms. Cached in-memory for 10 s to avoid hitting Redis
+ * on every cycle of every loop. A synchronous getter (`getCyclePauseMsSync`)
+ * returns the last-known value and triggers an async refresh when the cache
+ * has expired, so cycle scheduling never blocks on Redis I/O.
+ */
+const DEFAULT_CYCLE_PAUSE_MS = 50
+const CYCLE_PAUSE_MIN = 10
+const CYCLE_PAUSE_MAX = 200
+const CYCLE_PAUSE_CACHE_TTL_MS = 10_000
+
+let _cyclePauseMsCached: number = DEFAULT_CYCLE_PAUSE_MS
+let _cyclePauseMsFetchedAt = 0
+let _cyclePauseMsRefreshing = false
+
+function clampCyclePauseMs(n: unknown): number {
+  const v = typeof n === "number" ? n : Number(n)
+  if (!Number.isFinite(v)) return DEFAULT_CYCLE_PAUSE_MS
+  return Math.max(CYCLE_PAUSE_MIN, Math.min(CYCLE_PAUSE_MAX, Math.round(v)))
+}
+
+function refreshCyclePauseMsAsync(): void {
+  if (_cyclePauseMsRefreshing) return
+  _cyclePauseMsRefreshing = true
+  ;(async () => {
+    try {
+      const { getSettings } = await import("@/lib/redis-db")
+      const s = (await getSettings("app_settings")) || {}
+      if (s && typeof s === "object" && "cyclePauseMs" in s) {
+        _cyclePauseMsCached = clampCyclePauseMs((s as any).cyclePauseMs)
+      }
+      _cyclePauseMsFetchedAt = Date.now()
+    } catch {
+      // Keep last-known value on error
+      _cyclePauseMsFetchedAt = Date.now()
+    } finally {
+      _cyclePauseMsRefreshing = false
+    }
+  })()
+}
+
+function getCyclePauseMsSync(): number {
+  if (Date.now() - _cyclePauseMsFetchedAt > CYCLE_PAUSE_CACHE_TTL_MS) {
+    // Fire-and-forget refresh; return the cached value immediately.
+    refreshCyclePauseMsAsync()
+  }
+  return _cyclePauseMsCached
+}
+
+// Prime the cache on module load so the first cycle uses a recent value.
+refreshCyclePauseMsAsync()
 
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
@@ -215,13 +272,20 @@ export class TradeEngineManager {
         this.loadPrehistoricDataInBackground(prehistoricCacheKey, redisClient)
       }
 
+      // Mark engine as running BEFORE starting the self-scheduling processor
+      // loops. The new setTimeout-based loops check `this.isRunning` at the
+      // start of every tick, and the first tick fires at 0 ms — if the flag is
+      // still false at that moment the loop aborts and never re-schedules,
+      // leaving strategy/indication stats stuck at zero.
+      this.isRunning = true
+
       // Phase 3-4: Start indication and strategy processors
       await this.updateProgressionPhase("indications", 60, "Processing indications continuously")
       this.startIndicationProcessor(config.indicationInterval)
       // Force an immediate indication cycle
       let immediateSymbols = await this.getSymbols()
       if (!immediateSymbols || immediateSymbols.length === 0) {
-        immediateSymbols = ["WIFUSDT", "SIRENUSDT", "DRIFTUSDT"]
+        immediateSymbols = ["DRIFTUSDT"]
       }
       const immediateResults = await Promise.all(immediateSymbols.map((symbol) => this.indicationProcessor.processIndication(symbol).catch(() => [])))
       const totalImmediateIndications = immediateResults.reduce((sum, arr) => sum + arr.length, 0)
@@ -251,8 +315,7 @@ export class TradeEngineManager {
       this.startHealthMonitoring()
       this.startHeartbeat()
       
-      // Phase 6: Live trading ready
-      this.isRunning = true
+      // Phase 6: Live trading ready (isRunning was set earlier before processors started)
       this.isStarting = false
       this.startTime = new Date()
       await this.updateProgressionPhase("live_trading", 100, `Live trading ACTIVE - monitoring ${symbols.length} symbols`)
@@ -297,12 +360,15 @@ export class TradeEngineManager {
       if (error instanceof Error) {
         console.error(`[v0] [EngineManager] Stack:`, error.stack)
       }
-      // CRITICAL: Clean up any timers that were already started before the error
-      if (this.indicationTimer) { clearInterval(this.indicationTimer); this.indicationTimer = undefined }
-      if (this.strategyTimer) { clearInterval(this.strategyTimer); this.strategyTimer = undefined }
-      if (this.realtimeTimer) { clearInterval(this.realtimeTimer); this.realtimeTimer = undefined }
+      // CRITICAL: Clean up any timers that were already started before the error.
+      // (indication/strategy/realtime are now setTimeout-based; healthCheck/heartbeat
+      // remain setInterval. clearInterval and clearTimeout are interchangeable on
+      // Node.js Timeouts but we use clearTimeout where appropriate for clarity.)
+      if (this.indicationTimer) { clearTimeout(this.indicationTimer); this.indicationTimer = undefined }
+      if (this.strategyTimer)   { clearTimeout(this.strategyTimer);   this.strategyTimer = undefined }
+      if (this.realtimeTimer)   { clearTimeout(this.realtimeTimer);   this.realtimeTimer = undefined }
       if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = undefined }
-      if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = undefined }
+      if (this.heartbeatTimer)   { clearInterval(this.heartbeatTimer);   this.heartbeatTimer = undefined }
       
       await this.updateProgressionPhase("error", 0, errorMsg)
       await this.updateEngineState("error", errorMsg)
@@ -334,17 +400,19 @@ export class TradeEngineManager {
   async stop(): Promise<void> {
     console.log("[v0] Stopping trade engine for connection:", this.connectionId)
 
-    // Clear all timers
+    // Clear all timers. Processor loops are setTimeout-based; health/heartbeat
+    // are still setInterval. clearTimeout + clearInterval are the same kernel
+    // primitive in Node, but we keep the semantically correct one per timer.
     if (this.indicationTimer) {
-      clearInterval(this.indicationTimer)
+      clearTimeout(this.indicationTimer)
       this.indicationTimer = undefined
     }
     if (this.strategyTimer) {
-      clearInterval(this.strategyTimer)
+      clearTimeout(this.strategyTimer)
       this.strategyTimer = undefined
     }
     if (this.realtimeTimer) {
-      clearInterval(this.realtimeTimer)
+      clearTimeout(this.realtimeTimer)
       this.realtimeTimer = undefined
     }
     if (this.healthCheckTimer) {
@@ -391,7 +459,7 @@ export class TradeEngineManager {
         })
         // Fallback: load minimal market data
         try {
-          const fallbackSymbols = ["WIFUSDT", "SIRENUSDT", "DRIFTUSDT"]
+          const fallbackSymbols = ["DRIFTUSDT"]
           await loadMarketDataForEngine(fallbackSymbols)
         } catch (fallbackErr) {
           console.warn(`[v0] [Engine] Fallback market data failed:`, fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr))
@@ -401,24 +469,71 @@ export class TradeEngineManager {
 
   /**
    * Load prehistoric data (historical data before real-time processing)
+   * Default range: last 1 day, processed at 1-second timeframe intervals
    * Runs in background - does not block engine startup
    * Error handling: failures don't stop subsequent processing steps
    */
   private async loadPrehistoricData(): Promise<void> {
+    // Default: 8-hour look-back, 1-second timeframe interval.
+    // User can override via `app_settings.prehistoric_range_hours` (1-50h, step 1).
+    // Legacy `trade_engine_state:{id}.prehistoric_range_days` is still respected for
+    // backward compatibility.
+    const DEFAULT_RANGE_HOURS = 8
+    const DEFAULT_TIMEFRAME_SECONDS = 1
+    const MIN_RANGE_HOURS = 1
+    const MAX_RANGE_HOURS = 50
+
+    const calcStartTs = Date.now()
+
     try {
-      const engineState = await getSettings(`trade_engine_state:${this.connectionId}`)
-      if (engineState?.prehistoric_data_loaded) {
-        return
-      }
+      const [engineState, appSettings] = await Promise.all([
+        getSettings(`trade_engine_state:${this.connectionId}`),
+        getSettings("app_settings"),
+      ])
+
+      // Resolve range in hours — priority: app_settings > engine state (hours) >
+      // legacy engine state (days) > default.
+      let rangeHours: number =
+        Number((appSettings as any)?.prehistoric_range_hours) ||
+        Number((engineState as any)?.prehistoric_range_hours) ||
+        (Number((engineState as any)?.prehistoric_range_days) * 24) ||
+        DEFAULT_RANGE_HOURS
+      if (!Number.isFinite(rangeHours) || rangeHours <= 0) rangeHours = DEFAULT_RANGE_HOURS
+      rangeHours = Math.min(MAX_RANGE_HOURS, Math.max(MIN_RANGE_HOURS, Math.round(rangeHours)))
+
+      const storedTimeframeSec: number =
+        Number((engineState as any)?.prehistoric_timeframe_seconds) || DEFAULT_TIMEFRAME_SECONDS
+
+      // Derive legacy days value (rounded up) so existing UIs keep working.
+      const storedRangeDays: number = Math.max(1, Math.ceil(rangeHours / 24))
 
       const symbols = await this.getSymbols()
       await logProgressionEvent(this.connectionId, "prehistoric_data_scan", "info", "Scanning symbols for prehistoric processing", {
         symbols,
         symbolsCount: symbols.length,
+        rangeHours,
+        rangeDays: storedRangeDays,
+        timeframeSeconds: storedTimeframeSec,
       })
+      console.log(
+        `[v0] [Prehistoric] ▶ scan: ${symbols.length} symbols | range=${rangeHours}h | timeframe=${storedTimeframeSec}s`,
+      )
 
       const prehistoricEnd = new Date()
-      const prehistoricStart = new Date(prehistoricEnd.getTime() - 30 * 24 * 60 * 60 * 1000)
+      const prehistoricStart = new Date(prehistoricEnd.getTime() - rangeHours * 60 * 60 * 1000)
+
+      // Store canonical range metadata so dashboard can display timeframe details
+      const redisClient = getRedisClient()
+      await redisClient.hset(`prehistoric:${this.connectionId}`, {
+        range_start: prehistoricStart.toISOString(),
+        range_end: prehistoricEnd.toISOString(),
+        range_hours: String(rangeHours),
+        range_days: String(storedRangeDays),
+        timeframe_seconds: String(storedTimeframeSec),
+        is_complete: "0",
+        started_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
 
       // Initialize config sets and process prehistoric data through them
       const configProcessor = new ConfigSetProcessor(this.connectionId)
@@ -428,8 +543,13 @@ export class TradeEngineManager {
         strategyConfigs: configInitResult.strategies,
       })
       
-      // Process prehistoric data through config sets
-      const processingResult = await configProcessor.processPrehistoricData(symbols)
+      // Process prehistoric data: only missing ranges, step by timeframe interval
+      const processingResult = await configProcessor.processPrehistoricData(
+        symbols,
+        prehistoricStart,
+        prehistoricEnd,
+        storedTimeframeSec
+      )
       await logProgressionEvent(this.connectionId, "prehistoric_processed", processingResult.errors > 0 ? "warning" : "info", `Prehistoric complete: ${processingResult.indicationResults} indications, ${processingResult.strategyPositions} strategies`, {
         symbolsTotal: processingResult.symbolsTotal,
         symbolsProcessed: processingResult.symbolsProcessed,
@@ -438,13 +558,51 @@ export class TradeEngineManager {
         strategyPositions: processingResult.strategyPositions,
         errors: processingResult.errors,
         durationMs: processingResult.duration,
+        timeframeSeconds: storedTimeframeSec,
+        rangeDays: storedRangeDays,
+        intervalsProcessed: processingResult.intervalsProcessed || 0,
+        missingIntervalsLoaded: processingResult.missingIntervalsLoaded || 0,
       })
+
+      const totalPrehistoricDurationMs = Date.now() - calcStartTs
+
+      // Mark prehistoric hash as complete
+      await redisClient.hset(`prehistoric:${this.connectionId}`, {
+        is_complete: "1",
+        symbols_processed: String(processingResult.symbolsProcessed),
+        candles_loaded: String(processingResult.candlesProcessed),
+        indicators_calculated: String(processingResult.indicationResults),
+        total_duration_ms: String(totalPrehistoricDurationMs),
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      await redisClient.expire(`prehistoric:${this.connectionId}`, 86400)
+
+      // Publish an explicit "prehistoric done" marker. The live processors watch
+      // this flag and switch from fast churn mode to adaptive-backoff idle mode
+      // so the engine stops "spinning" on empty cycles once the historical calc
+      // is finished. The interval itself stays effective whenever productive
+      // work is available.
+      await redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 })
+
+      console.log(
+        `[v0] [Prehistoric] ✓ complete in ${totalPrehistoricDurationMs}ms | ` +
+        `symbols=${processingResult.symbolsProcessed}/${processingResult.symbolsTotal} | ` +
+        `candles=${processingResult.candlesProcessed} | ` +
+        `indications=${processingResult.indicationResults} | ` +
+        `strategies=${processingResult.strategyPositions} | ` +
+        `errors=${processingResult.errors}`,
+      )
 
       // Update state to mark prehistoric phase complete
       await setSettings(`trade_engine_state:${this.connectionId}`, {
         prehistoric_data_loaded: true,
         prehistoric_data_start: prehistoricStart.toISOString(),
         prehistoric_data_end: prehistoricEnd.toISOString(),
+        prehistoric_range_hours: rangeHours,
+        prehistoric_range_days: storedRangeDays,
+        prehistoric_timeframe_seconds: storedTimeframeSec,
+        prehistoric_duration_ms: totalPrehistoricDurationMs,
         prehistoric_symbols: symbols,
         config_sets_initialized: true,
         config_set_indication_results: processingResult.indicationResults,
@@ -458,15 +616,25 @@ export class TradeEngineManager {
         updated_at: new Date().toISOString(),
       })
 
-      // Also store in Redis sets for dashboard queries
+      // Also store in Redis sets for dashboard queries. Previously this loop
+      // fired ~4 sequential awaits per symbol (4N round-trips for N symbols).
+      // Fan-out everything in a single Promise.all — with 8h lookback × dozens
+      // of symbols this alone saves hundreds of serialised awaits at startup.
       try {
         const client = getRedisClient()
-        for (const symbol of symbols) {
-          await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
-          await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
-          await client.set(`prehistoric:${this.connectionId}:${symbol}:loaded`, "true")
-          await client.expire(`prehistoric:${this.connectionId}:${symbol}:loaded`, 86400)
+        const symbolsKey = `prehistoric:${this.connectionId}:symbols`
+        const writes: Promise<any>[] = []
+        if (symbols.length > 0) {
+          // Single SADD with multiple members, then one EXPIRE for the index.
+          writes.push((client as any).sadd(symbolsKey, ...symbols))
+          writes.push(client.expire(symbolsKey, 86400))
         }
+        for (const symbol of symbols) {
+          const loadedKey = `prehistoric:${this.connectionId}:${symbol}:loaded`
+          // set with EX in a single command avoids the set+expire pair.
+          writes.push(client.set(loadedKey, "true", { EX: 86400 } as any))
+        }
+        await Promise.all(writes)
       } catch (e) {
         console.warn("[v0] [Engine] Prehistoric Redis store failed:", e instanceof Error ? e.message : String(e))
       }
@@ -538,24 +706,85 @@ export class TradeEngineManager {
    */
   // Indication processor - runs strategy evaluation on interval
   // Version 3.0 - Removed totalStrategiesEvaluated to fix stale closure issues
-  private startIndicationProcessor(intervalSeconds: number = 1): void {
+  // Version 4.0 - Converted from setInterval to self-scheduling setTimeout so
+  //   each cycle runs back-to-back with a configurable pause (app_settings.cyclePauseMs,
+  //   10-200ms, default 50ms). This removes the old "skip-when-busy" pattern that
+  //   was causing the cycle time to climb to 4s+ and the engine to appear hung.
+  private startIndicationProcessor(_intervalSeconds: number = 1): void {
     // Counter variables for metrics tracking - simplified to avoid closure issues
     let cycleCount = 0
     let attemptedCycles = 0
     let totalDuration = 0
     let errorCount = 0
-    let isProcessing = false
 
-    this.indicationTimer = setInterval(async () => {
-      if (isProcessing) return
-      isProcessing = true
+    // Adaptive idle backoff. When prehistoric calc is complete and the cycle
+    // produces zero indications we progressively increase the pause from the
+    // user-configured cyclePauseMs up to MAX_IDLE_PAUSE_MS. A productive cycle
+    // immediately resets the backoff so the "effective interval" stays fast
+    // whenever new data is arriving.
+    const MAX_IDLE_PAUSE_MS = 1000
+    let consecutiveEmptyCycles = 0
+    const connId = this.connectionId
+
+    const scheduleNext = (wasProductive: boolean) => {
+      if (!this.isRunning) return
+      const base = getCyclePauseMsSync()
+      let pause = base
+      if (wasProductive) {
+        consecutiveEmptyCycles = 0
+      } else {
+        consecutiveEmptyCycles++
+        // Only back off once prehistoric is done — during warmup keep the fast
+        // cycle pause so we don't stall the initial data pipeline.
+        const prehistoricDone = prehistoricDoneFlag
+        if (prehistoricDone && consecutiveEmptyCycles > 2) {
+          // Exponential-ish: 2x, 4x, 8x base capped at MAX_IDLE_PAUSE_MS
+          const factor = Math.min(16, 1 << Math.min(4, consecutiveEmptyCycles - 2))
+          pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
+        }
+      }
+      // Unregister the prior handle BEFORE overwriting it — otherwise the
+      // global `__engine_timers` Set grows by one entry every cycle and
+      // stale handles accumulate forever (memory leak + slow HMR reloads).
+      if (this.indicationTimer) unregisterEngineTimer(this.indicationTimer)
+      this.indicationTimer = setTimeout(tick, pause)
+      registerEngineTimer(this.indicationTimer)
+    }
+
+    // Cheap cached flag — refreshed in the background every few seconds so the
+    // scheduler never blocks on Redis I/O. Flips true once prehistoric is done.
+    let prehistoricDoneFlag = false
+    let prehistoricDoneCheckedAt = 0
+    const refreshPrehistoricDone = async () => {
+      try {
+        const client = getRedisClient()
+        const v = await client.get(`prehistoric:${connId}:done`)
+        prehistoricDoneFlag = v === "1"
+      } catch { /* keep last known value */ }
+    }
+    // Prime immediately and refresh every 3s
+    void refreshPrehistoricDone()
+
+    const tick = async () => {
+      if (!this.isRunning) return
       const startTime = Date.now()
-      
+      // Local abort flag — when true, the finally block will NOT schedule the next cycle.
+      let aborted = false
+      // Productivity marker — tracks whether this cycle did meaningful work so
+      // scheduleNext() can reset / grow the idle backoff.
+      let producedIndications = false
+
+      // Refresh the prehistoric-done flag every 3s (non-blocking).
+      if (startTime - prehistoricDoneCheckedAt > 3000) {
+        prehistoricDoneCheckedAt = startTime
+        void refreshPrehistoricDone()
+      }
+
       // V8: Early exit if this timer is from a stale module version
       if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
         console.log(`[v0] Stale timer detected (version mismatch), self-clearing...`)
         if (this.indicationTimer) {
-          clearInterval(this.indicationTimer)
+          clearTimeout(this.indicationTimer)
           unregisterEngineTimer(this.indicationTimer)
         }
         return
@@ -564,7 +793,7 @@ export class TradeEngineManager {
       try {
         const symbols = await this.getSymbols()
         if (!symbols || symbols.length === 0) {
-          isProcessing = false
+          // No symbols yet — fall through; finally will schedule the next attempt.
           return
         }
 
@@ -599,32 +828,47 @@ export class TradeEngineManager {
         }
 
         const totalIndications = indicationResults.reduce((sum, arr) => sum + (arr?.length || 0), 0)
-        
+        producedIndications = totalIndications > 0
+
+        // Increment cycle count BEFORE writing to Redis so the stored value is accurate
+        cycleCount++
+        const duration = Date.now() - startTime
+        totalDuration += duration
+
         // Log detailed breakdown
         console.log(`[v0] [IndicationProcessor CYCLE ${cycleCount}] Symbols: ${symbols.length} | Total Indications: ${totalIndications}`)
         console.log(`[v0] [IndicationProcessor] Per-symbol: ${JSON.stringify(symbolIndicationCounts)}`)
         console.log(`[v0] [IndicationProcessor] Per-type: ${JSON.stringify(indicationTypeCounts)}`)
 
-        // Write per-type counters into progression hash so dashboard reads real values
+        // Write per-type counters into progression hash so dashboard reads real values.
+        //
+        // COUNTER TAXONOMY (user-facing progression vs. prehistoric/churn processing):
+        //   * indication_cycle_count          — EVERY tick (incl. warmup/empty cycles). Treat as
+        //                                       "prehistoric processing" churn — hidden from the
+        //                                       primary live-progression display.
+        //   * indication_live_cycle_count     �� only ticks that produced at least one indication.
+        //                                       This is the meaningful "live progression" counter.
+        //   * indications_count / per-type    — cumulative indications generated (hincrby).
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
+          // Fan-out all counter updates in parallel. The in-memory Redis
+          // client services these in constant time; Promise.all minimises the
+          // awaited round-trips per cycle compared to sequential awaits.
+          const writes: Promise<any>[] = [
+            client.hincrby(redisKey, "indication_cycle_count", 1),
+            client.hset(redisKey, "symbols_processed", String(symbols.length)),
+            client.expire(redisKey, 7 * 24 * 60 * 60),
+          ]
           if (Object.keys(indicationTypeCounts).length > 0) {
-            // Atomically increment per-type fields in the progression hash
+            writes.push(client.hincrby(redisKey, "indication_live_cycle_count", 1))
             for (const [type, count] of Object.entries(indicationTypeCounts)) {
-              const field = `indications_${type}_count`
-              await client.hincrby(redisKey, field, count)
+              writes.push(client.hincrby(redisKey, `indications_${type}_count`, count))
             }
-            await client.hincrby(redisKey, "indications_count", totalIndications)
-            await client.hset(redisKey, "indication_cycle_count", String(cycleCount))
-            await client.hset(redisKey, "symbols_processed", String(symbols.length))
-            await client.expire(redisKey, 7 * 24 * 60 * 60)
+            writes.push(client.hincrby(redisKey, "indications_count", totalIndications))
           }
+          await Promise.all(writes)
         } catch { /* non-critical */ }
-
-        const duration = Date.now() - startTime
-        cycleCount++
-        totalDuration += duration
 
         const processedThisCycle = indicationResults.reduce((sum, arr) => sum + (arr?.length || 0), 0)
 
@@ -632,11 +876,17 @@ export class TradeEngineManager {
         this.componentHealth.indications.cycleCount = cycleCount
         this.componentHealth.indications.successRate = cycleCount > 0 ? ((cycleCount - errorCount) / cycleCount) * 100 : 100
 
-        // Update progression cycle every cycle with detailed logging
-        try {
-          await ProgressionStateManager.incrementCycle(this.connectionId, true, processedThisCycle)
-        } catch (incError) {
-          console.error(`[v0] [Engine] Cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
+        // PROGRESSION CONTRACT: the global cycles_completed counter represents
+        // meaningful live progress (indications were generated), not churn.
+        // Skip the increment for empty warmup/prehistoric ticks — that keeps
+        // the dashboard success-rate honest and prevents cycles_completed from
+        // drifting into the tens of thousands while nothing has happened yet.
+        if (processedThisCycle > 0) {
+          try {
+            await ProgressionStateManager.incrementCycle(this.connectionId, true, processedThisCycle)
+          } catch (incError) {
+            console.error(`[v0] [Engine] Cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
+          }
         }
 
         // Persist cycle count every 100 cycles to reduce Redis writes
@@ -665,17 +915,18 @@ export class TradeEngineManager {
         } catch { /* ignore errors */ }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error)
-        
+
         // Suppress known stale closure errors from HMR - these will clear on server restart
         if (errorMessage.includes("totalStrategiesEvaluated is not defined")) {
-          // Self-heal: clear this stale timer
+          // Self-heal: clear this stale timer and do NOT reschedule
+          aborted = true
           if (this.indicationTimer) {
-            clearInterval(this.indicationTimer)
+            clearTimeout(this.indicationTimer)
             console.log("[v0] Cleared stale indication timer with totalStrategiesEvaluated error")
           }
           return
         }
-        
+
         errorCount++
         this.componentHealth.indications.errorCount++
         // Track failed cycle on every error to keep progression counters accurate.
@@ -693,35 +944,81 @@ export class TradeEngineManager {
         )
         console.error("[v0] Indication processor error:", error)
       } finally {
-        isProcessing = false
+        // Schedule next cycle after configurable pause so the event loop can breathe.
+        if (!aborted) scheduleNext(producedIndications)
       }
-    }, intervalSeconds * 1000)
-    
-    // Register timer for cleanup on module reload
+    }
+
+    // Kick off the first cycle immediately (0 ms delay).
+    this.indicationTimer = setTimeout(tick, 0)
     registerEngineTimer(this.indicationTimer)
   }
 
   /**
    * Start strategy processor (async)
-   * With debouncing to prevent overlapping cycles
+   *
+   * Self-scheduling setTimeout loop — cycles run back-to-back with a
+   * configurable pause (app_settings.cyclePauseMs). Natural serialisation
+   * prevents overlap without needing an isProcessing flag. Once prehistoric
+   * calc is complete, idle cycles (0 strategies evaluated) back off
+   * progressively up to 1s so the engine stops "spinning" on nothing.
    */
-  private startStrategyProcessor(intervalSeconds: number = 1): void {
+  private startStrategyProcessor(_intervalSeconds: number = 1): void {
     let cycleCount = 0
     let totalDuration = 0
     let errorCount = 0
     let totalStrategiesEvaluated = 0
-    let isProcessing = false
 
-    this.strategyTimer = setInterval(async () => {
-      if (isProcessing) return
-      isProcessing = true
+    // Adaptive idle backoff — same strategy as the indication processor.
+    const MAX_IDLE_PAUSE_MS = 1000
+    let consecutiveEmptyCycles = 0
+    const connId = this.connectionId
+    let prehistoricDoneFlag = false
+    let prehistoricDoneCheckedAt = 0
+    const refreshPrehistoricDone = async () => {
+      try {
+        const client = getRedisClient()
+        const v = await client.get(`prehistoric:${connId}:done`)
+        prehistoricDoneFlag = v === "1"
+      } catch { /* keep last known value */ }
+    }
+    void refreshPrehistoricDone()
+
+    const scheduleNext = (wasProductive: boolean) => {
+      if (!this.isRunning) return
+      const base = getCyclePauseMsSync()
+      let pause = base
+      if (wasProductive) {
+        consecutiveEmptyCycles = 0
+      } else {
+        consecutiveEmptyCycles++
+        if (prehistoricDoneFlag && consecutiveEmptyCycles > 2) {
+          const factor = Math.min(16, 1 << Math.min(4, consecutiveEmptyCycles - 2))
+          pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
+        }
+      }
+      // See indication processor: unregister the previous handle so the
+      // global timer Set doesn't grow unbounded.
+      if (this.strategyTimer) unregisterEngineTimer(this.strategyTimer)
+      this.strategyTimer = setTimeout(tick, pause)
+      registerEngineTimer(this.strategyTimer)
+    }
+
+    const tick = async () => {
+      if (!this.isRunning) return
       const startTime = Date.now()
-      
+      let producedStrategies = false
+
+      if (startTime - prehistoricDoneCheckedAt > 3000) {
+        prehistoricDoneCheckedAt = startTime
+        void refreshPrehistoricDone()
+      }
+
       // V8: Early exit if this timer is from a stale module version
       if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
         console.log(`[v0] Stale strategy timer detected, self-clearing...`)
         if (this.strategyTimer) {
-          clearInterval(this.strategyTimer)
+          clearTimeout(this.strategyTimer)
           unregisterEngineTimer(this.strategyTimer)
         }
         return
@@ -741,6 +1038,7 @@ export class TradeEngineManager {
 
         const evaluatedThisCycle = strategyResults.reduce((sum, result) => sum + (result?.strategiesEvaluated || 0), 0)
         const liveReadyThisCycle = strategyResults.reduce((sum, result) => sum + (result?.liveReady || 0), 0)
+        producedStrategies = evaluatedThisCycle > 0
         
         // Defensive: handle stale closures from HMR
         try {
@@ -762,26 +1060,34 @@ export class TradeEngineManager {
         this.componentHealth.strategies.cycleCount = cycleCount
         this.componentHealth.strategies.successRate = cycleCount > 0 ? ((cycleCount - errorCount) / cycleCount) * 100 : 100
 
-        // Write strategy counts into progression hash for dashboard real-time display
+        // Write ONLY cycle-level metrics into the progression hash.
+        // Per-stage Set counts (strategies_base_total, strategies_main_total,
+        // strategies_real_total, strategy_evaluated_*) are written atomically inside
+        // StrategyCoordinator.executeStrategyFlow() to avoid double-counting.
+        //
+        // See indication-processor comment above for counter taxonomy:
+        //   strategy_cycle_count          = every tick (churn)
+        //   strategy_live_cycle_count     = only ticks that evaluated at least 1 strategy
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
+          await client.hincrby(redisKey, "strategy_cycle_count", 1)
           if (evaluatedThisCycle > 0) {
+            await client.hincrby(redisKey, "strategy_live_cycle_count", 1)
             await client.hincrby(redisKey, "strategies_count", evaluatedThisCycle)
-            await client.hincrby(redisKey, "strategies_real_total", liveReadyThisCycle)
-            await client.hincrby(redisKey, "strategy_evaluated_real", liveReadyThisCycle)
-            await client.hset(redisKey, "strategy_cycle_count", String(cycleCount))
-            await client.hset(redisKey, "total_strategies_evaluated", String(totalStrategiesEvaluated))
-            await client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle))
-            await client.expire(redisKey, 7 * 24 * 60 * 60)
           }
+          await client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle))
+          await client.expire(redisKey, 7 * 24 * 60 * 60)
         } catch { /* non-critical */ }
 
-        // Update progression cycle
-        try {
-          await ProgressionStateManager.incrementCycle(this.connectionId, true, evaluatedThisCycle)
-        } catch (incError) {
-          console.error(`[v0] [Engine] Strategy cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
+        // Only count productive strategy cycles toward cycles_completed
+        // (see same-pattern comment in indication processor).
+        if (evaluatedThisCycle > 0) {
+          try {
+            await ProgressionStateManager.incrementCycle(this.connectionId, true, evaluatedThisCycle)
+          } catch (incError) {
+            console.error(`[v0] [Engine] Strategy cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
+          }
         }
 
         // Persist cycle count every 50 cycles (faster update rate for strategies)
@@ -826,40 +1132,88 @@ export class TradeEngineManager {
         })
         console.error("[v0] Strategy error:", errorMessage)
       } finally {
-        isProcessing = false
+        scheduleNext(producedStrategies)
       }
-    }, intervalSeconds * 1000)
-    
-    // Register timer for cleanup on module reload
+    }
+
+    // Kick off the first cycle immediately.
+    this.strategyTimer = setTimeout(tick, 0)
     registerEngineTimer(this.strategyTimer)
   }
 
   /**
    * Start realtime processor (async)
-   * With debouncing to prevent overlapping cycles
+   *
+   * Self-scheduling setTimeout loop — each cycle runs back-to-back with a
+   * configurable pause (app_settings.cyclePauseMs, 10-200ms, default 50ms).
+   * Applies adaptive idle backoff (max 1s) once prehistoric calc is done and
+   * cycles repeatedly produce no realtime updates.
    */
-  private startRealtimeProcessor(intervalSeconds: number = 1): void {
+  private startRealtimeProcessor(_intervalSeconds: number = 1): void {
     let cycleCount = 0
     let totalDuration = 0
     let errorCount = 0
-    let isProcessing = false
 
-    this.realtimeTimer = setInterval(async () => {
+    const MAX_IDLE_PAUSE_MS = 1000
+    let consecutiveEmptyCycles = 0
+    const connId = this.connectionId
+    let prehistoricDoneFlag = false
+    let prehistoricDoneCheckedAt = 0
+    const refreshPrehistoricDone = async () => {
+      try {
+        const client = getRedisClient()
+        const v = await client.get(`prehistoric:${connId}:done`)
+        prehistoricDoneFlag = v === "1"
+      } catch { /* keep last known value */ }
+    }
+    void refreshPrehistoricDone()
+
+    const scheduleNext = (wasProductive: boolean) => {
+      if (!this.isRunning) return
+      const base = getCyclePauseMsSync()
+      let pause = base
+      if (wasProductive) {
+        consecutiveEmptyCycles = 0
+      } else {
+        consecutiveEmptyCycles++
+        if (prehistoricDoneFlag && consecutiveEmptyCycles > 2) {
+          const factor = Math.min(16, 1 << Math.min(4, consecutiveEmptyCycles - 2))
+          pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
+        }
+      }
+      // See indication processor: unregister the previous handle so the
+      // global timer Set doesn't grow unbounded.
+      if (this.realtimeTimer) unregisterEngineTimer(this.realtimeTimer)
+      this.realtimeTimer = setTimeout(tick, pause)
+      registerEngineTimer(this.realtimeTimer)
+    }
+
+    const tick = async () => {
+      if (!this.isRunning) return
+      let producedRealtime = false
       // V8: Early exit if this timer is from a stale module version
       if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
         if (this.realtimeTimer) {
-          clearInterval(this.realtimeTimer)
+          clearTimeout(this.realtimeTimer)
           unregisterEngineTimer(this.realtimeTimer)
         }
         return
       }
-      if (isProcessing) return
-      isProcessing = true
       const startTime = Date.now()
+
+      if (startTime - prehistoricDoneCheckedAt > 3000) {
+        prehistoricDoneCheckedAt = startTime
+        void refreshPrehistoricDone()
+      }
 
       try {
         // Process realtime updates for active positions
-        await this.realtimeProcessor.processRealtimeUpdates()
+        const rtResult: any = await this.realtimeProcessor.processRealtimeUpdates()
+        // Mark cycle productive when the processor returned some work.
+        if (rtResult && typeof rtResult === "object") {
+          const updates = Number(rtResult.updates ?? rtResult.processed ?? rtResult.positionsUpdated ?? 0)
+          producedRealtime = updates > 0
+        }
 
         const duration = Date.now() - startTime
         cycleCount++
@@ -910,9 +1264,12 @@ export class TradeEngineManager {
           errorCount,
         })
       } finally {
-        isProcessing = false
+        scheduleNext(producedRealtime)
       }
-    }, intervalSeconds * 1000)
+    }
+
+    // Kick off the first cycle immediately.
+    this.realtimeTimer = setTimeout(tick, 0)
     
     // Register timer for cleanup on module reload
     registerEngineTimer(this.realtimeTimer)
@@ -1017,53 +1374,76 @@ export class TradeEngineManager {
   }
 
   /**
-   * Get symbols for this connection - uses connection's active_symbols first
+   * Get symbols for this connection - uses connection's active_symbols first.
+   *
+   * PERFORMANCE: The engine previously called getSymbols() on every tick across
+   * 3 processors (indication / strategy / realtime) which translated to ~12
+   * Redis reads per second just to resolve a list that changes at most a few
+   * times per day. We now cache the resolved array in memory for 5 seconds so
+   * each 1-second cycle reuses the same lookup. The short TTL keeps UI-driven
+   * symbol changes propagating to the engine within the next tick or two.
    */
+  private _symbolsCache: string[] | null = null
+  private _symbolsCachedAt = 0
+  private static readonly _SYMBOLS_TTL_MS = 5000
+
   private async getSymbols(): Promise<string[]> {
-    try {
-      // First, check connection's configured symbols in Redis
-      const connState = await getSettings(`trade_engine_state:${this.connectionId}`)
-      if (connState && typeof connState === "object") {
-        const connSymbols = (connState as any).symbols || (connState as any).active_symbols
-        if (Array.isArray(connSymbols) && connSymbols.length > 0) {
-          return connSymbols
-        }
-      }
-
-      // Check connection settings directly
-      const connSettings = await getSettings(`connection:${this.connectionId}`)
-      if (connSettings && typeof connSettings === "object") {
-        const symbolsField = (connSettings as any).active_symbols || (connSettings as any).symbols
-        let symbols = symbolsField
-        // Handle JSON string
-        if (typeof symbols === "string") {
-          try {
-            symbols = JSON.parse(symbols)
-          } catch { /* ignore */ }
-        }
-        if (Array.isArray(symbols) && symbols.length > 0) {
-          return symbols
-        }
-      }
-
-      // Fall back to global main symbols setting
-      const useMainSymbols = await getSettings("useMainSymbols")
-      if (useMainSymbols === true || useMainSymbols === "true") {
-        const mainSymbols = await getSettings("mainSymbols")
-        if (Array.isArray(mainSymbols) && mainSymbols.length > 0) {
-          return mainSymbols
-        }
-      }
-
-      // Default symbols - HIGH VOLATILITY ALTCOINS ONLY
-      // WIF, SIREN, DRIFT - specialized high-frequency altcoin trading
-      const defaultSymbols = ["WIFUSDT", "SIRENUSDT", "DRIFTUSDT"]
-      return defaultSymbols
-    } catch (error) {
-      console.error("[v0] Failed to get symbols, using fallback:", error instanceof Error ? error.message : String(error))
-      // Fallback to high-volatility altcoin symbols only
-      return ["WIFUSDT", "SIRENUSDT", "DRIFTUSDT"]
+    const now = Date.now()
+    if (this._symbolsCache && now - this._symbolsCachedAt < TradeEngineManager._SYMBOLS_TTL_MS) {
+      return this._symbolsCache
     }
+
+    const resolve = async (): Promise<string[]> => {
+      try {
+        // Fire both primary lookups concurrently so the first tick after TTL
+        // expiry doesn't pay two sequential Redis round-trips.
+        const [connState, connSettings] = await Promise.all([
+          getSettings(`trade_engine_state:${this.connectionId}`),
+          getSettings(`connection:${this.connectionId}`),
+        ])
+
+        if (connState && typeof connState === "object") {
+          const connSymbols = (connState as any).symbols || (connState as any).active_symbols
+          if (Array.isArray(connSymbols) && connSymbols.length > 0) return connSymbols
+        }
+
+        if (connSettings && typeof connSettings === "object") {
+          const symbolsField = (connSettings as any).active_symbols || (connSettings as any).symbols
+          let symbols = symbolsField
+          if (typeof symbols === "string") {
+            try { symbols = JSON.parse(symbols) } catch { /* ignore */ }
+          }
+          if (Array.isArray(symbols) && symbols.length > 0) return symbols
+        }
+
+        // Global main-symbols fallback
+        const useMainSymbols = await getSettings("useMainSymbols")
+        if (useMainSymbols === true || useMainSymbols === "true") {
+          const mainSymbols = await getSettings("mainSymbols")
+          if (Array.isArray(mainSymbols) && mainSymbols.length > 0) return mainSymbols
+        }
+
+        return ["DRIFTUSDT"]
+      } catch (error) {
+        console.error("[v0] Failed to get symbols, using fallback:", error instanceof Error ? error.message : String(error))
+        return ["DRIFTUSDT"]
+      }
+    }
+
+    const resolved = await resolve()
+    this._symbolsCache = resolved
+    this._symbolsCachedAt = now
+    return resolved
+  }
+
+  /**
+   * Force-expire the cached symbol list. Call from the heartbeat or when an
+   * admin API updates the connection's active_symbols so the next tick picks
+   * up the new value immediately rather than waiting for the TTL.
+   */
+  public invalidateSymbolsCache(): void {
+    this._symbolsCache = null
+    this._symbolsCachedAt = 0
   }
 
   /**

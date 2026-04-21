@@ -102,9 +102,11 @@ export async function ensureDefaultExchangesExist() {
         // ONLY bybit and bingx are inserted (shown on Main Connections by default)
         // All others (pionex, orangex) are disabled and hidden
         is_inserted: cfg.exchange === "bybit" || cfg.exchange === "bingx" ? "1" : "0",
-        // AUTO-ENABLE base connections (bybit/bingx) on active panel by default
-        // This ensures mainConnections shows these in the Smart Overview
-        is_active_inserted: cfg.exchange === "bybit" || cfg.exchange === "bingx" ? "1" : (existing?.is_active_inserted ?? "0"),
+        // PRESERVE existing is_active_inserted — only set "1" for brand-new bingx-x01 connections.
+        // Bybit should NOT be auto-inserted. Never override user deletions or manual toggles.
+        is_active_inserted: existing
+          ? (existing.is_active_inserted ?? "0")
+          : (cfg.exchange === "bingx" ? "1" : "0"),
         // ONLY bybit and bingx are enabled by default in settings
         is_enabled: cfg.exchange === "bybit" || cfg.exchange === "bingx" ? "1" : "0",
         is_enabled_dashboard: existing?.is_enabled_dashboard ?? "0",

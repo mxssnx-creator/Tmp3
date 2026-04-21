@@ -29,8 +29,8 @@ export function ConnectionLogsPanel({ connectionId, autoRefresh = true }: Connec
           const data = await response.json()
           setLogs(data.logs || [])
         }
-      } catch (error) {
-        console.error("[v0] Failed to fetch connection logs:", error)
+      } catch {
+        // non-critical
       } finally {
         setLoading(false)
       }

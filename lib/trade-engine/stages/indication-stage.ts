@@ -43,36 +43,40 @@ export async function processIndications(
     // Process each timeframe independently
     const timeframes = ["1m", "5m", "15m", "1h", "4h"]
 
+    // PERFORMANCE: All four indicators are derived purely from `ohlcData`,
+    // which does not change between timeframes in the caller. Recomputing
+    // them inside the loop produced identical values 5× per call — pure
+    // wasted CPU. Hoist the expensive math once and reuse the results.
+    const rsi = calculateRSI(ohlcData, 14)
+    const macd = calculateMACD(ohlcData)
+    const ema = calculateEMA(ohlcData)
+    const bb = calculateBollingerBands(ohlcData)
+    const signal = generateSignal({ rsi, macd, ema, bb })
+    const lastPrice = ohlcData[ohlcData.length - 1]?.close || 0
+    const ts = Date.now()
+    const connId = connection.id || connection.name
+
+    // Build all indication payloads up front, then fan out the 5 Redis
+    // setex writes concurrently instead of awaiting them serially.
+    const writes: Promise<any>[] = []
     for (const timeframe of timeframes) {
-      // Calculate indicators for timeframe
-      const rsi = calculateRSI(ohlcData, 14)
-      const macd = calculateMACD(ohlcData)
-      const ema = calculateEMA(ohlcData)
-      const bb = calculateBollingerBands(ohlcData)
-
-      // Generate signal based on indicators
-      const signal = generateSignal({ rsi, macd, ema, bb })
-
       const indication: IndicationSignal = {
-        connectionId: connection.id || connection.name,
+        connectionId: connId,
         connectionName: connection.name,
         symbol,
         timeframe,
-        timestamp: Date.now(),
+        timestamp: ts,
         indicators: { rsi, macd, ema, bb },
         signal: signal.type,
         strength: signal.strength,
-        price: ohlcData[ohlcData.length - 1]?.close || 0,
+        price: lastPrice,
       }
-
       signals.push(indication)
-
-      // Store indication
-      const indicationKey = `indication:${connection.id}:${symbol}:${timeframe}`
-      await client.setex(indicationKey, 86400, JSON.stringify(indication))
-
-      // Disabled per-signal logging - only log on errors to avoid excessive Redis key growth
+      writes.push(
+        client.setex(`indication:${connection.id}:${symbol}:${timeframe}`, 86400, JSON.stringify(indication)),
+      )
     }
+    await Promise.all(writes)
 
     return signals
   } catch (err) {

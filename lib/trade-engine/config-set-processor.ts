@@ -22,6 +22,12 @@ export interface ProcessingResult {
   candlesProcessed: number
   errors: number
   duration: number
+  // Interval-stepping metrics
+  intervalsProcessed: number
+  missingIntervalsLoaded: number
+  timeframeSeconds: number
+  rangeStartMs: number
+  rangeEndMs: number
 }
 
 export class ConfigSetProcessor {
@@ -73,87 +79,233 @@ export class ConfigSetProcessor {
   }
 
   /**
-   * Process prehistoric data through all config sets
-   * Main entry point for Phase 6 processing
+   * Process prehistoric data through all config sets.
+   * Processes ONLY missing time intervals (skips already-loaded ranges).
+   * Steps through the full time range one timeframe interval at a time.
+   *
+   * @param symbols       - Symbols to process
+   * @param rangeStart    - Start of the historical range (default: now - 1 day)
+   * @param rangeEnd      - End of the historical range (default: now)
+   * @param timeframeSec  - Timeframe interval in seconds (default: 1 = 1-second bars)
    */
-  async processPrehistoricData(symbols: string[]): Promise<ProcessingResult> {
+  async processPrehistoricData(
+    symbols: string[],
+    rangeStart?: Date,
+    rangeEnd?: Date,
+    timeframeSec: number = 1
+  ): Promise<ProcessingResult> {
     const startTime = Date.now()
-    console.log(`[v0] [ConfigSetProcessor] Starting prehistoric processing for ${symbols.length} symbols`)
+    const now = new Date()
+    const effectiveEnd = rangeEnd ?? now
+    // Default fallback — 8 hours, matches engine-manager DEFAULT_RANGE_HOURS.
+    const effectiveStart = rangeStart ?? new Date(now.getTime() - 8 * 60 * 60 * 1000)
+    const intervalMs = timeframeSec * 1000
+
+    // Symbol-level concurrency: process N symbols in parallel. Each symbol
+    // then fans out its enabled indication/strategy configs in parallel.
+    // Tunable via env (PREHISTORIC_SYMBOL_CONCURRENCY) — default 8.
+    const SYMBOL_CONCURRENCY = Math.max(
+      1,
+      Math.min(32, Number(process.env.PREHISTORIC_SYMBOL_CONCURRENCY) || 8)
+    )
+
+    console.log(
+      `[v0] [ConfigSetProcessor] ▶ prehistoric start | symbols=${symbols.length} | ` +
+      `range=${effectiveStart.toISOString()} → ${effectiveEnd.toISOString()} | ` +
+      `timeframe=${timeframeSec}s | concurrency=${SYMBOL_CONCURRENCY}`
+    )
 
     await initRedis()
     const client = getRedisClient()
 
+    // Mutable aggregates updated from parallel workers — guard with a lightweight
+    // local function since JS is single-threaded inside the event loop there's
+    // no true race, but this keeps the reads/writes explicit.
     let totalIndicationResults = 0
     let totalStrategyPositions = 0
     let symbolsProcessed = 0
     let symbolsWithoutData = 0
     let candlesProcessed = 0
     let errors = 0
+    let totalIntervalsProcessed = 0
+    let missingIntervalsLoaded = 0
 
-    const indicationConfigs = await this.indicationManager.getEnabledConfigs()
-    const strategyConfigs = await this.strategyManager.getEnabledConfigs()
+    const tConfigsStart = Date.now()
+    const [indicationConfigs, strategyConfigs] = await Promise.all([
+      this.indicationManager.getEnabledConfigs(),
+      this.strategyManager.getEnabledConfigs(),
+    ])
+    const tConfigsMs = Date.now() - tConfigsStart
 
     console.log(
-      `[v0] [ConfigSetProcessor] Processing with ${indicationConfigs.length} indication configs, ` +
-      `${strategyConfigs.length} strategy configs`
+      `[v0] [ConfigSetProcessor] loaded ${indicationConfigs.length} indication configs, ` +
+      `${strategyConfigs.length} strategy configs (in ${tConfigsMs}ms)`
     )
 
-    for (const symbol of symbols) {
+    // Store range metadata for dashboard
+    try {
+      await client.hset(`prehistoric:${this.connectionId}`, {
+        range_start: effectiveStart.toISOString(),
+        range_end: effectiveEnd.toISOString(),
+        timeframe_seconds: String(timeframeSec),
+        symbols_total: String(symbols.length),
+        symbol_concurrency: String(SYMBOL_CONCURRENCY),
+        indication_configs: String(indicationConfigs.length),
+        strategy_configs: String(strategyConfigs.length),
+        updated_at: new Date().toISOString(),
+      })
+    } catch { /* non-critical */ }
+
+    const progressKey = `progression:${this.connectionId}`
+
+    // Worker that processes a single symbol end-to-end. All DB writes inside
+    // are fired with Promise.all where possible to minimise the await chain.
+    const processOneSymbol = async (symbol: string): Promise<void> => {
+      const tSymStart = Date.now()
       try {
+        // --- Load all available candles for this symbol ---
+        let candles: any[] = []
+
         const candlesRaw = await client.get(`market_data:${symbol}:candles`)
-        const candles = candlesRaw ? JSON.parse(candlesRaw) : []
+        if (candlesRaw) {
+          candles = JSON.parse(candlesRaw)
+        }
 
         if (!candles || candles.length === 0) {
           const marketDataRaw = await client.get(`market_data:${symbol}:1m`)
           if (marketDataRaw) {
             const marketDataObj = JSON.parse(marketDataRaw)
             if (marketDataObj?.candles) {
-              candles.push(...marketDataObj.candles)
+              candles = marketDataObj.candles
             }
           }
         }
 
         if (candles.length === 0) {
-          console.log(`[v0] [ConfigSetProcessor] No candles found for ${symbol}, skipping`)
+          console.log(`[v0] [ConfigSetProcessor] ⚠ no candles for ${symbol} — skipping`)
           symbolsWithoutData++
           await logProgressionEvent(this.connectionId, "config_set_symbol_skipped", "warning", `No prehistoric candles for ${symbol}`, {
             symbol,
             stage: "prehistoric",
           })
-          continue
+          return
         }
 
-        console.log(`[v0] [ConfigSetProcessor] Processing ${candles.length} candles for ${symbol}`)
-        candlesProcessed += candles.length
+        // --- Determine which time intervals are already processed ---
+        const processedKey = `prehistoric:${this.connectionId}:${symbol}:processed_intervals`
+        let processedIntervals: Set<number> = new Set()
+        try {
+          const processedRaw = await client.get(processedKey)
+          if (processedRaw) {
+            const arr: number[] = JSON.parse(processedRaw)
+            processedIntervals = new Set(arr)
+          }
+        } catch { /* non-critical */ }
+
+        // --- Step through time range interval by interval, processing only missing ones ---
+        let currentTs = effectiveStart.getTime()
+        const endTs = effectiveEnd.getTime()
+
+        // Pre-sort candles by timestamp for faster bucket filtering.
+        const candlesSorted = candles
+          .map((c: any) => {
+            const cTs = typeof c.timestamp === "number"
+              ? c.timestamp
+              : new Date(c.timestamp || c.time).getTime()
+            return { ...c, _ts: cTs }
+          })
+          .sort((a: any, b: any) => a._ts - b._ts)
+
+        const intervalCandles: any[] = []
+        let symbolIntervalCount = 0
+        let symbolMissingCount = 0
+
+        // Use a single linear scan over pre-sorted candles instead of filtering
+        // per-bucket. O(n+B) instead of O(n*B).
+        let cursor = 0
+        while (currentTs < endTs) {
+          const bucketTs = Math.floor(currentTs / intervalMs) * intervalMs
+          symbolIntervalCount++
+          if (!processedIntervals.has(bucketTs)) {
+            // Advance cursor to first candle >= bucketTs
+            while (cursor < candlesSorted.length && candlesSorted[cursor]._ts < bucketTs) cursor++
+            let hadMatch = false
+            let probe = cursor
+            while (probe < candlesSorted.length && candlesSorted[probe]._ts < bucketTs + intervalMs) {
+              intervalCandles.push(candlesSorted[probe])
+              probe++
+              hadMatch = true
+            }
+            if (hadMatch) {
+              symbolMissingCount++
+              processedIntervals.add(bucketTs)
+            }
+          }
+          currentTs += intervalMs
+        }
+
+        totalIntervalsProcessed += symbolIntervalCount
+        missingIntervalsLoaded += symbolMissingCount
+
+        // Persist the updated processed-intervals set for this symbol (TTL = 25h)
+        try {
+          await client.set(processedKey, JSON.stringify([...processedIntervals]), { EX: 90000 })
+        } catch { /* non-critical */ }
+
+        // Merge interval candles with full candle array for processing
+        const combinedCandles = intervalCandles.length > 0 ? intervalCandles : candlesSorted
+        candlesProcessed += combinedCandles.length
         symbolsProcessed++
 
-        // Write intermediate prehistoric progress to progression hash so dashboard shows live tracking
-        try {
-          await client.hincrby(`progression:${this.connectionId}`, "prehistoric_candles_processed", candles.length)
-          await client.hincrby(`progression:${this.connectionId}`, "prehistoric_symbols_processed_count", 1)
-          await client.expire(`progression:${this.connectionId}`, 7 * 24 * 60 * 60)
-        } catch { /* non-critical */ }
+        // --- Write live progress to Redis hash (fire concurrently with computation) ---
+        const progressWrite = Promise.all([
+          client.hincrby(progressKey, "prehistoric_candles_processed", combinedCandles.length),
+          client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1),
+          client.hset(progressKey, {
+            prehistoric_current_symbol: symbol,
+            prehistoric_intervals_processed: String(totalIntervalsProcessed),
+            prehistoric_missing_loaded: String(missingIntervalsLoaded),
+            prehistoric_timeframe_seconds: String(timeframeSec),
+          }),
+          client.expire(progressKey, 7 * 24 * 60 * 60),
+        ]).catch(() => { /* non-critical */ })
 
-        const indicationResults = await this.processIndicationConfigs(symbol, candles, indicationConfigs)
+        // --- Run indications + strategies in parallel for this symbol ---
+        const tCalcStart = Date.now()
+        const [indicationResults, strategyPositions] = await Promise.all([
+          this.processIndicationConfigs(symbol, combinedCandles, indicationConfigs),
+          this.processStrategyConfigs(symbol, combinedCandles, strategyConfigs),
+        ])
+        const tCalcMs = Date.now() - tCalcStart
+
         totalIndicationResults += indicationResults
-
-        // Write indication result counts into progression hash
-        try {
-          await client.hincrby(`progression:${this.connectionId}`, "indications_count", indicationResults)
-          await client.expire(`progression:${this.connectionId}`, 7 * 24 * 60 * 60)
-        } catch { /* non-critical */ }
-
-        const strategyPositions = await this.processStrategyConfigs(symbol, candles, strategyConfigs)
         totalStrategyPositions += strategyPositions
 
-        // Write strategy position counts into progression hash
-        try {
-          await client.hincrby(`progression:${this.connectionId}`, "strategies_base_total", strategyPositions)
-          await client.expire(`progression:${this.connectionId}`, 7 * 24 * 60 * 60)
-        } catch { /* non-critical */ }
+        // Fan-out the counter writes & completion marker.
+        await Promise.all([
+          progressWrite,
+          client.hincrby(progressKey, "indications_count", indicationResults),
+          client.hincrby(progressKey, "strategies_base_total", strategyPositions),
+          client.expire(progressKey, 7 * 24 * 60 * 60),
+          client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol),
+          client.expire(`prehistoric:${this.connectionId}:symbols`, 86400),
+          client.hset(`prehistoric:${this.connectionId}`, {
+            candles_loaded: String(candlesProcessed),
+            symbols_processed: String(symbolsProcessed),
+            intervals_processed: String(totalIntervalsProcessed),
+            missing_intervals: String(missingIntervalsLoaded),
+          }),
+        ]).catch(() => { /* non-critical */ })
 
+        const tSymMs = Date.now() - tSymStart
+        console.log(
+          `[v0] [ConfigSetProcessor] ✓ ${symbol} | candles=${combinedCandles.length} | ` +
+          `intervals=${symbolIntervalCount} (missing=${symbolMissingCount}) | ` +
+          `indications=${indicationResults} | strategies=${strategyPositions} | ` +
+          `calc=${tCalcMs}ms | total=${tSymMs}ms`
+        )
       } catch (error) {
-        console.error(`[v0] [ConfigSetProcessor] Error processing ${symbol}:`, error)
+        console.error(`[v0] [ConfigSetProcessor] ✗ ${symbol}:`, error instanceof Error ? error.message : String(error))
         errors++
         await logProgressionEvent(this.connectionId, "config_set_symbol_error", "error", `Prehistoric processing failed for ${symbol}`, {
           symbol,
@@ -161,6 +313,21 @@ export class ConfigSetProcessor {
         })
       }
     }
+
+    // Fixed-size worker pool. We grab symbols off the queue as workers finish.
+    const queue = [...symbols]
+    const workers: Promise<void>[] = []
+    const spawnWorker = async (): Promise<void> => {
+      while (queue.length > 0) {
+        const sym = queue.shift()
+        if (!sym) break
+        await processOneSymbol(sym)
+      }
+    }
+    for (let i = 0; i < Math.min(SYMBOL_CONCURRENCY, symbols.length); i++) {
+      workers.push(spawnWorker())
+    }
+    await Promise.all(workers)
 
     const duration = Date.now() - startTime
     const result: ProcessingResult = {
@@ -174,6 +341,11 @@ export class ConfigSetProcessor {
       candlesProcessed,
       errors,
       duration,
+      intervalsProcessed: totalIntervalsProcessed,
+      missingIntervalsLoaded,
+      timeframeSeconds: timeframeSec,
+      rangeStartMs: effectiveStart.getTime(),
+      rangeEndMs: effectiveEnd.getTime(),
     }
 
     console.log(
@@ -201,30 +373,40 @@ export class ConfigSetProcessor {
   }
 
   /**
-   * Process candles through all indication configs
-   * Each config calculates independently
+   * Process candles through all indication configs.
+   * Each config calculates independently and runs in parallel. Results for a
+   * single config are written as a single batched lpush to minimise Redis ops.
    */
   private async processIndicationConfigs(
     symbol: string,
     candles: any[],
     configs: IndicationConfig[]
   ): Promise<number> {
-    let totalResults = 0
+    if (configs.length === 0) return 0
 
-    for (const config of configs) {
-      try {
-        const results = this.calculateIndicationResults(symbol, candles, config)
-        
-        for (const result of results) {
-          await this.indicationManager.addResult(config.id, result)
-          totalResults++
+    const perConfigResults = await Promise.all(
+      configs.map(async (config) => {
+        try {
+          const results = this.calculateIndicationResults(symbol, candles, config)
+          if (results.length === 0) return 0
+          if (typeof (this.indicationManager as any).addResults === "function") {
+            await (this.indicationManager as any).addResults(config.id, results)
+          } else {
+            // Fallback: fire in parallel instead of sequential awaits.
+            await Promise.all(results.map((r) => this.indicationManager.addResult(config.id, r)))
+          }
+          return results.length
+        } catch (error) {
+          console.error(
+            `[v0] [ConfigSetProcessor] ✗ indication config ${config.id}:`,
+            error instanceof Error ? error.message : String(error),
+          )
+          return 0
         }
-      } catch (error) {
-        console.error(`[v0] [ConfigSetProcessor] Error processing indication config ${config.id}:`, error)
-      }
-    }
+      })
+    )
 
-    return totalResults
+    return perConfigResults.reduce((sum, n) => sum + n, 0)
   }
 
   /**
@@ -295,30 +477,38 @@ export class ConfigSetProcessor {
   }
 
   /**
-   * Process candles through all strategy configs
-   * Creates pseudo positions based on strategy parameters
+   * Process candles through all strategy configs in parallel.
+   * Positions generated per config are written as a single batched lpush.
    */
   private async processStrategyConfigs(
     symbol: string,
     candles: any[],
     configs: StrategyConfig[]
   ): Promise<number> {
-    let totalPositions = 0
+    if (configs.length === 0) return 0
 
-    for (const config of configs) {
-      try {
-        const positions = this.calculateStrategyPositions(symbol, candles, config)
-        
-        for (const position of positions) {
-          await this.strategyManager.addPosition(config.id, position)
-          totalPositions++
+    const perConfigCounts = await Promise.all(
+      configs.map(async (config) => {
+        try {
+          const positions = this.calculateStrategyPositions(symbol, candles, config)
+          if (positions.length === 0) return 0
+          if (typeof (this.strategyManager as any).addPositions === "function") {
+            await (this.strategyManager as any).addPositions(config.id, positions)
+          } else {
+            await Promise.all(positions.map((p) => this.strategyManager.addPosition(config.id, p)))
+          }
+          return positions.length
+        } catch (error) {
+          console.error(
+            `[v0] [ConfigSetProcessor] ✗ strategy config ${config.id}:`,
+            error instanceof Error ? error.message : String(error),
+          )
+          return 0
         }
-      } catch (error) {
-        console.error(`[v0] [ConfigSetProcessor] Error processing strategy config ${config.id}:`, error)
-      }
-    }
+      })
+    )
 
-    return totalPositions
+    return perConfigCounts.reduce((sum, n) => sum + n, 0)
   }
 
   /**

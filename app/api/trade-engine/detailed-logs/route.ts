@@ -4,12 +4,15 @@ import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { getProgressionLogs } from "@/lib/engine-progression-logs"
 
 function mapPhaseToType(phase: string) {
+  // Order matters — "live_trading" must be classified before "position" so
+  // that the new Live filter in the UI captures exchange-side events only.
+  if (phase.includes("live")) return "live"
   if (phase.includes("indication")) return "indication"
   if (phase.includes("strategy")) return "strategy"
   if (phase.includes("position")) return "position"
   if (phase.includes("error")) return "error"
   return "engine"
-}
+  }
 
 function isTruthy(value: unknown): boolean {
   return value === true || value === 1 || value === "1" || value === "true"
@@ -80,22 +83,46 @@ async function countIndicationsByType(client: ReturnType<typeof getRedisClient>,
 }
 
 async function countStrategiesByType(client: ReturnType<typeof getRedisClient>, connectionId: string, symbols: string[]) {
+  // PRIMARY: read from per-stage counter keys written by statistics-tracker (most current)
+  const [baseFromCounter, mainFromCounter, realFromCounter] = await Promise.all([
+    client.get(`strategies:${connectionId}:base:count`).then(v => toNumber(v)).catch(() => 0),
+    client.get(`strategies:${connectionId}:main:count`).then(v => toNumber(v)).catch(() => 0),
+    client.get(`strategies:${connectionId}:real:count`).then(v => toNumber(v)).catch(() => 0),
+  ])
+
+  if (baseFromCounter > 0 || mainFromCounter > 0 || realFromCounter > 0) {
+    return { base: baseFromCounter, main: mainFromCounter, real: realFromCounter }
+  }
+
+  // SECONDARY: read from progression hash written by StrategyCoordinator (hincrby every cycle)
+  try {
+    const progHash = await client.hgetall(`progression:${connectionId}`) || {}
+    const baseFromHash = parseInt(progHash.strategies_base_total || "0", 10)
+    const mainFromHash = parseInt(progHash.strategies_main_total || "0", 10)
+    const realFromHash = parseInt(progHash.strategies_real_total || "0", 10)
+    if (baseFromHash > 0 || mainFromHash > 0 || realFromHash > 0) {
+      return { base: baseFromHash, main: mainFromHash, real: realFromHash }
+    }
+  } catch { /* non-critical */ }
+
+  // TERTIARY: fall back to settings hash keys written by setSettings in StrategyCoordinator
+  // Key pattern: settings:strategies:{connId}:{symbol}:{stage}:sets (hash with .count field)
   const uniqueSymbols = Array.from(new Set(symbols.filter(Boolean)))
   if (uniqueSymbols.length === 0) {
-    uniqueSymbols.push("BTCUSDT", "ETHUSDT")
+    uniqueSymbols.push("BTCUSDT", "ETHUSDT", "SOLUSDT")
   }
 
   const totals = { base: 0, main: 0, real: 0 }
 
   for (const symbol of uniqueSymbols) {
-    const [baseCount, mainCount, realCount] = await Promise.all([
-      countArrayEntries(client, `strategies:${connectionId}:${symbol}:base`),
-      countArrayEntries(client, `strategies:${connectionId}:${symbol}:main`),
-      countArrayEntries(client, `strategies:${connectionId}:${symbol}:real`),
-    ])
-    totals.base += baseCount
-    totals.main += mainCount
-    totals.real += realCount
+    for (const stage of ["base", "main", "real"] as const) {
+      try {
+        const settingsHash = await client.hgetall(`settings:strategies:${connectionId}:${symbol}:${stage}:sets`)
+        if (settingsHash && settingsHash.count) {
+          totals[stage] += parseInt(settingsHash.count, 10) || 0
+        }
+      } catch { /* non-critical */ }
+    }
   }
 
   return totals
@@ -191,6 +218,14 @@ export async function GET(request: Request) {
       activeConnections.map(async (conn: any, index: number) => {
         const state = (await getSettings(`trade_engine_state:${conn.id}`)) || {}
         const progression = progressionStates[index] || {}
+
+        // Read the live progression hash — written every indication cycle.
+        // This is more current than trade_engine_state (persisted every 50-100 cycles).
+        let progHash: Record<string, string> = {}
+        try {
+          progHash = (await client.hgetall(`progression:${conn.id}`)) || {}
+        } catch { /* non-critical */ }
+
         const symbols = Array.isArray((state as any).symbols)
           ? (state as any).symbols
           : Array.isArray((state as any).active_symbols)
@@ -221,9 +256,18 @@ export async function GET(request: Request) {
         return {
           id: conn.id,
           symbols,
-          indicationCycles: toNumber((state as any).indication_cycle_count) || toNumber((progression as any).cyclesCompleted),
-          strategyCycles: toNumber((state as any).strategy_cycle_count) || toNumber((progression as any).successfulCycles),
-          realtimeCycles: toNumber((state as any).realtime_cycle_count),
+          // Prefer live progression hash (updated every cycle) over engineState (every 50-100 cycles)
+          indicationCycles:
+            parseInt(progHash.indication_cycle_count || "0", 10) ||
+            toNumber((state as any).indication_cycle_count) ||
+            toNumber((progression as any).cyclesCompleted),
+          strategyCycles:
+            parseInt(progHash.strategy_cycle_count || "0", 10) ||
+            toNumber((state as any).strategy_cycle_count) ||
+            toNumber((progression as any).successfulCycles),
+          realtimeCycles:
+            parseInt(progHash.realtime_cycle_count || "0", 10) ||
+            toNumber((state as any).realtime_cycle_count),
           strategiesEvaluated: toNumber((state as any).total_strategies_evaluated),
           durations: {
             indication: toNumber((state as any).indication_avg_duration_ms),
@@ -245,6 +289,20 @@ export async function GET(request: Request) {
             optimal: baseOptimal,
           },
           livePositions: livePositionsCount,
+          // Live exchange execution metrics sourced from the progression hash
+          // (written by live-stage.ts). Counters only — no exchange history
+          // calls. Keeps the endpoint fast even with heavy live activity.
+          liveMetrics: {
+            ordersPlaced:     parseInt(progHash.live_orders_placed_count    || "0", 10) || 0,
+            ordersFilled:     parseInt(progHash.live_orders_filled_count    || "0", 10) || 0,
+            ordersFailed:     parseInt(progHash.live_orders_failed_count    || "0", 10) || 0,
+            ordersRejected:   parseInt(progHash.live_orders_rejected_count  || "0", 10) || 0,
+            ordersSimulated:  parseInt(progHash.live_orders_simulated_count || "0", 10) || 0,
+            positionsCreated: parseInt(progHash.live_positions_created_count || "0", 10) || 0,
+            positionsClosed:  parseInt(progHash.live_positions_closed_count  || "0", 10) || 0,
+            wins:             parseInt(progHash.live_wins_count             || "0", 10) || 0,
+            volumeUsdTotal:   parseFloat(progHash.live_volume_usd_total     || "0") || 0,
+          },
           prehistoric: {
             loaded: isTruthy((state as any).prehistoric_data_loaded),
             symbols: prehistoricSymbols || toNumber((state as any).config_set_symbols_processed),
@@ -373,6 +431,33 @@ export async function GET(request: Request) {
         )
       : 0
 
+    // Aggregate Live execution metrics across all connections (progression hash counters only).
+    const aggregatedLive = perConnection.reduce(
+      (acc, item) => {
+        const lm = (item as any).liveMetrics || {}
+        acc.ordersPlaced     += lm.ordersPlaced     || 0
+        acc.ordersFilled     += lm.ordersFilled     || 0
+        acc.ordersFailed     += lm.ordersFailed     || 0
+        acc.ordersRejected   += lm.ordersRejected   || 0
+        acc.ordersSimulated  += lm.ordersSimulated  || 0
+        acc.positionsCreated += lm.positionsCreated || 0
+        acc.positionsClosed  += lm.positionsClosed  || 0
+        acc.wins             += lm.wins             || 0
+        acc.volumeUsdTotal   += lm.volumeUsdTotal   || 0
+        return acc
+      },
+      {
+        ordersPlaced: 0, ordersFilled: 0, ordersFailed: 0, ordersRejected: 0, ordersSimulated: 0,
+        positionsCreated: 0, positionsClosed: 0, wins: 0, volumeUsdTotal: 0,
+      },
+    )
+    const liveFillRate = aggregatedLive.ordersPlaced > 0
+      ? Math.round((aggregatedLive.ordersFilled / aggregatedLive.ordersPlaced) * 1000) / 10
+      : 0
+    const liveWinRate = aggregatedLive.positionsClosed > 0
+      ? Math.round((aggregatedLive.wins / aggregatedLive.positionsClosed) * 1000) / 10
+      : 0
+
     const basePseudoByIndication = perConnection.reduce(
       (acc, item) => {
         acc.direction += item.basePseudoByIndication.direction
@@ -421,6 +506,13 @@ export async function GET(request: Request) {
         real: aggregatedPseudo.real || totalTrades,
       },
       livePositions,
+      // Detailed Live execution metrics — orders, positions, fill & win rates
+      liveExecution: {
+        ...aggregatedLive,
+        positionsOpen: Math.max(0, aggregatedLive.positionsCreated - aggregatedLive.positionsClosed),
+        fillRate: liveFillRate,
+        winRate: liveWinRate,
+      },
       cycleDurationMs,
       realtimeCycles,
       realtimeRunningConnections: perConnection.filter((item) => item.realtimeCycles > 0).length,

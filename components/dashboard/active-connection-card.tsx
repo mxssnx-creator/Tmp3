@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -122,6 +122,90 @@ export function ActiveConnectionCard({
   const [volumeType, setVolumeType] = useState<"usdt" | "contract">("usdt")
   const [mainTradeStatus, setMainTradeStatus] = useState<"idle" | "active" | "paused" | "stopped">("idle")
   const [presetTradeStatus, setPresetTradeStatus] = useState<"idle" | "active" | "paused" | "stopped">("idle")
+  // Live engine-stats counters displayed under the progress bar
+  // Ref to current phase — used inside stable interval callback to avoid recreating on every phase change
+  const phaseRef = useRef<string>("idle")
+  const [liveStats, setLiveStats] = useState<{
+    indicationCycles: number
+    strategyCycles: number
+    indications: number
+    strategies: number
+    positions: number
+  } | null>(null)
+  const [prehistoricStats, setPrehistoricStats] = useState<{
+    // Indication breakdown
+    indicationsDirection: number
+    indicationsMove: number
+    indicationsActive: number
+    indicationsOptimal: number
+    indicationsAuto: number
+    indicationsTotal: number
+    // Strategy stages
+    stratBase: number
+    stratMain: number
+    stratReal: number
+    stratLive: number
+    // Stage ratios and metrics
+    basePassRatio: number
+    mainPassRatio: number
+    realPassRatio: number
+    livePassRatio: number
+    avgProfitFactorBase: number
+    avgProfitFactorMain: number
+    avgProfitFactorReal: number
+    avgProfitFactorLive: number
+    avgDrawdownTimeBase: number
+    avgDrawdownTimeMain: number
+    avgDrawdownTimeReal: number
+    avgHoldTimeLive: number
+    avgPosEvalReal: number
+    avgPosEvalLive: number   // avg realised ROI per closed position
+    // Evaluated / passed counts per stage
+    baseEvaluated: number
+    basePassed: number
+    mainEvaluated: number
+    mainPassed: number
+    realEvaluated: number
+    realPassed: number
+    liveEvaluated: number
+    livePassed: number
+    countPosEvalReal: number
+    countPosEvalLive: number
+    liveTotalPnl: number
+    liveAvgPnl: number
+    liveAvgPosSizeUsd: number
+    // Live exchange execution metrics
+    liveOrdersPlaced: number
+    liveOrdersFilled: number
+    liveOrdersFailed: number
+    liveOrdersRejected: number
+    liveOrdersSimulated: number
+    livePositionsCreated: number
+    livePositionsClosed: number
+    livePositionsOpen: number
+    liveWins: number
+    liveVolumeUsdTotal: number
+    liveFillRate: number
+    liveWinRate: number
+    // Prehistoric metadata
+    rangeDays: number
+    timeframeSeconds: number
+    intervalsProcessed: number
+    missingIntervalsLoaded: number
+    currentSymbol: string
+    isComplete: boolean
+  } | null>(null)
+  // Live engine-running state — synced bidirectionally with the Enable / Live /
+  // Preset sliders. The DB flag remains the source of truth for the slider's
+  // `checked` value; this state lets the UI surface a drift indicator when the
+  // engine actually running does not match the flag.
+  const [engineStates, setEngineStates] = useState<{
+    engineRunning: boolean
+    runningHint: boolean
+    enabled: { flag: boolean; running: boolean; inSync: boolean }
+    live:    { flag: boolean; running: boolean; inSync: boolean }
+    preset:  { flag: boolean; running: boolean; inSync: boolean }
+  } | null>(null)
   const details = connection.details
 
   // Sync local toggle states and volume factors from connection details
@@ -136,6 +220,55 @@ export function ActiveConnectionCard({
     }
   }, [details])
 
+  // Poll per-connection engine-states endpoint so the Enable / Live / Preset
+  // sliders stay in sync with actual engine state. Uses a self-scheduling
+  // timeout that picks a faster cadence when the connection is marked active.
+  useEffect(() => {
+    let cancelled = false
+    let timeoutId: ReturnType<typeof setTimeout>
+
+    const fetchEngineStates = async () => {
+      try {
+        const res = await fetch(
+          `/api/connections/${connection.connectionId}/engine-states`,
+          { cache: "no-store" }
+        )
+        if (!res.ok) return
+        const data = await res.json()
+        if (cancelled || !data?.success) return
+        setEngineStates({
+          engineRunning: !!data.engineRunning,
+          runningHint:   !!data.runningHint,
+          enabled: data.enabled,
+          live:    data.live,
+          preset:  data.preset,
+        })
+        // If the DB flag says "live" but the engine is not running, re-sync the
+        // local toggle to the flag (authoritative). We do NOT flip the DB here —
+        // the toggle API is the only writer; we only correct local state drift.
+        if (typeof data?.live?.flag === "boolean") setLiveTrade(data.live.flag)
+        if (typeof data?.preset?.flag === "boolean") setPresetMode(data.preset.flag)
+      } catch {
+        /* non-critical polling */
+      }
+    }
+
+    const scheduleNext = () => {
+      const delay = connection.isActive ? 3000 : 8000
+      timeoutId = setTimeout(async () => {
+        await fetchEngineStates()
+        if (!cancelled) scheduleNext()
+      }, delay)
+    }
+
+    fetchEngineStates()
+    scheduleNext()
+
+    return () => {
+      cancelled = true
+      clearTimeout(timeoutId)
+    }
+  }, [connection.connectionId, connection.isActive])
   // Save volume factor changes to backend
   const handleLiveVolumeChange = useCallback(async (value: number) => {
     setLiveVolumeFactor(value)
@@ -166,7 +299,6 @@ export function ActiveConnectionCard({
   // Poll progression
   const fetchProgression = useCallback(async () => {
     try {
-      console.log(`[v0] [Card] Fetching progression for: ${connection.exchangeName} (${connection.connectionId})`)
       const res = await fetch(`/api/connections/progression/${connection.connectionId}`, {
         cache: "no-store",
         headers: { "Cache-Control": "no-cache, no-store, must-revalidate" },
@@ -174,47 +306,62 @@ export function ActiveConnectionCard({
       if (res.ok) {
         const data = await res.json()
         if (data.success && data.progression) {
-          console.log(`[v0] [Card] ✓ Progression received: phase=${data.progression.phase}, progress=${data.progression.progress}%, message="${data.progression.message}"`)
           setProgression(data.progression)
         }
-      } else {
-        console.warn(`[v0] [Card] ⚠ Progression API returned ${res.status}`)
       }
-    } catch (error) {
-      console.error("[v0] [Card] Failed to fetch progression:", error)
+    } catch {
+      // Non-critical polling — swallow silently
     }
-  }, [connection.connectionId, connection.exchangeName])
+  }, [connection.connectionId])
+
+  // Keep phaseRef current so the stable interval can read it without recreating
+  useEffect(() => {
+    phaseRef.current = progression?.phase || "idle"
+  }, [progression?.phase])
 
   useEffect(() => {
     fetchProgression()
-    const interval = setInterval(
-      fetchProgression,
-      progression?.phase && progression.phase !== "idle" && progression.phase !== "stopped" && progression.phase !== "live_trading"
-        ? 1000
-        : 5000
-    )
-    
-    // Listen for connection toggle events to refresh progression immediately
-    const handleConnectionToggled = () => {
-      console.log(`[v0] [Card] Detected connection toggle event, refreshing progression...`)
-      fetchProgression()
+
+    // Single stable interval — reads phaseRef.current on each tick to decide the next delay.
+    // Using a self-scheduling timeout so interval length adapts without recreating the effect.
+    let timeoutId: ReturnType<typeof setTimeout>
+    const scheduleNext = () => {
+      const phase = phaseRef.current
+      const isActivePhase = phase && phase !== "idle" && phase !== "stopped" && phase !== "live_trading" && phase !== "disabled"
+      const delay = isActivePhase ? 2000 : 5000
+      timeoutId = setTimeout(async () => {
+        await fetchProgression()
+        scheduleNext()
+      }, delay)
     }
-    
+    scheduleNext()
+
+    const handleConnectionToggled = () => { fetchProgression() }
     const handleLiveTradeToggled = (event: Event) => {
       const customEvent = event as CustomEvent
       if (customEvent.detail?.connectionId === connection.connectionId) {
-        console.log(`[v0] [Card] Detected live trade toggle for this connection, refreshing progression...`)
         fetchProgression()
       }
     }
+
+    if (typeof window !== "undefined") {
+      window.addEventListener("connection-toggled", handleConnectionToggled)
+      window.addEventListener("live-trade-toggled", handleLiveTradeToggled)
     
     if (typeof window !== 'undefined') {
       window.addEventListener('connection-toggled', handleConnectionToggled)
       window.addEventListener('live-trade-toggled', handleLiveTradeToggled)
       window.addEventListener('engine-state-changed', handleConnectionToggled)
     }
-    
+
     return () => {
+      clearTimeout(timeoutId)
+      if (typeof window !== "undefined") {
+        window.removeEventListener("connection-toggled", handleConnectionToggled)
+        window.removeEventListener("live-trade-toggled", handleLiveTradeToggled)
+      }
+    }
+  }, [fetchProgression, connection.connectionId])
       clearInterval(interval)
       if (typeof window !== 'undefined') {
         window.removeEventListener('connection-toggled', handleConnectionToggled)
@@ -224,24 +371,109 @@ export function ActiveConnectionCard({
     }
   }, [fetchProgression, progression?.phase, globalEngineRunning, connection.isActive])
 
-  // Handle Live Trade toggle
+  // Fetch live stats every 4s from the canonical /stats endpoint (per-connection, cumulative)
+  useEffect(() => {
+    if (!connection.isActive && !globalEngineRunning) {
+      setLiveStats(null)
+      return
+    }
+
+    const fetchLiveStats = async () => {
+      try {
+        // Use canonical stats endpoint — same source as progression info, per-connection
+        const res = await fetch(
+          `/api/connections/progression/${connection.connectionId}/stats`,
+          { cache: "no-store" }
+        )
+        if (!res.ok) return
+        const data = await res.json()
+        setLiveStats({
+          indicationCycles: data.realtime?.indicationCycles  || data.indicationCycleCount  || 0,
+          strategyCycles:   data.realtime?.strategyCycles    || data.strategyCycleCount    || 0,
+          indications:      data.realtime?.indicationsTotal  || data.totalIndicationsCount || 0,
+          strategies:       data.realtime?.strategiesTotal   || data.totalStrategyCount    || 0,
+          positions:        data.realtime?.positionsOpen     || data.positionsCount        || 0,
+        })
+
+        // Also populate prehistoric stats from the same response
+        const bd = data.breakdown || {}
+        const sd = data.strategyDetail || {}
+        const pm = data.prehistoricMeta || {}
+        const ind = bd.indications || {}
+        const strat = bd.strategies || {}
+        setPrehistoricStats({
+          indicationsDirection: ind.direction || 0,
+          indicationsMove:      ind.move      || 0,
+          indicationsActive:    ind.active    || 0,
+          indicationsOptimal:   ind.optimal   || 0,
+          indicationsAuto:      ind.auto      || 0,
+          indicationsTotal:     ind.total     || 0,
+          stratBase:  strat.base || 0,
+          stratMain:  strat.main || 0,
+          stratReal:  strat.real || 0,
+          stratLive:  strat.live || 0,
+          basePassRatio:       sd.base?.passRatio      || 0,
+          mainPassRatio:       sd.main?.passRatio      || 0,
+          realPassRatio:       sd.real?.passRatio      || 0,
+          livePassRatio:       sd.live?.passRatio      || 0,
+          avgProfitFactorBase: sd.base?.avgProfitFactor || 0,
+          avgProfitFactorMain: sd.main?.avgProfitFactor || 0,
+          avgProfitFactorReal: sd.real?.avgProfitFactor || 0,
+          avgProfitFactorLive: sd.live?.avgProfitFactor || 0,
+          avgDrawdownTimeBase: sd.base?.avgDrawdownTime || 0,
+          avgDrawdownTimeMain: sd.main?.avgDrawdownTime || 0,
+          avgDrawdownTimeReal: sd.real?.avgDrawdownTime || 0,
+          avgHoldTimeLive:     sd.live?.avgDrawdownTime || 0, // minutes
+          avgPosEvalReal:      sd.real?.avgPosEvalReal  || 0,
+          avgPosEvalLive:      sd.live?.avgPosEvalReal  || 0, // ROI fraction
+          // Evaluated / passed counts from per-stage detail
+          baseEvaluated:    sd.base?.evaluated   || (strat.base || 0),
+          basePassed:       sd.base?.passed       || (strat.main || 0),
+          mainEvaluated:    sd.main?.evaluated   || (strat.main || 0),
+          mainPassed:       sd.main?.passed       || (strat.real || 0),
+          realEvaluated:    sd.real?.evaluated   || (strat.real || 0),
+          realPassed:       sd.real?.passed       || (strat.real || 0),
+          liveEvaluated:    sd.live?.evaluated   || 0,  // orders placed
+          livePassed:       sd.live?.passed      || 0,  // orders filled
+          countPosEvalReal: sd.real?.countPosEval || 0,
+          countPosEvalLive: sd.live?.countPosEval || 0,
+          liveTotalPnl:     sd.live?.totalPnl    || 0,
+          liveAvgPnl:       sd.live?.avgPnl      || 0,
+          liveAvgPosSizeUsd: sd.live?.avgPosPerSet || 0,
+          // Live exchange execution — sourced from the /stats endpoint
+          // (fetched response is bound to `data`, not `json`).
+          liveOrdersPlaced:      data?.liveExecution?.ordersPlaced     || 0,
+          liveOrdersFilled:      data?.liveExecution?.ordersFilled     || 0,
+          liveOrdersFailed:      data?.liveExecution?.ordersFailed     || 0,
+          liveOrdersRejected:    data?.liveExecution?.ordersRejected   || 0,
+          liveOrdersSimulated:   data?.liveExecution?.ordersSimulated  || 0,
+          livePositionsCreated:  data?.liveExecution?.positionsCreated || 0,
+          livePositionsClosed:   data?.liveExecution?.positionsClosed  || 0,
+          livePositionsOpen:     data?.liveExecution?.positionsOpen    || 0,
+          liveWins:              data?.liveExecution?.wins             || 0,
+          liveVolumeUsdTotal:    data?.liveExecution?.volumeUsdTotal   || 0,
+          liveFillRate:          data?.liveExecution?.fillRate         || 0,
+          liveWinRate:           data?.liveExecution?.winRate          || 0,
+          rangeDays:               pm.rangeDays              || 1,
+          timeframeSeconds:        pm.timeframeSeconds        || 1,
+          intervalsProcessed:      pm.intervalsProcessed      || 0,
+          missingIntervalsLoaded:  pm.missingIntervalsLoaded  || 0,
+          currentSymbol:           pm.currentSymbol           || "",
+          isComplete:              pm.isComplete              || false,
+        })
+      } catch { /* non-critical */ }
+    }
+
+    fetchLiveStats()
+    const interval = setInterval(fetchLiveStats, 4000)
+    return () => clearInterval(interval)
+  }, [globalEngineRunning, connection.connectionId, connection.isActive])
+
+  // Handle Live Trade toggle — no longer gated on connection.isActive:
+  // the /live-trade route auto-starts the engine when Live is turned on,
+  // so the user can flip Live and the engine comes up with the flag set.
   const handleLiveTradeToggle = async (newState: boolean) => {
     const connName = connection.exchangeName
-    console.log(`[v0] [Card] Live Trade toggle clicked: ${connName}, current=${liveTrade}, new=${newState}`)
-    
-    // Validation
-    if (newState && !globalEngineRunning) {
-      console.log(`[v0] [Card] ✗ Cannot enable live trade - global engine not running`)
-      toast.error("Global Trade Engine must be running first")
-      return
-    }
-    if (newState && !connection.isActive) {
-      console.log(`[v0] [Card] ✗ Cannot enable live trade - connection not active on dashboard`)
-      toast.error("Enable the connection first")
-      return
-    }
-    
-    console.log(`[v0] [Card] → Calling live-trade API for ${connName}...`)
     setLiveTradeLoading(true)
     try {
       const res = await fetch(`/api/settings/connections/${connection.connectionId}/live-trade`, {
@@ -250,46 +482,30 @@ export function ActiveConnectionCard({
         body: JSON.stringify({ is_live_trade: newState }),
         cache: "no-store"
       })
-      
+
       const data = await res.json().catch(() => ({ error: "Failed to parse response" }))
-      console.log(`[v0] [Card] API Response for ${connName}:`, data)
-      
+
       if (res.ok && data.success) {
-        console.log(`[v0] [Card] ✓ Live trade ${newState ? "enabled" : "disabled"} for ${connName}`)
         setLiveTrade(newState)
         toast.success(newState ? `Live Trading starting on ${connName}...` : `Live Trading stopped on ${connName}`)
-        
-        // Dispatch event for system-wide refresh
         if (typeof window !== "undefined") {
-          window.dispatchEvent(new CustomEvent("live-trade-toggled", { 
-            detail: { connectionId: connection.connectionId, newState } 
+          window.dispatchEvent(new CustomEvent("live-trade-toggled", {
+            detail: { connectionId: connection.connectionId, newState }
           }))
         }
       } else {
-        console.log(`[v0] [Card] ✗ API error for ${connName}:`, data.error || data.details)
         toast.error(`Failed to toggle Live Trade: ${data.error || "Unknown error"}`)
-        if (data.details) {
-          console.log(`[v0] [Card] Error details:`, data.details)
-        }
       }
-    } catch (error) {
-      console.error(`[v0] [Card] Exception toggling live trade for ${connName}:`, error)
+    } catch {
       toast.error("Failed to toggle Live Trade")
     } finally {
       setLiveTradeLoading(false)
     }
   }
 
-  // Handle Preset Mode toggle
+  // Handle Preset Mode toggle — no longer gated on connection.isActive,
+  // same rationale as handleLiveTradeToggle above.
   const handlePresetModeToggle = async (newState: boolean) => {
-    if (newState && !globalEngineRunning) {
-      toast.error("Global Trade Engine must be running first")
-      return
-    }
-    if (newState && !connection.isActive) {
-      toast.error("Enable the connection first")
-      return
-    }
     setPresetModeLoading(true)
     try {
       const res = await fetch(`/api/settings/connections/${connection.connectionId}/preset-toggle`, {
@@ -454,16 +670,15 @@ export function ActiveConnectionCard({
 
             {/* Row 3: Three toggle switches */}
             <div className="flex items-center gap-4 mt-2.5 pt-2 border-t border-border/50">
-              {/* Enable toggle */}
+              {/* Enable toggle — no pre-condition on global engine; toggle-dashboard API starts the engine */}
               <div className="flex items-center gap-2">
                 <Switch
                   id={`enable-${connection.connectionId}`}
                   checked={connection.isActive}
                   onCheckedChange={() => {
-                    console.log(`[v0] [Card] Toggle clicked for ${connName}: ${connection.isActive} → ${!connection.isActive}`)
                     onToggle(connection.connectionId, connection.isActive)
                   }}
-                  disabled={isToggling || (!globalEngineRunning && !connection.isActive)}
+                  disabled={isToggling}
                   className="scale-[0.8]"
                 />
                 <Label
@@ -475,20 +690,33 @@ export function ActiveConnectionCard({
                       <Loader2 className="h-3 w-3 animate-spin" /> Enable
                     </span>
                   ) : (
-                    "Enable"
+                    <span className="flex items-center gap-1">
+                      Enable
+                      {engineStates && !engineStates.enabled.inSync && (
+                        <span
+                          title={engineStates.enabled.flag
+                            ? "Flag is ON but engine is not running — will reconcile shortly"
+                            : "Engine is running but flag is OFF — will stop shortly"}
+                          className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
+                          aria-label="engine state drift"
+                        />
+                      )}
+                    </span>
                   )}
                 </Label>
               </div>
 
               <Separator orientation="vertical" className="h-4" />
 
-              {/* Live Trade toggle */}
+              {/* Live Trade toggle — independent mode flag. The route will start the
+                  engine automatically if it is not already running, so we no longer
+                  disable the switch just because Enable is off. */}
               <div className="flex items-center gap-2">
                 <Switch
                   id={`live-${connection.connectionId}`}
                   checked={liveTrade}
                   onCheckedChange={handleLiveTradeToggle}
-                  disabled={liveTradeLoading || !connection.isActive || !globalEngineRunning}
+                  disabled={liveTradeLoading}
                   className="scale-[0.8]"
                 />
                 <Label
@@ -504,6 +732,13 @@ export function ActiveConnectionCard({
                   ) : (
                     <span className="flex items-center gap-1">
                       <Activity className="h-3 w-3" /> Live Trade
+                      {engineStates && liveTrade && !engineStates.live.inSync && (
+                        <span
+                          title="Live flag ON but engine state differs — reconciling"
+                          className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
+                          aria-label="live engine state drift"
+                        />
+                      )}
                     </span>
                   )}
                 </Label>
@@ -511,13 +746,13 @@ export function ActiveConnectionCard({
 
               <Separator orientation="vertical" className="h-4" />
 
-              {/* Preset Mode toggle */}
+              {/* Preset Mode toggle — independent mode flag, same semantics as Live. */}
               <div className="flex items-center gap-2">
                 <Switch
                   id={`preset-${connection.connectionId}`}
                   checked={presetMode}
                   onCheckedChange={handlePresetModeToggle}
-                  disabled={presetModeLoading || !connection.isActive || !globalEngineRunning}
+                  disabled={presetModeLoading}
                   className="scale-[0.8]"
                 />
                 <Label
@@ -531,7 +766,16 @@ export function ActiveConnectionCard({
                       <Loader2 className="h-3 w-3 animate-spin" /> Preset Mode
                     </span>
                   ) : (
-                    "Preset Mode"
+                    <span className="flex items-center gap-1">
+                      Preset Mode
+                      {engineStates && presetMode && !engineStates.preset.inSync && (
+                        <span
+                          title="Preset flag ON but engine state differs — reconciling"
+                          className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"
+                          aria-label="preset engine state drift"
+                        />
+                      )}
+                    </span>
                   )}
                 </Label>
               </div>
@@ -582,8 +826,29 @@ export function ActiveConnectionCard({
             </div>
           </CardHeader>
 
-          {/* Progress bar when engine is active AND connection is enabled */}
-          {connection.isActive && globalEngineRunning && phase !== "idle" && phase !== "stopped" && (
+          {/* Per-connection stats row — shown whenever active with data, even in idle/stopped phases */}
+          {connection.isActive && liveStats && (phase === "idle" || phase === "stopped" || phase === "disabled") && (
+            <CardContent className="pt-0 pb-2 px-4">
+              <div className="flex items-center gap-3 flex-wrap pt-1 border-t border-border/40">
+                {[
+                  { label: "Cycles",    value: liveStats.indicationCycles },
+                  { label: "Ind.",      value: liveStats.indications },
+                  { label: "Strat.",    value: liveStats.strategies },
+                  { label: "Positions", value: liveStats.positions },
+                ].map(({ label, value }) => (
+                  <div key={label} className="flex items-center gap-1 text-[10px]">
+                    <span className="text-muted-foreground">{label}</span>
+                    <span className="font-semibold tabular-nums">
+                      {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          )}
+
+          {/* Progress bar when engine has active progression data */}
+          {(connection.isActive || phase === "live_trading") && phase !== "idle" && phase !== "stopped" && phase !== "disabled" && (
             <CardContent className="pt-0 pb-3 px-4">
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-xs">
@@ -600,51 +865,422 @@ export function ActiveConnectionCard({
                   </p>
                 )}
                 
-                {/* Detailed prehistoric progress display */}
-                {phase === "prehistoric_data" && progression?.prehistoricProgress && (
-                  <div className="mt-2 p-2 bg-amber-50/50 dark:bg-amber-950/20 rounded border border-amber-200/50 dark:border-amber-800/30 space-y-1">
-                    <div className="text-[10px] font-medium text-amber-700 dark:text-amber-400">Historical Data Loading</div>
-                    
-                    {/* Symbols progress */}
-                    <div className="flex items-center justify-between text-[10px]">
-                      <span className="text-muted-foreground">Symbols</span>
-                      <span className="font-medium">
-                        {progression.prehistoricProgress.symbolsProcessed}/{progression.prehistoricProgress.symbolsTotal}
-                      </span>
+                {/* Per-connection engine stats — always shown when connection is active */}
+                {liveStats && phase !== "prehistoric_data" && (
+                  <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+                    {[
+                      { label: "Cycles",    value: liveStats.indicationCycles },
+                      { label: "Ind.",      value: liveStats.indications },
+                      { label: "Strat.",    value: liveStats.strategies },
+                      { label: "Positions", value: liveStats.positions },
+                    ].map(({ label, value }) => (
+                      <div key={label} className="flex items-center gap-1 text-[10px]">
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="font-semibold tabular-nums">
+                          {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Rich prehistoric progress display */}
+                {(phase === "prehistoric_data" || (prehistoricStats && (prehistoricStats.indicationsTotal > 0 || prehistoricStats.stratBase > 0))) && (
+                  <div className="mt-2 p-2 bg-amber-50/50 dark:bg-amber-950/20 rounded border border-amber-200/50 dark:border-amber-800/30 space-y-2">
+                    {/* Header row */}
+                    <div className="flex items-center justify-between">
+                      <div className="text-[10px] font-semibold text-amber-700 dark:text-amber-400">
+                        Historical Processing
+                      </div>
+                      <div className="flex items-center gap-1.5 text-[9px]">
+                        {prehistoricStats && (
+                          <>
+                            <span className="text-muted-foreground">
+                              {prehistoricStats.rangeDays}d range
+                            </span>
+                            <span className="text-muted-foreground/50">|</span>
+                            <span className="text-muted-foreground font-mono">
+                              {prehistoricStats.timeframeSeconds === 1 ? "1s" : `${prehistoricStats.timeframeSeconds}s`}
+                            </span>
+                            {prehistoricStats.isComplete && (
+                              <>
+                                <span className="text-muted-foreground/50">|</span>
+                                <span className="text-green-600 dark:text-green-400 font-medium">complete</span>
+                              </>
+                            )}
+                          </>
+                        )}
+                      </div>
                     </div>
-                    {progression.prehistoricProgress.currentSymbol && (
-                      <div className="text-[10px] text-muted-foreground">
-                        Processing: <span className="font-mono font-medium">{progression.prehistoricProgress.currentSymbol}</span>
+
+                    {/*
+                      Symbols & candles row.
+
+                      Previously this block was gated on `progression?.prehistoricProgress`,
+                      so whenever that endpoint returned a sparse payload (e.g. before the
+                      first prehistoric cycle landed or while the in-memory progression
+                      manager was still initialising) the entire row vanished — giving the
+                      "less info than before" impression the user reported.
+
+                      We now merge both canonical sources and always render as long as
+                      *either* has data. `progression.prehistoricProgress` is preferred
+                      for symbols/candles (it mirrors the trade_engine_state snapshot),
+                      with `prehistoricStats` fields as a fallback that is populated from
+                      `/stats` on the 4s live-stats tick.
+                    */}
+                    {(() => {
+                      const pp = progression?.prehistoricProgress
+                      const symbolsProcessed = pp?.symbolsProcessed ?? 0
+                      const symbolsTotal = pp?.symbolsTotal ?? 0
+                      const candlesLoaded = pp?.candlesLoaded ?? 0
+                      const indicatorsCalculated = pp?.indicatorsCalculated ?? (prehistoricStats?.isComplete ? 0 : 0)
+                      const intervalsProcessed = prehistoricStats?.intervalsProcessed ?? 0
+                      const missingIntervals = prehistoricStats?.missingIntervalsLoaded ?? 0
+                      const currentSymbol = pp?.currentSymbol || prehistoricStats?.currentSymbol || ""
+                      const hasData =
+                        Boolean(pp) ||
+                        symbolsProcessed > 0 ||
+                        candlesLoaded > 0 ||
+                        intervalsProcessed > 0 ||
+                        indicatorsCalculated > 0
+
+                      if (!hasData) return null
+
+                      const formatK = (n: number) =>
+                        n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n)
+
+                      return (
+                        <div className="flex items-center gap-3 text-[10px] flex-wrap">
+                          {symbolsTotal > 0 && (
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground">Symbols</span>
+                              <span className="font-medium tabular-nums">
+                                {symbolsProcessed}/{symbolsTotal}
+                              </span>
+                            </div>
+                          )}
+                          {candlesLoaded > 0 && (
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground">Candles</span>
+                              <span className="font-medium tabular-nums">
+                                {formatK(candlesLoaded)}
+                              </span>
+                            </div>
+                          )}
+                          {indicatorsCalculated > 0 && (
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground">Indicators</span>
+                              <span className="font-medium tabular-nums">
+                                {formatK(indicatorsCalculated)}
+                              </span>
+                            </div>
+                          )}
+                          {intervalsProcessed > 0 && (
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground">Intervals</span>
+                              <span className="font-medium tabular-nums">
+                                {formatK(intervalsProcessed)}
+                              </span>
+                            </div>
+                          )}
+                          {missingIntervals > 0 && (
+                            <div className="flex items-center gap-1">
+                              <span className="text-muted-foreground">Gaps filled</span>
+                              <span className="font-medium tabular-nums">
+                                {formatK(missingIntervals)}
+                              </span>
+                            </div>
+                          )}
+                          {currentSymbol && phase === "prehistoric_data" && (
+                            <div className="flex items-center gap-1 ml-auto">
+                              <span className="text-muted-foreground">Now:</span>
+                              <span className="font-mono font-medium text-[9px]">{currentSymbol}</span>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })()}
+
+                    {/* Indications breakdown */}
+                    {prehistoricStats && prehistoricStats.indicationsTotal > 0 && (
+                      <div className="space-y-0.5">
+                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Indications ({prehistoricStats.indicationsTotal.toLocaleString()})</div>
+                        <div className="grid grid-cols-5 gap-1">
+                          {[
+                            { label: "Dir", value: prehistoricStats.indicationsDirection },
+                            { label: "Move", value: prehistoricStats.indicationsMove },
+                            { label: "Act", value: prehistoricStats.indicationsActive },
+                            { label: "Opt", value: prehistoricStats.indicationsOptimal },
+                            { label: "Auto", value: prehistoricStats.indicationsAuto },
+                          ].map(({ label, value }) => (
+                            <div key={label} className="text-center">
+                              <div className="text-[8px] text-muted-foreground">{label}</div>
+                              <div className="text-[10px] font-semibold tabular-nums">
+                                {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     )}
-                    
-                    {/* Candles progress */}
-                    {progression.prehistoricProgress.candlesTotal > 0 && (
-                      <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-muted-foreground">Candles</span>
-                        <span className="font-medium">
-                          {progression.prehistoricProgress.candlesLoaded}/{progression.prehistoricProgress.candlesTotal}
-                        </span>
+
+                    {/* Strategy stages breakdown */}
+                    {prehistoricStats && (prehistoricStats.stratBase > 0 || prehistoricStats.stratMain > 0 || prehistoricStats.stratReal > 0 || prehistoricStats.livePositionsCreated > 0) && (
+                      <div className="space-y-1">
+                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Strategy Sets</div>
+                        {/* Stage rows: Base → Main → Real → Live (exchange-side outcomes) */}
+                        {[
+                          {
+                            label: "Base",
+                            count:     prehistoricStats.stratBase,
+                            evaluated: prehistoricStats.baseEvaluated,
+                            passed:    prehistoricStats.basePassed,
+                            passRatio: prehistoricStats.basePassRatio,
+                            avgPF:     prehistoricStats.avgProfitFactorBase,
+                            avgDDT:    prehistoricStats.avgDrawdownTimeBase,
+                            avgPosEval: null as number | null,
+                            countPosEval: null as number | null,
+                            color: "text-blue-600 dark:text-blue-400",
+                            isLive: false,
+                          },
+                          {
+                            label: "Main",
+                            count:     prehistoricStats.stratMain,
+                            evaluated: prehistoricStats.mainEvaluated,
+                            passed:    prehistoricStats.mainPassed,
+                            passRatio: prehistoricStats.mainPassRatio,
+                            avgPF:     prehistoricStats.avgProfitFactorMain,
+                            avgDDT:    prehistoricStats.avgDrawdownTimeMain,
+                            avgPosEval: null as number | null,
+                            countPosEval: null as number | null,
+                            color: "text-purple-600 dark:text-purple-400",
+                            isLive: false,
+                          },
+                          {
+                            label: "Real",
+                            count:     prehistoricStats.stratReal,
+                            evaluated: prehistoricStats.realEvaluated,
+                            passed:    prehistoricStats.realPassed,
+                            passRatio: prehistoricStats.realPassRatio,
+                            avgPF:     prehistoricStats.avgProfitFactorReal,
+                            avgDDT:    prehistoricStats.avgDrawdownTimeReal,
+                            avgPosEval: prehistoricStats.avgPosEvalReal,
+                            countPosEval: prehistoricStats.countPosEvalReal,
+                            color: "text-green-600 dark:text-green-400",
+                            isLive: false,
+                          },
+                          {
+                            // Live tier — real exchange positions history, sourced from
+                            // local Redis archive (no exchange history calls).
+                            label: "Live",
+                            count:     prehistoricStats.livePositionsCreated,
+                            evaluated: prehistoricStats.liveEvaluated,  // orders placed
+                            passed:    prehistoricStats.livePassed,     // orders filled
+                            passRatio: prehistoricStats.livePassRatio,  // fill rate %
+                            avgPF:     prehistoricStats.avgProfitFactorLive,
+                            avgDDT:    prehistoricStats.avgHoldTimeLive, // avg hold time
+                            avgPosEval: prehistoricStats.avgPosEvalLive, // realised ROI
+                            countPosEval: prehistoricStats.countPosEvalLive,
+                            color: "text-amber-600 dark:text-amber-400",
+                            isLive: true,
+                          },
+                        ].map(({ label, count, evaluated, passed, passRatio, avgPF, avgDDT, avgPosEval, countPosEval, color, isLive }) => (
+                          count > 0 && (
+                            <div key={label} className="space-y-0.5">
+                              {/* Main row: label, sets/positions count, pass/fill ratio, PF */}
+                              <div className="flex items-center gap-2 text-[10px]">
+                                <span className={`font-semibold w-7 shrink-0 ${color}`}>{label}</span>
+                                <span className="font-semibold tabular-nums">
+                                  {count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count} {isLive ? "pos" : "sets"}
+                                </span>
+                                {evaluated > 0 && (
+                                  <span className="text-muted-foreground">
+                                    {isLive ? "placed " : "eval "}
+                                    <span className="text-foreground font-medium tabular-nums">
+                                      {evaluated >= 1000 ? `${(evaluated / 1000).toFixed(1)}K` : evaluated}
+                                    </span>
+                                    {passed > 0 && (
+                                      <span className="text-foreground font-medium tabular-nums ml-0.5">
+                                        /{passed >= 1000 ? `${(passed / 1000).toFixed(1)}K` : passed} {isLive ? "filled" : "pass"}
+                                      </span>
+                                    )}
+                                  </span>
+                                )}
+                                {passRatio > 0 && (
+                                  <span className="text-muted-foreground">
+                                    <span className={`font-medium ${passRatio >= 50 ? "text-green-600 dark:text-green-400" : passRatio >= 25 ? "text-amber-600 dark:text-amber-400" : "text-foreground"}`}>
+                                      {passRatio.toFixed(1)}%
+                                    </span>
+                                  </span>
+                                )}
+                                <span className="text-muted-foreground ml-auto">
+                                  PF <span className={`font-medium ${avgPF >= 1.4 ? "text-green-600 dark:text-green-400" : avgPF >= 1.0 ? "text-foreground" : "text-red-500"}`}>
+                                    {avgPF > 0 ? avgPF.toFixed(2) : "—"}
+                                  </span>
+                                </span>
+                                <span className="text-muted-foreground">
+                                  {isLive ? "Hold" : "DDT"} <span className="text-foreground font-medium">
+                                    {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "—"}
+                                  </span>
+                                </span>
+                              </div>
+                              {/* Real-stage extra row: PosEval avg + count */}
+                              {avgPosEval !== null && !isLive && (
+                                <div className="flex items-center gap-2 text-[10px] pl-7">
+                                  <span className="text-muted-foreground">PosEval avg</span>
+                                  <span className={`font-medium ${avgPosEval >= 0.7 ? "text-green-600 dark:text-green-400" : avgPosEval >= 0.4 ? "text-amber-600 dark:text-amber-400" : "text-foreground"}`}>
+                                    {avgPosEval > 0 ? avgPosEval.toFixed(3) : "—"}
+                                  </span>
+                                  {countPosEval !== null && countPosEval > 0 && (
+                                    <span className="text-muted-foreground">
+                                      count <span className="text-foreground font-medium tabular-nums">{countPosEval}</span>
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                              {/* Live-tier exclusive sub-row: realised ROI, win-rate, total PnL */}
+                              {isLive && (
+                                <div className="flex items-center gap-2 text-[10px] pl-7">
+                                  <span className="text-muted-foreground">ROI avg</span>
+                                  <span className={`font-medium tabular-nums ${avgPosEval > 0 ? "text-green-600 dark:text-green-400" : avgPosEval < 0 ? "text-red-500" : "text-foreground"}`}>
+                                    {avgPosEval !== 0 ? `${(avgPosEval * 100).toFixed(2)}%` : "—"}
+                                  </span>
+                                  <span className="text-muted-foreground">
+                                    WR <span className={`font-medium ${prehistoricStats.liveWinRate >= 60 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveWinRate >= 40 ? "text-amber-600 dark:text-amber-400" : "text-red-500"}`}>
+                                      {prehistoricStats.liveWinRate > 0 ? `${prehistoricStats.liveWinRate.toFixed(1)}%` : "—"}
+                                    </span>
+                                  </span>
+                                  <span className="text-muted-foreground ml-auto">
+                                    PnL <span className={`font-semibold tabular-nums ${prehistoricStats.liveTotalPnl > 0 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveTotalPnl < 0 ? "text-red-500" : "text-foreground"}`}>
+                                      {prehistoricStats.liveTotalPnl !== 0
+                                        ? `${prehistoricStats.liveTotalPnl > 0 ? "+" : ""}$${Math.abs(prehistoricStats.liveTotalPnl).toFixed(2)}`
+                                        : "—"}
+                                    </span>
+                                  </span>
+                                  {countPosEval !== null && countPosEval > 0 && (
+                                    <span className="text-muted-foreground">
+                                      n=<span className="text-foreground font-medium tabular-nums">{countPosEval}</span>
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )
+                        ))}
                       </div>
                     )}
-                    
-                    {/* Indicators calculated */}
-                    {progression.prehistoricProgress.indicatorsCalculated > 0 && (
-                      <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-muted-foreground">Indicators</span>
-                        <span className="font-medium">
-                          {progression.prehistoricProgress.indicatorsCalculated}
-                        </span>
+
+                    {/* Live Exchange Execution — shown when any live-stage activity has occurred */}
+                    {prehistoricStats && (
+                      prehistoricStats.liveOrdersPlaced > 0 ||
+                      prehistoricStats.liveOrdersSimulated > 0 ||
+                      prehistoricStats.livePositionsCreated > 0
+                    ) && (
+                      <div className="space-y-1 border-t border-border/40 pt-2">
+                        <div className="flex items-center justify-between">
+                          <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Live Execution</div>
+                          {prehistoricStats.livePositionsOpen > 0 && (
+                            <div className="flex items-center gap-1 text-[9px]">
+                              <span className="relative flex h-1.5 w-1.5">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500" />
+                              </span>
+                              <span className="font-semibold text-green-600 dark:text-green-400 tabular-nums">
+                                {prehistoricStats.livePositionsOpen} open
+                              </span>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Orders row */}
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px]">
+                          <span className="text-muted-foreground">
+                            Orders <span className="text-foreground font-semibold tabular-nums">
+                              {prehistoricStats.liveOrdersPlaced}
+                            </span>
+                          </span>
+                          {prehistoricStats.liveOrdersFilled > 0 && (
+                            <span className="text-muted-foreground">
+                              filled <span className="text-green-600 dark:text-green-400 font-semibold tabular-nums">
+                                {prehistoricStats.liveOrdersFilled}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveOrdersRejected > 0 && (
+                            <span className="text-muted-foreground">
+                              rejected <span className="text-amber-600 dark:text-amber-400 font-semibold tabular-nums">
+                                {prehistoricStats.liveOrdersRejected}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveOrdersFailed > 0 && (
+                            <span className="text-muted-foreground">
+                              failed <span className="text-red-500 font-semibold tabular-nums">
+                                {prehistoricStats.liveOrdersFailed}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveOrdersSimulated > 0 && (
+                            <span className="text-muted-foreground">
+                              sim <span className="text-blue-600 dark:text-blue-400 font-semibold tabular-nums">
+                                {prehistoricStats.liveOrdersSimulated}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveFillRate > 0 && (
+                            <span className="ml-auto text-muted-foreground">
+                              fill <span className={`font-semibold ${prehistoricStats.liveFillRate >= 80 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveFillRate >= 50 ? "text-amber-600 dark:text-amber-400" : "text-foreground"}`}>
+                                {prehistoricStats.liveFillRate.toFixed(1)}%
+                              </span>
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Positions row */}
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px]">
+                          <span className="text-muted-foreground">
+                            Positions <span className="text-foreground font-semibold tabular-nums">
+                              {prehistoricStats.livePositionsCreated}
+                            </span>
+                          </span>
+                          {prehistoricStats.livePositionsClosed > 0 && (
+                            <span className="text-muted-foreground">
+                              closed <span className="text-foreground font-semibold tabular-nums">
+                                {prehistoricStats.livePositionsClosed}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveWins > 0 && (
+                            <span className="text-muted-foreground">
+                              wins <span className="text-green-600 dark:text-green-400 font-semibold tabular-nums">
+                                {prehistoricStats.liveWins}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveWinRate > 0 && (
+                            <span className="text-muted-foreground">
+                              WR <span className={`font-semibold ${prehistoricStats.liveWinRate >= 60 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveWinRate >= 40 ? "text-amber-600 dark:text-amber-400" : "text-red-500"}`}>
+                                {prehistoricStats.liveWinRate.toFixed(1)}%
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveVolumeUsdTotal > 0 && (
+                            <span className="ml-auto text-muted-foreground">
+                              vol <span className="text-foreground font-semibold tabular-nums">
+                                ${prehistoricStats.liveVolumeUsdTotal >= 1000
+                                  ? `${(prehistoricStats.liveVolumeUsdTotal / 1000).toFixed(1)}K`
+                                  : prehistoricStats.liveVolumeUsdTotal.toFixed(2)}
+                              </span>
+                            </span>
+                          )}
+                        </div>
                       </div>
                     )}
-                    
-                    {/* Duration */}
-                    {progression.prehistoricProgress.duration > 0 && (
-                      <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-muted-foreground">Duration</span>
-                        <span className="font-medium">
-                          {(progression.prehistoricProgress.duration / 1000).toFixed(1)}s
-                        </span>
+
+                    {/* Missing intervals info */}
+                    {prehistoricStats && prehistoricStats.missingIntervalsLoaded > 0 && (
+                      <div className="text-[9px] text-muted-foreground">
+                        Loaded {prehistoricStats.missingIntervalsLoaded.toLocaleString()} missing intervals
                       </div>
                     )}
                   </div>

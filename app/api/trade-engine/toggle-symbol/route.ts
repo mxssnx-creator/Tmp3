@@ -34,7 +34,6 @@ export async function POST(request: Request) {
       currentSet.add(symbol)
       await client.set("enabled_symbols", JSON.stringify(Array.from(currentSet)))
 
-      console.log(`[v0] [TradeEngine] Enabled live trading for ${symbol}`)
     } else {
       // Disable live trading for symbol
       await client.hset(`symbol:${symbol}`, {
@@ -48,7 +47,6 @@ export async function POST(request: Request) {
       currentSet.delete(symbol)
       await client.set("enabled_symbols", JSON.stringify(Array.from(currentSet)))
 
-      console.log(`[v0] [TradeEngine] Disabled live trading for ${symbol}`)
     }
 
     return NextResponse.json({

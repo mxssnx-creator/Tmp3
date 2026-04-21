@@ -155,6 +155,34 @@ export class StrategyConfigManager {
     await client.ltrim(key, 0, MAX_POSITIONS - 1)
   }
 
+  /**
+   * Batch variant — pushes many positions for a config with a single lpush
+   * and a single ltrim. Used by the prehistoric processor to cut per-position
+   * Redis round-trips by a factor of N.
+   */
+  async addPositions(configId: string, positions: PseudoPosition[]): Promise<void> {
+    if (!positions || positions.length === 0) return
+    await initRedis()
+    const client = getRedisClient()
+
+    const key = this.getPositionsKey(configId)
+    const entries = positions.map((p) =>
+      [
+        p.entry_time,
+        p.symbol,
+        p.entry_price.toString(),
+        p.take_profit.toString(),
+        p.stop_loss.toString(),
+        p.status,
+        p.result?.toString() || "0",
+        p.exit_time || "",
+        p.exit_price?.toString() || "0",
+      ].join("|"),
+    )
+    await client.lpush(key, ...entries)
+    await client.ltrim(key, 0, MAX_POSITIONS - 1)
+  }
+
   async getPositions(configId: string, limit = 50): Promise<PseudoPosition[]> {
     await initRedis()
     const client = getRedisClient()

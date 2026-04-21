@@ -28,13 +28,29 @@ export default function AutoIndicationPage() {
     loadSettings()
   }, [])
 
+  /**
+   * The `/api/settings/indications/main` route stores a single JSON blob at
+   * Redis key `indications:main` and returns it under `{ success, settings }`.
+   * The auto-advanced indication lives at `settings.active_advanced` within
+   * that blob, so:
+   *   - GET   → unwrap data.settings.active_advanced
+   *   - POST  → merge active_advanced back into the full settings object and
+   *             POST the whole object under `{ settings }` (there is no PATCH
+   *             verb defined on this route)
+   * This replaces the previous implementation which read/wrote at the wrong
+   * nesting level and used an unsupported PATCH method — leading to silent
+   * "save succeeded" toasts while nothing actually persisted.
+   */
   const loadSettings = async () => {
     try {
       const response = await fetch("/api/settings/indications/main?t=" + Date.now())
       if (response.ok) {
         const data = await response.json()
-        if (data.active_advanced) {
-          setSettings(data.active_advanced)
+        const advanced = data?.settings?.active_advanced
+        if (advanced && typeof advanced === "object") {
+          // Merge server-stored values on top of defaults so partial blobs
+          // (older installs that only persisted some fields) still render.
+          setSettings((prev: any) => ({ ...prev, ...advanced }))
         }
       }
     } catch (error) {
@@ -45,13 +61,25 @@ export default function AutoIndicationPage() {
   const handleSave = async () => {
     setSaving(true)
     try {
+      // Fetch the current full blob so we can merge our slice back in without
+      // clobbering sibling settings (direction / move / active / optimal etc).
+      const currentResp = await fetch("/api/settings/indications/main?t=" + Date.now())
+      const currentData = currentResp.ok ? await currentResp.json() : { settings: {} }
+      const updated = {
+        ...(currentData?.settings || {}),
+        active_advanced: settings,
+      }
+
       const response = await fetch("/api/settings/indications/main", {
-        method: "PATCH",
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ active_advanced: settings }),
+        body: JSON.stringify({ settings: updated }),
       })
 
-      if (!response.ok) throw new Error("Failed to save settings")
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok || !result?.success) {
+        throw new Error(result?.error || "Failed to save settings")
+      }
 
       toast.success("Auto indication settings saved successfully")
     } catch (error) {

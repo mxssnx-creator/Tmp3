@@ -178,8 +178,80 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                   step={100}
                 />
                 <p className="text-xs text-muted-foreground">
-                  After a valid indication evaluation, wait this duration before processing next. 
+                  After a valid indication evaluation, wait this duration before processing next.
                   Lower values = faster but more CPU. Higher values = more reliable but slower response.
+                </p>
+              </div>
+            </div>
+
+            {/* Prehistoric / historical calc look-back window. Controls how far back
+                the engine fetches and processes historical market data during the
+                prehistoric phase. 1–50h, step 1, default 8h. */}
+            <div className="space-y-4 border-t pt-4">
+              <h3 className="text-lg font-semibold">Historical Calc Range</h3>
+              <p className="text-xs text-muted-foreground">
+                Look-back window (in hours) for the prehistoric data calculation on
+                engine start. Lower values = faster warm-up, higher values = more
+                historical context for indications and strategies. Once the calc
+                completes, the engine stops spinning on empty cycles and switches
+                to adaptive idle backoff (up to 1s) until new data arrives.
+              </p>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label>Historical Range</Label>
+                  <span className="text-sm font-semibold tabular-nums">
+                    {settings.prehistoric_range_hours ?? 8}h
+                  </span>
+                </div>
+                <Slider
+                  value={[settings.prehistoric_range_hours ?? 8]}
+                  onValueChange={(v) => handleSettingChange("prehistoric_range_hours", v[0])}
+                  min={1}
+                  max={50}
+                  step={1}
+                />
+                <div className="flex justify-between text-[10px] text-muted-foreground">
+                  <span>1h</span>
+                  <span>Default 8h</span>
+                  <span>50h</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Cycle Pause — pause between engine cycles (indication / strategy / realtime).
+                Changes take effect within ~10s as the engine refreshes the cached value. */}
+            <div className="space-y-4 border-t pt-4">
+              <h3 className="text-lg font-semibold">Engine Cycle Pause</h3>
+              <p className="text-xs text-muted-foreground">
+                Pause between successive engine cycles (10ms – 200ms). Prevents the
+                event loop from starving under heavy workloads and keeps average
+                cycle time stable. Default 50ms.
+              </p>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label>Cycle Pause</Label>
+                  <span className="text-sm font-semibold tabular-nums">
+                    {settings.cyclePauseMs ?? 50}ms
+                  </span>
+                </div>
+                <Slider
+                  value={[settings.cyclePauseMs ?? 50]}
+                  onValueChange={(v) => handleSettingChange("cyclePauseMs", v[0])}
+                  min={10}
+                  max={200}
+                  step={10}
+                />
+                <div className="flex justify-between text-[10px] text-muted-foreground">
+                  <span>10ms</span>
+                  <span>Default 50ms</span>
+                  <span>200ms</span>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Lower values = higher throughput but more CPU pressure.
+                  Higher values = lower CPU and more time for other I/O between cycles.
+                  Applied to indication, strategy and realtime loops.
                 </p>
               </div>
             </div>

@@ -17,8 +17,6 @@ export async function POST(request: NextRequest) {
       installed: true,
     }))
 
-    console.log(`[v0] Checked ${dependencies.length} dependencies`)
-
     return NextResponse.json({
       dependencies,
       installed_count: dependencies.length,

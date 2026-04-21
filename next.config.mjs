@@ -1,3 +1,4 @@
+// Force rebuild: 2026-04-10T13:07:30
 const nextConfig = {
   reactStrictMode: false,
   typescript: {

@@ -1,30 +1,49 @@
 /**
- * Exchange Connector Factory
+ * Exchange Connector Factory v3.0
  * Creates appropriate connector based on exchange name
- * Falls back to CCXT for any supported exchange
- * NOTE: CCXT connector is server-only and loaded dynamically
+ * Handles API type normalization between perpetual/perpetual_futures variants
  */
 
 import type { BaseExchangeConnector, ExchangeCredentials } from "./base-connector"
 import { EXCHANGE_API_TYPES } from "@/lib/connection-predefinitions"
 
-// All primary exchanges use dedicated connectors (no CCXT dependency)
-// Connectors are dynamically imported to prevent them from being bundled into the client
+// Perpetual-type equivalents - these all mean the same thing across exchanges
+const PERP_TYPES = new Set(["perpetual", "perpetual_futures", "perp", "swap", "futures"])
+
+/**
+ * Convert API type to what the exchange actually accepts.
+ * bingx needs "perpetual_futures", pionex/orangex need "perpetual", etc.
+ */
+function convertApiType(apiType: string | undefined, exchangeSupported: string[] | undefined): string | undefined {
+  if (!apiType || !exchangeSupported) return apiType
+  if (exchangeSupported.includes(apiType)) return apiType
+  
+  // If this is a perpetual-variant, find the one this exchange uses
+  if (PERP_TYPES.has(apiType)) {
+    if (exchangeSupported.includes("perpetual_futures")) return "perpetual_futures"
+    if (exchangeSupported.includes("perpetual")) return "perpetual"
+    if (exchangeSupported.includes("swap")) return "swap"
+  }
+  
+  return apiType
+}
 
 export async function createExchangeConnector(
   exchange: string,
   credentials: ExchangeCredentials
 ): Promise<BaseExchangeConnector> {
   const normalizedExchange = exchange.toLowerCase().replace(/[^a-z]/g, "")
-
-  // Validate API type is supported for the exchange
-  if (credentials.apiType) {
-    const supported = EXCHANGE_API_TYPES[normalizedExchange]
-    if (supported && !supported.includes(credentials.apiType)) {
-      throw new Error(
-        `Invalid API type '${credentials.apiType}' for ${exchange}. Supported types: ${supported.join(", ")}`
-      )
-    }
+  const supported = EXCHANGE_API_TYPES[normalizedExchange]
+  
+  // Convert API type to what this exchange accepts
+  const originalType = credentials.apiType
+  credentials.apiType = convertApiType(credentials.apiType, supported)
+  
+  // Validate
+  if (credentials.apiType && supported && !supported.includes(credentials.apiType)) {
+    throw new Error(
+      `Invalid API type '${credentials.apiType}' for ${exchange}. Supported: ${supported.join(", ")}`
+    )
   }
 
   switch (normalizedExchange) {

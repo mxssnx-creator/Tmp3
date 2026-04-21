@@ -1,778 +1,803 @@
 "use client"
 
-
 export const dynamic = "force-dynamic"
-import { useState, useEffect, useCallback } from "react"
-import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+
+import { useState, useEffect, useCallback, useRef } from "react"
 import { Badge } from "@/components/ui/badge"
-import { Separator } from "@/components/ui/separator"
-import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import {
-  Info,
-  Database,
-  TrendingUp,
-  CheckCircle2,
-  AlertTriangle,
-  Bot,
-  Layers,
-  Activity,
-  Clock,
-  Zap,
-  BarChart3,
-  Menu,
+  RefreshCw, ChevronDown, ChevronRight, Activity, Zap, GitBranch,
+  Filter, Target, Database, Bot, Layers, TrendingUp, ArrowRight,
+  Network, LineChart, Cpu, Shield, BarChart3,
 } from "lucide-react"
 import { AuthGuard } from "@/components/auth-guard"
+import { useExchange } from "@/lib/exchange-context"
+import { cn } from "@/lib/utils"
 
-interface SystemStatus {
-  initializationProgress: number
-  currentPhase: string
-  symbolsLoaded: number
-  totalSymbols: number
-  prehistoricDataProgress: number
-  tradeEngineRunning: boolean
-  realTimeStreamConnected: boolean
-  indicationsGenerated: number
-  strategiesEvaluated: number
-  pseudoPositionsCreated: number
-  currentInterval: number
-  intervalExecutionTime: number
-  lastUpdate: string
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+interface EngineStats {
+  indicationCycleCount: number
+  strategyCycleCount: number
+  totalIndicationsCount: number
+  totalStrategyCount: number
+  baseStrategyCount: number
+  mainStrategyCount: number
+  realStrategyCount: number
+  liveStrategyCount: number
+  positionsCount: number
+  indicationsByType: Record<string, number>
+  cycleSuccessRate: number
+  cyclesCompleted: number
 }
 
-interface WorkflowPhase {
+interface LivePosition {
   id: string
-  label: string
-  status: "complete" | "warning" | "pending"
-  detail: string
+  symbol: string
+  direction: "long" | "short"
+  status: "pending" | "open" | "partially_filled" | "filled" | "closed" | "error" | "simulated"
+  quantity: number
+  executedQuantity: number
+  entryPrice: number
+  averageExecutionPrice: number
+  takeProfit: number
+  stopLoss: number
+  orderId?: string
+  exchangeData?: { unrealizedPnl?: number; roi?: number; markPrice?: number }
+  createdAt: number
 }
-
 interface QueueData {
-  queueSize: number
-  queueBacklog?: number
-  workflowHealth?: string
-  processingPressure?: number
-  processingRate: number
-  successRate: number
-  avgLatency: number
-  completedOrders: number
-  failedOrders: number
-  maxLatency: number
-  throughput: number
-  workflow?: WorkflowPhase[]
-  focusConnection?: {
-    id: string
-    name: string
-    exchange: string
-    hasCredentials: boolean
-    isActivePanel: boolean
-    isDashboardEnabled: boolean
-    liveTradeEnabled: boolean
-    presetTradeEnabled: boolean
-    testStatus: string
-  } | null
-  progression?: {
-    cyclesCompleted: number
-    successfulCycles: number
-    failedCycles: number
-    cycleSuccessRate: number
-    totalTrades: number
-    totalProfit: number
-  } | null
-  quickstart?: {
-    connectionId?: string
-    connectionName?: string
-    exchange?: string
-    timestamp?: string
-    durationMs?: number
-  } | null
+  queueSize: number; processingRate: number; successRate: number
+  avgLatency: number; completedOrders: number; failedOrders: number
+  workflowHealth: string; processingPressure: number
+  workflow: Array<{ id: string; label: string; status: "complete" | "warning" | "pending"; detail: string }>
+  focusConnection: { id: string; name: string; exchange: string; liveTradeEnabled: boolean } | null
+  progression: { cyclesCompleted: number; successfulCycles: number; cycleSuccessRate: number; totalTrades: number } | null
 }
 
-const defaultStatus: SystemStatus = {
-  initializationProgress: 0,
-  currentPhase: "Initializing",
-  symbolsLoaded: 0,
-  totalSymbols: 50,
-  prehistoricDataProgress: 0,
-  tradeEngineRunning: false,
-  realTimeStreamConnected: false,
-  indicationsGenerated: 0,
-  strategiesEvaluated: 0,
-  pseudoPositionsCreated: 0,
-  currentInterval: 0,
-  intervalExecutionTime: 0,
-  lastUpdate: new Date().toISOString(),
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function fmt(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M"
+  if (n >= 1_000)     return (n / 1_000).toFixed(1) + "K"
+  return String(n)
 }
 
-function StatusCards({ systemStatus }: { systemStatus: SystemStatus }) {
+// ─── Atoms ───────────────────────────────────────────────────────────────────
+
+function Dot({ on }: { on: boolean }) {
   return (
-    <div className="grid gap-4 md:grid-cols-4">
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium">Initialization</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-sm">
-              <span className="text-muted-foreground">Progress</span>
-              <span className="font-bold">{systemStatus.initializationProgress}%</span>
-            </div>
-            <Progress value={systemStatus.initializationProgress} className="h-2" />
-          </div>
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium">Symbols Loaded</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2">
-            <div className="text-2xl font-bold">
-              {systemStatus.symbolsLoaded}/{systemStatus.totalSymbols}
-            </div>
-            <Progress
-              value={systemStatus.totalSymbols > 0 ? (systemStatus.symbolsLoaded / systemStatus.totalSymbols) * 100 : 0}
-              className="h-2"
-            />
-          </div>
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium">Prehistoric Data</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-sm">
-              <span className="text-muted-foreground">Loading</span>
-              <span className="font-bold">{systemStatus.prehistoricDataProgress}%</span>
-            </div>
-            <Progress value={systemStatus.prehistoricDataProgress} className="h-2" />
-          </div>
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium">Current Interval</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2">
-            <div className="text-2xl font-bold">#{systemStatus.currentInterval}</div>
-            <div className="text-xs text-muted-foreground">
-              Exec time: {systemStatus.intervalExecutionTime.toFixed(0)}ms
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+    <span className="relative flex h-1.5 w-1.5 shrink-0">
+      {on && <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />}
+      <span className={cn("relative inline-flex h-1.5 w-1.5 rounded-full", on ? "bg-emerald-500" : "bg-muted-foreground/30")} />
+    </span>
+  )
+}
+
+function Tag({ children, color = "default" }: { children: React.ReactNode; color?: "blue" | "purple" | "green" | "orange" | "red" | "default" }) {
+  const map = {
+    blue:    "bg-blue-500/10 text-blue-400 border-blue-500/20",
+    purple:  "bg-purple-500/10 text-purple-400 border-purple-500/20",
+    green:   "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+    orange:  "bg-orange-500/10 text-orange-400 border-orange-500/20",
+    red:     "bg-red-500/10 text-red-400 border-red-500/20",
+    default: "bg-muted/40 text-muted-foreground border-border",
+  }
+  return <span className={cn("inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium", map[color])}>{children}</span>
+}
+
+// ─── KPI Strip ───────────────────────────────────────────────────────────────
+
+function KPI({ label, value, color = "default" }: { label: string; value: string | number; color?: "blue" | "purple" | "green" | "orange" | "default" }) {
+  const val = typeof value === "number" ? fmt(value) : value
+  const valColor = {
+    blue:    "text-blue-400",
+    purple:  "text-purple-400",
+    green:   "text-emerald-400",
+    orange:  "text-orange-400",
+    default: "text-foreground",
+  }[color]
+  return (
+    <div className="flex flex-col gap-0.5 border-r border-border px-3 last:border-r-0 first:pl-0">
+      <span className="text-[9px] uppercase tracking-widest text-muted-foreground">{label}</span>
+      <span className={cn("text-sm font-bold tabular-nums leading-none", valColor)}>{val}</span>
     </div>
   )
 }
 
-function RealTimeActivity({ systemStatus }: { systemStatus: SystemStatus }) {
+// ─── Row ─────────────────────────────────────────────────────────────────────
+
+function Row({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Activity className="h-5 w-5" />
-          Real-Time Activity
-        </CardTitle>
-        <CardDescription>Current system processing metrics</CardDescription>
-      </CardHeader>
-      <CardContent>
-        <div className="grid gap-4 md:grid-cols-3">
-          <div className="flex items-center gap-4">
-            <div className="rounded-lg bg-blue-500/10 p-3">
-              <Zap className="h-6 w-6 text-blue-500" />
-            </div>
-            <div>
-              <div className="text-sm text-muted-foreground">Indications Generated</div>
-              <div className="text-2xl font-bold">{systemStatus.indicationsGenerated}</div>
-            </div>
-          </div>
-          <div className="flex items-center gap-4">
-            <div className="rounded-lg bg-purple-500/10 p-3">
-              <BarChart3 className="h-6 w-6 text-purple-500" />
-            </div>
-            <div>
-              <div className="text-sm text-muted-foreground">Strategies Evaluated</div>
-              <div className="text-2xl font-bold">{systemStatus.strategiesEvaluated}</div>
-            </div>
-          </div>
-          <div className="flex items-center gap-4">
-            <div className="rounded-lg bg-green-500/10 p-3">
-              <TrendingUp className="h-6 w-6 text-green-500" />
-            </div>
-            <div>
-              <div className="text-sm text-muted-foreground">Pseudo Positions</div>
-              <div className="text-2xl font-bold">{systemStatus.pseudoPositionsCreated}</div>
-            </div>
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
-
-function WorkflowPhaseCard({ queueData }: { queueData: QueueData | null }) {
-  if (!queueData?.workflow?.length) return null
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <CheckCircle2 className="h-5 w-5" />
-          Quickstart Workflow
-        </CardTitle>
-        <CardDescription>Live readiness state for logistics, processing, and engine activation</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <div className="grid gap-3 md:grid-cols-3">
-          <div className="rounded-lg border p-3">
-            <div className="text-xs uppercase tracking-wide text-muted-foreground">Workflow Health</div>
-            <div className="mt-1 text-lg font-semibold capitalize">{queueData.workflowHealth || "unknown"}</div>
-          </div>
-          <div className="rounded-lg border p-3">
-            <div className="text-xs uppercase tracking-wide text-muted-foreground">Queue Backlog</div>
-            <div className="mt-1 text-lg font-semibold">{queueData.queueBacklog || 0}</div>
-          </div>
-          <div className="rounded-lg border p-3">
-            <div className="text-xs uppercase tracking-wide text-muted-foreground">Processing Pressure</div>
-            <div className="mt-1 text-lg font-semibold">{queueData.processingPressure || 0}%</div>
-            <Progress value={queueData.processingPressure || 0} className="mt-2 h-2" />
-          </div>
-        </div>
-        {queueData.workflow.map((phase) => (
-          <div key={phase.id} className="flex items-start justify-between gap-4 rounded-lg border p-3">
-            <div>
-              <div className="font-medium">{phase.label}</div>
-              <div className="text-sm text-muted-foreground">{phase.detail}</div>
-            </div>
-            <Badge
-              variant={phase.status === "complete" ? "default" : phase.status === "warning" ? "secondary" : "outline"}
-              className="shrink-0"
-            >
-              {phase.status}
-            </Badge>
-          </div>
-        ))}
-      </CardContent>
-    </Card>
-  )
-}
-
-function FocusConnectionCard({ queueData }: { queueData: QueueData | null }) {
-  if (!queueData?.focusConnection) return null
-
-  const focus = queueData.focusConnection
-  const progression = queueData.progression
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Zap className="h-5 w-5" />
-          Focus Connection
-        </CardTitle>
-        <CardDescription>Primary connection driving current logistics and progression visibility</CardDescription>
-      </CardHeader>
-      <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <div>
-          <div className="text-sm text-muted-foreground">Connection</div>
-          <div className="font-semibold">{focus.name}</div>
-          <div className="text-xs text-muted-foreground uppercase">{focus.exchange}</div>
-        </div>
-        <div>
-          <div className="text-sm text-muted-foreground">Connection State</div>
-          <div className="font-semibold">{focus.testStatus}</div>
-          <div className="text-xs text-muted-foreground">
-            Credentials: {focus.hasCredentials ? "Configured" : "Missing"}
-          </div>
-        </div>
-        <div>
-          <div className="text-sm text-muted-foreground">Progression</div>
-          <div className="font-semibold">{progression?.cyclesCompleted || 0} cycles</div>
-          <div className="text-xs text-muted-foreground">
-            Success rate: {Math.round(progression?.cycleSuccessRate || 0)}%
-          </div>
-        </div>
-        <div>
-          <div className="text-sm text-muted-foreground">Processing Flags</div>
-          <div className="flex flex-wrap gap-2 pt-1">
-            <Badge variant={focus.isActivePanel ? "default" : "outline"}>Active Panel</Badge>
-            <Badge variant={focus.isDashboardEnabled ? "default" : "outline"}>Dashboard Enabled</Badge>
-            <Badge variant={focus.liveTradeEnabled ? "default" : "outline"}>Live Trade</Badge>
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
-
-function QuickstartStatusCard({ queueData }: { queueData: QueueData | null }) {
-  if (!queueData?.quickstart) return null
-  const run = queueData.quickstart
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Zap className="h-5 w-5" />
-          Last Quickstart Run
-        </CardTitle>
-        <CardDescription>Cross-system quickstart status used by overview/tracking/logistics</CardDescription>
-      </CardHeader>
-      <CardContent className="grid gap-4 md:grid-cols-3">
-        <div>
-          <div className="text-sm text-muted-foreground">Connection</div>
-          <div className="font-semibold">{run.connectionName || run.connectionId || "N/A"}</div>
-        </div>
-        <div>
-          <div className="text-sm text-muted-foreground">Exchange</div>
-          <div className="font-semibold uppercase">{run.exchange || "N/A"}</div>
-        </div>
-        <div>
-          <div className="text-sm text-muted-foreground">Completed</div>
-          <div className="font-semibold">
-            {run.timestamp ? new Date(run.timestamp).toLocaleString() : "N/A"}
-            {typeof run.durationMs === "number" ? ` (${run.durationMs}ms)` : ""}
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
-
-function MainSystemTab({ systemStatus }: { systemStatus: SystemStatus }) {
-  return (
-    <div className="space-y-6">
-      <Alert className="border-l-4 border-l-primary">
-        <Info className="h-4 w-4" />
-        <AlertDescription>
-          <strong>Main System Trade Mode:</strong> Uses step-based indication calculations (Direction, Move,
-          Active types with 3-30 step ranges) generating up to 250 pseudo positions per indication.
-        </AlertDescription>
-      </Alert>
-
-      <Card className="border-l-4 border-l-blue-500">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-500 font-bold text-white">1</div>
-            Initialization Phase
-          </CardTitle>
-          <CardDescription>System startup and prehistoric data loading</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="rounded-lg border-l-4 border-l-blue-500 bg-blue-500/5 p-4">
-            <div className="mb-2 font-medium">1.1 Load System Settings from Database</div>
-            <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-              <div>{'Trade Engine Interval: 1.0s (default)'}</div>
-              <div>{'Real Positions Interval: 0.3s'}</div>
-              <div>{'Market Data Timeframe: 1 second'}</div>
-              <div>{'Time Range History: 5 days'}</div>
-            </div>
-          </div>
-          <div className="rounded-lg border-l-4 border-l-blue-500 bg-blue-500/5 p-4">
-            <div className="mb-2 font-medium">1.2 Load Symbols</div>
-            <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-              <div>{'Mode: Main Symbols -> Use configured list + forced symbols'}</div>
-              <div>{'Mode: Exchange Symbols -> Fetch top N by volume'}</div>
-              <div className="font-medium text-primary">
-                Result: {systemStatus.symbolsLoaded} unique symbols loaded
-              </div>
-            </div>
-          </div>
-          <div className="rounded-lg border-l-4 border-l-blue-500 bg-blue-500/5 p-4">
-            <div className="mb-2 flex items-center gap-2 font-medium">
-              1.3 Load Prehistoric Data (Async per Symbol)
-              <Badge className="bg-blue-500 text-white">Parallel</Badge>
-            </div>
-            <div className="ml-4 space-y-2 text-sm">
-              <div className="text-muted-foreground">All symbols processed simultaneously (concurrency limit: 10)</div>
-              <div className="rounded border bg-background p-3">
-                <Progress value={systemStatus.prehistoricDataProgress} className="h-2" />
-                <div className="mt-2 text-xs font-mono text-primary">
-                  Progress: {systemStatus.prehistoricDataProgress}% complete
-                </div>
-              </div>
-            </div>
-          </div>
-          <div className="rounded-lg border-l-4 border-l-blue-500 bg-blue-500/5 p-4">
-            <div className="mb-2 font-medium">1.4 Initialize Market Data Stream</div>
-            <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-              <div>Connect to exchange WebSocket, subscribe to all symbols</div>
-              <div className="flex items-center gap-2">
-                <span>Status:</span>
-                <Badge variant={systemStatus.realTimeStreamConnected ? "default" : "secondary"} className="text-xs">
-                  {systemStatus.realTimeStreamConnected ? "Connected" : "Connecting"}
-                </Badge>
-              </div>
-            </div>
-          </div>
-          {systemStatus.initializationProgress >= 100 && (
-            <Alert>
-              <CheckCircle2 className="h-4 w-4 text-green-500" />
-              <AlertDescription>
-                <strong>Initialization Complete:</strong> System ready and Trade Engine running
-              </AlertDescription>
-            </Alert>
-          )}
-        </CardContent>
-      </Card>
-
-      {systemStatus.tradeEngineRunning && (
-        <Card className="border-l-4 border-l-purple-500">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <div className="flex h-8 w-8 items-center justify-center rounded-full bg-purple-500 font-bold text-white">2</div>
-              Trade Interval Loop (1.0s)
-            </CardTitle>
-            <CardDescription>Indications - Strategies - Pseudo Positions - Logging (Non-Overlapping)</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <Alert>
-              <Info className="h-4 w-4" />
-              <AlertDescription>
-                <strong>Non-Overlapping Execution:</strong> New interval starts ONLY after previous completes.
-                Current execution time: {systemStatus.intervalExecutionTime.toFixed(0)}ms
-              </AlertDescription>
-            </Alert>
-            <div className="rounded-lg border-l-4 border-l-blue-500 bg-blue-500/5 p-4">
-              <div className="mb-3 flex items-center gap-2 font-medium">
-                2.1 Process Indications (Base Pseudo Positions)
-                <Badge className="bg-blue-500 text-white">Parallel by Symbol</Badge>
-              </div>
-              <div className="rounded border bg-background p-3 text-sm">
-                <div className="mb-2 font-medium text-green-600">Indication Types:</div>
-                <div className="ml-4 space-y-1 text-muted-foreground">
-                  <div>Direction Type (3-30 step ranges): Reversal trading</div>
-                  <div>Move Type (3-30 step ranges): Trend following</div>
-                  <div>Active Type (0.5-2.5% thresholds): Breakout strategies</div>
-                  <div>Optimal Type (Advanced): High-precision validated configs</div>
-                </div>
-                <div className="mt-3 rounded bg-primary/5 p-2 text-xs">
-                  <div className="flex justify-between"><span>Indications Generated:</span><span className="font-bold">{systemStatus.indicationsGenerated}</span></div>
-                  <div className="flex justify-between"><span>Current Interval:</span><span className="font-bold">#{systemStatus.currentInterval}</span></div>
-                </div>
-              </div>
-            </div>
-            <div className="rounded-lg border-l-4 border-l-purple-500 bg-purple-500/5 p-4">
-              <div className="mb-3 flex items-center gap-2 font-medium">
-                2.2 Evaluate Strategies
-                <Badge className="bg-purple-500 text-white">Sequential</Badge>
-              </div>
-              <div className="rounded border bg-background p-3 text-sm">
-                <div className="mb-2 font-medium text-purple-600">Strategy Evaluation:</div>
-                <div className="ml-4 space-y-1 text-muted-foreground">
-                  <div>Take Profit: 11 levels (0.5% to 5.0%)</div>
-                  <div>Stop Loss: 21 levels (0.1% to 2.0%)</div>
-                  <div>Trailing: 4 modes (OFF, Standard, Aggressive, Conservative)</div>
-                  <div>Total combinations: 924 per indication</div>
-                </div>
-                <div className="mt-3 rounded bg-purple-500/10 p-2 text-xs">
-                  <div className="flex justify-between"><span>Strategies Evaluated:</span><span className="font-bold">{systemStatus.strategiesEvaluated}</span></div>
-                </div>
-              </div>
-            </div>
-            <div className="rounded-lg border-l-4 border-l-green-500 bg-green-500/5 p-4">
-              <div className="mb-3 flex items-center gap-2 font-medium">
-                2.3 Create Pseudo Positions
-                <Badge className="bg-green-500 text-white">Database Write</Badge>
-              </div>
-              <div className="rounded border bg-background p-3 text-sm">
-                <div className="mb-2 font-medium text-green-600">Position Creation:</div>
-                <div className="ml-4 space-y-1 text-muted-foreground">
-                  <div>{'Filter by profit_factor >= 0.6'}</div>
-                  <div>Max 250 positions per configuration</div>
-                  <div>Track performance metrics</div>
-                </div>
-                <div className="mt-3 rounded bg-green-500/10 p-2 text-xs">
-                  <div className="flex justify-between"><span>Pseudo Positions Created:</span><span className="font-bold">{systemStatus.pseudoPositionsCreated}</span></div>
-                </div>
-              </div>
-            </div>
-            <div className="rounded-lg border-l-4 border-l-orange-500 bg-orange-500/5 p-4">
-              <div className="mb-3 flex items-center gap-2 font-medium">
-                2.4 System Logging
-                <Badge className="bg-orange-500 text-white">Async</Badge>
-              </div>
-              <div className="rounded border bg-background p-3 text-sm text-muted-foreground">
-                <div>Log all indications, strategies, and positions</div>
-                <div>Performance metrics tracking</div>
-                <div>Last update: {new Date(systemStatus.lastUpdate).toLocaleTimeString()}</div>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {systemStatus.tradeEngineRunning && (
-        <Card className="border-l-4 border-l-green-500">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <div className="flex h-8 w-8 items-center justify-center rounded-full bg-green-500 font-bold text-white">3</div>
-              Position Management
-            </CardTitle>
-            <CardDescription>Real positions monitoring and execution</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="rounded-lg border-l-4 border-l-green-500 bg-green-500/5 p-4">
-              <div className="mb-2 font-medium">3.1 Promote to Real Positions</div>
-              <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-                <div>{'Monitor pseudo position performance, promote best (profit_factor >= 0.8)'}</div>
-                <div>Place orders on exchange, track real-time P&L</div>
-              </div>
-            </div>
-            <div className="rounded-lg border-l-4 border-l-green-500 bg-green-500/5 p-4">
-              <div className="mb-2 font-medium">3.2 Monitor and Update (0.2s interval)</div>
-              <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-                <div>Fetch position updates from exchange</div>
-                <div>Update trailing stops, execute TP/SL, close positions</div>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
+    <div className="flex items-center justify-between gap-3 py-[3px]">
+      <span className="text-[11px] text-muted-foreground">{label}</span>
+      <span className={cn("text-[11px] font-medium", mono && "font-mono text-[10px] text-muted-foreground")}>{value}</span>
     </div>
   )
 }
+
+// ─── Expandable Block ─────────────────────────────────────────────────────────
+
+type AccentKey = "blue" | "purple" | "green" | "orange"
+
+function Block({
+  icon: Icon, title, sub, accent = "blue", children, open: defaultOpen = false, right,
+}: {
+  icon: React.ElementType; title: string; sub?: string; accent?: AccentKey
+  children?: React.ReactNode; open?: boolean; right?: React.ReactNode
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  const bar  = { blue: "bg-blue-500", purple: "bg-purple-500", green: "bg-emerald-500", orange: "bg-orange-500" }[accent]
+  const ic   = { blue: "text-blue-400", purple: "text-purple-400", green: "text-emerald-400", orange: "text-orange-400" }[accent]
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger asChild>
+        <button className="group flex w-full items-center gap-2 rounded-md py-1.5 pl-2 pr-1.5 text-left transition-colors hover:bg-muted/20">
+          <span className={cn("h-3.5 w-0.5 shrink-0 rounded-full", bar)} />
+          <Icon className={cn("h-3 w-3 shrink-0", ic)} />
+          <span className="flex-1 min-w-0">
+            <span className="text-[11px] font-medium leading-none">{title}</span>
+            {sub && <span className="ml-1.5 text-[10px] text-muted-foreground">{sub}</span>}
+          </span>
+          {right}
+          {open
+            ? <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground/50" />
+            : <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/30 group-hover:text-muted-foreground/50" />
+          }
+        </button>
+      </CollapsibleTrigger>
+      {children && (
+        <CollapsibleContent>
+          <div className="ml-5 mt-0.5 border-l border-border/50 pb-2 pl-3 space-y-0.5">
+            {children}
+          </div>
+        </CollapsibleContent>
+      )}
+    </Collapsible>
+  )
+}
+
+// ─── Section Header ───────────────────────────────────────────────────────────
+
+function SectionHeader({ num, label, sub, color }: { num: number; label: string; sub: string; color: AccentKey }) {
+  const bg = { blue: "bg-blue-500", purple: "bg-purple-500", green: "bg-emerald-500", orange: "bg-orange-500" }[color]
+  return (
+    <div className="flex items-center gap-2 pb-1 pt-2">
+      <span className={cn("flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-[9px] font-bold text-white", bg)}>{num}</span>
+      <span className="text-[11px] font-semibold uppercase tracking-wider">{label}</span>
+      <span className="text-[10px] text-muted-foreground">{sub}</span>
+    </div>
+  )
+}
+
+// ─── Funnel ──────────────────────────────────────────────────────────────────
+
+function Funnel({ stats }: { stats: EngineStats | null }) {
+  const stages = [
+    { label: "Base",  value: stats?.baseStrategyCount  || 0, max: 8,  color: "bg-purple-500/20 text-purple-400 border-purple-500/30" },
+    { label: "Main",  value: stats?.mainStrategyCount  || 0, max: 8,  color: "bg-purple-500/30 text-purple-300 border-purple-500/40" },
+    { label: "Real",  value: stats?.realStrategyCount  || 0, max: 8,  color: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30" },
+    { label: "Live",  value: stats?.liveStrategyCount  || 0, max: 8,  color: "bg-emerald-500/30 text-emerald-300 border-emerald-500/40" },
+  ]
+  return (
+    <div className="flex items-center gap-1">
+      {stages.map((s, i) => (
+        <div key={s.label} className="flex items-center gap-1">
+          <div className={cn("flex flex-col items-center rounded border px-2.5 py-1 text-center", s.color)}>
+            <span className="text-[10px] font-medium leading-none">{s.label}</span>
+            <span className="mt-0.5 text-base font-bold tabular-nums leading-none">{s.value}</span>
+          </div>
+          {i < stages.length - 1 && <ArrowRight className="h-2.5 w-2.5 shrink-0 text-muted-foreground/30" />}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ─── Main System Tab ─────────────────────────────────────────────────────────
+
+function MainSystemTab({ stats }: { stats: EngineStats | null }) {
+  const s = stats
+  const byType = s?.indicationsByType || {}
+  const indCycles = s?.indicationCycleCount || 0
+  const strCycles = s?.strategyCycleCount   || 0
+  const indTotal  = s?.totalIndicationsCount || 0
+  const strTotal  = s?.totalStrategyCount    || 0
+
+  return (
+    <div className="space-y-3">
+
+      {/* KPI row */}
+      <div className="flex flex-wrap items-center rounded-md border bg-muted/10 px-3 py-2 gap-y-2">
+        <KPI label="Ind Cycles" value={indCycles}  color="blue" />
+        <KPI label="Indications" value={indTotal}  color="blue" />
+        <KPI label="Str Cycles"  value={strCycles} color="purple" />
+        <KPI label="Strategies"  value={strTotal}  color="purple" />
+        <KPI label="Positions"   value={s?.positionsCount || 0} color="green" />
+        <KPI label="Cycle Rate"  value={indCycles > 0 ? `${(indTotal / indCycles).toFixed(1)}/c` : "—"} />
+      </div>
+
+      {/* Funnel */}
+      <div className="flex items-center justify-between rounded-md border bg-muted/5 px-3 py-2">
+        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">Strategy Funnel</span>
+        <Funnel stats={s} />
+      </div>
+
+      {/* Phase 1 */}
+      <div className="rounded-md border bg-card">
+        <div className="border-b px-3 py-1.5">
+          <SectionHeader num={1} label="Initialization" sub="startup · symbol load · prehistoric data" color="blue" />
+        </div>
+        <div className="px-3 py-1.5 space-y-0.5">
+          <Block icon={Database} title="Load Settings" sub="Redis hash → trade interval, timeframe, risk params" accent="blue">
+            <Row label="Trade interval"        value="1.0 s (non-overlapping)" />
+            <Row label="Position monitor"       value="0.3 s" />
+            <Row label="Candle timeframe"       value="1 s OHLCV" />
+            <Row label="History range"          value="5 days" />
+            <Row label="Concurrency"            value="10 parallel loads" />
+            <Row label="Config key" mono value={`settings:trade_engine_state:{connId}`} />
+          </Block>
+          <Block icon={BarChart3} title="Load Symbols" sub="main symbol list or exchange top-N by volume" accent="blue">
+            <Row label="Mode A" value="Configured list + forced symbols" />
+            <Row label="Mode B" value="Top N by 24h volume from exchange" />
+            <Row label="Storage" mono value="Redis SADD, unique only" />
+            <Row label="QuickStart" value="Most volatile 1h symbol per exchange" />
+          </Block>
+          <Block icon={Database} title="Prehistoric Data Load" sub="parallel OHLCV fetch for all symbols" accent="blue"
+            right={<Tag color="blue">Parallel</Tag>}>
+            <Row label="Candles per symbol" value="~432,000 (5d × 1s)" />
+            <Row label="Storage key" mono value={`prehistoric:{connId}:{symbol}:candles`} />
+            <Row label="Completion flag" mono value={`prehistoric:{connId}:{symbol}:completed`} />
+            <Row label="Fallback" value="Live candles only (reduced accuracy)" />
+          </Block>
+          <Block icon={Network} title="Market Data Stream" sub="WebSocket subscription → 1s candle per symbol" accent="blue">
+            <Row label="Protocol" value="Exchange WebSocket (kline 1s)" />
+            <Row label="Reconnect" value="Exponential backoff, auto-retry" />
+            <Row label="Redis emit" mono value={`market_data:{connId}:{symbol}`} />
+          </Block>
+        </div>
+      </div>
+
+      {/* Phase 2 */}
+      <div className="rounded-md border bg-card">
+        <div className="border-b px-3 py-1.5 flex items-center justify-between">
+          <SectionHeader num={2} label="Trade Loop" sub="1 s non-overlapping · indication → strategy → position" color="purple" />
+          <Tag color="purple">≈{strCycles > 0 ? (strTotal / strCycles).toFixed(0) : "—"} sets/cycle</Tag>
+        </div>
+        <div className="px-3 py-1.5 space-y-0.5">
+
+          <Block icon={Zap} title="Indication Processing" sub="4 types × 2 directions = 8 signals/symbol/cycle" accent="blue" open>
+            {/* per-type mini bars */}
+            <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 py-1">
+              {[
+                { k: "direction", label: "Direction", desc: "Reversal — close vs open, 3–30 steps" },
+                { k: "move",      label: "Move",      desc: "Momentum — trend follow, 3–30 steps" },
+                { k: "active",    label: "Active",    desc: "Breakout — 0.5–2.5% vol threshold" },
+                { k: "optimal",   label: "Optimal",   desc: "High-precision multi-filter signal" },
+              ].map(t => {
+                const cnt = byType[t.k] || 0
+                const maxCnt = Math.max(...Object.values(byType).map(Number), 1)
+                return (
+                  <div key={t.k}>
+                    <div className="flex items-center justify-between mb-0.5">
+                      <span className="text-[10px] font-medium text-blue-400">{t.label}</span>
+                      <span className="text-[10px] font-mono text-muted-foreground">{fmt(cnt)}</span>
+                    </div>
+                    <Progress value={(cnt / maxCnt) * 100} className="h-0.5 rounded-none [&>div]:bg-blue-500" />
+                    <span className="text-[9px] text-muted-foreground/60">{t.desc}</span>
+                  </div>
+                )
+              })}
+            </div>
+            <Row label="Total session indications" value={<span className="text-blue-400 font-bold">{fmt(indTotal)}</span>} />
+            <Row label="Avg per cycle" value={indCycles > 0 ? `${(indTotal / indCycles).toFixed(1)}` : "—"} />
+            <Row label="Storage" mono value={`progression:{connId} → indications_*_count`} />
+          </Block>
+
+          <Block icon={GitBranch} title="Base Stage" sub="924 combos/set · PF ≥ 0.55 to pass" accent="purple">
+            <Row label="Sets per cycle" value={`${s?.baseStrategyCount || 0} / 8`} />
+            <Row label="TP levels" value="11 (0.5 % → 5.0 %, step 0.45 %)" />
+            <Row label="SL levels" value="21 (0.1 % → 2.0 %, step 0.095 %)" />
+            <Row label="Trailing modes" value="4 — OFF / Std / Aggr / Cons" />
+            <Row label="Combinations" value="11 × 21 × 4 = 924 per Set" />
+            <Row label="Pass threshold" value="profit_factor ≥ 0.55" />
+          </Block>
+
+          <Block icon={Filter} title="Main Stage" sub="consistency filter · PF ≥ 0.65 × 3 consecutive" accent="purple">
+            <Row label="Sets this cycle" value={`${s?.mainStrategyCount || 0}`} />
+            <Row label="Threshold" value="PF ≥ 0.65" />
+            <Row label="Consistency" value="Must pass ≥ 3 consecutive cycles" />
+            <Row label="Storage" mono value={`progression:{connId} → strategies_main_total`} />
+          </Block>
+
+          <Block icon={Target} title="Real Stage" sub="high-confidence · PF ≥ 1.4 + conf ≥ 0.65" accent="purple">
+            <Row label="Sets this cycle" value={`${s?.realStrategyCount || 0}`} />
+            <Row label="PF threshold" value="≥ 1.4" />
+            <Row label="Confidence" value="≥ 0.65" />
+            <Row label="Max drawdown time" value="≤ 960 min (16 h)" />
+            <Row label="Live gate" value="is_live_trade=1 + valid credentials" />
+          </Block>
+
+          <Block icon={TrendingUp} title="Live Stage" sub="exchange orders · PF ≥ 1.4 + conf ≥ 0.65 + DDT ≤ 2h" accent="green"
+            right={<Tag color={s && s.liveStrategyCount > 0 ? "green" : "default"}>{s?.liveStrategyCount || 0} sets</Tag>}>
+            <Row label="Sets this cycle" value={<span className={cn("font-bold", (s?.liveStrategyCount || 0) > 0 ? "text-emerald-400" : "text-muted-foreground")}>{s?.liveStrategyCount || 0}</span>} />
+            <Row label="PF threshold" value="≥ 1.4 (same as REAL)" />
+            <Row label="Confidence" value="≥ 0.65" />
+            <Row label="Max drawdown time" value="≤ 120 min (2 h)" />
+            <Row label="Max live sets" value="500 (ranked by PF)" />
+            <Row label="Execution" value="Market order via exchange connector" />
+            <Row label="Guard" value="is_live_trade flag on connection" />
+          </Block>
+
+          <Block icon={LineChart} title="Pseudo Positions" sub="virtual tracking — no real capital" accent="green">
+            <Row label="Active positions" value={<span className="text-emerald-400 font-bold">{fmt(s?.positionsCount || 0)}</span>} />
+            <Row label="Creation filter" value="PF ≥ 0.6 at any stage" />
+            <Row label="Max per config" value="250" />
+            <Row label="Storage" mono value={`pseudo_positions:{connId}`} />
+          </Block>
+
+          <Block icon={Database} title="Logging" sub="async · never blocks trade loop" accent="orange">
+            <Row label="Log key" mono value={`engine:logs:{connId}`} />
+            <Row label="Format" value="Redis LIST of JSON (LPUSH, capped)" />
+            <Row label="Metrics" mono value={`progression:{connId} HASH`} />
+          </Block>
+        </div>
+      </div>
+
+      {/* Phase 3 */}
+      <div className="rounded-md border bg-card">
+        <div className="border-b px-3 py-1.5">
+          <SectionHeader num={3} label="Position Management" sub="real orders · 0.3 s monitor · feedback loop" color="green" />
+        </div>
+        <div className="px-3 py-1.5 space-y-0.5">
+          <Block icon={TrendingUp} title="Promote to Real" sub="live-stage.ts → executeLivePosition() → exchange order" accent="green">
+            <Row label="Threshold" value="PF ≥ 0.8 over ≥ 5 cycles" />
+            <Row label="Gate" value="is_live_trade=1 + credentials valid" />
+            <Row label="Order type" value="Market order at fill price" />
+            <Row label="Risk" value="Minimal qty + exchange-level TP/SL" />
+          </Block>
+          <Block icon={Activity} title="Position Monitor (0.3 s)" sub="TP/SL hit · trailing adjust · P&L update" accent="green">
+            <Row label="Price source" value="Market data stream (no REST call)" />
+            <Row label="Trailing update" value="Re-priced on favorable tick" />
+            <Row label="Max real positions" value="Configurable (default 5)" />
+            <Row label="Latency" value="&lt; 50 ms" />
+          </Block>
+          <Block icon={BarChart3} title="Feedback Loop" sub="closed positions update strategy rankings" accent="green">
+            <Row label="Metric" value="Realized PF of closed pseudo positions" />
+            <Row label="Ranking" value="EMA over last 20 closures" />
+            <Row label="Effect" value="Higher-ranked Sets promoted faster" />
+          </Block>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Preset Mode Tab ─────────────────────────────────────────────────────────
 
 function PresetModeTab() {
+  const indicators = [
+    { name: "RSI 14",        desc: "Overbought / oversold" },
+    { name: "MACD 12/26/9",  desc: "Momentum divergence" },
+    { name: "BB 20,2",       desc: "Volatility breakout" },
+    { name: "Parabolic SAR", desc: "Reversal stop" },
+    { name: "EMA 9/21/50",   desc: "Trend direction" },
+    { name: "Stoch 14,3,3",  desc: "Oscillator" },
+    { name: "ADX 14",        desc: "Trend strength" },
+    { name: "SMA 50/200",    desc: "Long-term context" },
+  ]
   return (
-    <div className="space-y-6">
-      <Alert className="border-l-4 border-l-primary">
-        <Database className="h-4 w-4" />
-        <AlertDescription>
-          <strong>Preset Mode:</strong> Uses predefined technical indicators (RSI, MACD, Bollinger, etc.)
-          for both calculations and live trade execution in one engine.
-        </AlertDescription>
-      </Alert>
-      <Card>
-        <CardHeader>
-          <CardTitle>Preset Mode Workflow</CardTitle>
-          <CardDescription>Indicator-based trading system (calculation + execution)</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="rounded-lg border-l-4 border-l-blue-500 bg-blue-500/5 p-4">
-            <div className="mb-2 font-medium">1. Technical Indicators</div>
-            <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-              <div>RSI, MACD, Bollinger Bands, Parabolic SAR</div>
-              <div>EMA, SMA, Stochastic Oscillator, ADX</div>
-            </div>
+    <div className="space-y-3">
+      <div className="rounded-md border bg-muted/5 px-3 py-2">
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          <span className="font-semibold text-foreground">Preset Mode</span> uses classic technical indicators with confluence filtering.
+          Unlike Main System, signals execute directly — no pseudo position stage. Minimum 2 indicators must agree for a trade signal.
+        </p>
+      </div>
+
+      <div className="rounded-md border bg-card">
+        <div className="border-b px-3 py-1.5">
+          <SectionHeader num={1} label="Indicators" sub="computed on each candle close per symbol" color="blue" />
+        </div>
+        <div className="px-3 py-1.5">
+          <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 py-1">
+            {indicators.map(ind => (
+              <div key={ind.name} className="flex items-center justify-between py-[3px]">
+                <span className="text-[10px] font-medium text-blue-400">{ind.name}</span>
+                <span className="text-[10px] text-muted-foreground">{ind.desc}</span>
+              </div>
+            ))}
           </div>
-          <div className="rounded-lg border-l-4 border-l-purple-500 bg-purple-500/5 p-4">
-            <div className="mb-2 font-medium">2. Signal Generation</div>
-            <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-              <div>{'Each indicator generates: BUY, SELL, or NEUTRAL'}</div>
-              <div>{'Confluence: 2+ indicators must agree, filter by profit_factor >= 0.6'}</div>
-            </div>
-          </div>
-          <div className="rounded-lg border-l-4 border-l-green-500 bg-green-500/5 p-4">
-            <div className="mb-2 font-medium">3. Position Execution</div>
-            <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-              <div>Create base pseudo positions, track performance</div>
-              <div>Promote best to real positions, execute on exchange</div>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+        </div>
+      </div>
+
+      <div className="rounded-md border bg-card">
+        <div className="border-b px-3 py-1.5">
+          <SectionHeader num={2} label="Confluence & Execution" sub="min 2 agree → market order → ATR-based TP/SL" color="purple" />
+        </div>
+        <div className="px-3 py-1.5 space-y-0.5">
+          <Block icon={Filter} title="Confluence Filter" sub="trend-strength indicators weighted higher" accent="purple" open>
+            <Row label="Minimum agreement" value="2 of N indicators" />
+            <Row label="Signal threshold" value="PF ≥ 0.6 (backtested quality)" />
+            <Row label="ADX / EMA weight" value="Higher (trend confirmation)" />
+            <Row label="NEUTRAL suppression" value="No signal if no agreement" />
+          </Block>
+          <Block icon={Target} title="Execution" sub="ATR-based TP/SL · fixed risk % sizing" accent="green">
+            <Row label="Order type" value="Market at current price" />
+            <Row label="TP" value="1.5× ATR from entry" />
+            <Row label="SL" value="1.0× ATR from entry" />
+            <Row label="Size" value="Fixed risk % of account" />
+          </Block>
+          <Block icon={Activity} title="Analytics" sub="P&L every 0.3 s · auto-pause on losses" accent="orange">
+            <Row label="Metrics" value="Win rate, avg profit, max DD, Sharpe-like" />
+            <Row label="Auto-pause" value="N consecutive losses (configurable)" />
+            <Row label="Limitation" value="No adaptive feedback loop" />
+          </Block>
+        </div>
+      </div>
     </div>
   )
 }
 
-function TradingBotsTab() {
+// ─── Bots Tab ─────────────────────────────────────────────────────────────────
+
+function BotsTab() {
+  const bots = [
+    {
+      icon: Layers, title: "Grid Bot", accent: "blue" as AccentKey,
+      sub: "range-bound buy-low / sell-high at fixed grid lines",
+      rows: [
+        ["Grid lines", "5 – 50 levels"],
+        ["Order size", "Capital ÷ levels"],
+        ["Profit source", "Grid spacing % per crossing"],
+        ["Optimal market", "Sideways / ranging"],
+        ["Range break", "Pauses — waits for re-entry"],
+      ],
+    },
+    {
+      icon: TrendingUp, title: "DCA Bot", accent: "purple" as AccentKey,
+      sub: "accumulate on dips · take profit on recovery",
+      rows: [
+        ["Entry spacing", "N% price drop from last entry"],
+        ["Max safety orders", "5 (configurable)"],
+        ["TP", "% above avg entry (all orders)"],
+        ["Optimal market", "Downtrend w/ expected recovery"],
+        ["Risk note", "Large exposure on sustained drop"],
+      ],
+    },
+    {
+      icon: GitBranch, title: "Arbitrage Bot", accent: "orange" as AccentKey,
+      sub: "inter-exchange price diff · buy low sell high simultaneously",
+      rows: [
+        ["Type", "Inter-exchange (e.g. BingX ↔ Bybit)"],
+        ["Detection", "Real-time bid/ask spread monitor"],
+        ["Min spread", "Fees + slippage + profit margin"],
+        ["Latency req.", "Sub-100 ms execution"],
+        ["Requirement", "Balance on both exchanges"],
+      ],
+    },
+    {
+      icon: Activity, title: "Market Making Bot", accent: "green" as AccentKey,
+      sub: "post limit orders at mid ± spread · capture bid-ask",
+      rows: [
+        ["Spread", "0.05 – 0.5 % (configurable)"],
+        ["Refresh", "Every N s or on fill"],
+        ["Inventory mgmt", "Adjust quote size by position"],
+        ["Optimal market", "Liquid pairs, high volume"],
+        ["Risk", "Directional exposure in trends"],
+      ],
+    },
+  ]
+
   return (
-    <div className="space-y-6">
-      <Alert className="border-l-4 border-l-primary">
-        <Bot className="h-4 w-4" />
-        <AlertDescription>
-          <strong>Trading Bots:</strong> Automated trading strategies with custom configurations and risk management.
-        </AlertDescription>
-      </Alert>
-      <Card>
-        <CardHeader>
-          <CardTitle>Bot Trading Configuration</CardTitle>
-          <CardDescription>Manage automated trading bots</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="rounded-lg border-l-4 border-l-blue-500 bg-blue-500/5 p-4">
-            <div className="mb-2 font-medium">Bot Types</div>
-            <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-              <div>Grid Trading, DCA, Arbitrage, Market Making</div>
+    <div className="space-y-3">
+      <div className="rounded-md border bg-muted/5 px-3 py-2">
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          <span className="font-semibold text-foreground">Trading Bots</span> run continuously with custom configs,
+          independent of Main System and Preset Mode. Each bot type has distinct mechanics and risk profiles.
+        </p>
+      </div>
+
+      <div className="rounded-md border bg-card">
+        <div className="border-b px-3 py-1.5">
+          <SectionHeader num={1} label="Bot Types" sub="click to expand mechanics & risk" color="blue" />
+        </div>
+        <div className="px-3 py-1.5 space-y-0.5">
+          {bots.map(bot => (
+            <Block key={bot.title} icon={bot.icon} title={bot.title} sub={bot.sub} accent={bot.accent}>
+              {bot.rows.map(([l, v]) => <Row key={l} label={l} value={v} />)}
+            </Block>
+          ))}
+          <Block icon={Cpu} title="Common Config" sub="shared parameters across all bot types" accent="blue">
+            {[
+              ["Symbol", "Trading pair, e.g. BTCUSDT"],
+              ["Exchange", "Target connection (BingX, Bybit…)"],
+              ["Capital", "USDT amount or % of account"],
+              ["Leverage", "1× spot – 20× futures"],
+              ["Global SL", "% to halt bot on drawdown"],
+              ["Global TP", "% session target"],
+              ["Auto-restart", "Resume after TP/SL hit"],
+            ].map(([l, v]) => <Row key={l} label={l} value={v} />)}
+          </Block>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Live Positions Section ───────────────────────────────────────────────────
+
+function LivePositionsSection({ positions }: { positions: LivePosition[] }) {
+  const active = positions.filter(p => p.status === "open" || p.status === "pending" || p.status === "partially_filled")
+  const simulated = positions.filter(p => p.status === "simulated")
+  const all = positions
+
+  if (all.length === 0) return null
+
+  const statusColor = (s: LivePosition["status"]) => {
+    if (s === "open" || s === "filled") return "green"
+    if (s === "pending" || s === "partially_filled") return "orange"
+    if (s === "simulated") return "blue"
+    if (s === "error") return "red"
+    return "default"
+  }
+
+  return (
+    <div className="rounded-md border bg-card">
+      <div className="flex items-center justify-between border-b px-3 py-1.5">
+        <div className="flex items-center gap-1.5">
+          <Activity className="h-3 w-3 text-emerald-400" />
+          <span className="text-[11px] font-semibold uppercase tracking-wider">Live Exchange Positions</span>
+          {active.length > 0 && (
+            <span className="relative flex h-1.5 w-1.5">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-1.5">
+          {active.length > 0 && <Tag color="green">{active.length} active</Tag>}
+          {simulated.length > 0 && <Tag color="blue">{simulated.length} sim</Tag>}
+          <Tag color="default">{all.length} total</Tag>
+        </div>
+      </div>
+      <div className="px-3 py-2 space-y-1">
+        {all.slice(0, 10).map(pos => (
+          <div key={pos.id} className="flex items-center gap-2 rounded border px-2 py-1">
+            <Tag color={pos.direction === "long" ? "green" : "red"}>{pos.direction.toUpperCase()}</Tag>
+            <span className="text-[10px] font-medium tabular-nums w-24 truncate">{pos.symbol}</span>
+            <Tag color={statusColor(pos.status) as any}>{pos.status}</Tag>
+            {pos.orderId && (
+              <span className="text-[9px] font-mono text-muted-foreground hidden sm:inline truncate max-w-[80px]" title={pos.orderId}>
+                #{pos.orderId.slice(0, 8)}
+              </span>
+            )}
+            <span className="text-[10px] text-muted-foreground ml-auto tabular-nums">
+              qty {pos.executedQuantity > 0 ? pos.executedQuantity.toFixed(4) : pos.quantity.toFixed(4)}
+            </span>
+            {pos.exchangeData?.unrealizedPnl !== undefined && (
+              <span className={cn("text-[10px] font-mono tabular-nums", (pos.exchangeData.unrealizedPnl || 0) >= 0 ? "text-emerald-400" : "text-red-400")}>
+                {pos.exchangeData.unrealizedPnl >= 0 ? "+" : ""}{pos.exchangeData.unrealizedPnl.toFixed(2)}
+              </span>
+            )}
+            {pos.exchangeData?.roi !== undefined && (
+              <span className={cn("text-[9px] tabular-nums", (pos.exchangeData.roi || 0) >= 0 ? "text-emerald-400/70" : "text-red-400/70")}>
+                {pos.exchangeData.roi.toFixed(1)}%
+              </span>
+            )}
+            <span className="text-[9px] text-muted-foreground/50 tabular-nums">
+              {new Date(pos.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            </span>
+          </div>
+        ))}
+        {all.length > 10 && (
+          <p className="text-[10px] text-muted-foreground text-center pt-1">+{all.length - 10} more positions</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Queue Card ───────────────────────────────────────────────────────────────
+
+function QueueSection({ queueData }: { queueData: QueueData | null }) {
+  if (!queueData) return null
+  const q = queueData
+  const healthColor = q.workflowHealth === "healthy" ? "green" : q.workflowHealth === "degraded" ? "orange" : "red"
+
+  return (
+    <div className="rounded-md border bg-card">
+      <div className="flex items-center justify-between border-b px-3 py-1.5">
+        <div className="flex items-center gap-1.5">
+          <Database className="h-3 w-3 text-muted-foreground" />
+          <span className="text-[11px] font-semibold uppercase tracking-wider">Order Queue</span>
+        </div>
+        <Tag color={healthColor as any}>{q.workflowHealth || "unknown"}</Tag>
+      </div>
+      <div className="px-3 py-2 space-y-2">
+        <div className="flex flex-wrap gap-x-4 gap-y-1">
+          {[
+            { l: "Queue",     v: q.queueSize         },
+            { l: "Rate/s",    v: q.processingRate     },
+            { l: "Success",   v: `${q.successRate}%`  },
+            { l: "Latency",   v: `${q.avgLatency}ms`  },
+            { l: "Completed", v: q.completedOrders    },
+            { l: "Failed",    v: q.failedOrders       },
+          ].map(m => (
+            <div key={m.l} className="flex flex-col">
+              <span className="text-[9px] uppercase tracking-wider text-muted-foreground">{m.l}</span>
+              <span className="text-xs font-bold tabular-nums">{m.v}</span>
+            </div>
+          ))}
+        </div>
+        {typeof q.processingPressure === "number" && (
+          <div className="space-y-0.5">
+            <div className="flex justify-between text-[10px] text-muted-foreground">
+              <span>Pressure</span><span>{q.processingPressure}%</span>
+            </div>
+            <Progress value={q.processingPressure} className="h-1" />
+          </div>
+        )}
+        {q.workflow?.length > 0 && (
+          <div className="space-y-1 pt-1">
+            <span className="text-[9px] uppercase tracking-wider text-muted-foreground">Workflow Phases</span>
+            <div className="grid grid-cols-2 gap-1.5">
+              {q.workflow.map(p => (
+                <div key={p.id} className="flex items-center justify-between rounded border px-2 py-1 gap-2">
+                  <div className="min-w-0">
+                    <div className="text-[10px] font-medium truncate">{p.label}</div>
+                    <div className="text-[9px] text-muted-foreground truncate">{p.detail}</div>
+                  </div>
+                  <Tag color={p.status === "complete" ? "green" : p.status === "warning" ? "orange" : "default"}>
+                    {p.status}
+                  </Tag>
+                </div>
+              ))}
             </div>
           </div>
-          <div className="rounded-lg border-l-4 border-l-purple-500 bg-purple-500/5 p-4">
-            <div className="mb-2 font-medium">Configuration</div>
-            <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-              <div>Symbol selection, price range, grid spacing, volume per order, TP/SL</div>
-            </div>
+        )}
+        {queueData.focusConnection && (
+          <div className="flex items-center gap-2 border-t pt-2 mt-1 text-[10px] text-muted-foreground">
+            <Shield className="h-2.5 w-2.5 shrink-0" />
+            <span>Focus:</span>
+            <span className="font-medium text-foreground">{queueData.focusConnection.name}</span>
+            <Tag color="blue">{queueData.focusConnection.exchange.toUpperCase()}</Tag>
+            {queueData.focusConnection.liveTradeEnabled && <Tag color="green">Live</Tag>}
+            {queueData.progression && (
+              <span className="ml-auto">
+                {queueData.progression.cyclesCompleted} cycles · {queueData.progression.cycleSuccessRate.toFixed(0)}% ok
+              </span>
+            )}
           </div>
-          <div className="rounded-lg border-l-4 border-l-green-500 bg-green-500/5 p-4">
-            <div className="mb-2 font-medium">Monitoring</div>
-            <div className="ml-4 space-y-1 text-sm text-muted-foreground">
-              <div>Real-time P&L, order execution status, performance analytics, risk metrics</div>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Tab Nav ──────────────────────────────────────────────────────────────────
+
+type Tab = "main" | "preset" | "bots"
+
+function TabBar({ active, onChange }: { active: Tab; onChange: (t: Tab) => void }) {
+  const tabs: { key: Tab; icon: React.ElementType; label: string }[] = [
+    { key: "main",   icon: Activity,  label: "Main System"  },
+    { key: "preset", icon: LineChart, label: "Preset Mode"  },
+    { key: "bots",   icon: Bot,       label: "Trading Bots" },
+  ]
+  return (
+    <div className="flex items-center gap-0.5 rounded-md border bg-muted/20 p-0.5">
+      {tabs.map(t => (
+        <button
+          key={t.key}
+          onClick={() => onChange(t.key)}
+          className={cn(
+            "flex items-center gap-1.5 rounded px-3 py-1.5 text-[11px] font-medium transition-colors",
+            active === t.key
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          <t.icon className="h-3 w-3" />
+          {t.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+// ─── Page ─────────────────────────────────────────────────────────────────────
+
+function LogisticsContent() {
+  const { selectedConnectionId } = useExchange()
+  const connId = selectedConnectionId || "bingx-x01"
+
+  const [tab,          setTab]          = useState<Tab>("main")
+  const [stats,        setStats]        = useState<EngineStats | null>(null)
+  const [queueData,    setQueueData]    = useState<QueueData | null>(null)
+  const [livePos,      setLivePos]      = useState<LivePosition[]>([])
+  const [lastRefresh,  setLastRefresh]  = useState<Date | null>(null)
+  const [refreshing,   setRefreshing]   = useState(false)
+  const pollRef = useRef<ReturnType<typeof setInterval>>()
+
+  const loadAll = useCallback(async (silent = false) => {
+    if (!silent) setRefreshing(true)
+    try {
+      const [statsRes, queueRes, livePosRes] = await Promise.allSettled([
+        fetch(`/api/trading/engine-stats?connection_id=${connId}`, { cache: "no-store" }),
+        // Forward the connectionId so the queue card focuses on the same
+        // exchange connection the sidebar exchange selector has chosen.
+        fetch(`/api/logistics/queue?connectionId=${encodeURIComponent(connId)}`, { cache: "no-store" }),
+        fetch(`/api/trading/live-positions?connection_id=${connId}`, { cache: "no-store" }),
+      ])
+      if (statsRes.status === "fulfilled" && statsRes.value.ok)
+        setStats(await statsRes.value.json())
+      if (queueRes.status === "fulfilled" && queueRes.value.ok)
+        setQueueData(await queueRes.value.json())
+      if (livePosRes.status === "fulfilled" && livePosRes.value.ok) {
+        const d = await livePosRes.value.json()
+        setLivePos(Array.isArray(d) ? d : (d?.positions || []))
+      }
+      setLastRefresh(new Date())
+    } catch { /* non-critical */ }
+    finally { if (!silent) setRefreshing(false) }
+  }, [connId])
+
+  useEffect(() => {
+    loadAll()
+    clearInterval(pollRef.current)
+    pollRef.current = setInterval(() => loadAll(true), 3000)
+    return () => clearInterval(pollRef.current)
+  }, [loadAll])
+
+  const engineRunning = (stats?.indicationCycleCount || 0) > 0
+  const refreshLabel  = lastRefresh ? lastRefresh.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—"
+
+  return (
+    <div className="flex min-h-screen flex-col">
+      {/* Top bar */}
+      <div className="sticky top-0 z-10 flex items-center justify-between border-b bg-background/95 px-4 py-2 backdrop-blur">
+        <div className="flex items-center gap-2">
+          <Dot on={engineRunning} />
+          <span className="text-xs font-semibold uppercase tracking-wider">Logistics</span>
+          <Tag color={engineRunning ? "green" : "default"}>{engineRunning ? "Live" : "Idle"}</Tag>
+          <span className="text-[10px] text-muted-foreground hidden sm:inline">{connId}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-muted-foreground hidden sm:inline">Updated {refreshLabel}</span>
+          <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => loadAll()} disabled={refreshing}>
+            <RefreshCw className={cn("h-3 w-3", refreshing && "animate-spin")} />
+          </Button>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="flex flex-col gap-3 p-4">
+        {/* Tab bar */}
+        <TabBar active={tab} onChange={setTab} />
+
+        {/* Queue section — always visible */}
+        <QueueSection queueData={queueData} />
+
+        {/* Live exchange positions — always visible when data exists */}
+        <LivePositionsSection positions={livePos} />
+
+        {/* Tab content */}
+        {tab === "main"   && <MainSystemTab stats={stats} />}
+        {tab === "preset" && <PresetModeTab />}
+        {tab === "bots"   && <BotsTab />}
+      </div>
     </div>
   )
 }
 
 export default function LogisticsPage() {
-  const [activeTab, setActiveTab] = useState("main")
-  const [systemStatus, setSystemStatus] = useState<SystemStatus>(defaultStatus)
-  const [loading, setLoading] = useState(true)
-  const [queueData, setQueueData] = useState<QueueData | null>(null)
-
-  const fetchSystemStatus = useCallback(async () => {
-    try {
-      console.log("[v0] [Logistics] Fetching system status...")
-      const [statusRes, statsRes, queueRes] = await Promise.all([
-        fetch("/api/trade-engine/status", { cache: "no-store" }),
-        fetch("/api/main/system-stats-v3", { cache: "no-store" }),
-        fetch("/api/logistics/queue", { cache: "no-store" }),
-      ])
-
-      const status = statusRes.ok ? await statusRes.json() : null
-      const stats = statsRes.ok ? await statsRes.json() : null
-      const queue = queueRes.ok ? await queueRes.json() : null
-
-      if (stats) {
-        console.log("[v0] [Logistics] Stats received:", stats)
-        setSystemStatus({
-          initializationProgress: status?.running ? 100 : 0,
-          currentPhase: status?.running ? "Running" : "Stopped",
-          symbolsLoaded: stats?.symbolsCount || 15,
-          totalSymbols: stats?.symbolsCount || 15,
-          prehistoricDataProgress: status?.running ? 100 : 0,
-          tradeEngineRunning: status?.running === true,
-          realTimeStreamConnected: status?.running === true,
-          indicationsGenerated: stats?.cycleStats?.indicationCycles || 0,
-          strategiesEvaluated: stats?.cycleStats?.strategyCycles || 0,
-          pseudoPositionsCreated: stats?.totalPositions || 0,
-          currentInterval: stats?.cycleStats?.cycleCount || 0,
-          intervalExecutionTime: stats?.cycleStats?.cycleDurationMs || 0,
-          lastUpdate: new Date().toISOString(),
-        })
-      }
-
-      if (queue) {
-        console.log("[v0] [Logistics] Queue data:", queue)
-        setQueueData(queue)
-      }
-    } catch (error) {
-      console.error("[v0] [Logistics] Error fetching status:", error)
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    fetchSystemStatus()
-    const interval = setInterval(fetchSystemStatus, 2000)
-    return () => clearInterval(interval)
-  }, [fetchSystemStatus])
-
   return (
     <AuthGuard>
-      <div className="flex min-h-screen w-full flex-col bg-background">
-        <header className="sticky top-0 z-50 w-full border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-          <div className="flex h-14 items-center gap-4 px-4">
-            <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Toggle menu">
-              <Menu className="h-4 w-4" />
-            </Button>
-            <div className="flex flex-1 items-center justify-between">
-              <h1 className="text-lg font-semibold">System Logistics</h1>
-              <div className="flex items-center gap-2">
-                <Badge variant={systemStatus.tradeEngineRunning ? "default" : "secondary"} className="gap-1">
-                  {systemStatus.tradeEngineRunning ? <Activity className="h-3 w-3" /> : <Clock className="h-3 w-3" />}
-                  {systemStatus.tradeEngineRunning ? "Running" : "Initializing"}
-                </Badge>
-              </div>
-            </div>
-          </div>
-        </header>
-
-        <main className="flex-1 space-y-6 p-6">
-          <StatusCards systemStatus={systemStatus} />
-          <RealTimeActivity systemStatus={systemStatus} />
-          <WorkflowPhaseCard queueData={queueData} />
-          <FocusConnectionCard queueData={queueData} />
-          <QuickstartStatusCard queueData={queueData} />
-
-          {/* Order Queue Logistics */}
-          {queueData && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <Database className="h-5 w-5" />
-                  Order Queue Logistics
-                </CardTitle>
-                <CardDescription>Real-time order processing metrics</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="grid gap-4 md:grid-cols-6">
-                  <div className="space-y-2">
-                    <div className="text-sm text-muted-foreground">Queue Size</div>
-                    <div className="text-2xl font-bold text-blue-500">{queueData.queueSize || 0}</div>
-                  </div>
-                  <div className="space-y-2">
-                    <div className="text-sm text-muted-foreground">Processing Rate</div>
-                    <div className="text-2xl font-bold text-green-500">{queueData.processingRate || 0}/s</div>
-                  </div>
-                  <div className="space-y-2">
-                    <div className="text-sm text-muted-foreground">Success Rate</div>
-                    <div className="text-2xl font-bold text-purple-500">{queueData.successRate || 0}%</div>
-                  </div>
-                  <div className="space-y-2">
-                    <div className="text-sm text-muted-foreground">Avg Latency</div>
-                    <div className="text-2xl font-bold text-orange-500">{queueData.avgLatency || 0}ms</div>
-                  </div>
-                  <div className="space-y-2">
-                    <div className="text-sm text-muted-foreground">Completed</div>
-                    <div className="text-2xl font-bold text-green-600">{queueData.completedOrders || 0}</div>
-                  </div>
-                  <div className="space-y-2">
-                    <div className="text-sm text-muted-foreground">Failed</div>
-                    <div className="text-2xl font-bold text-red-500">{queueData.failedOrders || 0}</div>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          )}
-
-          <Separator />
-
-          <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-            <TabsList className="grid w-full max-w-md grid-cols-3">
-              <TabsTrigger value="main" className="flex items-center gap-2">
-                <Layers className="h-4 w-4" />
-                Main System
-              </TabsTrigger>
-              <TabsTrigger value="preset" className="flex items-center gap-2">
-                <Database className="h-4 w-4" />
-                Preset Mode
-              </TabsTrigger>
-              <TabsTrigger value="bot" className="flex items-center gap-2">
-                <Bot className="h-4 w-4" />
-                Trading Bots
-              </TabsTrigger>
-            </TabsList>
-
-            <TabsContent value="main" className="mt-6">
-              <MainSystemTab systemStatus={systemStatus} />
-            </TabsContent>
-            <TabsContent value="preset" className="mt-6">
-              <PresetModeTab />
-            </TabsContent>
-            <TabsContent value="bot" className="mt-6">
-              <TradingBotsTab />
-            </TabsContent>
-          </Tabs>
-        </main>
-      </div>
+      <LogisticsContent />
     </AuthGuard>
   )
 }

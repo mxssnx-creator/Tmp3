@@ -105,7 +105,7 @@ interface ComprehensiveAnalytics {
 }
 
 export default function StatisticsPage() {
-  const { selectedExchange } = useExchange()
+  const { selectedExchange, selectedConnectionId } = useExchange()
   const [activeTab, setActiveTab] = useState("overview")
   const [analyticsEngine, setAnalyticsEngine] = useState<AnalyticsEngine | null>(null)
   const [hasRealConnections, setHasRealConnections] = useState(false)
@@ -157,6 +157,8 @@ export default function StatisticsPage() {
         }
 
         if (activeConnections.length === 0) {
+          // No real connections configured — fall back to demo positions so
+          // the analytics views remain explorable on a fresh install.
           const tradingEngine = new TradingEngine()
           const connections = ["bybit-x03", "bingx-x01", "pionex-x01"]
           const positions: TradingPosition[] = []
@@ -171,6 +173,72 @@ export default function StatisticsPage() {
           const engine = new AnalyticsEngine(positions)
           setAnalyticsEngine(engine)
           updateAnalytics(engine, filter)
+        } else {
+          // Real connections exist — pull the actual positions for the
+          // currently-selected exchange connection (or merge all active ones
+          // if the user hasn't picked one yet) and feed them into the
+          // analytics engine. This was the last page still running on
+          // fabricated mock data even when the user had live connections.
+          try {
+            const scopeIds: string[] = selectedConnectionId
+              ? [selectedConnectionId]
+              : activeConnections.map((c: any) => c.id).filter(Boolean)
+
+            const responses = await Promise.all(
+              scopeIds.map((id: string) =>
+                fetch(`/api/data/positions?connectionId=${encodeURIComponent(id)}`, { cache: "no-store" })
+                  .then((r) => (r.ok ? r.json() : null))
+                  .catch(() => null),
+              ),
+            )
+
+            const merged: TradingPosition[] = []
+            for (const payload of responses) {
+              if (payload && payload.success && Array.isArray(payload.data)) {
+                for (const p of payload.data) {
+                  // Shape payload from /api/data/positions (camelCase) into the
+                  // snake_case TradingPosition the AnalyticsEngine consumes.
+                  const entryPrice = Number(p.entryPrice) || 0
+                  const currentPrice = Number(p.currentPrice) || 0
+                  const quantity = Number(p.quantity) || 0
+                  const leverage = Number(p.leverage) || 1
+                  const unrealized = Number(p.unrealizedPnl) || 0
+                  merged.push({
+                    id: p.id,
+                    connection_id: payload.connectionId || "",
+                    symbol: p.symbol,
+                    strategy_type: "real",
+                    volume: quantity,
+                    entry_price: entryPrice,
+                    current_price: currentPrice,
+                    takeprofit: p.takeProfitPrice ? Number(p.takeProfitPrice) : undefined,
+                    stoploss: p.stopLossPrice ? Number(p.stopLossPrice) : undefined,
+                    profit_loss: unrealized,
+                    status: p.status === "closed" ? "closed" : "open",
+                    opened_at: p.createdAt || new Date().toISOString(),
+                    closed_at: p.status === "closed" ? p.createdAt : undefined,
+                    position_side: String(p.side || "LONG").toLowerCase() as "long" | "short",
+                    leverage,
+                    indication_type: "direction",
+                    unrealized_pnl: unrealized,
+                    realized_pnl: 0,
+                    margin_used: entryPrice * quantity / Math.max(leverage, 1),
+                    fees_paid: 0,
+                    hold_time: 0,
+                    max_profit: Math.max(0, unrealized),
+                    max_loss: Math.min(0, unrealized),
+                  } as TradingPosition)
+                }
+              }
+            }
+
+            setMockPositions(merged)
+            const engine = new AnalyticsEngine(merged)
+            setAnalyticsEngine(engine)
+            updateAnalytics(engine, filter)
+          } catch (err) {
+            console.error("[v0] [Statistics] Failed to load real positions:", err)
+          }
         }
       } catch (error) {
         console.error("Failed to check connections:", error)
@@ -180,7 +248,7 @@ export default function StatisticsPage() {
     }
 
     initialize()
-  }, [selectedExchange])
+  }, [selectedExchange, selectedConnectionId])
 
   const updateAnalytics = (engine: AnalyticsEngine, currentFilter: AnalyticsFilter) => {
     const strategies = engine.generateStrategyAnalytics(currentFilter)
@@ -529,9 +597,12 @@ export default function StatisticsPage() {
 
   if (isLoading) {
     return (
-      <div className="container mx-auto p-6">
-        <div className="text-center py-12">
-          <div className="text-muted-foreground">Loading statistics...</div>
+      <div className="p-4">
+        <div className="flex items-center justify-center min-h-[50vh]">
+          <div className="text-center space-y-3">
+            <div className="animate-spin rounded-full h-8 w-8 border-2 border-muted border-t-primary mx-auto"></div>
+            <div className="text-sm text-muted-foreground">Loading statistics&hellip;</div>
+          </div>
         </div>
       </div>
     )
@@ -539,127 +610,93 @@ export default function StatisticsPage() {
 
   if (hasRealConnections) {
     return (
-      <div className="container mx-auto p-6">
-        <div className="text-center py-12">
-          <h2 className="text-2xl font-bold mb-4">Real Trading Data</h2>
-          <p className="text-muted-foreground">
-            Statistics will be populated with real trading data from your active connections.
-          </p>
-        </div>
+      <div className="p-4">
+        <PageHeader title="Advanced Statistics" description="Analytics are populating with real trading data from your active connections." />
+        <Card className="mt-4">
+          <CardContent className="py-12 text-center space-y-2">
+            <BarChart3 className="h-12 w-12 text-muted-foreground/50 mx-auto" />
+            <div className="text-sm text-muted-foreground">
+              Real-data view is active. Statistics will appear here as your engine generates trades.
+            </div>
+          </CardContent>
+        </Card>
       </div>
     )
   }
 
+  /*
+   * Modernized the mock-data view:
+   *   - Shared PageHeader replaces the bespoke `<h1>` + big icon.
+   *   - Full-width demo-data banner moved above the header for visibility.
+   *   - The 6-card big stats row swapped for the compact icon-pill pattern
+   *     used across the rest of the sidebar so vertical space is reclaimed
+   *     for the charts below.
+   */
   return (
-    <div className="container mx-auto p-6 space-y-6">
-      <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4">
-        <div className="flex items-center gap-2">
-          <AlertTriangle className="h-5 w-5 text-yellow-500" />
+    <div className="p-4 space-y-4">
+      <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3">
+        <div className="flex items-start gap-2">
+          <AlertTriangle className="h-4 w-4 text-amber-500 mt-0.5 flex-shrink-0" />
           <div>
-            <div className="font-semibold text-yellow-700 dark:text-yellow-400">Using Mock Data</div>
-            <div className="text-sm text-yellow-600 dark:text-yellow-500">
+            <div className="text-xs font-semibold text-foreground">Using Mock Data</div>
+            <div className="text-xs text-muted-foreground">
               No active exchange connections found. Enable a connection in Settings to see real statistics.
             </div>
           </div>
         </div>
       </div>
 
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold flex items-center gap-3">
-            <BarChart3 className="h-8 w-8 text-blue-500" />
-            Advanced Statistics & Analytics
-          </h1>
-          <p className="text-muted-foreground">AI-powered comprehensive trading performance analysis with optimal strategy recommendations</p>
-        </div>
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <PageHeader
+          title="Advanced Statistics & Analytics"
+          description="AI-powered trading performance analysis with optimal strategy recommendations"
+        />
         <div className="flex items-center gap-2">
-          <Badge variant="secondary" className="flex items-center gap-1">
+          <Badge variant="secondary" className="h-7 gap-1">
             <Brain className="h-3 w-3" />
             AI Analysis
           </Badge>
-          <Button onClick={() => analyticsEngine && updateAnalytics(analyticsEngine, filter)}>
-            <RefreshCw className="h-4 w-4 mr-2" />
+          <Button
+            onClick={() => analyticsEngine && updateAnalytics(analyticsEngine, filter)}
+            size="sm"
+            className="h-8 text-xs"
+          >
+            <RefreshCw className="h-3 w-3 mr-1" />
             Refresh Analysis
           </Button>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-2">
-              <BarChart3 className="h-5 w-5 text-blue-500" />
-              <div>
-                <div className="text-2xl font-bold">{overviewStats.totalStrategies}</div>
-                <div className="text-sm text-muted-foreground">Total Strategies</div>
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
+        {[
+          { icon: BarChart3,  label: "Total Strategies", value: overviewStats.totalStrategies, tint: "text-primary" },
+          { icon: TrendingUp, label: "Profitable",       value: overviewStats.profitableStrategies, tint: "text-green-500" },
+          { icon: Activity,   label: "Total Trades",     value: overviewStats.totalTrades, tint: "text-indigo-500" },
+          {
+            icon: TrendingDown, // reused lucide icon, avoiding an extra DollarSign import; the stat card label explains the metric
+            label: "Total P&L",
+            value: formatCurrency(overviewStats.totalPnL),
+            tint: overviewStats.totalPnL >= 0 ? "text-green-500" : "text-red-500",
+          },
+          { icon: PieChartIcon, label: "Avg Win Rate",   value: `${(overviewStats.avgWinRate * 100).toFixed(1)}%`, tint: "text-amber-500" },
+          { icon: Award,        label: "Best Strategy",  value: overviewStats.bestStrategy, tint: "text-primary", isWide: true },
+        ].map((stat) => (
+          <Card key={stat.label} className="border-border bg-card">
+            <CardContent className="p-2 flex items-center gap-2">
+              <div className={`rounded bg-muted/60 p-1.5 ${stat.tint}`}>
+                <stat.icon className="h-3.5 w-3.5" />
               </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-2">
-              <TrendingUp className="h-5 w-5 text-green-500" />
-              <div>
-                <div className="text-2xl font-bold">{overviewStats.profitableStrategies}</div>
-                <div className="text-sm text-muted-foreground">Profitable</div>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-2">
-              <Activity className="h-5 w-5 text-purple-500" />
-              <div>
-                <div className="text-2xl font-bold">{overviewStats.totalTrades}</div>
-                <div className="text-sm text-muted-foreground">Total Trades</div>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-2">
-              <div className={`h-5 w-5 rounded ${overviewStats.totalPnL >= 0 ? "bg-green-500" : "bg-red-500"}`} />
-              <div>
-                <div
-                  className={`text-2xl font-bold ${overviewStats.totalPnL >= 0 ? "text-green-600" : "text-red-600"}`}
-                >
-                  {formatCurrency(overviewStats.totalPnL)}
+              <div className="min-w-0">
+                <div className={`${stat.isWide ? "text-sm" : "text-base"} font-bold tabular-nums truncate ${stat.tint}`}>
+                  {stat.value}
                 </div>
-                <div className="text-sm text-muted-foreground">Total P&L</div>
+                <div className="text-[10px] text-muted-foreground uppercase tracking-wide truncate">
+                  {stat.label}
+                </div>
               </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-2">
-              <PieChartIcon className="h-5 w-5 text-orange-500" />
-              <div>
-                <div className="text-2xl font-bold">{(overviewStats.avgWinRate * 100).toFixed(1)}%</div>
-                <div className="text-sm text-muted-foreground">Avg Win Rate</div>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-2">
-              <div className="h-5 w-5 bg-cyan-500 rounded" />
-              <div>
-                <div className="text-lg font-bold truncate">{overviewStats.bestStrategy}</div>
-                <div className="text-sm text-muted-foreground">Best Strategy</div>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+            </CardContent>
+          </Card>
+        ))}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">

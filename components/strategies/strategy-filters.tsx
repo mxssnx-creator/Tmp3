@@ -43,7 +43,8 @@ export function StrategyFilters({ filters, onFiltersChange }: StrategyFiltersPro
     })
   }
 
-  const mainStrategyTypes = ["Base", "Main", "Real"]
+  // Live = exchange-side outcomes tracked locally (no exchange-history fetch)
+  const mainStrategyTypes = ["Base", "Main", "Real", "Live"]
   const validationStates = ["valid", "invalid", "pending"]
 
   return (

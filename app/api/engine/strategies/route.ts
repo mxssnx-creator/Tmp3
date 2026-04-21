@@ -116,7 +116,7 @@ export async function GET(req: NextRequest) {
           }
         }
       } catch (queryErr) {
-        console.warn(`[v0] [EngineStrategies] Error querying strategy counts:`, queryErr)
+        console.warn(`[EngineStrategies] Error querying strategy counts:`, queryErr)
       }
       
       const response = {

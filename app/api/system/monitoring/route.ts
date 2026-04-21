@@ -87,24 +87,49 @@ export async function GET() {
     let strategiesRunning = false
     let redisActiveEngineCount = 0
     
+    // PRIMARY: read live progression hashes (written every cycle — always current)
     try {
-      const connectionStateKeys = allKeys.filter((k: string) => k.startsWith("settings:trade_engine_state:"))
-      for (const stateKey of connectionStateKeys) {
+      const progressionKeys = allKeys.filter((k: string) => k.startsWith("progression:") && !k.includes(":"))
+      for (const progKey of progressionKeys) {
         try {
-          const stateStr = await client.get(stateKey)
-          if (stateStr) {
-            const state = JSON.parse(stateStr)
-            totalIndicationCycles += Number(state.indication_cycle_count) || 0
-            totalStrategyCycles += Number(state.strategy_cycle_count) || 0
-            if (state.status === "running") {
-              indicationsRunning = true
-              strategiesRunning = true
+          const progHash = await client.hgetall(progKey)
+          if (progHash && typeof progHash === "object") {
+            const indCycles  = Number(progHash.indication_cycle_count)  || 0
+            const stratCycles = Number(progHash.strategy_cycle_count)   || 0
+            if (indCycles > 0 || stratCycles > 0) {
+              totalIndicationCycles += indCycles
+              totalStrategyCycles   += stratCycles
+              indicationsRunning     = true
+              strategiesRunning      = true
               redisActiveEngineCount++
             }
           }
         } catch {}
       }
     } catch {}
+
+    // FALLBACK: settings:trade_engine_state:* keys (stale — every 50-100 cycles)
+    // Only used when live progression hash is empty (engine just started)
+    if (totalIndicationCycles === 0) {
+      try {
+        const connectionStateKeys = allKeys.filter((k: string) => k.startsWith("settings:trade_engine_state:"))
+        for (const stateKey of connectionStateKeys) {
+          try {
+            const stateStr = await client.get(stateKey)
+            if (stateStr) {
+              const state = JSON.parse(stateStr)
+              totalIndicationCycles += Number(state.indication_cycle_count) || 0
+              totalStrategyCycles   += Number(state.strategy_cycle_count)   || 0
+              if (state.status === "running") {
+                indicationsRunning     = true
+                strategiesRunning      = true
+                redisActiveEngineCount++
+              }
+            }
+          } catch {}
+        }
+      } catch {}
+    }
     
     let redisEngineRunning = false
     try {

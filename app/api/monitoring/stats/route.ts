@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server"
-import { initRedis, getActiveConnectionsForEngine, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getAllConnections, getRedisClient } from "@/lib/redis-db"
 import { RedisMonitoring, RedisPositions, RedisTrades } from "@/lib/redis-operations"
 
 export const dynamic = "force-dynamic"
@@ -12,15 +12,21 @@ export async function GET(request: NextRequest) {
 
     await initRedis()
 
-    // Get ONLY active connections (is_enabled_dashboard = true) for monitoring
-    let connections = await getActiveConnectionsForEngine()
+    // Use all connections for position/trade queries; filter for active-inserted engines
+    const allConns = await getAllConnections()
+    let connections = allConns
 
     if (exchangeFilter) {
       connections = connections.filter((c: any) => c.exchange === exchangeFilter)
     }
 
+    // Active connections = those with a running engine (active-inserted or dashboard-enabled)
     const activeConnections = connections.filter(
-      (c: any) => c.is_active === true || c.is_active === "true",
+      (c: any) =>
+        c.is_active_inserted === true || c.is_active_inserted === "1" ||
+        c.is_assigned === true || c.is_assigned === "1" ||
+        c.is_active === true || c.is_active === "true" ||
+        c.is_enabled_dashboard === true || c.is_enabled_dashboard === "1",
     )
 
     let totalPositions = 0
@@ -52,6 +58,32 @@ export async function GET(request: NextRequest) {
 
     const stats = await RedisMonitoring.getStatistics()
 
+    // Get real engine progression data from Redis
+    let totalCycles = 0
+    let totalIndications = 0
+    let totalStrategies = 0
+    
+    try {
+      const client = getRedisClient()
+      // progression:* keys are Redis HASHES (written with hset/hincrby) — must use hgetall
+      const progressionKeys = await client.keys("progression:*")
+      
+      for (const key of progressionKeys) {
+        try {
+          const hash = await client.hgetall(key)
+          if (hash) {
+            totalCycles      += parseInt(hash.indication_cycle_count || "0", 10)
+            totalIndications += parseInt(hash.indications_count      || "0", 10)
+            totalStrategies  += parseInt(hash.strategies_count       || "0", 10)
+          }
+        } catch (e) {
+          // Silently skip errors per key
+        }
+      }
+    } catch (e) {
+      // non-critical
+    }
+
     return NextResponse.json({
       activeConnections: activeConnections.length,
       totalConnections: connections.length,
@@ -61,7 +93,18 @@ export async function GET(request: NextRequest) {
       dailyPnL: Number(dailyPnL.toFixed(2)),
       unrealizedPnL: Number(unrealizedPnL.toFixed(2)),
       totalBalance: Number((dailyPnL + unrealizedPnL).toFixed(2)),
-      statistics: stats,
+      statistics: {
+        ...stats,
+        totalCycles,
+        totalIndications,
+        totalStrategies,
+        avgCycleDuration: stats?.avgCycleDuration || 0,
+        winRate250: stats?.winRate250 || 0.5,
+        profitFactor250: stats?.profitFactor250 || 1.0,
+        winRate50: stats?.winRate50 || 0.5,
+        profitFactor50: stats?.profitFactor50 || 1.0,
+        uptime: stats?.uptime || (totalCycles > 0 ? `${totalCycles} cycles` : "Starting..."),
+      },
       timestamp: new Date().toISOString(),
     })
   } catch (error) {

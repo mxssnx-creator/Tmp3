@@ -65,6 +65,8 @@ export function ConnectionStateProvider({ children }: { children: ReactNode }) {
   // Prevent concurrent loads and excessive queries
   const loadingRef = useRef<{ base: boolean; active: boolean }>({ base: false, active: false })
   const lastLoadRef = useRef<{ base: number; active: number }>({ base: 0, active: 0 })
+  // Ref to hold current exchangeConnectionsActiveStatus so async callbacks are never stale
+  const activeStatusRef = useRef<Map<string, boolean>>(new Map())
   const LOAD_COOLDOWN = 5000 // 5 seconds between same-type loads (reduced from 30s for better UX)
 
   // Load all connections for Settings (single unified function)
@@ -110,7 +112,7 @@ export function ConnectionStateProvider({ children }: { children: ReactNode }) {
         }
       }
     } catch (error) {
-      console.error("[v0] [ConnectionState] Failed to load base connections:", error)
+      console.error("[ConnectionState] Failed to load base connections:", error)
     } finally {
       loadingRef.current.base = false
       setIsBaseLoading(false)
@@ -136,34 +138,35 @@ export function ConnectionStateProvider({ children }: { children: ReactNode }) {
         const data = await response.json()
         const allConnections = data.connections || []
         
-        // Show ALL inserted connections (not just 4 hardcoded exchanges)
-        // Matches the same logic as DashboardActiveConnectionsManager
+        // Filter matches DashboardActiveConnectionsManager exactly:
+        //   - BASE_EXCHANGES (bybit, bingx) always show
+        //   - Non-base connections show only when explicitly assigned to Active panel
+        //   - is_inserted alone does NOT qualify (that's Settings-level visibility)
         const BASE_EXCHANGES = ["bybit", "bingx"]
         const activeConns = allConnections.filter((c: any) => {
           const exchange = (c.exchange || "").toLowerCase().trim()
           const isBase = BASE_EXCHANGES.includes(exchange)
-          const isInserted = c.is_inserted === true || c.is_inserted === "1" || c.is_inserted === "true"
-          const isDashboardActive = c.is_enabled_dashboard === true || c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === "true"
-          return isBase || isInserted || isDashboardActive
+          const isActiveInserted = toBoolean(c.is_active_inserted) || toBoolean(c.is_dashboard_inserted)
+          const isDashboardActive = toBoolean(c.is_enabled_dashboard)
+          return isBase || isActiveInserted || isDashboardActive
         })
         
         setExchangeConnectionsActive(activeConns)
         
-        // PRESERVE EXISTING DASHBOARD TOGGLE STATE - only update for new connections
-        // This prevents overwriting user's manual toggle changes
-        const newStatusMap = new Map<string, boolean>(exchangeConnectionsActiveStatus) // Copy existing state
+        // PRESERVE EXISTING DASHBOARD TOGGLE STATE — use ref to avoid stale closure
+        // Only initialise status for new connections, preserve existing user toggle state
+        const newStatusMap = new Map<string, boolean>(activeStatusRef.current)
         activeConns.forEach((conn: ExchangeConnection) => {
-          // Only initialize status for new connections, preserve existing user toggle state
           if (!newStatusMap.has(conn.id)) {
-            const isDashboardEnabled = (conn as any).is_enabled_dashboard === true || (conn as any).is_enabled_dashboard === "1" || (conn as any).is_enabled_dashboard === "true"
+            const isDashboardEnabled = toBoolean((conn as any).is_enabled_dashboard)
             newStatusMap.set(conn.id, isDashboardEnabled)
           }
-          // Keep existing user toggle state unchanged
         })
+        activeStatusRef.current = newStatusMap
         setExchangeConnectionsActiveStatus(newStatusMap)
       }
     } catch (error) {
-      console.error("[v0] [ConnectionState] Failed to load Active Connections:", error)
+      console.error("[ConnectionState] Failed to load active connections:", error)
     } finally {
       loadingRef.current.active = false
       setIsExchangeConnectionsActiveLoading(false)
@@ -208,11 +211,7 @@ export function ConnectionStateProvider({ children }: { children: ReactNode }) {
       const currentStatus = next.get(id) ?? false
       const newStatus = !currentStatus
       next.set(id, newStatus)
-      
-      // Find the connection to log its name
-      const conn = exchangeConnectionsActive.find(c => c.id === `active-${id}`) || exchangeConnectionsActive.find(c => c.id === id)
-      const connName = conn?.name || conn?.id || id
-      console.log(`[v0] [ConnectionStateToggle] ${newStatus ? "✓ ENABLED" : "✗ DISABLED"}: ${connName} (${id})`)
+      activeStatusRef.current = next
       
       return next
     })

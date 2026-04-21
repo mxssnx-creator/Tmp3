@@ -53,6 +53,13 @@ export interface StrategyStageMetrics {
   passRate: number
   avgProfitFactor: number
   avgDrawdownTime: number // minutes
+  // Real-stage specific: average position evaluation score (0–1)
+  avgPosEvalReal?: number
+  // Extra detail fields for prehistoric display
+  timeframeSeconds?: number
+  intervalsProcessed?: number
+  missingIntervalsLoaded?: number
+  rangeDays?: number
 }
 
 export interface EngineProgressState {
@@ -141,9 +148,9 @@ export class EngineProgressManager {
       lastCycleTime: null,
       indicationMetrics: {},
       strategyMetrics: {
-        base: { stage: 'base', setsCount: 0, evaluated: 0, passed: 0, failed: 0, passRate: 0, avgProfitFactor: 0, avgDrawdownTime: 0 },
-        main: { stage: 'main', setsCount: 0, evaluated: 0, passed: 0, failed: 0, passRate: 0, avgProfitFactor: 0, avgDrawdownTime: 0 },
-        real: { stage: 'real', setsCount: 0, evaluated: 0, passed: 0, failed: 0, passRate: 0, avgProfitFactor: 0, avgDrawdownTime: 0 },
+        base: { stage: 'base', setsCount: 0, evaluated: 0, passed: 0, failed: 0, passRate: 0, avgProfitFactor: 0, avgDrawdownTime: 0, avgPosEvalReal: 0 },
+        main: { stage: 'main', setsCount: 0, evaluated: 0, passed: 0, failed: 0, passRate: 0, avgProfitFactor: 0, avgDrawdownTime: 0, avgPosEvalReal: 0 },
+        real: { stage: 'real', setsCount: 0, evaluated: 0, passed: 0, failed: 0, passRate: 0, avgProfitFactor: 0, avgDrawdownTime: 0, avgPosEvalReal: 0 },
       },
       symbols: {},
       errors: [],
@@ -335,7 +342,17 @@ export class EngineProgressManager {
   // Strategy Metrics
   // ============================================
 
-  async updateStrategyMetrics(stage: 'base' | 'main' | 'real', setsCount: number, evaluated: number, passed: number, failed: number, avgPF: number, avgDDT: number): Promise<void> {
+  async updateStrategyMetrics(
+    stage: 'base' | 'main' | 'real',
+    setsCount: number,
+    evaluated: number,
+    passed: number,
+    failed: number,
+    avgPF: number,
+    avgDDT: number,
+    avgPosEvalReal: number = 0,
+    extras?: { timeframeSeconds?: number; intervalsProcessed?: number; missingIntervalsLoaded?: number; rangeDays?: number }
+  ): Promise<void> {
     const m = this.state.strategyMetrics[stage]
     m.setsCount = setsCount
     m.evaluated = evaluated
@@ -344,6 +361,13 @@ export class EngineProgressManager {
     m.passRate = evaluated > 0 ? (passed / evaluated) * 100 : 0
     m.avgProfitFactor = avgPF
     m.avgDrawdownTime = avgDDT
+    m.avgPosEvalReal = avgPosEvalReal
+    if (extras) {
+      if (extras.timeframeSeconds !== undefined) m.timeframeSeconds = extras.timeframeSeconds
+      if (extras.intervalsProcessed !== undefined) m.intervalsProcessed = extras.intervalsProcessed
+      if (extras.missingIntervalsLoaded !== undefined) m.missingIntervalsLoaded = extras.missingIntervalsLoaded
+      if (extras.rangeDays !== undefined) m.rangeDays = extras.rangeDays
+    }
     await this.saveState()
   }
 

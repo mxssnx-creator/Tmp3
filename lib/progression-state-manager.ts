@@ -171,25 +171,44 @@ export class ProgressionStateManager {
 
       const redisKey = `progression:${connectionId}`
 
-      // Read current values from Redis first (to handle server restarts)
-      let existing: Record<string, string> = {}
+      // CRITICAL FIX: use atomic hincrby instead of read-modify-write hset.
+      // Three processors (indication/strategy/realtime) call incrementCycle
+      // concurrently. The old read-then-write pattern had a race window that
+      // dropped updates, which contributed to jumping/inconsistent counters
+      // across refreshes. hincrby is atomic at the Redis level.
+      let newCompleted = 0
+      let newSuccessful = 0
+      let newFailed = 0
       try {
-        existing = await client.hgetall(redisKey)
+        // Fire the counter increment + the read of the non-incremented counter
+        // concurrently. The two operations are independent (hincrby on one
+        // field, hget on another) so there is no ordering constraint, and we
+        // save one Redis round-trip per cycle.
+        if (successful) {
+          const [completed, successCount, failedStr] = await Promise.all([
+            client.hincrby(redisKey, "cycles_completed", 1),
+            client.hincrby(redisKey, "successful_cycles", 1),
+            client.hget(redisKey, "failed_cycles"),
+          ])
+          newCompleted = Number(completed) || 0
+          newSuccessful = Number(successCount) || 0
+          newFailed = parseInt((failedStr as any) || "0", 10)
+        } else {
+          const [completed, failCount, successStr] = await Promise.all([
+            client.hincrby(redisKey, "cycles_completed", 1),
+            client.hincrby(redisKey, "failed_cycles", 1),
+            client.hget(redisKey, "successful_cycles"),
+          ])
+          newCompleted = Number(completed) || 0
+          newFailed = Number(failCount) || 0
+          newSuccessful = parseInt((successStr as any) || "0", 10)
+        }
       } catch (e) {
-        console.warn(`[v0] Failed to read progression data for ${connectionId}:`, e)
+        console.warn(`[v0] Failed to increment progression counters for ${connectionId}:`, e)
         return
       }
 
-      const currentCompleted = parseInt(existing?.cycles_completed || "0", 10)
-      const currentSuccessful = parseInt(existing?.successful_cycles || "0", 10)
-      const currentFailed = parseInt(existing?.failed_cycles || "0", 10)
-
-      // Increment based on Redis values
-      const newCompleted = currentCompleted + 1
-      const newSuccessful = successful ? currentSuccessful + 1 : currentSuccessful
-      const newFailed = successful ? currentFailed : currentFailed + 1
-
-      // Update local counter for tracking
+      // Update local counter for tracking (best-effort mirror; not authoritative)
       this.cycleCounters.set(connectionId, {
         completed: newCompleted,
         successful: newSuccessful,
@@ -198,22 +217,20 @@ export class ProgressionStateManager {
 
       const successRate = newCompleted > 0 ? (newSuccessful / newCompleted) * 100 : 0
 
-      // Write update to Redis
+      // Write metadata (non-counter fields) + expire in parallel.
       try {
-        await client.hset(redisKey, {
-          cycles_completed: String(newCompleted),
-          successful_cycles: String(newSuccessful),
-          failed_cycles: String(newFailed),
-          cycle_success_rate: String(successRate.toFixed(2)),
-          last_cycle_time: new Date().toISOString(),
-          last_update: new Date().toISOString(),
-          connection_id: connectionId,
-        })
-
-        // Set expiration
-        await client.expire(redisKey, 7 * 24 * 60 * 60)
+        const nowIso = new Date().toISOString()
+        await Promise.all([
+          client.hset(redisKey, {
+            cycle_success_rate: String(successRate.toFixed(2)),
+            last_cycle_time: nowIso,
+            last_update: nowIso,
+            connection_id: connectionId,
+          }),
+          client.expire(redisKey, 7 * 24 * 60 * 60),
+        ])
       } catch (writeError) {
-        console.warn(`[v0] Failed to write progression data for ${connectionId}:`, writeError)
+        console.warn(`[v0] Failed to write progression metadata for ${connectionId}:`, writeError)
         return
       }
 
@@ -235,26 +252,37 @@ export class ProgressionStateManager {
       const client = getRedisClient()
       const key = `progression:${connectionId}`
 
-      // Get current state
-      const current = await this.getProgressionState(connectionId)
+      // PERFORMANCE: The previous implementation called `getProgressionState`
+      // which does a full `hgetall` + JSON parse on every call — expensive
+      // and unnecessary. We now use atomic hincrby for the counter and a
+      // per-connection Set for the processed symbols which deduplicates in
+      // O(1) Redis-side without needing to re-read the whole hash.
+      const symbolsSetKey = `${key}:prehistoric_symbols_set`
+      const nowIso = new Date().toISOString()
 
-      // Update prehistoric metrics
-      const prehistoricCycles = (current.prehistoricCyclesCompleted || 0) + 1
-      const symbolsProcessed = current.prehistoricSymbolsProcessed || []
-      
-      if (!symbolsProcessed.includes(symbol)) {
-        symbolsProcessed.push(symbol)
-      }
+      const [prehistoricCycles] = await Promise.all([
+        client.hincrby(key, "prehistoric_cycles_completed", 1),
+        client.sadd(symbolsSetKey, symbol).catch(() => 0),
+        client.expire(symbolsSetKey, 7 * 24 * 60 * 60).catch(() => 0),
+      ])
 
-      // Save to Redis
-      await client.hset(key, {
-        prehistoric_cycles_completed: String(prehistoricCycles),
-        prehistoric_symbols_processed: JSON.stringify(symbolsProcessed),
-        prehistoric_phase_active: "true",
-        last_update: new Date().toISOString(),
-      })
+      // Mirror the processed symbols list into the hash so existing readers
+      // (which still expect `prehistoric_symbols_processed` as JSON) keep
+      // working. `smembers` replaces the old read-modify-write cycle.
+      const symbolsProcessed = ((await client.smembers(symbolsSetKey).catch(() => [])) || []) as string[]
 
-      console.log(`[v0] [Prehistoric] Symbol ${symbol}: Cycle ${prehistoricCycles} | Processed: ${symbolsProcessed.join(", ")}`)
+      await Promise.all([
+        client.hset(key, {
+          prehistoric_symbols_processed: JSON.stringify(symbolsProcessed),
+          prehistoric_phase_active: "true",
+          last_update: nowIso,
+        }),
+        client.expire(key, 7 * 24 * 60 * 60),
+      ])
+
+      console.log(
+        `[v0] [Prehistoric] Symbol ${symbol}: Cycle ${prehistoricCycles} | Processed: ${symbolsProcessed.join(", ")}`,
+      )
     } catch (error) {
       console.error(`[v0] Failed to track prehistoric cycle for ${connectionId}:`, error)
     }
@@ -281,31 +309,106 @@ export class ProgressionStateManager {
 
   /**
    * Record a trade execution
+   *
+   * CRITICAL FIX: the previous implementation used the classic read-modify-write
+   * pattern (`getProgressionState` → mutate locally → `hset`). When trades
+   * complete for multiple symbols concurrently (e.g. the strategy coordinator
+   * fans out live-set execution in parallel) this silently dropped counter
+   * updates because the two in-flight writers each read the same `total_trades`
+   * value and wrote `+1` on top of the other's write.
+   *
+   * We now use atomic Redis primitives (`hincrby` / `hincrbyfloat`) so every
+   * trade is counted exactly once regardless of concurrency. The derived
+   * `trade_success_rate` is computed from the freshly-incremented counters
+   * rather than from stale in-memory snapshots.
+   *
+   * `total_profit` is stored as a float via `hincrbyfloat`. On the mock Redis
+   * adapter this call falls through to `hincrby` (which rejects non-integer
+   * deltas); we detect that path and fall back to a safe snapshot update.
    */
   static async recordTrade(connectionId: string, successful: boolean, profit: number = 0): Promise<void> {
     try {
       const client = getRedisClient()
+      if (!client) {
+        console.warn(`[v0] Redis client not available for recordTrade`)
+        return
+      }
       const key = `progression:${connectionId}`
 
-      // Get current state
-      const current = await this.getProgressionState(connectionId)
+      // Atomic counter increments. Kick off both counters concurrently — hincrby
+      // returns the post-increment value so we can derive the success rate from
+      // authoritative data rather than a read-then-write snapshot.
+      const totalTradesP = client.hincrby(key, "total_trades", 1)
+      const successfulTradesP = successful
+        ? client.hincrby(key, "successful_trades", 1)
+        : Promise.resolve(null as any)
 
-      // Update trade metrics
-      const totalTrades = current.totalTrades + 1
-      const successfulTrades = successful ? current.successfulTrades + 1 : current.successfulTrades
-      const totalProfit = current.totalProfit + profit
-      const tradeSuccessRate = totalTrades > 0 ? (successfulTrades / totalTrades) * 100 : 0
+      // Profit is a float. Prefer hincrbyfloat; if the adapter doesn't support
+      // it (e.g. mock / older inline client) fall back to a read-modify-write
+      // on `total_profit` only — the counters above remain atomic either way.
+      let totalProfitP: Promise<any>
+      const hincrbyfloat = (client as any).hincrbyfloat as
+        | ((k: string, f: string, d: number) => Promise<string | number>)
+        | undefined
+      if (typeof hincrbyfloat === "function" && profit !== 0) {
+        totalProfitP = hincrbyfloat.call(client, key, "total_profit", profit).catch(async () => {
+          // Fallback: read current, add, write. Best-effort only — racy vs
+          // other profit updates but the counter integrity is preserved.
+          try {
+            const cur = Number((await client.hget(key, "total_profit")) || "0") || 0
+            await client.hset(key, { total_profit: String(cur + profit) })
+          } catch { /* ignore */ }
+        })
+      } else if (profit !== 0) {
+        totalProfitP = (async () => {
+          try {
+            const cur = Number((await client.hget(key, "total_profit")) || "0") || 0
+            await client.hset(key, { total_profit: String(cur + profit) })
+          } catch { /* ignore */ }
+        })()
+      } else {
+        totalProfitP = Promise.resolve()
+      }
 
-      // Save to Redis
-      await client.hset(key, {
-        total_trades: String(totalTrades),
-        successful_trades: String(successfulTrades),
-        total_profit: String(totalProfit),
-        trade_success_rate: String(tradeSuccessRate),
-        last_update: new Date().toISOString(),
-      })
+      const [totalTradesRaw, successfulTradesRaw] = await Promise.all([
+        totalTradesP,
+        successfulTradesP,
+        totalProfitP,
+      ])
 
-      console.log(`[v0] [Progression] Trade recorded: ${successful ? "✓ Win" : "✗ Loss"} | Profit: ${profit.toFixed(2)} | Success Rate: ${tradeSuccessRate.toFixed(1)}%`)
+      const newTotalTrades = Number(totalTradesRaw) || 0
+      // If this trade was unsuccessful we didn't increment `successful_trades`
+      // — read it so the success rate math is still correct.
+      let newSuccessfulTrades: number
+      if (successful) {
+        newSuccessfulTrades = Number(successfulTradesRaw) || 0
+      } else {
+        try {
+          newSuccessfulTrades = Number((await client.hget(key, "successful_trades")) || "0") || 0
+        } catch {
+          newSuccessfulTrades = 0
+        }
+      }
+
+      const tradeSuccessRate =
+        newTotalTrades > 0 ? (newSuccessfulTrades / newTotalTrades) * 100 : 0
+
+      // Metadata + rate write in parallel with the expire refresh.
+      const nowIso = new Date().toISOString()
+      await Promise.all([
+        client.hset(key, {
+          trade_success_rate: String(tradeSuccessRate.toFixed(2)),
+          last_update: nowIso,
+          last_trade_time: nowIso,
+        }),
+        client.expire(key, 7 * 24 * 60 * 60),
+      ]).catch(() => { /* non-critical */ })
+
+      console.log(
+        `[v0] [Progression] Trade recorded: ${successful ? "✓ Win" : "✗ Loss"} | ` +
+          `Profit: ${profit.toFixed(2)} | Trades: ${newSuccessfulTrades}/${newTotalTrades} | ` +
+          `Success Rate: ${tradeSuccessRate.toFixed(1)}%`,
+      )
     } catch (error) {
       console.error(`[v0] Failed to record trade for ${connectionId}:`, error)
     }

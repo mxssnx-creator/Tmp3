@@ -8,8 +8,6 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
     const body = await request.json()
     const { preset_type_id } = body
 
-    console.log(`[v0] Assigning preset type ${preset_type_id} to connection ${id}`)
-
     // Validate preset type exists if provided
     if (preset_type_id) {
       const [presetType] = await sql`
@@ -29,11 +27,9 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
       WHERE id = ${id}
     `
 
-    console.log(`[v0] Successfully assigned preset type to connection ${id}`)
-
     return NextResponse.json({ success: true })
   } catch (error) {
-    console.error("[v0] Failed to assign preset type:", error)
+    console.error("Failed to assign preset type:", error)
     return NextResponse.json({ error: "Failed to assign preset type" }, { status: 500 })
   }
 }

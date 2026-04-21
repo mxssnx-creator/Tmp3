@@ -37,8 +37,6 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
-    console.error("[v0] Error caught by boundary:", error, errorInfo)
-
     // Log to monitoring API
     fetch("/api/monitoring/site", {
       method: "POST",
@@ -53,7 +51,7 @@ export class ErrorBoundary extends Component<Props, State> {
           errorBoundary: true,
         },
       }),
-    }).catch((err) => console.error("[v0] Failed to log error:", err))
+    }).catch(() => { /* non-critical */ })
 
     this.setState({
       error,

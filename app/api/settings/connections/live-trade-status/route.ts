@@ -6,8 +6,6 @@ export async function GET() {
     await initRedis()
     const allConnections = await getAllConnections()
     
-    console.log(`[v0] [LiveTradeStatus] Checking ${allConnections.length} connections`)
-    
     const liveTradeStatus = allConnections.map((conn: any) => {
       const isLiveTrading = conn.is_live_trade === "1" || conn.is_live_trade === true
       const isDashboardActive = conn.is_enabled_dashboard === "1" || conn.is_enabled_dashboard === true
@@ -25,8 +23,7 @@ export async function GET() {
     })
     
     const activeLiveTrading = liveTradeStatus.filter(c => c.is_live_trade)
-    console.log(`[v0] [LiveTradeStatus] ${activeLiveTrading.length} connections with live trading enabled`)
-    
+
     return NextResponse.json({
       success: true,
       total: allConnections.length,

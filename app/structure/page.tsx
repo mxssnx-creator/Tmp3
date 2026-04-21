@@ -4,9 +4,8 @@ export const dynamic = "force-dynamic"
 
 import { useState, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
 import {
   Activity,
@@ -24,6 +23,8 @@ import {
   Network,
   Target,
 } from "lucide-react"
+import { PageHeader } from "@/components/page-header"
+import { useExchange } from "@/lib/exchange-context"
 
 interface SystemMetrics {
   cpu_usage: number
@@ -57,6 +58,7 @@ interface ModuleStatus {
 }
 
 export default function OverviewPage() {
+  const { selectedConnectionId, selectedConnection } = useExchange()
   const [activeTab, setActiveTab] = useState("system")
   const [systemMetrics, setSystemMetrics] = useState<SystemMetrics>({
     cpu_usage: 35,
@@ -94,9 +96,18 @@ export default function OverviewPage() {
   ])
 
   useEffect(() => {
+    // When the user picks a connection in the sidebar exchange selector the
+    // Structure page is re-scoped to that connection's Redis metrics so the
+    // system/trading/module widgets always mirror the "live" exchange the
+    // rest of the sidebar is working against.
+    const qs =
+      selectedConnectionId && !selectedConnectionId.startsWith("demo")
+        ? `?connectionId=${encodeURIComponent(selectedConnectionId)}`
+        : ""
+
     const fetchMetrics = async () => {
       try {
-        const response = await fetch("/api/structure/metrics")
+        const response = await fetch(`/api/structure/metrics${qs}`, { cache: "no-store" })
         const result = await response.json()
         if (result.success) {
           setSystemMetrics(result.data.systemMetrics)
@@ -109,7 +120,7 @@ export default function OverviewPage() {
 
     const fetchModules = async () => {
       try {
-        const response = await fetch("/api/structure/modules")
+        const response = await fetch(`/api/structure/modules${qs}`, { cache: "no-store" })
         const result = await response.json()
         if (result.success) {
           setModules(result.data)
@@ -130,7 +141,7 @@ export default function OverviewPage() {
     }, 5000)
 
     return () => clearInterval(interval)
-  }, [])
+  }, [selectedConnectionId])
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -167,81 +178,98 @@ export default function OverviewPage() {
     }).format(amount)
   }
 
+  /*
+   * Derive the "System Health" percentage from real module health data
+   * instead of a hardcoded 98%. This was static placeholder content that
+   * drifted from the underlying metrics and made the page feel fake.
+   */
+  const systemHealth = modules.length > 0
+    ? Math.round(modules.reduce((s, m) => s + (m.status === "active" ? m.health : 0), 0) / modules.length)
+    : 0
+  const activeModuleCount = modules.filter((m) => m.status === "active").length
+
   return (
-    <div className="container mx-auto p-6 space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold">System Overview</h1>
-          <p className="text-muted-foreground">Comprehensive system workability, logistics, and functionality status</p>
-        </div>
-        <div className="flex items-center gap-4">
-          <Badge variant="outline" className="text-sm px-3 py-1">
-            <Activity className="h-3 w-3 mr-1" />
-            System Healthy
+    <div className="p-4 space-y-4">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <PageHeader
+          title="System Overview"
+          description={
+            selectedConnection
+              ? `Workability, logistics, and module status — scoped to ${selectedConnection.name || selectedConnection.exchange}`
+              : "Comprehensive system workability, logistics, and functionality status (all connections)"
+          }
+        />
+        <div className="flex items-center gap-2">
+          {/* The scoped-connection chip is now rendered globally by PageHeader
+              (see components/page-header.tsx), so we only keep the system
+              health status badge + refresh action here to avoid duplication. */}
+          <Badge variant="outline" className="h-7 gap-1">
+            <Activity className="h-3 w-3" />
+            {systemHealth >= 90 ? "System Healthy" : systemHealth >= 70 ? "System Degraded" : "System Critical"}
           </Badge>
-          <Button onClick={() => window.location.reload()}>
-            <RefreshCw className="h-4 w-4 mr-2" />
+          <Button onClick={() => window.location.reload()} size="sm" className="h-8 text-xs">
+            <RefreshCw className="h-3 w-3 mr-1" />
             Refresh
           </Button>
         </div>
       </div>
 
-      {/* Quick Status Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <Card>
-          <CardContent className="py-2 px-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-sm text-muted-foreground">System Health</div>
-                <div className="text-2xl font-bold text-green-600">98%</div>
-              </div>
-              <CheckCircle className="h-8 w-8 text-green-500" />
-            </div>
-            <Progress value={98} className="mt-2" />
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="py-2 px-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-sm text-muted-foreground">Uptime</div>
-                <div className="text-2xl font-bold">{systemMetrics.uptime_hours}h</div>
-              </div>
-              <Clock className="h-8 w-8 text-blue-500" />
-            </div>
-            <div className="text-xs text-muted-foreground mt-2">7 days continuous</div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="py-2 px-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-sm text-muted-foreground">Active Modules</div>
-                <div className="text-2xl font-bold">
-                  {modules.filter((m) => m.status === "active").length}/{modules.length}
+      {/*
+        Quick Status — compact icon-pill cards, same pattern as the rest of
+        the sidebar pages. Replaces 4 bulky Card columns whose values were
+        partially hardcoded (e.g. "7 days continuous", "98%").
+      */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        {[
+          {
+            icon: CheckCircle,
+            label: "System Health",
+            value: `${systemHealth}%`,
+            sub: systemHealth >= 90 ? "All systems OK" : "Action recommended",
+            tint: systemHealth >= 90 ? "text-green-500" : systemHealth >= 70 ? "text-amber-500" : "text-red-500",
+            progress: systemHealth,
+          },
+          {
+            icon: Clock,
+            label: "Uptime",
+            value: `${systemMetrics.uptime_hours}h`,
+            sub: systemMetrics.uptime_hours >= 168 ? "7+ days continuous" : `${Math.floor(systemMetrics.uptime_hours / 24)}d`,
+            tint: "text-primary",
+          },
+          {
+            icon: Zap,
+            label: "Active Modules",
+            value: `${activeModuleCount}/${modules.length}`,
+            sub: activeModuleCount === modules.length ? "All operational" : "Some degraded",
+            tint: activeModuleCount === modules.length ? "text-green-500" : "text-amber-500",
+          },
+          {
+            icon: TrendingUp,
+            label: "Response Time",
+            value: `${tradingLogistics.avg_response_time}ms`,
+            sub: tradingLogistics.avg_response_time < 100 ? "Optimal" : "Elevated",
+            tint: tradingLogistics.avg_response_time < 100 ? "text-green-500" : "text-amber-500",
+          },
+        ].map((stat) => (
+          <Card key={stat.label} className="border-border bg-card">
+            <CardContent className="p-2.5 space-y-1.5">
+              <div className="flex items-center gap-2">
+                <div className={`rounded bg-muted/60 p-1.5 ${stat.tint}`}>
+                  <stat.icon className="h-3.5 w-3.5" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className={`text-lg font-bold tabular-nums ${stat.tint}`}>{stat.value}</div>
+                  <div className="text-[10px] text-muted-foreground uppercase tracking-wide">{stat.label}</div>
                 </div>
               </div>
-              <Zap className="h-8 w-8 text-orange-500" />
-            </div>
-            <div className="text-xs text-muted-foreground mt-2">All systems operational</div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="py-2 px-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-sm text-muted-foreground">Response Time</div>
-                <div className="text-2xl font-bold">{tradingLogistics.avg_response_time}ms</div>
-              </div>
-              <TrendingUp className="h-8 w-8 text-purple-500" />
-            </div>
-            <div className="text-xs text-green-600 mt-2">Optimal performance</div>
-          </CardContent>
-        </Card>
+              {stat.progress !== undefined ? (
+                <Progress value={stat.progress} className="h-1" />
+              ) : (
+                <div className="text-[10px] text-muted-foreground">{stat.sub}</div>
+              )}
+            </CardContent>
+          </Card>
+        ))}
       </div>
 
       {/* Main Content Tabs */}
@@ -369,22 +397,19 @@ export default function OverviewPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="space-y-4">
-                  <div className="text-4xl font-bold">{tradingLogistics.active_connections}</div>
-                  <div className="text-sm text-muted-foreground">Active exchange connections</div>
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between text-sm">
-                      <span>Bybit X03</span>
-                      <Badge variant="default">Active</Badge>
-                    </div>
-                    <div className="flex items-center justify-between text-sm">
-                      <span>BingX X01</span>
-                      <Badge variant="default">Active</Badge>
-                    </div>
-                    <div className="flex items-center justify-between text-sm">
-                      <span>Pionex X01</span>
-                      <Badge variant="default">Active</Badge>
-                    </div>
+                {/*
+                  Removed the hardcoded "Bybit X03 / BingX X01 / Pionex X01"
+                  list (placeholder content that was visible to every user
+                  regardless of their actual connected exchanges). The
+                  breakdown will re-appear once /api/structure/metrics
+                  surfaces per-connection status (currently it returns only
+                  the aggregate `active_connections` count).
+                */}
+                <div className="space-y-3">
+                  <div className="text-3xl font-bold tabular-nums">{tradingLogistics.active_connections}</div>
+                  <div className="text-xs text-muted-foreground">Active exchange connections</div>
+                  <div className="text-xs text-muted-foreground">
+                    Manage connections in the Settings &rarr; Exchange tab.
                   </div>
                 </div>
               </CardContent>
@@ -467,16 +492,21 @@ export default function OverviewPage() {
                 ].map((step, index) => (
                   <div key={index} className="text-center space-y-2">
                     <div className="flex justify-center">
+                      {/*
+                        Swapped `bg-green-100` / `bg-gray-100` (light-mode-only)
+                        for token-aware tinted backgrounds so the workflow
+                        circles stay legible in dark mode.
+                      */}
                       <div
-                        className={`w-16 h-16 rounded-full flex items-center justify-center ${
-                          step.status === "active" ? "bg-green-100" : "bg-gray-100"
+                        className={`w-14 h-14 rounded-full flex items-center justify-center ${
+                          step.status === "active" ? "bg-green-500/15" : "bg-muted"
                         }`}
                       >
-                        <CheckCircle className={`h-8 w-8 ${getStatusColor(step.status)}`} />
+                        <CheckCircle className={`h-7 w-7 ${getStatusColor(step.status)}`} />
                       </div>
                     </div>
-                    <div className="font-semibold text-sm">{step.name}</div>
-                    <div className={`text-xs font-medium ${getHealthColor(step.health)}`}>{step.health}% Health</div>
+                    <div className="font-semibold text-xs">{step.name}</div>
+                    <div className={`text-[11px] font-medium tabular-nums ${getHealthColor(step.health)}`}>{step.health}% Health</div>
                   </div>
                 ))}
               </div>
@@ -524,50 +554,55 @@ export default function OverviewPage() {
               <CardDescription>Suggestions to improve system performance and efficiency</CardDescription>
             </CardHeader>
             <CardContent>
+              {/*
+                Switched the recommendation banners from `bg-xxx-50` / `text-xxx-900`
+                hard-coded tailwind palette utilities (which were unreadable
+                in dark mode) to a tinted-border + soft-fill pattern using
+                `bg-xxx-500/10` + `border-xxx-500/30`. Text uses `text-foreground`
+                so it remains legible in both themes.
+              */}
               <div className="space-y-4">
-                {/* Optimal Status */}
-                <div className="flex items-start gap-3 py-2 px-4 bg-green-50 rounded-lg border border-green-200">
-                  <CheckCircle className="h-5 w-5 text-green-600 mt-0.5" />
+                <div className="flex items-start gap-3 py-2 px-4 rounded-md border border-green-500/30 bg-green-500/10">
+                  <CheckCircle className="h-5 w-5 text-green-500 mt-0.5 flex-shrink-0" />
                   <div className="flex-1">
-                    <div className="font-semibold text-green-900">System Running Optimally</div>
-                    <div className="text-sm text-green-700 mt-1">
-                      All metrics are within optimal ranges. CPU usage at {systemMetrics.cpu_usage.toFixed(1)}%, memory
-                      at {systemMetrics.memory_usage.toFixed(1)}%.
+                    <div className="font-semibold text-sm text-foreground">System Running Optimally</div>
+                    <div className="text-xs text-muted-foreground mt-1">
+                      All metrics are within optimal ranges. CPU at {systemMetrics.cpu_usage.toFixed(1)}%, memory at{" "}
+                      {systemMetrics.memory_usage.toFixed(1)}%.
                     </div>
                   </div>
                 </div>
 
-                {/* Recommendations */}
                 <div className="space-y-3">
-                  <h4 className="font-semibold">Performance Recommendations</h4>
+                  <h4 className="font-semibold text-sm">Performance Recommendations</h4>
 
-                  <div className="flex items-start gap-3 py-2 px-4 bg-blue-50 rounded-lg border border-blue-200">
-                    <BarChart3 className="h-5 w-5 text-blue-600 mt-0.5" />
+                  <div className="flex items-start gap-3 py-2 px-4 rounded-md border border-blue-500/30 bg-blue-500/10">
+                    <BarChart3 className="h-5 w-5 text-blue-500 mt-0.5 flex-shrink-0" />
                     <div className="flex-1">
-                      <div className="font-semibold text-blue-900">Database Optimization</div>
-                      <div className="text-sm text-blue-700 mt-1">
+                      <div className="font-semibold text-sm text-foreground">Database Optimization</div>
+                      <div className="text-xs text-muted-foreground mt-1">
                         Consider archiving positions older than 90 days to maintain optimal query performance. Current
                         database size: {systemMetrics.database_size} MB.
                       </div>
                     </div>
                   </div>
 
-                  <div className="flex items-start gap-3 py-2 px-4 bg-purple-50 rounded-lg border border-purple-200">
-                    <Target className="h-5 w-5 text-purple-600 mt-0.5" />
+                  <div className="flex items-start gap-3 py-2 px-4 rounded-md border border-indigo-500/30 bg-indigo-500/10">
+                    <Target className="h-5 w-5 text-indigo-500 mt-0.5 flex-shrink-0" />
                     <div className="flex-1">
-                      <div className="font-semibold text-purple-900">Strategy Efficiency</div>
-                      <div className="text-sm text-purple-700 mt-1">
+                      <div className="font-semibold text-sm text-foreground">Strategy Efficiency</div>
+                      <div className="text-xs text-muted-foreground mt-1">
                         {tradingLogistics.total_strategies - tradingLogistics.active_strategies} strategies are
                         inactive. Review and remove unused strategies to reduce system overhead.
                       </div>
                     </div>
                   </div>
 
-                  <div className="flex items-start gap-3 py-2 px-4 bg-orange-50 rounded-lg border border-orange-200">
-                    <Zap className="h-5 w-5 text-orange-600 mt-0.5" />
+                  <div className="flex items-start gap-3 py-2 px-4 rounded-md border border-amber-500/30 bg-amber-500/10">
+                    <Zap className="h-5 w-5 text-amber-500 mt-0.5 flex-shrink-0" />
                     <div className="flex-1">
-                      <div className="font-semibold text-orange-900">API Rate Optimization</div>
-                      <div className="text-sm text-orange-700 mt-1">
+                      <div className="font-semibold text-sm text-foreground">API Rate Optimization</div>
+                      <div className="text-xs text-muted-foreground mt-1">
                         Current API request rate: {formatNumber(systemMetrics.api_requests_per_minute)}/min. Consider
                         implementing request batching for improved efficiency.
                       </div>
@@ -575,28 +610,66 @@ export default function OverviewPage() {
                   </div>
                 </div>
 
-                {/* System Capacity */}
-                <div className="mt-6">
-                  <h4 className="font-semibold mb-3">System Capacity Analysis</h4>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <div className="py-2 px-4 bg-muted rounded-lg">
-                      <div className="text-sm text-muted-foreground">Current Load</div>
-                      <div className="text-2xl font-bold mt-1">Medium</div>
-                      <div className="text-xs text-muted-foreground mt-2">
-                        {tradingLogistics.open_positions} positions / 500 max capacity
+                {/*
+                  Capacity Analysis — derive Load + Efficiency from real
+                  numbers instead of a hardcoded "Medium"/"92%". Scalability
+                  is still qualitative (the system doesn't ship a
+                  real capacity model yet) but flagged as such.
+                */}
+                <div className="mt-4">
+                  <h4 className="font-semibold text-sm mb-2">System Capacity Analysis</h4>
+                  {(() => {
+                    const MAX_POSITIONS = 500
+                    const loadPct = Math.min(100, (tradingLogistics.open_positions / MAX_POSITIONS) * 100)
+                    const loadLabel = loadPct < 25 ? "Low" : loadPct < 60 ? "Medium" : loadPct < 85 ? "High" : "Critical"
+                    const loadTint =
+                      loadPct < 60 ? "text-green-500" : loadPct < 85 ? "text-amber-500" : "text-red-500"
+
+                    // Efficiency: composite of CPU/memory headroom + module health average.
+                    const cpuScore = Math.max(0, 100 - systemMetrics.cpu_usage)
+                    const memScore = Math.max(0, 100 - systemMetrics.memory_usage)
+                    const modScore =
+                      modules.length > 0 ? modules.reduce((s, m) => s + m.health, 0) / modules.length : 0
+                    const efficiency = Math.round((cpuScore + memScore + modScore) / 3)
+
+                    return (
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                        <div className="rounded-md bg-muted/50 p-3">
+                          <div className="text-xs text-muted-foreground">Current Load</div>
+                          <div className={`text-xl font-bold mt-1 ${loadTint}`}>{loadLabel}</div>
+                          <div className="text-[10px] text-muted-foreground mt-1">
+                            {tradingLogistics.open_positions} / {MAX_POSITIONS} positions
+                          </div>
+                        </div>
+                        <div className="rounded-md bg-muted/50 p-3">
+                          <div className="text-xs text-muted-foreground">Scalability</div>
+                          <div className="text-xl font-bold mt-1 text-green-500">
+                            {loadPct < 33 ? "High" : loadPct < 66 ? "Moderate" : "Constrained"}
+                          </div>
+                          <div className="text-[10px] text-muted-foreground mt-1">
+                            Headroom: {(100 - loadPct).toFixed(0)}%
+                          </div>
+                        </div>
+                        <div className="rounded-md bg-muted/50 p-3">
+                          <div className="text-xs text-muted-foreground">Efficiency Score</div>
+                          <div
+                            className={`text-xl font-bold mt-1 ${
+                              efficiency >= 80
+                                ? "text-green-500"
+                                : efficiency >= 60
+                                  ? "text-amber-500"
+                                  : "text-red-500"
+                            }`}
+                          >
+                            {efficiency}%
+                          </div>
+                          <div className="text-[10px] text-muted-foreground mt-1">
+                            CPU/Memory/Module composite
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                    <div className="py-2 px-4 bg-muted rounded-lg">
-                      <div className="text-sm text-muted-foreground">Scalability</div>
-                      <div className="text-2xl font-bold mt-1 text-green-600">High</div>
-                      <div className="text-xs text-muted-foreground mt-2">Can handle 3x current load</div>
-                    </div>
-                    <div className="py-2 px-4 bg-muted rounded-lg">
-                      <div className="text-sm text-muted-foreground">Efficiency Score</div>
-                      <div className="text-2xl font-bold mt-1 text-blue-600">92%</div>
-                      <div className="text-xs text-muted-foreground mt-2">Above industry average</div>
-                    </div>
-                  </div>
+                    )
+                  })()}
                 </div>
               </div>
             </CardContent>

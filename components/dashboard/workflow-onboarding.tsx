@@ -78,9 +78,7 @@ export function WorkflowOnboarding() {
           newSteps[2].status = 'current'
         }
         setSteps(newSteps)
-      } catch (err) {
-        console.error('[v0] Failed to fetch workflow status:', err)
-      }
+      } catch { /* non-critical */ }
     }
 
     fetchStatus()

@@ -59,7 +59,6 @@ export async function POST() {
         dashboard_enabled: false,
         has_credentials: hasCredentials,
       }
-      console.log(`[v0] [FixConnections] ${conn}: ${exists ? "UPDATED" : "CREATED"} - active_inserted=1, credentials=${hasCredentials}`)
     }
     
     // Count successful updates

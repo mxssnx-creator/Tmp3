@@ -15,13 +15,14 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
 
-    // Update connection to be active on dashboard
+    // Add connection to Active panel (assigned but NOT yet enabled — user must toggle Enable)
     const updatedConnection = {
       ...connection,
-      is_active_inserted: "1",
-      is_dashboard_inserted: "1",
-      is_enabled_dashboard: "1",
-      is_active: "1",
+      is_active_inserted: "1",     // Mark as assigned to Active panel
+      is_dashboard_inserted: "1",  // Mark as inserted on dashboard
+      is_assigned: "1",            // Assigned to Main Connections
+      is_enabled_dashboard: "0",   // Disabled by default — user enables via toggle
+      is_active: "0",              // Not processing yet
       updated_at: new Date().toISOString(),
     }
 
@@ -59,13 +60,15 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
 
-    // Update connection to remove from active - unassign completely
+    // Update connection to remove from active panel - unassign from Main Connections
+    // NOTE: is_inserted is preserved so the connection remains in Settings
     const updatedConnection = {
       ...connection,
       is_active_inserted: "0",      // Remove assignment from main panel
       is_dashboard_inserted: "0",   // Remove dashboard insertion
       is_enabled_dashboard: "0",    // Disable dashboard toggle
       is_active: "0",               // Not active for processing
+      is_assigned: "0",             // Unassign from main connections
       updated_at: new Date().toISOString(),
     }
 

@@ -8,7 +8,6 @@ export async function GET() {
     const coordinator = getGlobalTradeEngineCoordinator()
     
     if (!coordinator) {
-      console.warn("[v0] [START-ALL] Coordinator is null")
       return NextResponse.json({
         success: false,
         error: "Trade engine coordinator not initialized",
@@ -20,7 +19,6 @@ export async function GET() {
     const connections = await getAllConnections()
     
     if (!Array.isArray(connections)) {
-      console.error("[v0] [START-ALL] Connections is not an array:", typeof connections)
       return NextResponse.json({
         success: false,
         error: "Invalid connections data",
@@ -36,8 +34,6 @@ export async function GET() {
       const hasLiveTrade = c.is_live_trade === "1" || c.is_live_trade === true
       return isInserted && isEnabled && hasLiveTrade
     })
-
-    console.log(`[v0] [START-ALL] Total: ${connections.length}, Active: ${activeConnections.length}, With LiveTrade: ${activeConnections.length}`)
 
     if (activeConnections.length === 0) {
       return NextResponse.json({
@@ -59,8 +55,6 @@ export async function GET() {
 
     for (const connection of activeConnections) {
       try {
-        console.log(`[v0] [START-ALL] Starting engine for: ${connection.name}`)
-
         await coordinator.startEngine(connection.id, {
           connectionId: connection.id,
           indicationInterval,
@@ -78,8 +72,6 @@ export async function GET() {
 
         successCount++
       } catch (error) {
-        console.error(`[v0] [START-ALL] Failed to start ${connection.name}:`, error)
-
         results.push({
           connectionId: connection.id,
           connectionName: connection.name,
@@ -90,8 +82,6 @@ export async function GET() {
       }
     }
 
-    console.log(`[v0] [START-ALL] Complete: ${successCount}/${activeConnections.length} started`)
-
     return NextResponse.json({
       success: true,
       message: `Started ${successCount} of ${activeConnections.length} trade engines`,
@@ -101,7 +91,7 @@ export async function GET() {
       results,
     })
   } catch (error) {
-    console.error("[v0] [START-ALL] Error:", error)
+    console.error("[START-ALL] Error:", error)
 
     return NextResponse.json(
       {

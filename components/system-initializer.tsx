@@ -18,15 +18,6 @@ async function initializeSystem() {
   initializationPromise = (async () => {
     try {
       const versionInfo = getSystemVersionInfo()
-      console.log('[v0] [SystemInitializer] ========================================')
-      console.log('[v0] [SystemInitializer] SYSTEM VERSION INFO:')
-      console.log('[v0] [SystemInitializer] System Version:', versionInfo.system)
-      console.log('[v0] [SystemInitializer] Component Versions:', JSON.stringify(versionInfo.components, null, 2))
-      console.log('[v0] [SystemInitializer] API Versions:', JSON.stringify(versionInfo.apis, null, 2))
-      console.log('[v0] [SystemInitializer] Build Time:', versionInfo.buildTime)
-      console.log('[v0] [SystemInitializer] ========================================')
-      
-      console.log('[v0] [SystemInitializer] Starting comprehensive system initialization...')
       
       // STEP 1: Run /api/init for general initialization
       const initResponse = await fetch('/api/init', { 
@@ -38,12 +29,7 @@ async function initializeSystem() {
         },
       })
       
-      if (initResponse.ok) {
-        const initResult = await initResponse.json()
-        console.log('[v0] [SystemInitializer] API init complete:', initResult.message)
-      } else {
-        console.warn('[v0] [SystemInitializer] API init returned status:', initResponse.status)
-      }
+      await initResponse.json().catch(() => {})
       
       // STEP 2: Run comprehensive startup initialization
       const startupResponse = await fetch('/api/startup/initialize', {
@@ -56,22 +42,14 @@ async function initializeSystem() {
         },
       })
       
-      if (!startupResponse.ok) {
-        console.warn('[v0] [SystemInitializer] Startup returned:', startupResponse.status)
-        return
-      }
-      
+      if (!startupResponse.ok) return
+
       const startupResult = await startupResponse.json()
-      
       if (startupResult.success) {
-        console.log('[v0] [SystemInitializer] ✓ System fully initialized')
-        console.log('[v0] [SystemInitializer] Results:', startupResult.results)
         hasInitialized = true
-      } else {
-        console.error('[v0] [SystemInitializer] Startup failed:', startupResult.error)
       }
-    } catch (error) {
-      console.error('[v0] [SystemInitializer] Error initializing system:', error)
+    } catch {
+      // non-critical — system may already be initialized
     } finally {
       initializationPromise = null
     }

@@ -104,20 +104,16 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
     required = false
   ): Promise<string | null> => {
     updateStep(id, "loading")
-    console.log(`[v0] [QuickStart] >>> ${label}`)
     try {
       const msg = await fn()
-      console.log(`[v0] [QuickStart] ✓ ${label}: ${msg}`)
       updateStep(id, "success", msg)
       return msg
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      console.error(`[v0] [QuickStart] ✗ ${label}: ${msg}`)
       if (required) {
         updateStep(id, "error", msg)
         throw new Error(`${label} failed: ${msg}`)
       }
-      console.warn(`[v0] [QuickStart] Continuing after non-critical failure`)
       updateStep(id, "success", "Skipped")
       return null
     }
@@ -134,10 +130,6 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
     setIsRunning(true)
     setFunctionalOverview(null)
     setSteps(prev => prev.map(s => ({ ...s, status: "pending", message: undefined })))
-
-    console.log("[v0] [QuickStart] ========================================")
-    console.log("[v0] [QuickStart] QUICKSTART INITIATED — BingX, 1 symbol")
-    console.log("[v0] [QuickStart] ========================================")
 
     let enabledConnectionId: string | null = null
 
@@ -173,7 +165,6 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
       await runStep("start", "STEP 4: Start Global Coordinator", async () => {
         const res = await timedFetch("/api/trade-engine/start", { method: "POST" }, 20000)
         const d = await res.json().catch(() => ({}))
-        console.log("[v0] [QuickStart] Coordinator response:", JSON.stringify(d))
         if (!res.ok && !d.success) throw new Error(d.error ?? `HTTP ${res.status}`)
         const n = d.resumedConnections?.length ?? 0
         return `Coordinator running${n > 0 ? ` | Resumed ${n}` : ""}`
@@ -189,7 +180,6 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
         }, 25000)
         const d = await res.json().catch(() => ({}))
         quickStartResponse = d
-        console.log("[v0] [QuickStart] Enable response:", JSON.stringify(d))
         if (!res.ok && !d.success) throw new Error(d.error ?? `HTTP ${res.status}`)
         if (!d.success) throw new Error(d.error ?? "Enable returned failure")
         enabledConnectionId = d.connection?.id ?? null
@@ -209,21 +199,16 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
       await runStep("engine", "STEP 6: Launch BingX Engine", async () => {
         const connId = enabledConnectionId
         if (!connId) return "Skipped - no connection ID"
-        console.log(`[v0] [QuickStart] Starting live-trade engine for: ${connId}`)
         const res = await timedFetch(`/api/settings/connections/${connId}/live-trade`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ is_live_trade: true }),
         }, 30000)
         const d = await res.json().catch(() => ({}))
-        console.log("[v0] [QuickStart] Live-trade response:", JSON.stringify(d))
         if (res.ok && d.success) return `Engine running | Status: ${d.engineStatus}`
         return `Queued (${d.error ?? d.message ?? "coordinator processing"})`
       })
 
-      console.log("[v0] [QuickStart] ========================================")
-      console.log("[v0] [QuickStart] QUICKSTART COMPLETE")
-      console.log("[v0] [QuickStart] ========================================")
       toast.success("Quick Start complete — BingX engine running with BTCUSDT.")
 
       // Fetch functional overview in background
@@ -231,11 +216,10 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
         const res = await timedFetch("/api/trade-engine/functional-overview", {}, 6000)
         if (res.ok) {
           const d = await res.json()
-          console.log("[v0] [QuickStart] Functional Overview:", JSON.stringify(d))
           setFunctionalOverview(d)
         }
-      } catch (e) {
-        console.warn("[v0] [QuickStart] Overview unavailable:", e)
+      } catch {
+        // Non-critical: overview unavailable
       }
 
       if (typeof window !== "undefined") {
@@ -244,7 +228,6 @@ export function QuickStartButton({ onQuickStartComplete }: QuickStartButtonProps
       onQuickStartComplete?.()
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Unknown error"
-      console.error("[v0] [QuickStart] FATAL:", msg)
       toast.error(`Quick Start failed: ${msg}`)
     } finally {
       setIsRunning(false)

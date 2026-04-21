@@ -58,6 +58,29 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       structuredLogs = []
     }
 
+    // Read per-type indication counts directly from the live progression hash.
+    // statistics-tracker writes these as HINCRBY every indication cycle, so they are
+    // always more current than the flat indications:{connId}:count key.
+    let progHashForLogs: Record<string, string> = {}
+    try {
+      progHashForLogs = (await client.hgetall(`progression:${connectionId}`)) || {}
+    } catch {
+      progHashForLogs = {}
+    }
+    const indicationsByType = {
+      direction: toNumber(progHashForLogs["indications_direction_count"]),
+      move:      toNumber(progHashForLogs["indications_move_count"]),
+      active:    toNumber(progHashForLogs["indications_active_count"]),
+      optimal:   toNumber(progHashForLogs["indications_optimal_count"]),
+      auto:      toNumber(progHashForLogs["indications_auto_count"]),
+    }
+    const indicationsByTypeTotal =
+      indicationsByType.direction +
+      indicationsByType.move +
+      indicationsByType.active +
+      indicationsByType.optimal +
+      indicationsByType.auto
+
     const mergedLogs = logs.length > 0
       ? logs
       : structuredLogs.map((log: any) => ({
@@ -123,7 +146,13 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         realtimeCycleCount: sanitizeNonNegative(engineState?.realtime_cycle_count),
         cycleTimeMs: sanitizeNonNegative(engineState?.last_cycle_duration),
         intervalsProcessed: sanitizeNonNegative(await client.get(`intervals:${connectionId}:processed_count`).catch(() => 0)),
-        indicationsCount: sanitizeNonNegative(await client.get(`indications:${connectionId}:count`).catch(() => 0)),
+        indicationsCount: sanitizeNonNegative(
+          // Prefer the live progression hash total; fall back to the flat counter
+          indicationsByTypeTotal > 0
+            ? indicationsByTypeTotal
+            : toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0))
+        ),
+        indicationsByType,
         strategiesCount: sanitizeNonNegative(await client.get(`strategies:${connectionId}:count`).catch(() => 0)),
         strategyEvaluatedBase: sanitizeNonNegative(await client.get(`strategies:${connectionId}:base:evaluated`).catch(() => 0)),
         strategyEvaluatedMain: sanitizeNonNegative(await client.get(`strategies:${connectionId}:main:evaluated`).catch(() => 0)),

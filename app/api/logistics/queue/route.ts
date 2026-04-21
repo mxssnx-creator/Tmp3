@@ -1,12 +1,20 @@
-import { NextResponse } from "next/server"
+import { type NextRequest, NextResponse } from "next/server"
 import { getDashboardWorkflowSnapshot } from "@/lib/dashboard-workflow"
 import { buildLogisticsQueuePayload } from "@/lib/logistics-workflow"
 
 export const dynamic = "force-dynamic"
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
-    const snapshot = await getDashboardWorkflowSnapshot()
+    // When the Logistics page has a connection selected in the sidebar, the
+    // queue payload re-focuses on that connection so "Focus Connection" in
+    // the queue card mirrors the currently selected exchange.
+    const connectionId = request.nextUrl.searchParams.get("connectionId") || undefined
+    const preferredConnectionId =
+      connectionId && connectionId !== "demo-mode" && !connectionId.startsWith("demo")
+        ? connectionId
+        : undefined
+    const snapshot = await getDashboardWorkflowSnapshot({ preferredConnectionId })
 
     return NextResponse.json(buildLogisticsQueuePayload(snapshot))
   } catch (error) {

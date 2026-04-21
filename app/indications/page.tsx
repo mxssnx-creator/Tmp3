@@ -207,67 +207,73 @@ export default function IndicationsPage() {
     )
   }
 
+  /*
+   * Same fix as live-trading: the previous JSX closed the `p-4 space-y-4`
+   * wrapper immediately after the action buttons, orphaning the stats and
+   * the filter/result grid outside the padding. Also swapped hard-coded
+   * status colors for design tokens + accent tints with a uniform stat card.
+   */
   return (
-    <div className="space-y-4">
-      <PageHeader title="Indications" description="Trading signals with confidence and strength metrics" />
-      <div className="p-4 space-y-4">
-      <div className="flex gap-2">
-        <Button variant="outline" size="sm" onClick={() => window.location.reload()} className="h-8 text-xs">
-          <RefreshCw className="h-3 w-3 mr-1" />
-          Refresh
-        </Button>
-        <Button variant="outline" size="sm" className="h-8 text-xs">
-          <Download className="h-3 w-3 mr-1" />
-          Export
-        </Button>
+    <div className="p-4 space-y-4">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <PageHeader title="Indications" description="Trading signals with confidence and strength metrics" />
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={() => window.location.reload()} className="h-8 text-xs">
+            <RefreshCw className="h-3 w-3 mr-1" />
+            Refresh
+          </Button>
+          <Button variant="outline" size="sm" className="h-8 text-xs">
+            <Download className="h-3 w-3 mr-1" />
+            Export
+          </Button>
         </div>
       </div>
 
-       {/* Stats cards - compact */}
-       <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
-         {[
-           { icon: BarChart3, label: "Total", value: stats.total, color: "text-blue-600" },
-           { icon: Activity, label: "Enabled", value: stats.enabled, color: "text-green-600" },
-           { icon: TrendingUp, label: "Bullish", value: stats.upSignals, color: "text-orange-600" },
-           { icon: Zap, label: "High Conf", value: stats.highConfidence, color: "text-yellow-600" },
-           { icon: Activity, label: "Avg Conf", value: stats.avgConfidence.toFixed(1) + "%", color: "text-cyan-600" },
-         ].map((stat) => (
-           <Card key={stat.label} className="border-border bg-slate-50">
-             <CardContent className="p-2">
-               <div className="flex items-center gap-2">
-                 <stat.icon className={`h-3 w-3 ${stat.color}`} />
-                 <div className="min-w-0">
-                   <div className={`text-lg font-bold ${stat.color}`}>{stat.value}</div>
-                   <div className="text-xs text-muted-foreground">{stat.label}</div>
-                 </div>
-               </div>
-             </CardContent>
-           </Card>
-         ))}
-       </div>
+      {/* Stats cards — compact with accent icon pills */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+        {[
+          { icon: BarChart3, label: "Total",     value: stats.total, tint: "text-primary" },
+          { icon: Activity,  label: "Enabled",   value: stats.enabled, tint: "text-green-500" },
+          { icon: TrendingUp,label: "Bullish",   value: stats.upSignals, tint: "text-amber-500" },
+          { icon: Zap,       label: "High Conf", value: stats.highConfidence, tint: "text-amber-600 dark:text-amber-400" },
+          { icon: Activity,  label: "Avg Conf",  value: stats.avgConfidence.toFixed(1) + "%", tint: "text-primary" },
+        ].map((stat) => (
+          <Card key={stat.label} className="border-border bg-card">
+            <CardContent className="p-2 flex items-center gap-2">
+              <div className={`rounded bg-muted/60 p-1.5 ${stat.tint}`}>
+                <stat.icon className="h-3.5 w-3.5" />
+              </div>
+              <div className="min-w-0">
+                <div className={`text-base font-bold tabular-nums ${stat.tint}`}>{stat.value}</div>
+                <div className="text-[10px] text-muted-foreground uppercase tracking-wide">{stat.label}</div>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
 
-      {/* Main content - filters and results */}
+      {/* Main content - filters sidebar + results */}
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-        {/* Filters sidebar */}
         <div className="lg:col-span-1">
           <IndicationFiltersAdvanced filters={filters} onFiltersChange={setFilters} />
         </div>
 
-         {/* Results */}
-         <div className="lg:col-span-4 space-y-3">
-           {/* Results header */}
-           <div className="flex items-center justify-between text-xs px-3 py-2 bg-slate-50 rounded border border-border">
-             <div className="text-muted-foreground">
-               Showing <span className="font-semibold text-cyan-600">{filteredAndSortedIndications.length}</span> of <span className="font-semibold">{indications.length}</span> indications
-             </div>
-             <div className="text-muted-foreground">
-              {filters.sortBy === "recent" && "Sorted by: Most Recent"}
-              {filters.sortBy === "confidence" && "Sorted by: Confidence"}
-              {filters.sortBy === "strength" && "Sorted by: Strength"}
+        <div className="lg:col-span-4 space-y-3">
+          <div className="flex items-center justify-between text-xs px-3 py-2 bg-muted/40 rounded-md border border-border">
+            <div className="text-muted-foreground">
+              Showing{" "}
+              <span className="font-semibold text-foreground tabular-nums">{filteredAndSortedIndications.length}</span>{" "}
+              of{" "}
+              <span className="font-semibold tabular-nums">{indications.length}</span>{" "}
+              indications
+            </div>
+            <div className="text-muted-foreground">
+              {filters.sortBy === "recent"     && "Sorted: Most Recent"}
+              {filters.sortBy === "confidence" && "Sorted: Confidence"}
+              {filters.sortBy === "strength"   && "Sorted: Strength"}
             </div>
           </div>
 
-          {/* Results list */}
           <div className="space-y-1.5 max-h-[calc(100vh-300px)] overflow-y-auto">
             {filteredAndSortedIndications.length > 0 ? (
               filteredAndSortedIndications.map((indication, index) => (
@@ -283,9 +289,9 @@ export default function IndicationsPage() {
                   index={index}
                 />
               ))
-             ) : (
-               <div className="text-center py-12 text-muted-foreground">
-                 <div className="text-sm mb-2">No indications match your filters</div>
+            ) : (
+              <div className="text-center py-12 text-muted-foreground">
+                <div className="text-sm mb-2">No indications match your filters</div>
                 <Button variant="outline" size="sm" onClick={() => setFilters(initialFilters)} className="text-xs h-7">
                   Reset Filters
                 </Button>

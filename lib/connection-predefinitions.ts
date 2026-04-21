@@ -74,8 +74,8 @@ export const EXCHANGE_API_TYPES: Record<string, string[]> = {
   kucoin: ["spot", "perpetual", "margin", "futures"], // Spot, Perpetual Futures, Margin, Delivery Futures
   mexc: ["spot", "perpetual"], // Spot, Perpetual Swap
   bitget: ["spot", "perpetual", "margin", "usdt_futures"], // Spot, USDT Futures, USDC Futures, Coin Futures
-  pionex: ["spot", "perpetual"], // Spot, Perpetual
-  orangex: ["spot", "perpetual"], // Spot, Perpetual Futures
+  pionex: ["spot", "perpetual", "perpetual_futures"], // Spot, Perpetual (perpetual_futures alias)
+  orangex: ["spot", "perpetual", "perpetual_futures"], // Spot, Perpetual Futures (perpetual_futures alias)
   huobi: ["spot", "perpetual", "margin", "futures"], // Spot, Linear Swap, Inverse Swap, Margin
   kraken: ["spot", "futures"], // Spot, Futures
   coinbase: ["spot", "advanced"], // Spot, Advanced Trade API

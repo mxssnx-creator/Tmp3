@@ -49,6 +49,7 @@ interface Settings {
   negativeChangePercent: number
   leveragePercentage: number
   prehistoricDataDays: number
+  prehistoric_range_hours: number // 1-50h, step 1, default 8
   marketTimeframe: number
   tradeIntervalSeconds: number
   realPositionsIntervalSeconds: number
@@ -350,6 +351,7 @@ const initialSettings: Settings = {
   negativeChangePercent: 20, // 5-30 step 5, Default 20 - used for loss trigger calculation
   leveragePercentage: 100, // 5-100 step 5, Default 100
   prehistoricDataDays: 5,
+  prehistoric_range_hours: 8, // 1-50h, step 1, default 8
   marketTimeframe: 1,
   tradeIntervalSeconds: 1,
   realPositionsIntervalSeconds: 0.3,
@@ -412,8 +414,10 @@ const initialSettings: Settings = {
   maxPositionsPerConfigDirection: 1, // default 1 (max positions per config per direction)
   maxPositionsLong: 1, // Max 1 long position per configuration
   maxPositionsShort: 1, // Max 1 short position per configuration
-  indicationTimeoutMs: 1000, // 100ms to 3000ms, step 100ms, default 1000ms
-  maxConcurrentOperations: 100, // 10-250, default 100
+    indicationTimeoutMs: 1000, // 100ms to 3000ms, step 100ms, default 1000ms
+    maxConcurrentOperations: 100, // 10-250, default 100
+    cyclePauseMs: 50, // 10-200ms, step 10, default 50ms — pause between engine cycles
+    prehistoric_range_hours: 8, // 1-50h, step 1, default 8h — look-back window for prehistoric calc
 
   // System Configuration
   autoRestartOnErrors: true,

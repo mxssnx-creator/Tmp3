@@ -195,9 +195,7 @@ export function StatisticsOverview({ connections }: StatisticsOverviewProps) {
         setAggregateStats(aggregate)
       }
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : "Unknown error"
-      console.error("[v0] Statistics load error:", errorMsg)
-      setError(errorMsg)
+      setError(err instanceof Error ? err.message : "Unknown error")
     } finally {
       setLoading(false)
     }

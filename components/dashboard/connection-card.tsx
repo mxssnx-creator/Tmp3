@@ -139,7 +139,6 @@ export function ConnectionCard({
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined
     if (!autoTested && !connection.last_test_status && connection.is_enabled) {
-      console.log("[v0] Auto-testing connection:", connection.name)
       setAutoTested(true)
       // Delay auto-test by 2 seconds to avoid overwhelming the API
       timer = setTimeout(() => {
@@ -153,8 +152,7 @@ export function ConnectionCard({
     const timestamp = new Date().toISOString()
     const logEntry = { timestamp, level, message }
 
-    console.log(`[${level.toUpperCase()}] ${message}`)
-    setLogs((prev) => [...prev, logEntry].slice(-50)) // Keep last 50 logs
+    setLogs((prev) => [...prev, logEntry].slice(-50))
 
     // Send to system logger
     fetch("/api/system/log", {
@@ -166,7 +164,7 @@ export function ConnectionCard({
         message,
         connectionId: connection.id,
       }),
-    }).catch((err) => console.error("[v0] Failed to send log:", err))
+    }).catch(() => { /* non-critical */ })
   }
 
   useEffect(() => {
@@ -177,9 +175,7 @@ export function ConnectionCard({
           const data = await response.json()
           setLogs(data.logs || [])
         }
-      } catch (error) {
-        console.error("[v0] Failed to load connection logs:", error)
-      }
+      } catch { /* non-critical */ }
     }
 
     if (showLogs) {
@@ -200,9 +196,7 @@ export function ConnectionCard({
             // Progress update would trigger parent component re-render
           }
         }
-      } catch (error) {
-        console.error("[v0] Failed to poll connection status:", error)
-      }
+      } catch { /* non-critical */ }
     }
 
     const interval = setInterval(pollStatus, 3000) // Poll every 3 seconds
@@ -219,9 +213,7 @@ export function ConnectionCard({
           const data = await response.json()
           setAvailablePresetTypes(data.filter((p: PresetType) => p.is_active))
         }
-      } catch (error) {
-        console.error("[v0] Failed to load preset types:", error)
-      }
+      } catch { /* non-critical */ }
     }
 
     loadPresetTypes()
@@ -257,9 +249,7 @@ export function ConnectionCard({
             },
           })
         }
-      } catch (error) {
-        console.error("[v0] Failed to load connection info:", error)
-      }
+      } catch { /* non-critical */ }
     }
 
     if (showInfo) {
@@ -284,9 +274,7 @@ export function ConnectionCard({
             dcaEnabled: data.dca_enabled !== false,
           })
         }
-      } catch (error) {
-        console.error("[v0] Failed to load preset config:", error)
-      }
+      } catch { /* non-critical */ }
     }
 
     if (showSettings || showPresetConfig) {
@@ -303,11 +291,7 @@ export function ConnectionCard({
           setVolumeFactorLive(settings.baseVolumeFactorLive || 1.0)
           setVolumeFactorPreset(settings.baseVolumeFactorPreset || 1.0)
         }
-      } catch (error) {
-        console.error("[v0] Failed to load volume factors:", error)
-        setVolumeFactorLive(1.0)
-        setVolumeFactorPreset(1.0)
-      }
+      } catch { /* non-critical */ }
     }
 
     if (connection.id) {
@@ -323,9 +307,7 @@ export function ConnectionCard({
           const data = await response.json()
           setActiveIndications(data)
         }
-      } catch (error) {
-        console.error("[v0] Failed to load active indications:", error)
-      }
+      } catch { /* non-critical */ }
     }
 
     if (connection.is_enabled) {
@@ -395,15 +377,12 @@ export function ConnectionCard({
 
       setSelectedPresetType(presetTypeId)
       toast.success("Preset type assigned successfully")
-    } catch (error) {
-      console.error("[v0] Failed to assign preset type:", error)
+    } catch {
       toast.error("Failed to assign preset type")
     }
   }
 
   const handleMainEnableToggle = async (enabled: boolean) => {
-    console.log("[v0] Main enable toggle:", connection.id, enabled)
-
     if (!enabled) {
       setShowDisableConfirm(true)
     } else {
@@ -417,15 +396,11 @@ export function ConnectionCard({
             const systemSettings = await settingsRes.json()
             maxPositions = systemSettings.maxPositionsPerExchange?.[exchangeType] || 100
           }
-        } catch (err) {
-          console.warn("[v0] Could not load max positions, using default:", err)
-        }
+        } catch { /* use default */ }
 
-        console.log(`[v0] Enabling connection with max ${maxPositions} positions for ${exchangeType}`)
         await onToggleEnable(connection.id, true)
         toast.success(`Connection enabled (max ${maxPositions} positions)`)
-      } catch (error) {
-        console.error("[v0] Failed to enable connection:", error)
+      } catch {
         toast.error("Failed to enable connection")
       }
     }
@@ -445,8 +420,7 @@ export function ConnectionCard({
 
       setShowDisableConfirm(false)
       toast.success("Connection disabled - all trading stopped")
-    } catch (error) {
-      console.error("[v0] Failed to disable connection:", error)
+    } catch {
       toast.error("Failed to disable connection")
     }
   }
@@ -500,16 +474,13 @@ export function ConnectionCard({
         })
 
         if (response.ok) {
-          console.log("[v0] Preset coordination engine started")
           startStatusPolling()
           toast.success("Preset trade engine started")
         } else {
-          console.error("[v0] Failed to start preset coordination engine")
           setPresetTradeEnabled(false)
           toast.error("Failed to start preset trade engine")
         }
-      } catch (error) {
-        console.error("[v0] Error starting preset coordination engine:", error)
+      } catch {
         setPresetTradeEnabled(false)
         toast.error("Failed to start preset trade engine")
       }
@@ -520,12 +491,10 @@ export function ConnectionCard({
         })
 
         if (response.ok) {
-          console.log("[v0] Preset coordination engine stopped")
           stopStatusPolling()
           toast.success("Preset trade engine stopped")
         }
-      } catch (error) {
-        console.error("[v0] Error stopping preset coordination engine:", error)
+      } catch {
         toast.error("Failed to stop preset trade engine")
       }
     }
@@ -550,9 +519,7 @@ export function ConnectionCard({
           setEngineStatus(status)
           setTestingProgress(status.testing_progress || 0)
         }
-      } catch (error) {
-        console.error("[v0] Error fetching engine status:", error)
-      }
+      } catch { /* non-critical */ }
     }, 2000)
   }
 
@@ -606,8 +573,7 @@ export function ConnectionCard({
       }
 
       toast.success(`${type === "live" ? "Live" : "Preset"} volume factor updated to ${validatedValue.toFixed(1)}`)
-    } catch (error) {
-      console.error("[v0] Failed to update volume factor:", error)
+    } catch {
       toast.error("Failed to update volume factor")
     }
   }
@@ -626,8 +592,7 @@ export function ConnectionCard({
 
       toast.success("Preset configuration saved")
       setShowPresetConfig(false)
-    } catch (error) {
-      console.error("[v0] Failed to save preset config:", error)
+    } catch {
       toast.error("Failed to save preset configuration")
     }
   }
@@ -652,7 +617,6 @@ export function ConnectionCard({
       toast.success("Active indications saved")
       setShowActivateTradeDialog(false)
     } catch (error) {
-      console.error("[v0] Failed to save active indications:", error)
       toast.error(error instanceof Error ? error.message : "Failed to save active indications")
     }
   }
@@ -686,8 +650,7 @@ export function ConnectionCard({
         setTestResult({ success: false, error: data.details || data.error })
         toast.error(data.details || data.error || "Connection test failed")
       }
-    } catch (error) {
-      console.error("[v0] Connection test error:", error)
+    } catch {
       setTestResult({ success: false, error: "Network error" })
       toast.error("Failed to test connection")
     } finally {

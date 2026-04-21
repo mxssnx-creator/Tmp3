@@ -1,5 +1,9 @@
 import * as crypto from "crypto"
-import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-connector"
+import {
+  BaseExchangeConnector,
+  type ExchangeConnectorResult,
+  type PlaceOrderOptions,
+} from "./base-connector"
 import { safeParseResponse } from "@/lib/safe-response-parser"
 
 /**
@@ -33,9 +37,41 @@ export class BingXConnector extends BaseExchangeConnector {
   }
 
   private getSignature(params: Record<string, any>): string {
+    // Kept only for the one remaining helper that doesn't need the query
+    // string back (balance query). Prefer signParams() for everything else.
     const sortedKeys = Object.keys(params).sort()
-    const queryString = sortedKeys.map(key => `${key}=${params[key]}`).join('&')
+    const queryString = sortedKeys.map((key) => `${key}=${params[key]}`).join("&")
     return crypto.createHmac("sha256", this.credentials.apiSecret).update(queryString).digest("hex")
+  }
+
+  /**
+   * CRITICAL: BingX rejects every signed request unless the signature is
+   * computed over the EXACT query string that is transmitted. The previous
+   * implementation used `getSignature(params)` (sorted alphabetically) to
+   * produce the signature, then built the URL with
+   * `new URLSearchParams(params).toString()` (insertion order) — two
+   * different strings, which is why every `placeOrder`, `cancelOrder`,
+   * `setLeverage`, `setMarginType` and `setPositionMode` call came back with
+   * `code=100001: Signature verification failed` in the server logs.
+   *
+   * `signParams` returns the canonical (alphabetically-sorted) query string
+   * along with its signature so callers can use both for the URL and have
+   * them guaranteed to match. Values are stringified identically in both
+   * the signed payload and the URL, so no URL-encoding skew is possible.
+   *
+   * Characters relevant to our trading payloads (`-`, alphanumerics, digits,
+   * `.`) are all URL-unreserved per RFC 3986, so we can safely concatenate
+   * without `encodeURIComponent`. Keeping the signed and transmitted strings
+   * byte-identical is the important invariant.
+   */
+  private signParams(params: Record<string, any>): { signature: string; queryString: string } {
+    const sortedKeys = Object.keys(params).sort()
+    const queryString = sortedKeys.map((key) => `${key}=${params[key]}`).join("&")
+    const signature = crypto
+      .createHmac("sha256", this.credentials.apiSecret)
+      .update(queryString)
+      .digest("hex")
+    return { signature, queryString }
   }
 
   private toStringParams(params: Record<string, any>): Record<string, string> {
@@ -44,6 +80,41 @@ export class BingXConnector extends BaseExchangeConnector {
       result[key] = String(value)
     }
     return result
+  }
+
+  /**
+   * Convert a plain symbol (e.g. "BTCUSDT") into the BingX-specific format
+   * required by the perpetual-futures endpoints ("BTC-USDT").
+   *
+   * Spot endpoints historically accept both "BTCUSDT" and "BTC-USDT", but
+   * perpetual-futures trade endpoints (/openApi/swap/v2/trade/*) will respond
+   * with the generic "this api is not exist" error when the symbol lacks the
+   * hyphen, which is the most common source of order-placement failures.
+   *
+   * This helper is idempotent (already-hyphenated input is returned as-is) and
+   * only applied when the credentials describe a non-spot account.
+   */
+  private toBingXSymbol(symbol: string): string {
+    if (!symbol) return symbol
+    // Already hyphenated → nothing to do.
+    if (symbol.includes("-")) return symbol
+    // Spot still uses the plain BTCUSDT format on BingX.
+    if (this.credentials.apiType === "spot") return symbol
+
+    const upper = symbol.toUpperCase()
+    // Handle common quote assets; insert a dash before the quote.
+    const quotes = ["USDT", "USDC", "BTC", "ETH", "USD"]
+    for (const quote of quotes) {
+      if (upper.endsWith(quote) && upper.length > quote.length) {
+        return `${upper.slice(0, upper.length - quote.length)}-${quote}`
+      }
+    }
+    return upper
+  }
+
+  /** BingX returns `code` as a number on some endpoints and a string on others. */
+  private isBingXSuccess(code: unknown): boolean {
+    return code === 0 || code === "0"
   }
 
   getCapabilities(): string[] {
@@ -155,8 +226,8 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`Response status: ${response.status}`)
       this.log(`Response code: ${data.code}`)
 
-      // Check for error responses
-      if (!response.ok || data.code !== 0) {
+      // Check for error responses — BingX can return `code` as a number or string
+      if (!response.ok || !this.isBingXSuccess(data.code)) {
         const errorMsg = data.msg || data.error || `HTTP ${response.status}: ${response.statusText}`
         this.logError(`API Error (code ${data.code}): ${errorMsg}`)
         throw new Error(errorMsg)
@@ -255,32 +326,101 @@ export class BingXConnector extends BaseExchangeConnector {
     side: "buy" | "sell",
     quantity: number,
     price?: number,
-    orderType: "limit" | "market" = "limit"
+    orderType: "limit" | "market" = "limit",
+    options: PlaceOrderOptions = {},
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
-      this.log(`Placing ${orderType} ${side} order: ${quantity} ${symbol}`)
+      // ── Quantity sanity & formatting ─────────────────────────────────────
+      // BingX rejects quantities that fall below the symbol step size, and in
+      // many cases responds with its generic "this api is not exist" error
+      // instead of a precise reason. Normalise the quantity to a reasonable
+      // precision and refuse obviously-doomed amounts before signing.
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        const msg = `Invalid quantity: ${quantity}`
+        this.logError(`✗ ${msg}`)
+        return { success: false, error: msg }
+      }
+      // Round to 6 decimal places (enough for both high- and low-priced assets)
+      // then strip trailing zeros when serialising.
+      const roundedQty = Math.round(quantity * 1e6) / 1e6
+      if (roundedQty < 0.000001) {
+        const msg = `Quantity too small after rounding: ${quantity} → ${roundedQty}`
+        this.logError(`✗ ${msg}`)
+        return { success: false, error: msg }
+      }
+      // Serialise without scientific notation or trailing zeros.
+      const qtyStr = roundedQty.toFixed(6).replace(/\.?0+$/, "")
 
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/order" : "/openApi/swap/v3/trade/order"
+      // ── Symbol formatting ────────────────────────────────────────────────
+      // BingX perpetual futures require the hyphenated form "BTC-USDT". Spot
+      // accepts either. Passing "BTCUSDT" to a perp trade endpoint is the
+      // single biggest cause of "this api is not exist" errors in the wild.
+      const isSpot = this.credentials.apiType === "spot"
+      const bingxSymbol = this.toBingXSymbol(symbol)
+
+      // ── Position-side & reduce-only handling ─────────────────────────────
+      // BingX perp accepts positionSide = LONG | SHORT only when the account
+      // is in **hedge mode**. In one-way mode the same parameter will be
+      // rejected and the whole order fails. Resolution order:
+      //   1. Caller passed an explicit options.positionSide — trust it (only
+      //      valid when the caller also indicates hedge mode, else we drop it).
+      //   2. Caller told us hedgeMode=false — emit no positionSide (one-way).
+      //   3. Fallback (legacy behaviour) — derive from order side, which is
+      //      only correct for OPENING orders. For reduce-only orders this
+      //      would silently open a new opposite-side position, which is why
+      //      callers should always pass options.positionSide for SL/TP/close.
+      const hedgeMode = options.hedgeMode !== false
+      const explicitPositionSide = options.positionSide
+      const derivedPositionSide: "LONG" | "SHORT" = side === "buy" ? "LONG" : "SHORT"
+      const effectivePositionSide = explicitPositionSide
+        || (options.reduceOnly
+          // Reduce-only + no explicit side → infer the position side from the
+          // close side (a SELL-to-close is closing a LONG, a BUY-to-close is
+          // closing a SHORT).
+          ? (side === "sell" ? "LONG" : "SHORT")
+          : derivedPositionSide)
+
+      this.log(
+        `Placing ${orderType} ${side} order: ${qtyStr} ${bingxSymbol} (raw=${symbol})` +
+        `${options.reduceOnly ? " [reduceOnly]" : ""}` +
+        `${hedgeMode ? ` posSide=${effectivePositionSide}` : " [one-way]"}`
+      )
+
+      // Trade endpoints live under /openApi/swap/v2/* for perpetual futures
+      // and /openApi/spot/v1/* for spot.
+      const endpoint = isSpot ? "/openApi/spot/v1/trade/order" : "/openApi/swap/v2/trade/order"
 
       const params: Record<string, any> = {
-        symbol,
+        symbol: bingxSymbol,
         side: side.toUpperCase(),
         type: orderType === "market" ? "MARKET" : "LIMIT",
-        quantity: String(quantity),
+        quantity: qtyStr,
         timestamp: Date.now(),
       }
 
-      if (price && orderType === "limit") {
-        params.price = String(price)
+      if (!isSpot) {
+        if (hedgeMode) {
+          params.positionSide = effectivePositionSide
+        }
+        // reduceOnly is only meaningful on perp endpoints.
+        if (options.reduceOnly) {
+          params.reduceOnly = "true"
+        }
+        if (options.clientOrderId) {
+          params.clientOrderId = options.clientOrderId
+        }
       }
 
-      const signature = this.getSignature(params)
-      const stringParams: Record<string, string> = {}
-      for (const [key, value] of Object.entries(params)) {
-        stringParams[key] = String(value)
+      if (price && orderType === "limit") {
+        // Same precision treatment for price.
+        const priceRounded = Math.round(price * 1e8) / 1e8
+        params.price = priceRounded.toFixed(8).replace(/\.?0+$/, "")
       }
-      const queryString = `${new URLSearchParams(stringParams).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+
+      // Sign and build URL from the SAME sorted query string so BingX's
+      // signature check succeeds (see `signParams` comment for context).
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -293,14 +433,42 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        // Special-case: 80014 "position side does not match" — the account is
+        // in one-way mode but we sent a hedge-mode positionSide. Retry once
+        // without positionSide so the order still goes through rather than
+        // being silently dropped.
+        const sideMismatch = String(data.code) === "80014"
+          || /position.*side/i.test(String(data.msg || ""))
+        if (sideMismatch && !isSpot && hedgeMode) {
+          this.log("Retrying order without positionSide (detected one-way account)")
+          delete params.positionSide
+          params.timestamp = Date.now()
+          const { signature: retrySig, queryString: retryQs } = this.signParams(params)
+          const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}&signature=${retrySig}`
+          const retryResp = await this.rateLimitedFetch(retryUrl, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const retryData = await retryResp.json()
+          if (this.isBingXSuccess(retryData.code)) {
+            const info = retryData.data?.order || retryData.data || {}
+            const id = info.orderId || info.id || retryData.data?.orderId
+            this.log(`✓ Order placed on retry (one-way): ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined }
+          }
+          throw new Error(`BingX API error (code=${retryData.code}): ${retryData.msg || "Unknown error"}`)
+        }
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
-      const orderId = data.data?.orderId || data.data?.id
-      this.log(`�� Order placed successfully: ${orderId}`)
+      // BingX wraps the order payload inconsistently: sometimes data.data.order,
+      // sometimes data.data, sometimes data.data.orderId directly.
+      const orderInfo = data.data?.order || data.data || {}
+      const orderId = orderInfo.orderId || orderInfo.id || data.data?.orderId
+      this.log(`✓ Order placed successfully: ${orderId}`)
 
-      return { success: true, orderId }
+      return { success: true, orderId: orderId ? String(orderId) : undefined }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to place order: ${errorMsg}`)
@@ -312,24 +480,24 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       this.log(`Cancelling order ${orderId} for ${symbol}`)
 
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/cancel_order" : "/openApi/swap/v3/trade/cancel_order"
+      // Perp swap: DELETE /openApi/swap/v2/trade/order (no separate cancel path).
+      // Spot: POST /openApi/spot/v1/trade/cancel (v1 spot still uses a subpath).
+      const isSpot = this.credentials.apiType === "spot"
+      const endpoint = isSpot ? "/openApi/spot/v1/trade/cancel" : "/openApi/swap/v2/trade/order"
+      const method = isSpot ? "POST" : "DELETE"
+      const bingxSymbol = this.toBingXSymbol(symbol)
 
       const params = {
-        symbol,
+        symbol: bingxSymbol,
         orderId,
         timestamp: Date.now(),
       }
 
-      const signature = this.getSignature(params)
-      const stringParams: Record<string, string> = {}
-      for (const [key, value] of Object.entries(params)) {
-        stringParams[key] = String(value)
-      }
-      const queryString = `${new URLSearchParams(stringParams).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
-        method: "POST",
+        method,
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
@@ -339,8 +507,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       this.log(`✓ Order cancelled successfully`)
@@ -356,25 +524,29 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       this.log(`Fetching order ${orderId} for ${symbol}`)
 
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/query_order" : "/openApi/swap/v3/trade/query_order"
+      // Perp swap: GET /openApi/swap/v2/trade/order (same path as place/cancel, different method).
+      // Spot: GET /openApi/spot/v1/trade/query (v1 spot uses a subpath).
+      const isSpot = this.credentials.apiType === "spot"
+      const endpoint = isSpot ? "/openApi/spot/v1/trade/query" : "/openApi/swap/v2/trade/order"
+      const bingxSymbol = this.toBingXSymbol(symbol)
 
       const params = {
-        symbol,
+        symbol: bingxSymbol,
         orderId,
         timestamp: Date.now(),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
+        method: "GET",
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
       const data = await response.json()
 
-      if (data.code !== "0") {
+      if (!this.isBingXSuccess(data.code)) {
         return null
       }
 
@@ -390,19 +562,19 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       this.log(`Fetching open orders${symbol ? ` for ${symbol}` : ""}`)
 
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/openOrders" : "/openApi/swap/v3/trade/openOrders"
+      // Perp: /openApi/swap/v2/trade/openOrders (not v3).
+      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/openOrders" : "/openApi/swap/v2/trade/openOrders"
 
       const params: Record<string, any> = {
         timestamp: Date.now(),
       }
 
       if (symbol) {
-        params.symbol = symbol
+        params.symbol = this.toBingXSymbol(symbol)
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
@@ -410,11 +582,13 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
+      if (!this.isBingXSuccess(data.code)) {
         return []
       }
 
-      return data.data || []
+      // Swap openOrders returns { orders: [...] }; spot returns an array directly.
+      const rows = data.data?.orders || data.data
+      return Array.isArray(rows) ? rows : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch open orders: ${errorMsg}`)
@@ -426,7 +600,8 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       this.log(`Fetching order history${symbol ? ` for ${symbol}` : ""} (limit: ${limit})`)
 
-      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/allOrders" : "/openApi/swap/v3/trade/allOrders"
+      // Perp: /openApi/swap/v2/trade/allOrders (not v3).
+      const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/allOrders" : "/openApi/swap/v2/trade/allOrders"
 
       const params: Record<string, any> = {
         limit,
@@ -434,12 +609,11 @@ export class BingXConnector extends BaseExchangeConnector {
       }
 
       if (symbol) {
-        params.symbol = symbol
+        params.symbol = this.toBingXSymbol(symbol)
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
@@ -447,11 +621,12 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
+      if (!this.isBingXSuccess(data.code)) {
         return []
       }
 
-      return data.data || []
+      const rows = data.data?.orders || data.data
+      return Array.isArray(rows) ? rows : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch order history: ${errorMsg}`)
@@ -482,19 +657,18 @@ export class BingXConnector extends BaseExchangeConnector {
       }
 
       if (symbol) {
-        params.symbol = symbol
+        params.symbol = this.toBingXSymbol(symbol)
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      
+      const { signature, queryString: signedQs } = this.signParams(params)
+
       // Use different endpoint based on contract type
       let endpoint = "/openApi/swap/v3/user/positions" // USDT Perpetual
       if (effectiveContractType === "coin-perpetual") {
         endpoint = "/openApi/cswap/v1/user/positions" // Coin-M Perpetual
       }
-      
-      const url = `${this.getBaseUrl()}${endpoint}?${queryString}`
+
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
       this.log(`Using endpoint: ${endpoint}`)
 
       const response = await this.rateLimitedFetch(url, {
@@ -503,11 +677,11 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
+      if (!this.isBingXSuccess(data.code)) {
         return []
       }
 
-      return data.data || []
+      return Array.isArray(data.data) ? data.data : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch positions: ${errorMsg}`)
@@ -529,7 +703,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`Modifying position ${symbol}${leverage ? ` leverage=${leverage}` : ""}${marginType ? ` marginType=${marginType}` : ""}`)
 
       const params: Record<string, any> = {
-        symbol,
+        symbol: this.toBingXSymbol(symbol),
         timestamp: Date.now(),
       }
 
@@ -541,9 +715,9 @@ export class BingXConnector extends BaseExchangeConnector {
         params.marginType = marginType === "cross" ? "CROSSED" : "ISOLATED"
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(this.toStringParams(params)).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/swap/v3/trade/positionSide/set?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      // Perp: /openApi/swap/v2/trade/positionSide/dual — v3 path does not exist.
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/positionSide/dual?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -552,8 +726,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       this.log(`✓ Position modified successfully`)
@@ -574,9 +748,35 @@ export class BingXConnector extends BaseExchangeConnector {
         return { success: false, error: "Position not found" }
       }
 
-      // Place opposite order to close
-      const side = position.side === "LONG" ? "sell" : "buy"
-      const result = await this.placeOrder(symbol, side as "buy" | "sell", position.contracts, position.currentPrice, "market")
+      // Determine the effective side of the *position* we are closing so the
+      // reduce-only close order carries the correct `positionSide` on hedge
+      // accounts. When the caller tells us explicitly, trust it; otherwise
+      // infer from the exchange response.
+      const posSideNormalised = (positionSide
+        ? positionSide.toUpperCase()
+        : String(position.side || position.positionSide || "LONG").toUpperCase()) as "LONG" | "SHORT"
+
+      // Close side is the OPPOSITE of the position side:
+      //   LONG position  → SELL to close
+      //   SHORT position → BUY to close
+      const closeSide = posSideNormalised === "LONG" ? "sell" : "buy"
+      const qty = Number(position.contracts || position.positionAmt || position.quantity || 0)
+      if (!qty || qty <= 0) {
+        return { success: false, error: "Position size is zero or invalid — nothing to close" }
+      }
+
+      const result = await this.placeOrder(
+        symbol,
+        closeSide as "buy" | "sell",
+        qty,
+        undefined,
+        "market",
+        {
+          reduceOnly: true,
+          positionSide: posSideNormalised,
+          hedgeMode: true,
+        },
+      )
 
       if (!result.success) {
         return result
@@ -600,9 +800,8 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(Date.now()),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/wallet/v1/query_address?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/wallet/v1/query_address?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
@@ -610,8 +809,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       const address = data.data?.address
@@ -636,9 +835,8 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(Date.now()),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/wallet/v1/withdraw?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/wallet/v1/withdraw?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -647,8 +845,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       const txId = data.data?.txId
@@ -671,9 +869,8 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(Date.now()),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/wallet/v1/query_withdraw_list?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/wallet/v1/query_withdraw_list?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
@@ -681,11 +878,11 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
+      if (!this.isBingXSuccess(data.code)) {
         return []
       }
 
-      return data.data || []
+      return Array.isArray(data.data) ? data.data : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch transfer history: ${errorMsg}`)
@@ -695,30 +892,50 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setLeverage(symbol: string, leverage: number): Promise<{ success: boolean; error?: string }> {
     try {
-      this.log(`Setting leverage to ${leverage}x for ${symbol}`)
+      const bingxSymbol = this.toBingXSymbol(symbol)
+      this.log(`Setting leverage to ${leverage}x for ${bingxSymbol} on both sides`)
 
-      const params: Record<string, string> = {
-        symbol,
-        leverage: String(leverage),
-        timestamp: String(Date.now()),
+      // Previously this method always sent `side: "LONG"`, which meant any
+      // SHORT position opened afterwards was stuck on the default leverage
+      // (often 5x) regardless of what the engine requested — and in some
+      // accounts caused the subsequent SHORT entry to be rejected for
+      // leverage-mismatch. Fire both LONG and SHORT side updates in parallel
+      // so hedge-mode accounts have matching leverage on both sides.
+      const updateForSide = async (side: "LONG" | "SHORT") => {
+        const params: Record<string, string> = {
+          symbol: bingxSymbol,
+          side,
+          leverage: String(leverage),
+          timestamp: String(Date.now()),
+        }
+        const { signature, queryString: signedQs } = this.signParams(params)
+        const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${signedQs}&signature=${signature}`
+        const response = await this.rateLimitedFetch(url, {
+          method: "POST",
+          headers: { "X-BX-APIKEY": this.credentials.apiKey },
+        })
+        const data = await response.json()
+        return { side, ok: this.isBingXSuccess(data.code), data }
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/swap/v3/trade/leverage?${queryString}`
+      const [longResult, shortResult] = await Promise.all([
+        updateForSide("LONG").catch((err) => ({ side: "LONG", ok: false, data: { msg: String(err) } })),
+        updateForSide("SHORT").catch((err) => ({ side: "SHORT", ok: false, data: { msg: String(err) } })),
+      ])
 
-      const response = await this.rateLimitedFetch(url, {
-        method: "POST",
-        headers: { "X-BX-APIKEY": this.credentials.apiKey },
-      })
+      // Accept the call as successful if at least one side was configured.
+      // On one-way-mode accounts BingX rejects the `side` param with code
+      // 80012 / 80014; treat those as non-fatal — the engine still proceeds.
+      const ok = longResult.ok || shortResult.ok ||
+        String(longResult.data?.code) === "80014" ||
+        String(shortResult.data?.code) === "80014"
 
-      const data = await response.json()
-
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!ok) {
+        const reason = longResult.data?.msg || shortResult.data?.msg || "Unknown error"
+        throw new Error(`BingX leverage API error: ${reason}`)
       }
 
-      this.log(`✓ Leverage set to ${leverage}x`)
+      this.log(`✓ Leverage set to ${leverage}x (long=${longResult.ok}, short=${shortResult.ok})`)
       return { success: true }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
@@ -729,17 +946,18 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setMarginType(symbol: string, marginType: "cross" | "isolated"): Promise<{ success: boolean; error?: string }> {
     try {
-      this.log(`Setting margin type to ${marginType} for ${symbol}`)
+      const bingxSymbol = this.toBingXSymbol(symbol)
+      this.log(`Setting margin type to ${marginType} for ${bingxSymbol}`)
 
       const params: Record<string, string> = {
-        symbol,
+        symbol: bingxSymbol,
         marginType: marginType === "cross" ? "CROSSED" : "ISOLATED",
         timestamp: String(Date.now()),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/swap/v3/trade/marginType?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      // Perp: /openApi/swap/v2/trade/marginType (not v3).
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -748,8 +966,13 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        // Margin-type-unchanged is not a real error on BingX; ignore code 101404.
+        if (data.code === 101404 || /no need to change/i.test(String(data.msg || ""))) {
+          this.log(`Margin type already ${marginType} — no change needed`)
+          return { success: true }
+        }
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       this.log(`✓ Margin type set to ${marginType}`)
@@ -770,9 +993,9 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: String(Date.now()),
       }
 
-      const signature = this.getSignature(params)
-      const queryString = `${new URLSearchParams(params).toString()}&signature=${signature}`
-      const url = `${this.getBaseUrl()}/openApi/swap/v3/trade/positionSide/set?${queryString}`
+      const { signature, queryString: signedQs } = this.signParams(params)
+      // Perp: /openApi/swap/v2/trade/positionSide/dual — v3 and /set do not exist.
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/positionSide/dual?${signedQs}&signature=${signature}`
 
       const response = await this.rateLimitedFetch(url, {
         method: "POST",
@@ -781,8 +1004,8 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const data = await response.json()
 
-      if (data.code !== "0") {
-        throw new Error(`BingX API error: ${data.msg || "Unknown error"}`)
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
       }
 
       this.log(`✓ Position mode set to ${hedgeMode ? "hedge" : "one-way"}`)

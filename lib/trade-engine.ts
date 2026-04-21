@@ -6,7 +6,7 @@
 // CRITICAL: Import patch FIRST to fix cache initialization issues in stale webpack bundles
 import "./trade-engine/indication-processor-patch"
 
-const COORDINATOR_VERSION = "4.0.0"
+const COORDINATOR_VERSION = "4.1.0"
 
 // Force clear stale engine instances on version change
 const coordGlobal = globalThis as unknown as { 
@@ -342,7 +342,12 @@ export class GlobalTradeEngineCoordinator {
       
       await initRedis()
       const enabledIds = new Set(connections.map(c => c.id))
-      const runningIds = new Set(this.engineManagers.keys())
+      // Only count managers whose engine is actually running, not zombie Map entries from stale closures
+      const runningIds = new Set(
+        Array.from(this.engineManagers.entries())
+          .filter(([, mgr]) => mgr.isEngineRunning)
+          .map(([id]) => id),
+      )
       
       console.log(`[v0] [Coordinator] Missing engines check: shouldBeRunning=${enabledIds.size}, currentlyRunning=${runningIds.size}`)
       
@@ -422,7 +427,12 @@ export class GlobalTradeEngineCoordinator {
       const allConnections = await getAllConnections()
       
       const enabledIds = new Set(enabledConnections.map(c => c.id))
-      const runningIds = new Set(this.engineManagers.keys())
+      // Only count managers whose engine is actually running (not just present in the Map)
+      const runningIds = new Set(
+        Array.from(this.engineManagers.entries())
+          .filter(([, mgr]) => mgr.isEngineRunning)
+          .map(([id]) => id)
+      )
       
       console.log(`[v0] [Coordinator] State: enabled=${enabledConnections.length}, running=${runningIds.size}`)
       
@@ -853,7 +863,7 @@ const engineGlobalThis = globalThis as unknown as {
   __engine_timers?: Set<ReturnType<typeof setInterval>>
 }
 
-const TRADE_ENGINE_VERSION = "5.0.0"
+const TRADE_ENGINE_VERSION = "5.1.0"
 
 // V5: Aggressive cleanup - clear ALL registered engine timers on version change
 if (engineGlobalThis.__tradeEngineVersion !== TRADE_ENGINE_VERSION) {
