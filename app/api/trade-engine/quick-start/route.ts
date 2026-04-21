@@ -568,7 +568,10 @@ export async function POST(request: Request) {
         },
         main: mainPseudoPositions,
         real: realPseudoPositions,
-        total: basePseudoPositions + mainPseudoPositions + realPseudoPositions,
+        // Cascade pipeline — NOT a sum. `total` is the final-stage (Real) count;
+        // Base/Main pseudos are intermediate filter stages of the SAME underlying
+        // pseudo-positions, so summing would multi-count the same entries.
+        total: realPseudoPositions,
       },
       
       // Live positions

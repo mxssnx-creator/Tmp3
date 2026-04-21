@@ -207,7 +207,10 @@ async function buildDashboardWorkflowSnapshot(preferredConnectionId?: string) {
           base: baseSets,
           main: mainSets,
           real: realSets,
-          total: baseSets + mainSets + realSets,
+          // Cascade pipeline — Base → Main → Real is eval → filter → adjust on
+          // the SAME underlying pseudo-position population. `total` = Real-stage
+          // survivors only; summing the three would multi-count the same items.
+          total: realSets,
         },
         livePositions: 0,
       },

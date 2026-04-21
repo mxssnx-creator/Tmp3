@@ -247,8 +247,15 @@ export function StatisticsOverview({ connections }: StatisticsOverviewProps) {
 }
 
 function StatisticsCards({ stats }: { stats: ConnectionStats }) {
-  const indicationsTotal = stats.indications.base + stats.indications.main + stats.indications.real + stats.indications.live
-  const strategiesTotal = stats.strategies.base + stats.strategies.main + stats.strategies.real + stats.strategies.live
+  // ── Pipeline-aware totals ────────────────────────────────────────────────
+  // Base → Main → Real → Live is a CASCADE FILTER (eval → filter → adjust →
+  // promote) applied to the SAME logical items. Each downstream stage is a
+  // filtered subset of its upstream stage — never a new, distinct population.
+  // Therefore the canonical "total" is the FINAL-STAGE count (Real), never a
+  // sum of the four stage counters. Live is shown separately because it is
+  // a runtime-promotion subset of Real, not an additional stage.
+  const indicationsTotal = stats.indications.real
+  const strategiesTotal  = stats.strategies.real
   const indicationToStrategyRatio = strategiesTotal > 0 ? (indicationsTotal / strategiesTotal).toFixed(2) : "0"
   const strategyToPositionRatio = stats.positions.total_evaluated > 0 ? (strategiesTotal / stats.positions.total_evaluated).toFixed(2) : "0"
 

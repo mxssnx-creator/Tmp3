@@ -33,16 +33,33 @@ function pick(...values: unknown[]): number {
  * Falls back to trade_engine_state:{connId} (flushed every 50-100 cycles)
  * only when the primary sources return zero.
  *
+ * ── IMPORTANT: Pipeline semantics (applies to every stage total below) ─
+ * Base → Main → Real → Live is a CASCADE FILTER pipeline:
+ *   Base  = initial Set enumeration (eval)
+ *   Main  = Base Sets that survived the Main PF/DDT filter
+ *   Real  = Main Sets that survived the strict Real filter (adjust)
+ *   Live  = Real Sets promoted to the exchange (runtime subset of Real)
+ * Each downstream stage contains the SAME logical strategies that survived
+ * the upstream stage — it is NOT a separate population. Therefore:
+ *
+ *   canonical "strategies total" = Real-stage count (final filtered output)
+ *
+ * and stage counters MUST NEVER be summed together. Ratios between adjacent
+ * stages (e.g. main/base) express pass-through rate, not additive totals.
+ * The same rule applies to pseudo-position base/main/real counts.
+ *
  * Response shape:
  * {
  *   historic: { symbolsProcessed, symbolsTotal, candlesLoaded, indicatorsCalculated,
  *               cyclesCompleted, isComplete, progressPercent }
  *   realtime: { indicationCycles, strategyCycles, realtimeCycles, indicationsTotal,
  *               strategiesTotal, positionsOpen, isActive, successRate, avgCycleTimeMs }
+ *               ↑ strategiesTotal = Real-stage output (NOT sum of stages)
  *   breakdown: {
  *     indications: { direction, move, active, optimal, auto, total }
  *     strategies:  { base, main, real, live, total,
  *                    baseEvaluated, mainEvaluated, realEvaluated }
+ *                    ↑ `total` = Real-stage count only, per pipeline rule above
  *   }
  *   metadata: { engineRunning, phase, progress, message, lastUpdate, redisDbEntries }
  * }
@@ -682,7 +699,7 @@ export async function GET(
         }
       })(),
 
-      // ── Live Exchange Execution metrics ─────────────────────────────────
+      // ��─ Live Exchange Execution metrics ─────────────────────────────────
       // Read directly from progression hash counters written by the live-stage
       // pipeline (see lib/trade-engine/stages/live-stage.ts). Every stage of
       // the pipeline increments one of these so the UI can show a real-time

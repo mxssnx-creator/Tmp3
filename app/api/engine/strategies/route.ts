@@ -119,19 +119,24 @@ export async function GET(req: NextRequest) {
         console.warn(`[EngineStrategies] Error querying strategy counts:`, queryErr)
       }
       
+      // ── Pipeline-aware totals ─────────────────────────────────────────
+      // Base → Main → Real is a cascade filter. Each stage processes the
+      // SAME logical strategies that survived the previous filter, so
+      // summing them would triple-count. The canonical "total" at every
+      // level is the Real-stage count only.
       const response = {
         connectionId,
         strategies: {
           base: baseStrategyCount,
           main: mainStrategyCount,
           real: realStrategyCount,
-          total: baseStrategyCount + mainStrategyCount + realStrategyCount,
+          total: realStrategyCount,
         },
         evaluated: {
           base: evaluatedBase,
           main: evaluatedMain,
           real: evaluatedReal,
-          total: evaluatedBase + evaluatedMain + evaluatedReal,
+          total: evaluatedReal,
         },
         timestamp: new Date().toISOString(),
       }
