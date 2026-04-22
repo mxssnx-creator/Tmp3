@@ -105,7 +105,11 @@ function refreshCyclePauseMsAsync(): void {
   _cyclePauseMsRefreshing = true
   ;(async () => {
     try {
-      const { getAppSettings, getSettingsVersion } = await import("@/lib/redis-db")
+      // `getAppSettings` / `getSettingsVersion` are statically imported
+      // at the top of the module — hoisted out of the hot path to avoid
+      // a per-cycle `await import()` round-trip that was previously
+      // costing ~1 ms every time the settings version advanced.
+      //
       // Snapshot the version BEFORE the read so any further bump that
       // lands mid-read still triggers a subsequent refresh.
       const version = await getSettingsVersion()
@@ -149,7 +153,7 @@ function getCyclePauseMsSync(): number {
 // Prime the cache on module load so the first cycle uses a recent value.
 refreshCyclePauseMsAsync()
 
-import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis, getSettingsVersionCachedSync } from "@/lib/redis-db"
+import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis, getSettingsVersionCachedSync, getAppSettings, getAppSetting, getSettingsVersion } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
 import { IndicationProcessor } from "./indication-processor-fixed"
 import { StrategyProcessor } from "./strategy-processor"
@@ -1583,8 +1587,9 @@ export class TradeEngineManager {
         // Global main-symbols fallback — the UI stores these as fields on
         // the canonical `app_settings` hash, never as standalone Redis
         // keys, so `getSettings("useMainSymbols")` would always return
-        // null. Use the mirror-aware scalar reader instead.
-        const { getAppSetting } = await import("@/lib/redis-db")
+        // null. Use the mirror-aware scalar reader (statically imported
+        // at the top of the module; avoids a `await import()` on this
+        // cycle-hot path).
         const useMainSymbols = await getAppSetting<boolean>("useMainSymbols", false)
         if (useMainSymbols === true) {
           const mainSymbols = await getAppSetting<string[]>("mainSymbols", [])

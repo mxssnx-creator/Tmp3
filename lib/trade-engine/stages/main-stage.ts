@@ -300,15 +300,19 @@ export async function getMainPositions(connectionId: string): Promise<MainPositi
 
   try {
     const keys = await client.keys(`main:position:main:${connectionId}:*`)
+    if (keys.length === 0) return []
+
+    // Batch GETs into a single fan-out. The prior sequential loop paid
+    // one Redis round-trip per position, which dominated cycle latency
+    // when positions accumulated. Matches the live-stage pattern.
+    const rawValues = await Promise.all(
+      keys.map((k: string) => client.get(k).catch(() => null)),
+    )
     const positions: MainPosition[] = []
-
-    for (const key of keys) {
-      const data = await client.get(key)
-      if (data) {
-        positions.push(JSON.parse(data))
-      }
+    for (const data of rawValues) {
+      if (!data) continue
+      try { positions.push(JSON.parse(data as string)) } catch { /* ignore */ }
     }
-
     return positions
   } catch (err) {
     console.warn(`${LOG_PREFIX} Error getting main positions:`, err)

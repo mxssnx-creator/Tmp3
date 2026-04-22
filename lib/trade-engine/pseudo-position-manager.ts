@@ -27,7 +27,10 @@ export class PseudoPositionManager {
   // incoming market price against this memo before issuing an HSET, so
   // sub-epsilon ticks on quiet symbols produce zero Redis writes. Entry
   // is cleared on close via invalidatePriceMemo() so a reopened id with
-  // the same position key starts fresh.
+  // the same position key starts fresh. FIFO-capped at MAX_PRICE_MEMO
+  // so a leaked position id (e.g. close signal lost mid-transaction)
+  // cannot grow the map unboundedly over a long-running engine.
+  private static readonly MAX_PRICE_MEMO = 1000
   private lastWrittenPrice: Map<string, number> = new Map()
 
   constructor(connectionId: string) {
@@ -394,6 +397,15 @@ export class PseudoPositionManager {
           current_price: String(currentPrice),
           updated_at: new Date().toISOString(),
         })
+        // FIFO-evict oldest entry if the memo grows beyond a safety cap.
+        // Entries are normally cleared on close via `closePosition` →
+        // `lastWrittenPrice.delete(positionId)`, so this branch only
+        // fires for abandoned position ids (e.g. a close signal lost
+        // mid-transaction). Keeps long-running engine memory bounded.
+        if (this.lastWrittenPrice.size >= PseudoPositionManager.MAX_PRICE_MEMO && !this.lastWrittenPrice.has(positionId)) {
+          const oldest = this.lastWrittenPrice.keys().next().value
+          if (oldest !== undefined) this.lastWrittenPrice.delete(oldest)
+        }
         this.lastWrittenPrice.set(positionId, currentPrice)
 
         // Calculate unrealized PnL for the broadcast only — skipping

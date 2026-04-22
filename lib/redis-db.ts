@@ -910,16 +910,20 @@ export async function getAllSettings(): Promise<Record<string, any>> {
   await initRedis()
   const client = getClient()
   const keys = await client.keys("settings:*")
+  if (keys.length === 0) return {}
+
+  // Fan out every hgetall in parallel — sequential awaits compounded
+  // latency linearly with the number of settings hashes, which showed
+  // up in export and admin-dashboard endpoints.
+  const hashes = await Promise.all(
+    keys.map((k) => client.hgetall(k).catch(() => null)),
+  )
   const settings: Record<string, any> = {}
-  
-  for (const key of keys) {
-    const settingKey = key.replace("settings:", "")
-    const hash = await client.hgetall(key)
-    if (hash) {
-      settings[settingKey] = parseHash(hash)
-    }
+  for (let i = 0; i < keys.length; i++) {
+    const hash = hashes[i]
+    if (!hash) continue
+    settings[keys[i].replace("settings:", "")] = parseHash(hash)
   }
-  
   return settings
 }
 
@@ -1187,15 +1191,16 @@ export async function getAllPositions(): Promise<any[]> {
   await initRedis()
   const client = getClient()
   const keys = await client.keys("position:*")
+  if (keys.length === 0) return []
+
+  const hashes = await Promise.all(
+    keys.map((k) => client.hgetall(k).catch(() => null)),
+  )
   const positions: any[] = []
-  
-  for (const key of keys) {
-    const hash = await client.hgetall(key)
-    if (hash) {
-      positions.push(parseHash(hash))
-    }
+  for (const hash of hashes) {
+    if (!hash) continue
+    positions.push(parseHash(hash))
   }
-  
   return positions
 }
 
@@ -1234,15 +1239,16 @@ export async function getAllTrades(): Promise<any[]> {
   await initRedis()
   const client = getClient()
   const keys = await client.keys("trade:*")
+  if (keys.length === 0) return []
+
+  const hashes = await Promise.all(
+    keys.map((k) => client.hgetall(k).catch(() => null)),
+  )
   const trades: any[] = []
-  
-  for (const key of keys) {
-    const hash = await client.hgetall(key)
-    if (hash) {
-      trades.push(parseHash(hash))
-    }
+  for (const hash of hashes) {
+    if (!hash) continue
+    trades.push(parseHash(hash))
   }
-  
   return trades
 }
 
@@ -1275,15 +1281,16 @@ export async function getAllIndications(): Promise<any[]> {
   await initRedis()
   const client = getClient()
   const keys = await client.keys("indication:*")
+  if (keys.length === 0) return []
+
+  const hashes = await Promise.all(
+    keys.map((k) => client.hgetall(k).catch(() => null)),
+  )
   const indications: any[] = []
-  
-  for (const key of keys) {
-    const hash = await client.hgetall(key)
-    if (hash) {
-      indications.push(parseHash(hash))
-    }
+  for (const hash of hashes) {
+    if (!hash) continue
+    indications.push(parseHash(hash))
   }
-  
   return indications
 }
 
@@ -1316,15 +1323,16 @@ export async function getAllStrategies(): Promise<any[]> {
   await initRedis()
   const client = getClient()
   const keys = await client.keys("strategy:*")
+  if (keys.length === 0) return []
+
+  const hashes = await Promise.all(
+    keys.map((k) => client.hgetall(k).catch(() => null)),
+  )
   const strategies: any[] = []
-  
-  for (const key of keys) {
-    const hash = await client.hgetall(key)
-    if (hash) {
-      strategies.push(parseHash(hash))
-    }
+  for (const hash of hashes) {
+    if (!hash) continue
+    strategies.push(parseHash(hash))
   }
-  
   return strategies
 }
 
@@ -1928,28 +1936,49 @@ export async function flushAll(): Promise<void> {
    await client.flushDb()
  }
 
+// Cache getRedisStats for 5 s. The underlying `client.keys("*")` is an
+// O(N) scan over the entire keyspace, so hammering it from a polling
+// monitoring dashboard would be a foot-gun. The cached value is plenty
+// fresh for a "connected + key count" display.
+let _redisStatsCache: {
+  value: { connected: boolean; memoryUsage: number; keyCount: number; uptime: number }
+  ts: number
+} | null = null
+const REDIS_STATS_CACHE_TTL_MS = 5000
+
 export async function getRedisStats(): Promise<{
   connected: boolean
   memoryUsage: number
   keyCount: number
   uptime: number
 }> {
+  const now = Date.now()
+  if (_redisStatsCache && now - _redisStatsCache.ts < REDIS_STATS_CACHE_TTL_MS) {
+    return _redisStatsCache.value
+  }
   try {
     const client = getRedisClient()
     const keys = await client.keys("*")
-    return {
+    const value = {
       connected: true,
       memoryUsage: 0, // In-memory implementation doesn't track this
       keyCount: keys.length,
       uptime: Date.now() - (globalThis as any).__redis_start_time || 0,
     }
+    _redisStatsCache = { value, ts: now }
+    return value
   } catch {
-    return {
+    const value = {
       connected: false,
       memoryUsage: 0,
       keyCount: 0,
       uptime: 0,
     }
+    // Cache failures briefly too so a broken Redis doesn't pin the CPU
+    // retrying connection on every polling request. Shorter TTL so
+    // recovery is still detected quickly.
+    _redisStatsCache = { value, ts: now - (REDIS_STATS_CACHE_TTL_MS - 1000) }
+    return value
   }
 }
 

@@ -250,15 +250,20 @@ export async function getCurrentIndications(
 
   try {
     const keys = await client.keys(`indication:${connectionId}:*`)
+    if (keys.length === 0) return []
+
+    // Fan-out GETs in parallel — indications can number in the
+    // hundreds across symbols, and a sequential await loop dominated
+    // cycle latency. Matches the pattern used by every position
+    // getter (real / main / live / base stages).
+    const rawValues = await Promise.all(
+      keys.map((k: string) => client.get(k).catch(() => null)),
+    )
     const indications: IndicationSignal[] = []
-
-    for (const key of keys) {
-      const data = await client.get(key)
-      if (data) {
-        indications.push(JSON.parse(data))
-      }
+    for (const data of rawValues) {
+      if (!data) continue
+      try { indications.push(JSON.parse(data as string)) } catch { /* ignore */ }
     }
-
     return indications
   } catch (err) {
     console.warn(`${LOG_PREFIX} Error getting indications: ${err}`)
