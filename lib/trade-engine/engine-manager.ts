@@ -69,18 +69,29 @@ function unregisterEngineTimer(timer: ReturnType<typeof setInterval>): void {
  * Configurable pause (ms) between engine cycles.
  *
  * Value comes from the `app_settings.cyclePauseMs` key in Redis, clamped to
- * [10, 200]. Default 50 ms. Cached in-memory for 10 s to avoid hitting Redis
- * on every cycle of every loop. A synchronous getter (`getCyclePauseMsSync`)
- * returns the last-known value and triggers an async refresh when the cache
- * has expired, so cycle scheduling never blocks on Redis I/O.
+ * [10, 200]. Default 50 ms.
+ *
+ * ── Live-settings contract ────────────────────────────────────────────
+ * Cached in-memory so cycle scheduling never blocks on Redis I/O, BUT the
+ * cache is tied to the global `settings_version` counter (bumped by every
+ * write via `setAppSettings` / `bumpSettingsVersion`), not a wall-clock
+ * TTL. The synchronous getter returns the last-known value and fires an
+ * async refresh whenever:
+ *   (a) the counter has changed since the last refresh   → operator saved
+ *   (b) 30 s have elapsed without any version bump       → defence-in-
+ *       depth against a missed signal (Redis flush, lost INCR, etc.)
+ * This makes saved settings take effect on the very next cycle (typically
+ * < 300 ms later, bounded by SETTINGS_VERSION_READ_TTL_MS + cycle pause)
+ * with NO engine restart required.
  */
 const DEFAULT_CYCLE_PAUSE_MS = 50
 const CYCLE_PAUSE_MIN = 10
 const CYCLE_PAUSE_MAX = 200
-const CYCLE_PAUSE_CACHE_TTL_MS = 10_000
+const CYCLE_PAUSE_HARD_REFRESH_MS = 30_000
 
 let _cyclePauseMsCached: number = DEFAULT_CYCLE_PAUSE_MS
 let _cyclePauseMsFetchedAt = 0
+let _cyclePauseMsVersion = -1
 let _cyclePauseMsRefreshing = false
 
 function clampCyclePauseMs(n: unknown): number {
@@ -94,14 +105,19 @@ function refreshCyclePauseMsAsync(): void {
   _cyclePauseMsRefreshing = true
   ;(async () => {
     try {
-      const { getSettings } = await import("@/lib/redis-db")
-      const s = (await getSettings("app_settings")) || {}
+      const { getAppSettings, getSettingsVersion } = await import("@/lib/redis-db")
+      // Snapshot the version BEFORE the read so any further bump that
+      // lands mid-read still triggers a subsequent refresh.
+      const version = await getSettingsVersion()
+      const s = (await getAppSettings()) || {}
       if (s && typeof s === "object" && "cyclePauseMs" in s) {
         _cyclePauseMsCached = clampCyclePauseMs((s as any).cyclePauseMs)
       }
+      _cyclePauseMsVersion = version
       _cyclePauseMsFetchedAt = Date.now()
     } catch {
-      // Keep last-known value on error
+      // Keep last-known value on error; still stamp the clock so we
+      // don't stampede the refresh on every cycle.
       _cyclePauseMsFetchedAt = Date.now()
     } finally {
       _cyclePauseMsRefreshing = false
@@ -109,9 +125,22 @@ function refreshCyclePauseMsAsync(): void {
   })()
 }
 
+/**
+ * Synchronous read used by every cycle loop. Hot path — must not await.
+ * Checks the version-counter cache (maintained by getSettingsVersion's
+ * own 250 ms in-process cache) and fires a background refresh whenever
+ * the counter has advanced OR the hard-refresh deadline has passed.
+ */
 function getCyclePauseMsSync(): number {
-  if (Date.now() - _cyclePauseMsFetchedAt > CYCLE_PAUSE_CACHE_TTL_MS) {
-    // Fire-and-forget refresh; return the cached value immediately.
+  const now = Date.now()
+  // Read the cached version synchronously via the non-blocking snapshot
+  // maintained in redis-db.ts. `getSettingsVersionCachedSync` never
+  // awaits — it opportunistically schedules a background refresh when
+  // its own 250 ms TTL has lapsed and returns the last-known value.
+  const liveVersion = getSettingsVersionCachedSync()
+  if (liveVersion !== _cyclePauseMsVersion) {
+    refreshCyclePauseMsAsync()
+  } else if (now - _cyclePauseMsFetchedAt > CYCLE_PAUSE_HARD_REFRESH_MS) {
     refreshCyclePauseMsAsync()
   }
   return _cyclePauseMsCached
@@ -120,7 +149,7 @@ function getCyclePauseMsSync(): number {
 // Prime the cache on module load so the first cycle uses a recent value.
 refreshCyclePauseMsAsync()
 
-import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
+import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis, getSettingsVersionCachedSync } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
 import { IndicationProcessor } from "./indication-processor-fixed"
 import { StrategyProcessor } from "./strategy-processor"
@@ -522,9 +551,14 @@ export class TradeEngineManager {
     const calcStartTs = Date.now()
 
     try {
+      // Use the mirror-aware reader so the operator's prehistoric_range_hours
+      // applies whether it was saved to the canonical (`app_settings`) or
+      // legacy (`all_settings`) hash. Read the `getAppSettings` lazily from
+      // redis-db to avoid adding another top-level import round-trip.
+      const { getAppSettings } = await import("@/lib/redis-db")
       const [engineState, appSettings] = await Promise.all([
         getSettings(`trade_engine_state:${this.connectionId}`),
-        getSettings("app_settings"),
+        getAppSettings(),
       ])
 
       // Resolve range in hours — priority: app_settings > engine state (hours) >

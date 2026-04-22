@@ -1,5 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { getSettings, setSettings } from "@/lib/redis-db"
+import { getSettings, setSettings, bumpSettingsVersion } from "@/lib/redis-db"
 
 /**
  * System-scoped settings bundle (rate limits, cleanup, backup toggles).
@@ -29,6 +29,11 @@ async function writeMirroredSystem(value: Record<string, any>): Promise<void> {
     setSettings(SYSTEM_KEY_CANONICAL, value),
     setSettings(SYSTEM_KEY_LEGACY,    value),
   ])
+  // Bump the global settings-version counter so any running processor
+  // that caches system-settings-derived values (cleanup schedule,
+  // leverage, exchange position cost) refreshes on its next cycle
+  // without waiting for its local TTL to expire.
+  await bumpSettingsVersion()
 }
 
 export async function GET(_request: NextRequest) {

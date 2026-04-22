@@ -3,7 +3,35 @@ import {
   getAppSettings,
   setAppSettings,
   initRedis,
+  getAllConnections,
 } from "@/lib/redis-db"
+import { logProgressionEvent } from "@/lib/engine-progression-logs"
+
+/**
+ * Fan out a single "settings_changed" progression log event to every
+ * active connection so the operator sees confirmation in the Engine
+ * Progression dashboard that their saved change was detected by the
+ * running engine on the very next cycle. Errors are swallowed — a log
+ * failure must never cause a settings save to 500.
+ */
+async function emitSettingsChanged(keyCount: number): Promise<void> {
+  try {
+    const connections = await getAllConnections().catch(() => [])
+    await Promise.all(
+      (connections || []).map((conn: any) =>
+        logProgressionEvent(
+          conn.id,
+          "settings_changed",
+          "info",
+          `Operator saved ${keyCount} setting${keyCount === 1 ? "" : "s"} — change will apply on the next cycle`,
+          { keyCount },
+        ).catch(() => { /* non-critical */ }),
+      ),
+    )
+  } catch {
+    /* non-critical */
+  }
+}
 
 export const runtime = "nodejs"
 
@@ -84,6 +112,9 @@ export async function POST(request: Request) {
     // indication-sets-processor — all of which read `all_settings`) see the
     // same snapshot on the next cycle.
     await setAppSettings(body)
+    // Fan out a progression event so the operator can confirm the new
+    // values reached every running engine.
+    await emitSettingsChanged(Object.keys(body || {}).length)
 
     console.log("[v0] Settings saved successfully to Redis (canonical + legacy mirror)")
 
@@ -115,6 +146,7 @@ export async function PUT(request: Request) {
     const mergedSettings = { ...existingSettings, ...incoming }
 
     await setAppSettings(mergedSettings)
+    await emitSettingsChanged(Object.keys(incoming || {}).length)
 
     console.log("[v0] Settings updated successfully in Redis (canonical + legacy mirror)")
 

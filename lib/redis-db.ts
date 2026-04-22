@@ -943,17 +943,23 @@ export async function getAllSettings(): Promise<Record<string, any>> {
 const APP_SETTINGS_KEY_CANONICAL = "app_settings" as const
 const APP_SETTINGS_KEY_LEGACY    = "all_settings" as const
 
-let appSettingsCache: { value: Record<string, any>; ts: number } | null = null
-const APP_SETTINGS_CACHE_TTL_MS = 2000
+let appSettingsCache: { value: Record<string, any>; ts: number; version: number } | null = null
+// Hard-refresh deadline — picks up silent Redis writes that happened
+// without going through our mirror writer (e.g. an out-of-band SET from
+// a migration script or another Vercel region). The version-counter
+// check below handles the common case in single-digit milliseconds.
+const APP_SETTINGS_HARD_REFRESH_MS = 30_000
 
 export async function getAppSettings(
   options: { bypassCache?: boolean } = {},
 ): Promise<Record<string, any>> {
   const now = Date.now()
+  const liveVersion = getSettingsVersionCachedSync()
   if (
     !options.bypassCache &&
     appSettingsCache &&
-    now - appSettingsCache.ts < APP_SETTINGS_CACHE_TTL_MS
+    appSettingsCache.version === liveVersion &&
+    now - appSettingsCache.ts < APP_SETTINGS_HARD_REFRESH_MS
   ) {
     return appSettingsCache.value
   }
@@ -964,7 +970,7 @@ export async function getAppSettings(
     ])
     // Legacy provides fallback values — canonical overrides on conflict.
     const merged = { ...(legacy || {}), ...(canonical || {}) }
-    appSettingsCache = { value: merged, ts: now }
+    appSettingsCache = { value: merged, ts: now, version: liveVersion }
     return merged
   } catch {
     return appSettingsCache?.value ?? {}
@@ -1007,19 +1013,145 @@ export async function getAppSetting<T = unknown>(
  * Writer that keeps the canonical + legacy hashes in sync. Call this
  * from the settings UI/API instead of `setSettings("app_settings", ...)`
  * so trade-engine consumers that read `all_settings` also pick up the
- * operator's latest values on the next cycle.
+ * operator's latest values on the next cycle. Also bumps the global
+ * `settings_version` counter so long-running processors detect the
+ * change without waiting for their local TTL to expire.
  */
 export async function setAppSettings(value: Record<string, any>): Promise<void> {
   await Promise.all([
     setSettings(APP_SETTINGS_KEY_CANONICAL, value),
     setSettings(APP_SETTINGS_KEY_LEGACY,    value),
   ])
-  appSettingsCache = { value, ts: Date.now() }
+  // Bump first so the new version number is known before we stamp the
+  // cache; otherwise the same-process cache would look "stale" to the
+  // next reader and cause an unnecessary Redis re-read.
+  const newVersion = await bumpSettingsVersion()
+  appSettingsCache = { value, ts: Date.now(), version: newVersion }
 }
 
 /** Invalidates the in-process app-settings cache. Callable from any write path. */
 export function invalidateAppSettingsCache(): void {
   appSettingsCache = null
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Live-settings version counter
+//
+// When an operator hits Save in the Settings UI, the server updates the
+// canonical + legacy Redis hashes. But the trade engine is a long-running
+// process on its own timers (possibly on another serverless instance),
+// so it needs a CHEAP signal that "something changed, bust your cache".
+//
+// Pattern: a monotonic integer counter at key `settings_version`.
+//   - Writers call `bumpSettingsVersion()` (INCR) after every save.
+//   - Consumers call `getSettingsVersion()` once per cycle (O(1) GET)
+//     and compare against their last-seen value. On mismatch they
+//     invalidate their cache of parsed settings fields.
+//
+// The counter read is itself cached in-process for 250 ms so a tight
+// inner loop doing many reads doesn't hammer Redis on every call.
+// ─────────────────────────────────────────────────────────────────────
+
+const SETTINGS_VERSION_KEY = "settings_version" as const
+let _settingsVersionCached: number = 0
+let _settingsVersionFetchedAt = 0
+let _settingsVersionRefreshing = false
+const SETTINGS_VERSION_READ_TTL_MS = 250
+
+/**
+ * Synchronous snapshot of the latest settings version. Used by hot-path
+ * cycle loops that can't await. Never hits Redis — returns the value
+ * maintained by the most recent call to `getSettingsVersion()` (or the
+ * background poll). Callers that see a stale value will simply get a
+ * belated refresh on the next cycle, which is acceptable because the
+ * soft-refresh deadline kicks in anyway.
+ */
+export function getSettingsVersionCachedSync(): number {
+  // Opportunistically fire a background refresh if the snapshot is
+  // older than the read TTL so cycle loops that never call the async
+  // variant still see updates within ~250 ms + one cycle.
+  const now = Date.now()
+  if (
+    !_settingsVersionRefreshing &&
+    now - _settingsVersionFetchedAt > SETTINGS_VERSION_READ_TTL_MS
+  ) {
+    _settingsVersionRefreshing = true
+    ;(async () => {
+      try {
+        await initRedis()
+        const client = getClient()
+        const raw = await client.get(SETTINGS_VERSION_KEY)
+        const parsed = Number(raw)
+        _settingsVersionCached = Number.isFinite(parsed) ? parsed : _settingsVersionCached
+        _settingsVersionFetchedAt = Date.now()
+      } catch {
+        _settingsVersionFetchedAt = Date.now()
+      } finally {
+        _settingsVersionRefreshing = false
+      }
+    })()
+  }
+  return _settingsVersionCached
+}
+
+/**
+ * Returns the latest settings version. Cheap — cached for 250 ms. Safe
+ * to call on every engine cycle. A strictly monotonic-increasing
+ * integer; any change means "something changed, refresh your cache".
+ */
+export async function getSettingsVersion(): Promise<number> {
+  const now = Date.now()
+  if (now - _settingsVersionFetchedAt < SETTINGS_VERSION_READ_TTL_MS) {
+    return _settingsVersionCached
+  }
+  if (_settingsVersionRefreshing) {
+    // Another in-flight refresh is already going to land shortly; skip
+    // the duplicate Redis call and return whatever we had.
+    return _settingsVersionCached
+  }
+  _settingsVersionRefreshing = true
+  try {
+    await initRedis()
+    const client = getClient()
+    const raw = await client.get(SETTINGS_VERSION_KEY)
+    const parsed = Number(raw)
+    _settingsVersionCached = Number.isFinite(parsed) ? parsed : 0
+    _settingsVersionFetchedAt = now
+  } catch {
+    // Keep the last-known value on a transient Redis error.
+    _settingsVersionFetchedAt = now
+  } finally {
+    _settingsVersionRefreshing = false
+  }
+  return _settingsVersionCached
+}
+
+/**
+ * Bumps the settings version counter. Call this from every write path
+ * that mutates settings (including system settings, per-connection
+ * settings, etc.) so cache holders know to refresh. Also invalidates
+ * the in-process `appSettingsCache` so the next read in this process
+ * is guaranteed fresh without waiting for the 2 s TTL.
+ */
+export async function bumpSettingsVersion(): Promise<number> {
+  try {
+    await initRedis()
+    const client = getClient()
+    const next = await client.incr(SETTINGS_VERSION_KEY)
+    const parsed = Number(next)
+    _settingsVersionCached = Number.isFinite(parsed) ? parsed : _settingsVersionCached + 1
+    _settingsVersionFetchedAt = Date.now()
+    // Flush the in-process caches immediately so the same process that
+    // wrote the value doesn't hand out stale merged data to readers
+    // that call `getAppSettings()` within the 2 s TTL window.
+    invalidateAppSettingsCache()
+    return _settingsVersionCached
+  } catch {
+    // If Redis is briefly unavailable, at least invalidate the local
+    // cache so the same process re-fetches on next read.
+    invalidateAppSettingsCache()
+    return _settingsVersionCached
+  }
 }
 
 // ========== Market Data Operations ==========

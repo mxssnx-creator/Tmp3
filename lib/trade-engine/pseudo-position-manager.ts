@@ -4,7 +4,7 @@
  * NOW: 100% Redis-backed, no SQL
  */
 
-import { getRedisClient, getSettings, getAppSettings, setSettings, createPosition as redisCreatePosition } from "@/lib/redis-db"
+import { getRedisClient, getSettings, getAppSettings, getSettingsVersionCachedSync, setSettings, createPosition as redisCreatePosition } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { emitPositionUpdate } from "@/lib/broadcast-helpers"
 import { StrategyConfigManager, type PseudoPosition as StrategyPseudoPosition } from "@/lib/strategy-config-manager"
@@ -61,17 +61,29 @@ export class PseudoPositionManager {
 
   // ── Per-direction cap cache (P0-4) ──────────────────────────────────
   // The operator-tunable cap (Settings → Strategy → Base →
-  // `maxActiveBasePseudoPositionsPerDirection`) is re-read every 5s to
-  // avoid paying a Redis round-trip on every `createPosition` call.
-  // Default value of 1 matches the spec default.
-  private static directionCapCache: { value: number; ts: number } | null = null
-  private static readonly DIRECTION_CAP_CACHE_TTL_MS = 5000
+  // `maxActiveBasePseudoPositionsPerDirection`) is cached in-process so
+  // `createPosition` doesn't round-trip to Redis on every call, but the
+  // cache is version-aware: it invalidates whenever the global
+  // `settings_version` counter advances (which happens on every save
+  // via `setAppSettings` / `bumpSettingsVersion`). This guarantees a
+  // settings change takes effect on the next `createPosition` call
+  // within ~250 ms (the version-snapshot TTL) without an engine restart.
+  //
+  // Default value of 1 matches the spec default. A 30 s hard-refresh
+  // deadline covers the edge case where a bump signal is lost.
+  private static directionCapCache: { value: number; ts: number; version: number } | null = null
+  private static readonly DIRECTION_CAP_HARD_REFRESH_MS = 30_000
   private static readonly DEFAULT_DIRECTION_CAP = 1
 
   private async getMaxActivePerDirection(): Promise<number> {
     const now = Date.now()
+    const liveVersion = getSettingsVersionCachedSync()
     const cached = PseudoPositionManager.directionCapCache
-    if (cached && now - cached.ts < PseudoPositionManager.DIRECTION_CAP_CACHE_TTL_MS) {
+    if (
+      cached &&
+      cached.version === liveVersion &&
+      now - cached.ts < PseudoPositionManager.DIRECTION_CAP_HARD_REFRESH_MS
+    ) {
       return cached.value
     }
     try {
@@ -85,7 +97,7 @@ export class PseudoPositionManager {
         Number.isFinite(parsed) && parsed >= 1
           ? Math.floor(parsed)
           : PseudoPositionManager.DEFAULT_DIRECTION_CAP
-      PseudoPositionManager.directionCapCache = { value, ts: now }
+      PseudoPositionManager.directionCapCache = { value, ts: now, version: liveVersion }
       return value
     } catch {
       // Fail-safe — cap to the spec default so we never exceed 1 on a
