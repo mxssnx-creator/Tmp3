@@ -1,6 +1,27 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { getSession } from "@/lib/auth"
-import { getRedisClient } from "@/lib/redis-db"
+import { PseudoPositionManager } from "@/lib/trade-engine/pseudo-position-manager"
+
+/**
+ * Live Positions API
+ *
+ * Returns the pseudo positions actively maintained by the trade engine.
+ * The canonical keyspace is owned by `PseudoPositionManager`:
+ *
+ *   - Index  : `pseudo_positions:{connId}`          (SET of position ids)
+ *   - Record : `pseudo_position:{connId}:{id}`      (HASH of snake_case fields)
+ *
+ * The previous implementation read from a non-existent `position:{id}`
+ * JSON keyspace and camelCase field names that the engine never writes.
+ * That is why the live-trading positions panel was permanently empty for
+ * real connections (and always fell through to `generateMockPositions`
+ * for anything flagged demo).
+ *
+ * We delegate to `PseudoPositionManager.getActivePositions` so the route
+ * stays authoritative with a single source of truth. PnL is derived here
+ * from the hash fields because `updatePosition` elides redundant writes
+ * when the price hasn't moved, so we recompute at read time.
+ */
 
 interface Position {
   id: string
@@ -49,47 +70,68 @@ function generateMockPositions(connectionId: string, count: number = 25): Positi
   })
 }
 
+/**
+ * Normalise a raw `pseudo_position:{connId}:{id}` hash into the camelCase
+ * shape the UI expects, computing unrealised PnL from the live price.
+ */
+function normalise(raw: Record<string, any>): Position | null {
+  if (!raw || !raw.id) return null
+
+  const entryPrice = parseFloat(raw.entry_price || "0")
+  const currentPrice = parseFloat(raw.current_price || raw.entry_price || "0")
+  const quantity = parseFloat(raw.quantity || "0")
+  // Leverage isn't stored on the pseudo hash — the engine sizes purely
+  // via `position_cost` / `quantity`. Derive a display leverage so the UI
+  // can render it: notional / position_cost. Fall back to 1x when no
+  // cost field is present (very old rows).
+  const positionCost = parseFloat(raw.position_cost || "0")
+  const notional = entryPrice * quantity
+  const leverage = positionCost > 0 ? Math.max(1, Math.round(notional / positionCost)) : 1
+
+  const sideRaw = String(raw.side || "long").toLowerCase()
+  const side: "LONG" | "SHORT" = sideRaw === "short" ? "SHORT" : "LONG"
+
+  // Prefer authoritative `realized_pnl` for closed rows (written atomically
+  // at close time); recompute mark-to-market for open rows. This matches
+  // what `getPositionStats` does so dashboards stay consistent.
+  const status = (raw.status === "active" ? "open" : raw.status) || "open"
+  let unrealizedPnl: number
+  if (status === "closed" && raw.realized_pnl != null) {
+    const stored = parseFloat(raw.realized_pnl)
+    unrealizedPnl = Number.isFinite(stored) ? stored : 0
+  } else {
+    unrealizedPnl =
+      side === "LONG"
+        ? (currentPrice - entryPrice) * quantity
+        : (entryPrice - currentPrice) * quantity
+  }
+  const unrealizedPnlPercent = notional > 0 ? (unrealizedPnl / notional) * 100 : 0
+
+  const tpPrice = parseFloat(raw.takeprofit_price || raw.take_profit || "0")
+  const slPrice = parseFloat(raw.stoploss_price || raw.stop_loss || "0")
+
+  return {
+    id: String(raw.id),
+    symbol: String(raw.symbol || "UNKNOWN"),
+    side,
+    entryPrice,
+    currentPrice,
+    quantity,
+    leverage,
+    unrealizedPnl,
+    unrealizedPnlPercent,
+    takeProfitPrice: tpPrice > 0 ? tpPrice : undefined,
+    stopLossPrice: slPrice > 0 ? slPrice : undefined,
+    createdAt: String(raw.opened_at || raw.entry_time || raw.created_at || new Date().toISOString()),
+    status: (status === "open" || status === "closing" || status === "closed") ? status : "open",
+  }
+}
+
 async function getRealPositions(connectionId: string): Promise<Position[]> {
   try {
-    const client = await getRedisClient()
-    
-    // Get position IDs for this connection
-    const positionIds = await client.smembers(`positions:by-connection:${connectionId}`)
-    
-    if (!positionIds || positionIds.length === 0) {
-      return []
-    }
-
-    const positions: Position[] = []
-
-    // Fetch each position from Redis
-    for (const posId of positionIds) {
-      try {
-        const posData = await client.get(`position:${posId}`)
-        if (posData) {
-          const pos = JSON.parse(posData)
-          positions.push({
-            id: pos.id || posId,
-            symbol: pos.symbol || "UNKNOWN",
-            side: pos.side || "LONG",
-            entryPrice: Number(pos.entryPrice) || 0,
-            currentPrice: Number(pos.currentPrice) || 0,
-            quantity: Number(pos.quantity) || 0,
-            leverage: Number(pos.leverage) || 1,
-            unrealizedPnl: Number(pos.unrealizedPnl) || 0,
-            unrealizedPnlPercent: Number(pos.unrealizedPnlPercent) || 0,
-            takeProfitPrice: pos.takeProfitPrice ? Number(pos.takeProfitPrice) : undefined,
-            stopLossPrice: pos.stopLossPrice ? Number(pos.stopLossPrice) : undefined,
-            createdAt: pos.createdAt || new Date().toISOString(),
-            status: pos.status || "open",
-          })
-        }
-      } catch (err) {
-        console.warn(`Failed to parse position ${posId}:`, err)
-      }
-    }
-
-    return positions
+    const manager = new PseudoPositionManager(connectionId)
+    const raws = await manager.getActivePositions()
+    return raws.map(normalise).filter((p): p is Position => p !== null)
   } catch (error) {
     console.error(`Failed to get real positions for ${connectionId}:`, error)
     return []
@@ -117,7 +159,7 @@ export async function GET(request: NextRequest) {
       // Generate mock positions for demo mode
       positions = generateMockPositions(connectionId)
     } else {
-      // Try to get real positions from Redis, fallback to empty
+      // Real positions — go through the PseudoPositionManager keyspace.
       positions = await getRealPositions(connectionId)
     }
 

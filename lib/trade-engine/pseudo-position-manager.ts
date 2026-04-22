@@ -82,18 +82,36 @@ export class PseudoPositionManager {
       const ids = await client.smembers(this.positionsSetKey())
       if (!ids || ids.length === 0) return []
 
-      const raw = await Promise.all(ids.map((id: string) => this.readPosition(id).catch(() => null)))
+      // Pipelined fan-in: queue one HGETALL per id into a single multi()
+      // and `exec()` them in one round trip. Prior implementation issued
+      // `Promise.all(readPosition(id))` which, against any networked Redis
+      // client (Upstash / ioredis / node-redis), is N individual commands
+      // on N sockets — the exact latency cliff we're trying to avoid on
+      // the 100ms realtime tick. Against the in-memory `InlineLocalRedis`
+      // shim this collapses to the same microseconds, so no regression.
+      const pipeline = client.multi()
+      for (const id of ids) pipeline.hgetall(this.positionKey(id))
+      const results = await pipeline.exec()
+
+      const raw: any[] = []
+      for (let i = 0; i < ids.length; i++) {
+        const r = results?.[i]
+        if (!r || r instanceof Error) continue
+        // Normalise across upstash (returns the value directly) vs ioredis
+        // (returns `[err, value]` tuples). Both shapes resolve to the hash
+        // object we want.
+        const data = Array.isArray(r) ? r[1] : r
+        if (!data || typeof data !== "object" || Object.keys(data).length === 0) continue
+        raw.push({ ...data, id: ids[i] })
+      }
+
       const hasFilter = Boolean(
         filter?.status || filter?.side || filter?.symbol || filter?.indicationType,
       )
-
-      if (!hasFilter) {
-        return raw.filter((p): p is any => Boolean(p))
-      }
+      if (!hasFilter) return raw
 
       const positions: any[] = []
       for (const pos of raw) {
-        if (!pos) continue
         if (filter?.status && pos.status !== filter.status) continue
         if (filter?.side && pos.side !== filter.side) continue
         if (filter?.symbol && pos.symbol !== filter.symbol) continue
@@ -124,6 +142,7 @@ export class PseudoPositionManager {
     profitFactor: number
     trailingEnabled: boolean
     configSetKey?: string  // unique fingerprint of the config combination
+    strategyConfigId?: string  // StrategyConfig.id (DB primary key) — optional link into the historic-fill Set keyspace
   }): Promise<string | null> {
     try {
       // Build a canonical config set key if not provided
@@ -184,6 +203,12 @@ export class PseudoPositionManager {
         indication_type: params.indicationType,
         side: params.side,
         config_set_key: configSetKey,
+        // Optional explicit link to the historic-fill Set namespace
+        // (`strategy:{connId}:config:{strategy_config_id}:positions`).
+        // When present, `closePosition` writes the closed row into that
+        // list so historic-backfilled Sets stay continuously current.
+        // When absent, `closePosition` falls back to parsing `config_set_key`.
+        strategy_config_id: params.strategyConfigId || "",
         entry_price: String(params.entryPrice),
         current_price: String(params.entryPrice),
         quantity: String(volumeCalc.finalVolume),
@@ -373,7 +398,16 @@ export class PseudoPositionManager {
       const client = getRedisClient()
       const closedAtIso = new Date().toISOString()
       const configSetKey = position.config_set_key || ""
-      const configId = StrategyConfigManager.extractConfigId(configSetKey)
+      // Prefer the explicit `strategy_config_id` field when present — it's
+      // the authoritative StrategyConfig.id (DB primary key) that the
+      // historic prehistoric processor keyed its Set writes with. Fall
+      // through to parsing `config_set_key` only for legacy rows written
+      // before the field existed. When neither produces a truthy id, we
+      // skip the Set writeback entirely rather than write to a phantom
+      // list whose key no reader ever hits.
+      const configId =
+        String(position.strategy_config_id || "").trim() ||
+        StrategyConfigManager.extractConfigId(configSetKey)
 
       // Build the single close-path pipeline.
       const pipeline = client.multi()

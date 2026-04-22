@@ -102,20 +102,36 @@ export class RealtimeProcessor {
   }
 
   /**
-   * Read the latest prev-set position for a given pseudo-position's
-   * `config_set_key`. Delegates to `StrategyConfigManager.getLatestPosition`
-   * — the single canonical primitive that owns both the Redis keyspace
-   * (`strategy:{connId}:config:{configId}:positions`) and the entry
-   * schema used by every writer (prehistoric fill in
-   * `config-set-processor.calculateStrategyPositions` and live
-   * write-back in `pseudo-position-manager.closePosition`).
+   * Read the latest prev-set position for a live pseudo-position.
    *
-   * No parsing, no key construction, no schema here — all of that lives
-   * on `StrategyConfigManager`. This method is just the per-tick cache
-   * in front of that single source of truth.
+   * Resolution order for the target `configId`:
+   *   1. Explicit `strategy_config_id` field on the position hash (set
+   *      by `createPosition` when the caller knows the DB primary key).
+   *      This is the authoritative link into the historic-fill keyspace.
+   *   2. Tail segment of `config_set_key` (legacy fallback, may be a
+   *      fingerprint rather than a real configId).
+   *
+   * Delegates to `StrategyConfigManager.getLatestPosition` — the single
+   * canonical primitive that owns both the Redis keyspace
+   * (`strategy:{connId}:config:{configId}:positions`) and the entry
+   * schema used by every writer.
+   *
+   * Cache is bounded to `MAX_PREV_SET_CACHE` entries using a simple FIFO
+   * eviction so long-running engines with many distinct config ids can't
+   * grow the map unboundedly. Also exposes `invalidatePrevSet` so the
+   * close path can drop stale entries the moment the underlying Set is
+   * mutated.
    */
-  async getPrevSetPosition(configSetKey: string | undefined): Promise<PseudoPosition | null> {
-    const configId = StrategyConfigManager.extractConfigId(configSetKey)
+  async getPrevSetPosition(
+    position: { config_set_key?: string; strategy_config_id?: string } | string | undefined,
+  ): Promise<PseudoPosition | null> {
+    let configId = ""
+    if (typeof position === "string" || position == null) {
+      configId = StrategyConfigManager.extractConfigId(position)
+    } else {
+      const explicit = String(position.strategy_config_id || "").trim()
+      configId = explicit || StrategyConfigManager.extractConfigId(position.config_set_key)
+    }
     if (!configId) return null
 
     const now = Date.now()
@@ -124,18 +140,38 @@ export class RealtimeProcessor {
 
     try {
       const pos = await this.strategy.getLatestPosition(configId)
-      this.prevSetCache.set(configId, { pos, ts: now })
+      this.setPrevSetCache(configId, pos, now)
       return pos
     } catch (err) {
       // On transient failure we negative-cache briefly so bursty traffic
       // doesn't stampede Redis with the same lookup.
-      this.prevSetCache.set(configId, { pos: null, ts: now })
+      this.setPrevSetCache(configId, null, now)
       console.warn(
         `[v0] [Realtime] getPrevSetPosition(${configId}) failed:`,
         err instanceof Error ? err.message : String(err),
       )
       return null
     }
+  }
+
+  /** Hard cap on `prevSetCache` entries. Exceeded entries are FIFO-evicted. */
+  private readonly MAX_PREV_SET_CACHE = 2048
+
+  /** Insert with FIFO-eviction when the cache is full. */
+  private setPrevSetCache(configId: string, pos: PseudoPosition | null, ts: number): void {
+    if (this.prevSetCache.size >= this.MAX_PREV_SET_CACHE && !this.prevSetCache.has(configId)) {
+      // Map iteration is insertion order — drop the oldest entry.
+      const oldest = this.prevSetCache.keys().next().value
+      if (oldest !== undefined) this.prevSetCache.delete(oldest)
+    }
+    this.prevSetCache.set(configId, { pos, ts })
+  }
+
+  /** Drop a cached prev-set entry. Called from the close path to avoid
+   *  serving stale context for the remainder of the TTL window. */
+  invalidatePrevSet(configId: string | undefined): void {
+    if (!configId) return
+    this.prevSetCache.delete(configId)
   }
 
   /**
@@ -257,7 +293,12 @@ export class RealtimeProcessor {
       // counts.
       const [currentPrice, prevSetPos] = await Promise.all([
         this.getCurrentPrice(position.symbol),
-        this.getPrevSetPosition(position.config_set_key),
+        // Pass the whole position so getPrevSetPosition can prefer the
+        // explicit `strategy_config_id` field over parsing
+        // `config_set_key`. The explicit id targets the same Redis list
+        // that the prehistoric processor seeded, so realtime reads and
+        // historic writes stay in perfect sync.
+        this.getPrevSetPosition(position),
       ])
 
       if (!currentPrice) {
@@ -305,9 +346,19 @@ export class RealtimeProcessor {
       // field) without needing an extra HGETALL.
       position.current_price = String(currentPrice)
 
+      // Resolve the target configId ONCE so we can invalidate the
+      // prev-set cache entry the instant the underlying Set is mutated
+      // by closePosition. Without this, the processor would serve the
+      // stale (pre-close) prev-set record for up to PREV_SET_CACHE_TTL
+      // to any other position pointing at the same config.
+      const cacheConfigId =
+        String(position.strategy_config_id || "").trim() ||
+        StrategyConfigManager.extractConfigId(position.config_set_key)
+
       // Check take profit
       if (this.shouldCloseTakeProfit(position, currentPrice)) {
         await this.positionManager.closePosition(position.id, "take_profit", position)
+        this.invalidatePrevSet(cacheConfigId)
         console.log(`[v0] [Realtime] TP hit for ${position.symbol} ${side} | PnL: ${pnl.toFixed(4)}`)
         return
       }
@@ -315,6 +366,7 @@ export class RealtimeProcessor {
       // Check stop loss
       if (this.shouldCloseStopLoss(position, currentPrice)) {
         await this.positionManager.closePosition(position.id, "stop_loss", position)
+        this.invalidatePrevSet(cacheConfigId)
         console.log(`[v0] [Realtime] SL hit for ${position.symbol} ${side} | PnL: ${pnl.toFixed(4)}`)
         return
       }
