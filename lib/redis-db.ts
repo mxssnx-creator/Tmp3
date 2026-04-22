@@ -588,6 +588,77 @@ export class InlineLocalRedis {
     
     return Math.floor((expireAt - now) / 1000)
   }
+
+  /**
+   * Pipeline / MULTI compatibility shim.
+   *
+   * The in-memory `InlineLocalRedis` has zero network round-trips — every
+   * op resolves in microseconds against a `Map`. Real pipelining (batching
+   * commands into one RTT) is therefore meaningless for this backend.
+   * BUT several call sites (and every real Upstash/ioredis client in the
+   * wild) expect a chainable `client.multi()` that queues commands and
+   * executes them on `.exec()`. Without a compatible shim here, callers
+   * crash with "client.multi is not a function" and — because most of
+   * those call sites wrap in try/catch that swallow errors — the failures
+   * go undetected (e.g. prefetchMarketDataBatch, close-path pipelines).
+   *
+   * This shim records `(method, args)` pairs and dispatches them
+   * sequentially on `.exec()` via the real method on the same instance,
+   * returning an array of results in order — same contract as upstash's
+   * and ioredis's pipeline APIs. Sequential execution is correct (Map
+   * ops are synchronous) and still zero-RTT. If this project ever swaps
+   * in a network Redis client, the caller code is already shaped for a
+   * real pipeline.
+   */
+  multi(): {
+    [k: string]: any
+    exec: () => Promise<any[]>
+  } {
+    const ops: Array<{ method: string; args: any[] }> = []
+    const self = this as unknown as Record<string, any>
+    const queue = new Proxy(
+      {},
+      {
+        get: (_target, prop: string) => {
+          if (prop === "exec") {
+            return async (): Promise<any[]> => {
+              const results: any[] = []
+              for (const { method, args } of ops) {
+                const fn = self[method]
+                if (typeof fn !== "function") {
+                  // Unknown command: push a null result so caller index
+                  // alignment isn't broken.
+                  results.push(null)
+                  continue
+                }
+                try {
+                  results.push(await fn.apply(self, args))
+                } catch (err) {
+                  // Match upstash/ioredis: include the error per-slot.
+                  results.push(err)
+                }
+              }
+              return results
+            }
+          }
+          // Chainable command recorder.
+          return (...args: any[]) => {
+            ops.push({ method: prop, args })
+            return queue
+          }
+        },
+      },
+    ) as { [k: string]: any; exec: () => Promise<any[]> }
+    return queue
+  }
+
+  /**
+   * Alias for `multi()` — upstash-redis's client exposes both names. Keeps
+   * any caller that happened to standardize on `pipeline()` working.
+   */
+  pipeline(): ReturnType<InlineLocalRedis["multi"]> {
+    return this.multi()
+  }
 }
 
 let redisInstance: InlineLocalRedis | null = null
