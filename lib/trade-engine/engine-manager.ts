@@ -1304,33 +1304,39 @@ export class TradeEngineManager {
         await refreshPrehistoricDone()
       }
 
-      // ── Prehistoric gate ──────────────────────────────────────────
-      // Realtime processing MUST NOT run until prehistoric has produced
-      // the per-symbol Set calculations that provide the "prev position"
-      // context. Skip the cycle with a lightweight log and let
-      // scheduleNext() re-poll on the short cadence.
+      // ── Prehistoric advisory (P0-5) ──────────────────────────────
+      // The realtime loop USED to hard-skip ticks until the
+      // `prehistoric:{id}:done` flag flipped. That's no longer correct
+      // because open pseudo positions must get mark-to-market updates
+      // on every tick regardless of prehistoric state (spec: "Open
+      // Pseudo positions get updated handled on each cycle, Independent
+      // of active indication process"). The realtime processor now
+      // internally treats the flag as advisory — Phase A (TP/SL,
+      // trailing, unrealised PnL) always runs; Phase B (prev-set
+      // enrichment) is the only part that gates. We just log the first
+      // few gated cycles for visibility.
       if (!prehistoricDoneFlag) {
         gatedCycles++
-        // Emit a progression log at a very low rate so the dashboard can
-        // surface the wait state without drowning the log list.
-        if (gatedCycles === 1 || gatedCycles % 20 === 0) {
+        if (gatedCycles === 1 || gatedCycles % 50 === 0) {
           void logProgressionEvent(
             this.connectionId,
-            "realtime_gated",
+            "realtime_prev_set_pending",
             "info",
-            "Realtime tick skipped — waiting for prehistoric calculation to finish",
+            "Realtime tick running without prev-set enrichment — waiting for prehistoric calc",
             { gatedCycles },
           ).catch(() => { /* non-critical */ })
         }
-        outcome = "gated"
-        scheduleNext(outcome)
-        return
       }
 
       try {
         // Process realtime updates for active positions
         const rtResult: any = await this.realtimeProcessor.processRealtimeUpdates()
         // Mark cycle productive when the processor returned some work.
+        // Cadence guarantee (P0-5): any tick that touched open positions
+        // counts as productive so idle backoff never kicks in while
+        // positions are open. The processor returns `updates` = number
+        // of positions processed, so `updates > 0` already implies open
+        // positions exist.
         if (rtResult && typeof rtResult === "object") {
           const updates = Number(rtResult.updates ?? rtResult.processed ?? rtResult.positionsUpdated ?? 0)
           if (updates > 0) outcome = "productive"

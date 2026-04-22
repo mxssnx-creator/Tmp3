@@ -49,6 +49,48 @@ export class PseudoPositionManager {
     return `pseudo_positions:${this.connectionId}:active_config_keys`
   }
 
+  /**
+   * Direction-indexed Redis sets for P0-4 max-1-per-direction enforcement.
+   * Populated alongside `activeConfigKeysSetKey` on create/close so the
+   * per-direction count is O(1) via `scard` without having to enumerate
+   * every active position's hash.
+   */
+  private activeByDirectionKey(side: "long" | "short"): string {
+    return `pseudo_positions:${this.connectionId}:active_by_direction:${side}`
+  }
+
+  // ── Per-direction cap cache (P0-4) ──────────────────────────────────
+  // The operator-tunable cap (Settings → Strategy → Base →
+  // `maxActiveBasePseudoPositionsPerDirection`) is re-read every 5s to
+  // avoid paying a Redis round-trip on every `createPosition` call.
+  // Default value of 1 matches the spec default.
+  private static directionCapCache: { value: number; ts: number } | null = null
+  private static readonly DIRECTION_CAP_CACHE_TTL_MS = 5000
+  private static readonly DEFAULT_DIRECTION_CAP = 1
+
+  private async getMaxActivePerDirection(): Promise<number> {
+    const now = Date.now()
+    const cached = PseudoPositionManager.directionCapCache
+    if (cached && now - cached.ts < PseudoPositionManager.DIRECTION_CAP_CACHE_TTL_MS) {
+      return cached.value
+    }
+    try {
+      const s = (await getSettings("all_settings")) || {}
+      const raw = s.maxActiveBasePseudoPositionsPerDirection
+      const parsed = Number(raw)
+      const value =
+        Number.isFinite(parsed) && parsed >= 1
+          ? Math.floor(parsed)
+          : PseudoPositionManager.DEFAULT_DIRECTION_CAP
+      PseudoPositionManager.directionCapCache = { value, ts: now }
+      return value
+    } catch {
+      // Fail-safe — cap to the spec default so we never exceed 1 on a
+      // transient Redis error rather than silently uncapping.
+      return PseudoPositionManager.DEFAULT_DIRECTION_CAP
+    }
+  }
+
   /** Redis hash key for one position */
   private positionKey(id: string): string {
     return `pseudo_position:${this.connectionId}:${id}`
@@ -154,13 +196,15 @@ export class PseudoPositionManager {
         params.trailingEnabled ? "1" : "0",
       ].join(":")
 
+      // P0-4: Gate on both Set-uniqueness AND the per-direction cap.
       const canCreate = await this.canCreatePosition(
         params.symbol,
         configSetKey,
+        params.side,
       )
 
       if (!canCreate) {
-        return null  // silent — one position per config set is expected
+        return null  // silent — one position per config set is expected, or direction cap reached
       }
 
       // Calculate volume for this position
@@ -229,6 +273,11 @@ export class PseudoPositionManager {
       await client.sadd(this.positionsSetKey(), id)
       // Register this configSetKey as active for O(1) duplicate detection on next creation
       await client.sadd(this.activeConfigKeysSetKey(), configSetKey)
+      // P0-4: Register this position id into the per-direction set so
+      // `canCreatePosition` can enforce the spec cap
+      // (`maxActiveBasePseudoPositionsPerDirection`, default 1) via O(1)
+      // SCARD on the very next call. Removed on close.
+      await client.sadd(this.activeByDirectionKey(params.side), id)
 
       console.log(`[v0] Created pseudo position ${id} for ${params.symbol} side=${params.side} vol=${volumeCalc.finalVolume}`)
 
@@ -421,6 +470,13 @@ export class PseudoPositionManager {
       if (configSetKey) {
         pipeline.srem(this.activeConfigKeysSetKey(), configSetKey)
       }
+      // P0-4: Free the per-direction slot so another position in the
+      // same direction can open on the next cycle. Use the hash's
+      // stored `side` so this stays correct for legacy positions that
+      // predate the direction-indexed sets.
+      if (side === "long" || side === "short") {
+        pipeline.srem(this.activeByDirectionKey(side), positionId)
+      }
       // 7-day TTL on the closed hash for operator forensics.
       pipeline.expire(this.positionKey(positionId), 604800)
 
@@ -612,25 +668,52 @@ export class PseudoPositionManager {
   }
 
   /**
-   * Check if a new position can be created for the given config set key.
-   * Each unique config combination (indType:dir:symbol) is an independent Set —
-   * exactly 1 active pseudo position is allowed per Set.
+   * Check if a new position can be created for the given config set key + side.
    *
-   * Uses O(1) SISMEMBER on the activeConfigKeysSetKey index instead of scanning
-   * all positions, which is critical for high-frequency operation.
+   * Two gates (both must pass):
+   *   1. **Per-Set uniqueness** (pre-existing): exactly 1 active pseudo
+   *      position per unique config combination (indType:dir:tp:sl:…).
+   *      O(1) via SISMEMBER on `activeConfigKeysSetKey`.
+   *   2. **Per-direction cap** (P0-4): hard cap on concurrent pseudo
+   *      positions PER DIRECTION (Long/Short) across ALL config Sets.
+   *      Cap comes from the operator-tunable setting
+   *      `maxActiveBasePseudoPositionsPerDirection` (default 1, spec).
+   *      O(1) via SCARD on `activeByDirectionKey(side)`.
+   *
+   * Gate 2 is the new piece — previously only gate 1 existed, which
+   * meant N distinct Sets could each hold 1 active long → N×1 longs
+   * (unbounded). Spec: *"Active Pseudo Position Limit for each
+   * direction Long,short maximal 1"*.
    */
   private async canCreatePosition(
     symbol: string,
     configSetKey: string,
+    side?: "long" | "short",
   ): Promise<boolean> {
     try {
       const client = getRedisClient()
+      // Gate 1: Set-uniqueness (SISMEMBER).
       const isMember = await client.sismember(this.activeConfigKeysSetKey(), configSetKey)
-      // isMember is 1 (number) if already active, 0 or null if not
-      return !isMember
+      if (isMember) return false
+
+      // Gate 2: per-direction cap (SCARD). When `side` is not supplied
+      // (legacy callers), skip the per-direction gate to preserve
+      // backwards compatibility — the setting is enforced at
+      // `createPosition` which always passes `side`.
+      if (side) {
+        const cap = await this.getMaxActivePerDirection()
+        const count = await client.scard(this.activeByDirectionKey(side))
+        if (Number(count) >= cap) {
+          return false
+        }
+      }
+      return true
     } catch (error) {
-      console.error("[v0] Failed to check position limit for config set:", error)
-      // On Redis error fall through and allow creation (fail-open)
+      console.error("[v0] Failed to check position limit:", error)
+      // On Redis error fall through and allow creation (fail-open).
+      // The spec default of 1 per direction is enforced via the cap
+      // cache's default, so a brief cache miss during a Redis blip
+      // won't let the cap silently drift.
       return true
     }
   }

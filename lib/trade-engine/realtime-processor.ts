@@ -177,28 +177,25 @@ export class RealtimeProcessor {
   /**
    * Process real-time updates for all active positions.
    *
-   * HARD GATED on `prehistoric:{id}:done`: if prehistoric hasn't finished
-   * we return immediately with zero updates. The engine-manager loop
-   * gates on the same flag with its own fast-poll interval, so this
-   * check is a defence-in-depth guard that also protects any direct
-   * caller (e.g. one-off warm-ups, tests) from running realtime against
-   * an empty prev-position context.
+   * ── Decoupling contract (P0-5) ────────────────────────────────────
+   * Per the architectural spec — *"Open Pseudo positions get updated
+   * handled on each cycle, Independent of active indication process"* —
+   * this loop MUST update every open position every tick regardless of
+   * whether indication/strategy/prehistoric phases have produced any
+   * work. The prehistoric-ready flag used to be a HARD gate here; it
+   * is now an ADVISORY flag, passed to `processPosition` to decide
+   * whether to also do prev-set enrichment (Phase B). The mark-to-
+   * market update (Phase A — `current_price`, `unrealized_pnl`,
+   * trailing stop, TP/SL check) ALWAYS runs.
    *
    * Returns the number of positions actually processed so callers can
    * gate follow-up work (telemetry, backoff) without re-querying Redis.
    */
   async processRealtimeUpdates(): Promise<{ updates: number }> {
     try {
-      // ── Prehistoric readiness gate ────────────────────────────────
-      // The realtime processor depends on prehistoric-calculated Set
-      // positions to provide the "prev position" context used in
-      // `processPosition`. Running before prehistoric has finished
-      // would evaluate live positions with a cold history — exactly
-      // the cold-start bug we want to avoid.
-      const ready = await this.isPrehistoricReady()
-      if (!ready) {
-        return { updates: 0 }
-      }
+      // Advisory readiness flag — tells processPosition whether it's
+      // safe to attach prev-set context. Never blocks Phase A work.
+      const prehistoricReady = await this.isPrehistoricReady()
 
       const activePositions = await this.positionManager.getActivePositions()
       const count = activePositions.length
@@ -263,7 +260,14 @@ export class RealtimeProcessor {
       // Process each position in parallel. Each call carries the
       // position object through — no second HGETALL in updatePosition
       // or closePosition, since the caller already has the hash.
-      await Promise.all(activePositions.map((position) => this.processPosition(position)))
+      // `prehistoricReady` is passed as an advisory flag so Phase B
+      // (prev-set enrichment) can be conditionally skipped without
+      // blocking Phase A (mark-to-market + TP/SL).
+      await Promise.all(
+        activePositions.map((position) =>
+          this.processPosition(position, prehistoricReady),
+        ),
+      )
       return { updates: count }
     } catch (error) {
       console.error("[v0] Failed to process realtime updates:", error)
@@ -277,38 +281,51 @@ export class RealtimeProcessor {
   /**
    * Process an individual active pseudo-position.
    *
-   * Enriches the raw position with the "prev position" context derived
-   * from the prehistoric Set calculations (see `getPrevSetPosition`).
-   * The prev-set record is attached to the position object as
-   * `_prev_set_position` and forwarded into the TP/SL + trailing-stop
-   * helpers, so they can calibrate decisions against the most recent
-   * closed position from the same strategy config (e.g. a prev-win
-   * can tighten the trailing stop, a prev-loss can extend it).
+   * ── Two-phase execution (P0-5) ─────────────────────────────────────
+   * Every open pseudo-position gets a Phase A pass on every tick,
+   * REGARDLESS of indication / strategy / prehistoric state. Phase B
+   * enrichment is advisory and only runs when prehistoric has produced
+   * the prev-set Sets.
+   *
+   *   Phase A — mark-to-market (ALWAYS):
+   *     - refresh `current_price` from the 200ms market-data cache
+   *     - recompute `unrealized_pnl`
+   *     - update `trailing_stop_price` when trailing is enabled
+   *     - check TP / SL and dispatch close
+   *
+   *   Phase B — prev-set enrichment (ONLY when prehistoricReady):
+   *     - fetch the latest prev-set position via the 2s prev-set cache
+   *     - attach it to the position as `_prev_set_position` so the
+   *       TP/SL helpers can calibrate against the most recent closed
+   *       position from the same strategy config
+   *
+   * This guarantees open positions always get mark-to-market updates
+   * and timely TP/SL enforcement, even during the prehistoric warm-up
+   * window or if any position somehow exists before prehistoric has
+   * finished. Prev-set-calibrated decisions (a small refinement, not
+   * the core safety mechanism) gracefully degrade to defaults when
+   * prehistoric is not yet ready.
    */
-  private async processPosition(position: any): Promise<void> {
+  private async processPosition(position: any, prehistoricReady: boolean): Promise<void> {
     try {
-      // Pull the current price and the prev-set context concurrently —
-      // both are cached and cheap, and avoiding an extra sequential
-      // await keeps the per-tick budget predictable under high symbol
-      // counts.
-      const [currentPrice, prevSetPos] = await Promise.all([
-        this.getCurrentPrice(position.symbol),
-        // Pass the whole position so getPrevSetPosition can prefer the
-        // explicit `strategy_config_id` field over parsing
-        // `config_set_key`. The explicit id targets the same Redis list
-        // that the prehistoric processor seeded, so realtime reads and
-        // historic writes stay in perfect sync.
-        this.getPrevSetPosition(position),
-      ])
+      // Phase A is the critical path — always kick off the price fetch.
+      // Phase B (prev-set) only fires when prehistoric is ready, and
+      // runs in parallel with the price fetch to avoid sequential
+      // latency under high symbol counts.
+      const pricePromise = this.getCurrentPrice(position.symbol)
+      const prevSetPromise: Promise<PseudoPosition | null> = prehistoricReady
+        ? this.getPrevSetPosition(position)
+        : Promise.resolve(null)
+
+      const [currentPrice, prevSetPos] = await Promise.all([pricePromise, prevSetPromise])
 
       if (!currentPrice) {
         return
       }
 
-      // Attach the prev-set context onto the in-memory position object
-      // so downstream helpers can reference it without re-querying
-      // Redis. Using an underscore-prefixed field to make clear this is
-      // a transient enrichment, not persisted state.
+      // Phase B attachment — only when prehistoric produced something.
+      // Underscore prefix makes clear this is transient enrichment,
+      // not persisted state.
       if (prevSetPos) {
         position._prev_set_position = prevSetPos
       }

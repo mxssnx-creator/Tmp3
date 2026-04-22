@@ -87,6 +87,9 @@ interface Settings {
   databaseSizePreset: number
   positionCooldownMs: number
   maxPositionsPerConfigDirection: number
+  // P0-4: Spec cap on concurrent pseudo positions per direction (Long/Short)
+  // across ALL config Sets. Default 1. Enforced by PseudoPositionManager.
+  maxActiveBasePseudoPositionsPerDirection: number
   maxPositionsLong: number // Max 1 long position per config
   maxPositionsShort: number // Max 1 short position per config
   indicationTimeoutMs: number // 100ms to 3000ms, step 100ms
@@ -412,6 +415,9 @@ const initialSettings: Settings = {
   // Trade Engine Configuration
   positionCooldownMs: 100, // 50-3000ms, default 100ms
   maxPositionsPerConfigDirection: 1, // default 1 (max positions per config per direction)
+  // P0-4: spec default 1 — hard cap on concurrent active pseudo
+  // positions PER DIRECTION across all config Sets.
+  maxActiveBasePseudoPositionsPerDirection: 1,
   maxPositionsLong: 1, // Max 1 long position per configuration
   maxPositionsShort: 1, // Max 1 short position per configuration
     indicationTimeoutMs: 1000, // 100ms to 3000ms, step 100ms, default 1000ms
@@ -919,6 +925,11 @@ export default function SettingsPage() {
           }
           if (data.settings.maxPositionsPerConfigDirection === undefined) {
             updatedSettings.maxPositionsPerConfigDirection = 2
+          }
+          // P0-4 migration: default to spec value 1 when the setting
+          // isn't present in the persisted state hash.
+          if (data.settings.maxActiveBasePseudoPositionsPerDirection === undefined) {
+            updatedSettings.maxActiveBasePseudoPositionsPerDirection = 1
           }
           if (data.settings.maxConcurrentOperations === undefined) {
             updatedSettings.maxConcurrentOperations = 100
@@ -1640,6 +1651,9 @@ export default function SettingsPage() {
               if (data.settings.positionCooldownMs === undefined) updatedSettings.positionCooldownMs = 100
               if (data.settings.maxPositionsPerConfigDirection === undefined)
                 updatedSettings.maxPositionsPerConfigDirection = 2
+              // P0-4 migration (spec default = 1).
+              if (data.settings.maxActiveBasePseudoPositionsPerDirection === undefined)
+                updatedSettings.maxActiveBasePseudoPositionsPerDirection = 1
               if (data.settings.maxConcurrentOperations === undefined) updatedSettings.maxConcurrentOperations = 100
               // Position cost default
               if (data.settings.positionCost === undefined) updatedSettings.positionCost = 0.1
