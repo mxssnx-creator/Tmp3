@@ -45,6 +45,59 @@ interface VariantDetail {
   passRate: number
 }
 
+// Indication configuration Set-count snapshot — how many DISTINCT Sets the
+// engine could enumerate per Main indication type, given the current settings.
+// This is a *static* enumeration (possible configurations), not live runtime
+// counts. Renders as a row per type at the top of the expanded stats area.
+interface IndicationConfigCounts {
+  totalPossibleSets: number
+  perSetDbCapacity:  number   // 250 default — per-Set position history length
+  maxStorablePositions: number
+  settings: {
+    indicationRangeMin:        number
+    indicationRangeMax:        number
+    indicationRangeStep:       number
+    takeProfitRangeDivisor:    number
+    validRangeCount:           number
+    optimalBasePositionsLimit: number
+  }
+  types: Array<{
+    type: "direction" | "move" | "active" | "optimal" | "auto"
+    label: string
+    possibleSets: number
+    formula: string
+    params: Record<string, string | number>
+    description: string
+  }>
+}
+
+// Live exchange footer — aggregates REAL-exchange positions & account balance
+// across every enabled connection. Not the same as pseudo-position counts.
+interface ExchangeLiveSummary {
+  connections: Array<{
+    connectionId: string
+    name: string
+    exchange: string
+    openPositions: number
+    longPositions: number
+    shortPositions: number
+    unrealizedPnl: number
+    balance: { total: number; available: number; equity: number; currency: string }
+    positions: Array<{ symbol: string; side: string; qty: number; entry: number; mark: number; pnl: number }>
+  }>
+  totals: {
+    openPositions: number
+    longPositions: number
+    shortPositions: number
+    unrealizedPnl: number
+    totalBalance:  number
+    availableBalance: number
+    equity:        number
+    currency:      string
+  }
+  updatedAt: number
+}
+
 // Main-stage coordination snapshot — surfaces the per-cycle position context
 // (pseudo-positions gating variant selection), how many related variant Sets
 // were built fresh vs. reused from the fingerprint cache, and the list of
@@ -195,7 +248,7 @@ function MiniStat({ label, value, sub }: { label: string; value: string; sub?: s
   )
 }
 
-// ─── main component ─���─────────────────────────────────────────────────────────
+// ─── main component ─�����─────────────────────────────────────────────────────────
 
 export function QuickstartSection() {
   const { selectedConnectionId, selectedExchange } = useExchange()
@@ -223,8 +276,20 @@ export function QuickstartSection() {
   // component default) — used as the target for the Live toggle.
   const [activeConnectionId, setActiveConnectionId] = useState<string>(connectionId)
 
+  // ── Indication configuration Set-count snapshot (static enumeration) ─
+  // Pulled from /api/indications/config-counts. Refreshed every 60s since it
+  // is derived from settings — not runtime state — so it rarely changes.
+  const [configCounts, setConfigCounts] = useState<IndicationConfigCounts | null>(null)
+
+  // ── Live exchange summary (positions + balance) ──────────────────────
+  // Pulled from /api/exchange/live-summary. Polled every 10s whenever the
+  // expanded panel is open so the footer feels live without hammering Redis.
+  const [liveSummary, setLiveSummary] = useState<ExchangeLiveSummary | null>(null)
+
   const logsEndRef = useRef<HTMLDivElement>(null)
   const pollRef    = useRef<NodeJS.Timeout>()
+  const configPollRef = useRef<NodeJS.Timeout>()
+  const livePollRef   = useRef<NodeJS.Timeout>()
 
   // ── fetch live stats ──────────────────────────────────────────────────────
   const fetchStats = useCallback(async (silent = false) => {
@@ -439,6 +504,38 @@ export function QuickstartSection() {
     pollRef.current = setInterval(() => fetchStats(true), interval)
     return () => clearInterval(pollRef.current)
   }, [expanded, isRunning, fetchStats])
+
+  // ── Poll indication config-counts (settings-derived, slow cadence) ────────
+  // 60s when expanded, 5min otherwise. This endpoint only changes when the
+  // operator edits connection settings, so aggressive polling would be waste.
+  useEffect(() => {
+    clearInterval(configPollRef.current)
+    const fetchConfig = () =>
+      fetch("/api/indications/config-counts", { cache: "no-store" })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d: IndicationConfigCounts | null) => { if (d) setConfigCounts(d) })
+        .catch(() => { /* non-critical */ })
+    fetchConfig()
+    const interval = expanded ? 60_000 : 300_000
+    configPollRef.current = setInterval(fetchConfig, interval)
+    return () => clearInterval(configPollRef.current)
+  }, [expanded])
+
+  // ── Poll live exchange summary (positions + balance) ──────────────────────
+  // 10s when expanded, 30s otherwise. Kept lightweight — this endpoint just
+  // reads already-materialised Redis hashes, so frequent polling is fine.
+  useEffect(() => {
+    clearInterval(livePollRef.current)
+    const fetchLive = () =>
+      fetch("/api/exchange/live-summary", { cache: "no-store" })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d: ExchangeLiveSummary | null) => { if (d) setLiveSummary(d) })
+        .catch(() => { /* non-critical */ })
+    fetchLive()
+    const interval = expanded ? 10_000 : 30_000
+    livePollRef.current = setInterval(fetchLive, interval)
+    return () => clearInterval(livePollRef.current)
+  }, [expanded])
 
   // ── log helper ─────────────────────────────────────────────────────────────
   const addLog = (msg: string, type: LogEntry["type"] = "info") =>
@@ -940,6 +1037,103 @@ export function QuickstartSection() {
               </div>
             </div>
 
+            {/* ── Indication Configuration Possible Counts (Sets) ────────
+                Renders the *possible* Set enumeration per Main indication
+                type (direction / move / active / optimal / auto), derived
+                purely from the current settings. Each row shows:
+                  • the number of Independent Sets this type could spawn
+                  • the formula (ranges × ratios × variations, etc.)
+                  • the calc parameters (ranges, steps, time windows,
+                    drawdown gate) so the operator understands what drives
+                    the number.
+                NOTE: this is CAPACITY — the engine may generate fewer at
+                runtime based on live gating. Summing the five type totals
+                gives the theoretical ceiling of Sets per symbol.
+             */}
+            {configCounts && (
+              <div className="rounded-md border bg-muted/20 p-2.5 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                    <Database className="w-3.5 h-3.5 text-cyan-500" />
+                    Indication Config — Possible Sets
+                  </div>
+                  <span
+                    className="text-[10px] text-muted-foreground tabular-nums"
+                    title="Sum of possible Independent Sets across all 5 Main indication types, per symbol. Each Set has its own position DB (capacity shown)."
+                  >
+                    Total {fmt(configCounts.totalPossibleSets)} Sets
+                    {" · "}
+                    <span className="text-muted-foreground/70">
+                      {configCounts.perSetDbCapacity}/Set DB
+                    </span>
+                  </span>
+                </div>
+
+                {/* Settings-drive hint row: ranges & divisor */}
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[9px] text-muted-foreground">
+                  <span>
+                    range <span className="text-foreground tabular-nums">
+                      {configCounts.settings.indicationRangeMin}–{configCounts.settings.indicationRangeMax}
+                    </span> step <span className="text-foreground tabular-nums">
+                      {configCounts.settings.indicationRangeStep}
+                    </span>
+                  </span>
+                  <span>
+                    tp-divisor <span className="text-foreground tabular-nums">
+                      {configCounts.settings.takeProfitRangeDivisor}
+                    </span>
+                  </span>
+                  <span>
+                    valid ranges <span className="text-foreground tabular-nums">
+                      {configCounts.settings.validRangeCount}
+                    </span>
+                  </span>
+                </div>
+
+                {/* Per-type rows */}
+                <div className="space-y-1">
+                  {configCounts.types.map((t) => {
+                    const pct = configCounts.totalPossibleSets > 0
+                      ? Math.min(100, (t.possibleSets / configCounts.totalPossibleSets) * 100)
+                      : 0
+                    // color-code each indication type with a distinct hue so the
+                    // row reads at a glance.
+                    const hue: Record<string, string> = {
+                      direction: "bg-violet-500/70",
+                      move:      "bg-sky-500/70",
+                      active:    "bg-amber-500/70",
+                      optimal:   "bg-emerald-500/70",
+                      auto:      "bg-rose-500/70",
+                    }
+                    return (
+                      <div key={t.type} className="space-y-0.5">
+                        <div className="flex items-center gap-2 text-[10px]">
+                          <span className="w-14 text-foreground shrink-0 font-medium capitalize">
+                            {t.type}
+                          </span>
+                          <div className="flex-1 h-1 bg-muted rounded-full overflow-hidden">
+                            <div className={`h-full rounded-full ${hue[t.type] ?? "bg-muted-foreground/40"}`} style={{ width: `${pct}%` }} />
+                          </div>
+                          <span className="w-12 text-right tabular-nums font-semibold">
+                            {fmt(t.possibleSets)}
+                          </span>
+                          <span className="w-10 text-right tabular-nums text-muted-foreground">
+                            {pct.toFixed(0)}%
+                          </span>
+                        </div>
+                        <div
+                          className="pl-16 text-[9px] text-muted-foreground/80 truncate"
+                          title={`${t.formula}${t.description ? " — " + t.description : ""}`}
+                        >
+                          {t.formula}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
             {/* indications breakdown */}
             <div className="rounded-md border bg-muted/20 p-2.5 space-y-2">
               <div className="flex items-center justify-between">
@@ -1249,6 +1443,125 @@ export function QuickstartSection() {
                 <div className="flex items-center gap-1 px-2 py-0.5 rounded-full border border-border bg-muted/30 text-muted-foreground">
                   <Clock className="w-2.5 h-2.5" />
                   {stats.avgCycleMs}ms avg
+                </div>
+              )}
+            </div>
+
+            {/* ── Live Exchange Positions & Account Balance (footer) ───
+                Real-exchange snapshot across ALL enabled connections. This
+                is intentionally the LAST block in the quickstart card so
+                the operator can see, at the end of the status scroll, what
+                is actually live on the exchange right now.
+
+                Totals row renders: total open positions (long/short split),
+                unrealised PnL, total + available balance, equity. Below it
+                we show a compact row per connection with its own open-
+                position count, PnL and balance — useful when running
+                multiple accounts simultaneously.
+             */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                  <Activity className="w-3.5 h-3.5 text-emerald-500" />
+                  Live Exchange — Positions &amp; Balance
+                </div>
+                <span className="text-[10px] text-muted-foreground">
+                  {liveSummary
+                    ? `${liveSummary.connections.length} conn${liveSummary.connections.length === 1 ? "" : "s"}`
+                    : "loading…"}
+                </span>
+              </div>
+
+              {/* Totals row — top-level roll-up across connections */}
+              <div className="flex flex-wrap gap-1.5">
+                <MiniStat
+                  label="Open Pos"
+                  value={fmt(liveSummary?.totals.openPositions ?? 0)}
+                  sub={liveSummary
+                    ? `${liveSummary.totals.longPositions}L / ${liveSummary.totals.shortPositions}S`
+                    : undefined}
+                />
+                <MiniStat
+                  label="Unrealised PnL"
+                  value={(() => {
+                    const v = liveSummary?.totals.unrealizedPnl ?? 0
+                    return `${v >= 0 ? "+" : ""}${v.toFixed(2)}`
+                  })()}
+                  sub={liveSummary?.totals.currency}
+                />
+                <MiniStat
+                  label="Balance"
+                  value={(liveSummary?.totals.totalBalance ?? 0).toFixed(2)}
+                  sub={liveSummary?.totals.currency}
+                />
+                <MiniStat
+                  label="Available"
+                  value={(liveSummary?.totals.availableBalance ?? 0).toFixed(2)}
+                  sub={liveSummary?.totals.currency}
+                />
+                <MiniStat
+                  label="Equity"
+                  value={(liveSummary?.totals.equity ?? 0).toFixed(2)}
+                  sub={liveSummary?.totals.currency}
+                />
+              </div>
+
+              {/* Per-connection compact rows (only when >1 connection or >0 positions) */}
+              {liveSummary && liveSummary.connections.length > 0 && (
+                <div className="space-y-0.5 pt-1">
+                  <div className="grid grid-cols-[1fr_auto_auto_auto] gap-x-2 text-[9px] uppercase tracking-wide text-muted-foreground/70 pb-0.5 border-b border-border/40">
+                    <span>Connection</span>
+                    <span className="text-right">Pos</span>
+                    <span className="text-right">PnL</span>
+                    <span className="text-right">Balance</span>
+                  </div>
+                  {liveSummary.connections.map((c) => (
+                    <div
+                      key={c.connectionId}
+                      className="grid grid-cols-[1fr_auto_auto_auto] gap-x-2 text-[10px] items-baseline"
+                    >
+                      <span className="truncate">
+                        <span className="font-medium">{c.name}</span>
+                        {c.exchange && (
+                          <span className="text-muted-foreground/70 ml-1">
+                            {c.exchange}
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-right tabular-nums">
+                        {c.openPositions}
+                        {c.openPositions > 0 && (
+                          <span className="text-muted-foreground/70 ml-1">
+                            {c.longPositions}L/{c.shortPositions}S
+                          </span>
+                        )}
+                      </span>
+                      <span
+                        className={
+                          "text-right tabular-nums " +
+                          (c.unrealizedPnl > 0
+                            ? "text-emerald-600 dark:text-emerald-400"
+                            : c.unrealizedPnl < 0
+                              ? "text-rose-600 dark:text-rose-400"
+                              : "text-muted-foreground")
+                        }
+                      >
+                        {c.unrealizedPnl >= 0 ? "+" : ""}{c.unrealizedPnl.toFixed(2)}
+                      </span>
+                      <span className="text-right tabular-nums">
+                        {c.balance.total.toFixed(2)}
+                        <span className="text-muted-foreground/70 ml-0.5">
+                          {c.balance.currency}
+                        </span>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {liveSummary && liveSummary.connections.length === 0 && (
+                <div className="text-[10px] text-muted-foreground text-center py-1">
+                  No enabled connections — enable a connection to see live positions &amp; balance.
                 </div>
               )}
             </div>
