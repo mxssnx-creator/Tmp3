@@ -10,6 +10,7 @@ import { IndicationConfigManager, IndicationResult, IndicationConfig } from "@/l
 import { StrategyConfigManager, PseudoPosition, StrategyConfig } from "@/lib/strategy-config-manager"
 import { getRedisClient, initRedis, getSettings } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 export interface ProcessingResult {
   indicationConfigs: number
@@ -295,6 +296,15 @@ export class ConfigSetProcessor {
             intervals_processed: String(totalIntervalsProcessed),
             missing_intervals: String(missingIntervalsLoaded),
           }),
+          // Bump the canonical `prehistoric_cycles_completed` counter and
+          // mirror the processed symbols into the hash via the shared
+          // ProgressionStateManager primitive. Without this call, the
+          // engine-boot prehistoric path wrote per-field stats directly
+          // but left `prehistoric_cycles_completed` at 0 forever — which
+          // broke `/api/system/verify-engine` (reads the field), the
+          // `progression/[id]/stats` route, and every dashboard that
+          // distinguishes "prehistoric done" from "never ran".
+          ProgressionStateManager.incrementPrehistoricCycle(this.connectionId, symbol).catch(() => { /* non-critical */ }),
         ]).catch(() => { /* non-critical */ })
 
         const tSymMs = Date.now() - tSymStart
@@ -368,6 +378,20 @@ export class ConfigSetProcessor {
       errors: result.errors,
       durationMs: result.duration,
     })
+
+    // Flip `prehistoric_phase_active` to "false" and refresh last_update.
+    // Downstream readers (verify-engine API, progression stats API, the
+    // dashboard prehistoric card) use this as the authoritative "historical
+    // calc is done" signal. Without this call the phase stayed `active`
+    // forever even though processing had finished.
+    try {
+      await ProgressionStateManager.completePrehistoricPhase(this.connectionId)
+    } catch (err) {
+      console.warn(
+        `[v0] [ConfigSetProcessor] completePrehistoricPhase failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
 
     return result
   }

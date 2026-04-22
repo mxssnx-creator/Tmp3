@@ -266,6 +266,21 @@ export class TradeEngineManager {
           prehistoric_data_source: "cache",
           updated_at: new Date().toISOString(),
         })
+        // CRITICAL: Re-arm the `prehistoric:{id}:done` gate flag in the cache
+        // path. Without this, the realtime processor stays gated forever after
+        // an engine restart inside the 24h TTL window of
+        // `prehistoric_loaded:{id}` — because the `done` flag lives on a
+        // separate key with an independent TTL and was never set in this
+        // path. The fix is idempotent (same value, 24h re-expire) and costs
+        // exactly one Redis SET per engine boot.
+        try {
+          await redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 } as any)
+        } catch (gateErr) {
+          console.warn(
+            `[v0] [Engine] Failed to re-arm prehistoric done gate on cache hit:`,
+            gateErr instanceof Error ? gateErr.message : String(gateErr),
+          )
+        }
       } else {
         // Non-blocking prehistoric loading
         await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
@@ -605,6 +620,33 @@ export class TradeEngineManager {
       // is finished. The interval itself stays effective whenever productive
       // work is available.
       await redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 })
+
+      // Emit a log event (NOT a phase overwrite) so the dashboard can show
+      // prehistoric completion in its event stream without clobbering the
+      // main `engine_progression:{id}` phase hash — which by this point has
+      // already advanced to `live_trading @ 100%` (set during boot while
+      // prehistoric was running in the background). Rolling the phase
+      // backward would be confusing UX; an explicit event is the right
+      // channel for this one-shot milestone.
+      try {
+        await logProgressionEvent(
+          this.connectionId,
+          "prehistoric_complete",
+          processingResult.errors > 0 ? "warning" : "info",
+          `Prehistoric calc done — ${processingResult.symbolsProcessed}/${processingResult.symbolsTotal} symbols, ` +
+          `${processingResult.candlesProcessed} candles, ${processingResult.indicationResults} indications, ` +
+          `${processingResult.strategyPositions} positions in ${totalPrehistoricDurationMs}ms`,
+          {
+            symbolsTotal: processingResult.symbolsTotal,
+            symbolsProcessed: processingResult.symbolsProcessed,
+            candlesProcessed: processingResult.candlesProcessed,
+            indicationResults: processingResult.indicationResults,
+            strategyPositions: processingResult.strategyPositions,
+            errors: processingResult.errors,
+            durationMs: totalPrehistoricDurationMs,
+          },
+        )
+      } catch { /* non-critical */ }
 
       console.log(
         `[v0] [Prehistoric] ✓ complete in ${totalPrehistoricDurationMs}ms | ` +

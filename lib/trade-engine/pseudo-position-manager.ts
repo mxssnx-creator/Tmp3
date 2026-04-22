@@ -402,12 +402,37 @@ export class PseudoPositionManager {
       if (configId) {
         const notional = entryPrice * quantity
         const resultPct = notional > 0 ? (pnl / notional) * 100 : 0
+        // Canonical field on a live `pseudo_position` hash is `opened_at` (see
+        // createPosition()). Historical/fill rows use `entry_time`. Legacy
+        // rows used `created_at`. Fall through in priority order so the
+        // prev-set entry ALWAYS carries the true entry timestamp — previously
+        // it silently fell through to `closedAtIso` (= exit_time), which made
+        // every live-closed writeback look like a zero-duration trade.
+        const entryIso = String(
+          position.opened_at ||
+          position.entry_time ||
+          position.created_at ||
+          closedAtIso,
+        )
+        // Take-profit / stop-loss absolute prices live under different field
+        // names depending on the writer:
+        //   - `pseudo-position-manager.createPosition()` stores them as
+        //     `takeprofit_price` / `stoploss_price` (canonical).
+        //   - `config-set-processor.calculateStrategyPositions()` (historical
+        //     fill) stores them as `take_profit` / `stop_loss`.
+        // Read both so the Set entry exposes real levels regardless of origin.
+        const tpPrice = parseFloat(
+          position.takeprofit_price || position.take_profit || "0",
+        )
+        const slPrice = parseFloat(
+          position.stoploss_price || position.stop_loss || "0",
+        )
         const setEntry: StrategyPseudoPosition = {
-          entry_time:  String(position.created_at || position.entry_time || closedAtIso),
+          entry_time:  entryIso,
           symbol:      String(position.symbol || ""),
           entry_price: entryPrice,
-          take_profit: parseFloat(position.take_profit || "0"),
-          stop_loss:   parseFloat(position.stop_loss || "0"),
+          take_profit: tpPrice,
+          stop_loss:   slPrice,
           status:      "closed",
           result:      resultPct,
           exit_time:   closedAtIso,
@@ -477,20 +502,62 @@ export class PseudoPositionManager {
       const activeLong = active.filter(p => p.side === "long").length
       const activeShort = active.filter(p => p.side === "short").length
 
+      // Closed-position PnL is authoritative in the stored `realized_pnl`
+      // field (written atomically during closePosition() from the live
+      // current_price at close time). Recomputing from current_price here
+      // risked drift because:
+      //   - `updatePosition` elides Redis writes on tiny price moves,
+      //     which meant the hash's `current_price` could lag the price
+      //     that was live when TP/SL actually triggered;
+      //   - for closed rows the semantically correct value to report is
+      //     realised PnL, not a mark-to-market recomputation.
+      // We still fall back to the recompute path for any legacy row
+      // that predates the `realized_pnl` field, so nothing regresses.
       let totalPnl = 0
       let pnlLong = 0
       let pnlShort = 0
+      let closedLongCount = 0
+      let closedShortCount = 0
 
       for (const p of closed) {
-        const entry = parseFloat(p.entry_price || "0")
-        const current = parseFloat(p.current_price || "0")
-        const qty = parseFloat(p.quantity || "0")
         const side = p.side || "long"
-        const pnl = side === "long" ? (current - entry) * qty : (entry - current) * qty
+        let pnl: number
+        const stored = p.realized_pnl != null ? parseFloat(p.realized_pnl) : NaN
+        if (Number.isFinite(stored)) {
+          pnl = stored
+        } else {
+          const entry = parseFloat(p.entry_price || "0")
+          const current = parseFloat(p.current_price || "0")
+          const qty = parseFloat(p.quantity || "0")
+          pnl = side === "long" ? (current - entry) * qty : (entry - current) * qty
+        }
         totalPnl += pnl
-        if (side === "long") pnlLong += pnl
-        else pnlShort += pnl
+        if (side === "long") {
+          pnlLong += pnl
+          closedLongCount++
+        } else {
+          pnlShort += pnl
+          closedShortCount++
+        }
       }
+
+      const totalRealizedPct = closed.length > 0
+        ? closed.reduce((acc, p) => {
+            const entry = parseFloat(p.entry_price || "0")
+            const qty = parseFloat(p.quantity || "0")
+            const notional = entry * qty
+            if (!(notional > 0)) return acc
+            const stored = p.realized_pnl != null ? parseFloat(p.realized_pnl) : NaN
+            const pnl = Number.isFinite(stored)
+              ? stored
+              : (() => {
+                  const current = parseFloat(p.current_price || "0")
+                  const side = p.side || "long"
+                  return side === "long" ? (current - entry) * qty : (entry - current) * qty
+                })()
+            return acc + (pnl / notional) * 100
+          }, 0)
+        : 0
 
       return {
         total_positions: allPositions.length,
@@ -498,9 +565,11 @@ export class PseudoPositionManager {
         active_long: activeLong,
         active_short: activeShort,
         closed_positions: closed.length,
+        total_pnl: totalPnl,
         avg_pnl: closed.length > 0 ? totalPnl / closed.length : 0,
-        avg_pnl_long: closed.filter(p => p.side === "long").length > 0 ? pnlLong / closed.filter(p => p.side === "long").length : 0,
-        avg_pnl_short: closed.filter(p => p.side === "short").length > 0 ? pnlShort / closed.filter(p => p.side === "short").length : 0,
+        avg_pnl_long: closedLongCount > 0 ? pnlLong / closedLongCount : 0,
+        avg_pnl_short: closedShortCount > 0 ? pnlShort / closedShortCount : 0,
+        avg_pnl_pct: closed.length > 0 ? totalRealizedPct / closed.length : 0,
       }
     } catch (error) {
       console.error("[v0] Failed to get position stats:", error)
