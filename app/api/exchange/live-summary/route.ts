@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { initRedis, getRedisClient, getAllConnections } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getSettings, getAllConnections } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
 
@@ -7,24 +7,28 @@ export const dynamic = "force-dynamic"
  * GET /api/exchange/live-summary
  *
  * Aggregates LIVE exchange positions + account balance across every
- * enabled connection, for display in the QuickStart footer on the
- * dashboard.
+ * connection currently assigned to the engine. Drives the
+ * "Live Exchange — Positions & Balance" footer on the QuickStart card.
  *
- * Position data source:
- *   positions:{connectionId}                (SET of position IDs)
- *   position:{connectionId}:{posId}          (HASH with position state)
+ * ── Data sources (verified against lib/exchange-position-manager.ts and
+ *    lib/volume-calculator.ts) ─────────────────────────────────────────
+ *   exchange_positions:{connectionId}:open   (SET of aex_* position ids)
+ *   settings:exchange_position:{posId}       (JSON via getSettings/setSettings)
+ *     shape: { connection_id, symbol, side, entry_price, current_price,
+ *              quantity, volume_usd, unrealized_pnl, status, trade_mode,
+ *              indication_type, leverage, opened_at, ... }
+ *   settings:connection_balance:{connectionId}
+ *     shape: { balance: number, timestamp: number }
+ *     — written by VolumeCalculator after a fresh connector.getBalance()
  *
- * We only count positions with `status === "open"` AND `trade_mode`
- * indicating a live-exchange mode (i.e. not "paper" / "pseudo").
+ * Connection eligibility mirrors the engine filter in redis-db:
+ * `is_active_inserted` OR `is_assigned` OR `is_enabled`. The dashboard
+ * flag is an optional hint and is NOT required — the footer should
+ * reflect the full live-trading state even before a user toggles
+ * dashboard visibility.
  *
- * Balance data source (best-effort):
- *   connection:{connectionId}:balance        (HASH: {total, available, equity, currency})
- * The exchange connector writes this hash after each trade/reconcile.
- * When it is missing we report zero for that connection rather than
- * erroring — the footer should never block the dashboard.
- *
- * Response shape is intentionally flat + cheap — the UI polls this
- * every ~10s so it needs to be snappy.
+ * This endpoint NEVER 500s — on any error it returns zero totals so the
+ * dashboard footer just shows "0 conns" rather than an error badge.
  */
 export async function GET() {
   try {
@@ -32,103 +36,149 @@ export async function GET() {
     const client = getRedisClient()
     const connections = await getAllConnections()
 
-    // Only enabled AND enabled-on-dashboard connections — these are the
-    // ones the operator actually trades live on.
+    // Reuse the same flag semantics as the engine filter. Accept both
+    // boolean and string truthy representations ("1" / "true" / true).
+    const isTruthy = (v: any): boolean =>
+      v === true || v === "true" || v === "1" || v === 1
+
+    // Show every connection actively assigned to the trading engine.
+    // Matches the engine's own filter (redis-db.ts getAssignedAndEnabled-
+    // Connections) so the footer reflects the exact set of connections
+    // that could legitimately hold live positions.
     const activeConns = connections.filter((c) => {
-      const enabled   = c.is_enabled === "1" || c.is_enabled === true || c.is_enabled === "true"
-      const dashOn    = c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true || c.is_enabled_dashboard === "true"
-      return enabled && dashOn
+      const assignedOrActive = isTruthy(c.is_active_inserted) || isTruthy(c.is_assigned)
+      const engineEnabled    = isTruthy(c.is_enabled) || isTruthy(c.enabled)
+      // Require engine-assigned AND not-disabled. Either condition alone
+      // is insufficient: `is_enabled` alone covers connections that can
+      // be tested but aren't trading; `is_active_inserted` alone could
+      // include connections that have been disabled globally.
+      return assignedOrActive && engineEnabled
     })
 
     if (activeConns.length === 0) {
-      return NextResponse.json({
-        connections: [],
-        totals: {
-          openPositions:  0,
-          longPositions:  0,
-          shortPositions: 0,
-          unrealizedPnl:  0,
-          totalBalance:   0,
-          availableBalance: 0,
-          equity:         0,
-          currency:       "USDT",
-        },
-        updatedAt: Date.now(),
-      })
+      return NextResponse.json(emptyResponse())
     }
 
     // ── Fan out: gather positions + balance for every connection in parallel ─
     const perConnection = await Promise.all(
       activeConns.map(async (conn) => {
-        const connId = conn.id
-        const [posIds, balanceRaw] = await Promise.all([
+        const connId = String(conn.id)
+
+        // ── Two parallel live-position stores ─────────────────────────
+        //  A) exchange-position-manager: `exchange_positions:{id}:open` SET
+        //     with JSON at `settings:exchange_position:{posId}`. Used by
+        //     the real-stage mirroring path.
+        //  B) /api/positions generic store: `positions:{id}` SET with
+        //     hashes at `position:{id}:{posId}`. Used by the direct
+        //     position-creation API (trade_mode: "main" = live).
+        // We query BOTH and merge, de-duplicating by id. This keeps the
+        // footer correct regardless of which code path opened the
+        // position. Balance cache is pulled in the same round-trip.
+        const [exchangeIdsRaw, genericIdsRaw, balanceCache] = await Promise.all([
+          client.smembers(`exchange_positions:${connId}:open`).catch(() => [] as string[]),
           client.smembers(`positions:${connId}`).catch(() => [] as string[]),
-          client.hgetall(`connection:${connId}:balance`).catch(() => ({} as Record<string, string>)),
+          getSettings(`connection_balance:${connId}`).catch(() => null),
         ])
+
+        const exchangeIds = Array.isArray(exchangeIdsRaw) ? exchangeIdsRaw : []
+        const genericIds  = Array.isArray(genericIdsRaw)  ? genericIdsRaw  : []
+
+        // Cap each source at 200 as a safety guard.
+        const cappedExchange = exchangeIds.slice(0, 200)
+        const cappedGeneric  = genericIds.slice(0, 200)
+
+        // Fetch both stores in parallel.
+        const [exchangePositionObjs, genericPositionHashes] = await Promise.all([
+          Promise.all(cappedExchange.map((id) => getSettings(`exchange_position:${id}`).catch(() => null))),
+          Promise.all(cappedGeneric.map((id)  => client.hgetall(`position:${connId}:${id}`).catch(() => null))),
+        ])
+
+        // Normalise both into a single array of position objects. Only
+        // include live-trading entries (skip paper/pseudo/simulated).
+        const positionObjs: any[] = []
+        const seenIds = new Set<string>()
+        for (const p of exchangePositionObjs) {
+          if (!p) continue
+          const id = String(p.id || "")
+          if (id && seenIds.has(id)) continue
+          if (id) seenIds.add(id)
+          positionObjs.push(p)
+        }
+        for (const p of genericPositionHashes) {
+          if (!p || Object.keys(p).length === 0) continue
+          const id = String(p.id || "")
+          if (id && seenIds.has(id)) continue
+          // Skip pseudo/paper modes on this store — it holds both.
+          const mode = String(p.trade_mode || "").toLowerCase()
+          if (mode === "paper" || mode === "pseudo" || mode === "simulated" || mode === "test") continue
+          if (id) seenIds.add(id)
+          positionObjs.push(p)
+        }
 
         let openPositions  = 0
         let longPositions  = 0
         let shortPositions = 0
         let unrealizedPnl  = 0
-        const positions: Array<{ symbol: string; side: string; qty: number; entry: number; mark: number; pnl: number }> = []
+        const positions: Array<{
+          symbol: string; side: string; qty: number
+          entry: number;  mark: number; pnl: number
+        }> = []
 
-        if (Array.isArray(posIds) && posIds.length > 0) {
-          // Batch fetch each position hash. Positions count grows O(connections
-          // × openPositions) so we cap at 200 per connection as a safety guard.
-          const capped = posIds.slice(0, 200)
-          const positionHashes = await Promise.all(
-            capped.map((id) =>
-              client.hgetall(`position:${connId}:${id}`).catch(() => ({} as Record<string, string>)),
-            ),
-          )
+        for (const p of positionObjs) {
+          if (!p) continue
+          // Only "open" positions contribute to the live count. The
+          // exchange-position-manager removes ids from the :open set on
+          // close, but we double-check status as a safety net against
+          // stale entries.
+          if (p.status && p.status !== "open") continue
 
-          for (const p of positionHashes) {
-            if (!p || Object.keys(p).length === 0) continue
-            // Live = open + trade_mode NOT in {paper, pseudo, simulated}
-            if (p.status !== "open") continue
-            const mode = (p.trade_mode || "").toLowerCase()
-            if (mode === "paper" || mode === "pseudo" || mode === "simulated") continue
+          openPositions++
+          const side = String(p.side || "long").toLowerCase()
+          if (side === "short") shortPositions++
+          else                  longPositions++
 
-            openPositions++
-            const side = (p.side || "long").toLowerCase()
-            if (side === "short") shortPositions++
-            else                  longPositions++
+          const pnl = toNum(p.unrealized_pnl ?? p.pnl)
+          unrealizedPnl += pnl
 
-            const pnl = Number(p.pnl ?? 0) || 0
-            unrealizedPnl += pnl
-
-            positions.push({
-              symbol: p.symbol || "",
-              side,
-              qty:    Number(p.quantity ?? 0) || 0,
-              entry:  Number(p.entry_price ?? 0) || 0,
-              mark:   Number(p.current_price ?? p.mark_price ?? p.entry_price ?? 0) || 0,
-              pnl,
-            })
-          }
+          positions.push({
+            symbol: String(p.symbol || ""),
+            side,
+            qty:    toNum(p.quantity),
+            entry:  toNum(p.entry_price),
+            mark:   toNum(p.current_price ?? p.mark_price ?? p.entry_price),
+            pnl,
+          })
         }
 
-        // Balance hash: {total, available, equity, currency}. Fall back to 0.
-        const total     = Number(balanceRaw?.total ?? 0)     || 0
-        const available = Number(balanceRaw?.available ?? 0) || 0
-        const equity    = Number(balanceRaw?.equity ?? total) || 0
-        const currency  = (balanceRaw?.currency as string) || "USDT"
+        // Balance cache shape is { balance: number, timestamp: number }.
+        // The exchange connectors only expose a single USDT total — we do
+        // not have a separate available/equity split at this layer, so
+        // we mirror `total` across all three fields for display.
+        const totalBal  = toNum(balanceCache?.balance)
+        const currency  = (balanceCache?.currency as string) || "USDT"
+        const balanceTs = toNum(balanceCache?.timestamp)
 
         return {
           connectionId: connId,
-          name:         conn.name || conn.exchange_name || connId,
-          exchange:     conn.exchange || conn.exchange_type || "",
+          name:         String(conn.name || conn.exchange_name || conn.exchange || connId),
+          exchange:     String(conn.exchange || conn.exchange_type || conn.exchange_name || ""),
           openPositions,
           longPositions,
           shortPositions,
           unrealizedPnl,
-          balance: { total, available, equity, currency },
-          positions: positions.slice(0, 20), // top 20 for UI; full list via /api/positions
+          balance: {
+            total:     totalBal,
+            available: totalBal,        // connectors don't split available/locked
+            equity:    totalBal + unrealizedPnl, // total + unrealised = equity estimate
+            currency,
+            updatedAt: balanceTs || null,
+          },
+          positions: positions.slice(0, 20),
         }
       }),
     )
 
-    // ── Roll-up totals across every active connection ──────────────────────
+    // ── Roll-up totals ────────────────────────────────────────────────────
     const totals = perConnection.reduce(
       (acc, c) => {
         acc.openPositions    += c.openPositions
@@ -138,8 +188,6 @@ export async function GET() {
         acc.totalBalance     += c.balance.total
         acc.availableBalance += c.balance.available
         acc.equity           += c.balance.equity
-        // First non-empty currency wins — all connections *should* be USDT
-        // on Bybit/Binance derivatives; this is a display hint only.
         if (!acc.currency && c.balance.currency) acc.currency = c.balance.currency
         return acc
       },
@@ -158,17 +206,24 @@ export async function GET() {
     })
   } catch (error) {
     console.error("[v0] /api/exchange/live-summary error:", error)
-    return NextResponse.json(
-      {
-        connections: [],
-        totals: {
-          openPositions: 0, longPositions: 0, shortPositions: 0,
-          unrealizedPnl: 0, totalBalance: 0, availableBalance: 0,
-          equity: 0, currency: "USDT",
-        },
-        updatedAt: Date.now(),
-      },
-      { status: 200 }, // never block the dashboard on this endpoint
-    )
+    // Soft-fail — we never want the footer to break the dashboard.
+    return NextResponse.json(emptyResponse(), { status: 200 })
+  }
+}
+
+function toNum(v: any): number {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : 0
+}
+
+function emptyResponse() {
+  return {
+    connections: [],
+    totals: {
+      openPositions: 0, longPositions: 0, shortPositions: 0,
+      unrealizedPnl: 0, totalBalance: 0, availableBalance: 0,
+      equity: 0, currency: "USDT",
+    },
+    updatedAt: Date.now(),
   }
 }
