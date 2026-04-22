@@ -1327,9 +1327,33 @@ export class StrategyCoordinator {
 
         for (const h of hashes) {
           if (!h) continue
-          const closedAt = Number(h.closed_at || h.closedAt || h.opened_at || 0)
-          if (!closedAt || closedAt < cutoff) continue
-          const pnl = Number(h.pnl ?? h.realized_pnl ?? h.profit ?? 0)
+          // ── P2-1: Strict closed-only gate ──────────────────────────────
+          // Main variant gating (prevLosses, lastWins, lastLosses,
+          // prevPosCount, lastPosCount) MUST be computed from closed
+          // pseudo positions ONLY. Previously this block used the
+          // `opened_at` value as a fallback for the close timestamp and
+          // read `h.pnl` blindly — both of which made floating open
+          // positions (their mark-to-market PnL) leak into the stats
+          // that drive fingerprint buckets and `selectActiveVariants`
+          // gates. Now we enforce three explicit conditions:
+          //   (1) `status === "closed"` — hard gate. Any other value
+          //       (open, pending, rejected, error, partial) is ignored.
+          //   (2) a valid numeric `closed_at` / `closedAt` within the
+          //       lookback window. `opened_at` is NO LONGER a fallback.
+          //   (3) a realized-pnl field (`realized_pnl` or `pnl` written
+          //       AT close) — not the live unrealised value.
+          const status = String(h.status || "").toLowerCase()
+          if (status !== "closed") continue
+          const closedAtRaw = h.closed_at ?? h.closedAt ?? 0
+          const closedAt = Number(closedAtRaw)
+          if (!Number.isFinite(closedAt) || closedAt <= 0) continue
+          if (closedAt < cutoff) continue
+          // Prefer `realized_pnl`; fall back to `pnl` only when the row
+          // is marked closed (the closePosition pipeline writes `pnl`
+          // to the realized value at close time).
+          const pnlRaw = h.realized_pnl ?? h.pnl ?? h.profit ?? 0
+          const pnl = Number(pnlRaw)
+          if (!Number.isFinite(pnl)) continue
           prevPosCount++
           if (pnl < 0) prevLosses++
           lastN.push({ closedAt, pnl })
@@ -1370,6 +1394,24 @@ export class StrategyCoordinator {
    * related Set for that variant this cycle (keeps work proportional to
    * context). The `default` variant is always on — it mirrors the original
    * one-Set-per-base behaviour and is what Real/Live have always consumed.
+   *
+   * ── P2-3: Closed-only contract for statistics-driven gates ────────
+   * The `ctx` input here comes from `getPositionContext()`, which (as
+   * of P2-1) enforces a strict `status==="closed"` filter on every
+   * statistical field it builds:
+   *   - prevPosCount, prevLosses, lastPosCount, lastWins, lastLosses
+   *     → closed pseudo positions within a 24h lookback window.
+   * Intentional exceptions (fields based on OPEN state by design, per
+   * spec) — gates on these fields are NOT closed-only:
+   *   - continuousCount  → # currently-open pseudo positions
+   *                        (spec: "Continuous Positions" are active)
+   *   - perSymbolOpen    → per-symbol open count (feeds `block` gate
+   *                        which explicitly needs an open position to
+   *                        continue into)
+   * Every other axis used below is closed-only. This invariant keeps
+   * Main-stage factor coordination free of floating mark-to-market
+   * pollution while allowing the few gates that MUST reference live
+   * open state to do so cleanly.
    */
   private selectActiveVariants(ctx: PositionContext): Array<ReturnType<StrategyCoordinator["variantProfiles"]>[number]> {
     return this.variantProfiles().filter((p) => p.gate(ctx))
@@ -1455,6 +1497,12 @@ export class StrategyCoordinator {
    * operator only visits O(20-80) of them per symbol per run. The
    * alternative (materialising Sets for every combo) would blow the
    * 250-entry cap and thrash Redis with no accuracy win.
+   *
+   * ── P2-3: Closed-only contract for statistics-driven buckets ──────
+   * `lastWins`, `lastLosses`, `prevPosCount`, `prevLosses` below are
+   * closed-only by construction (see `getPositionContext` P2-1 gate).
+   * `continuousCount` is intentionally live — Continuous Positions
+   * denote currently-open pseudo positions per spec.
    */
   private variantFingerprint(
     baseSet: StrategySet,
@@ -1464,6 +1512,8 @@ export class StrategyCoordinator {
     const bPF = Math.round(baseSet.avgProfitFactor * 10) / 10
     const bEC = baseSet.entryCount
     // Clamp each context dimension to its spec maximum.
+    // cont is live-open by spec; the other four are closed-only via
+    // the P2-1 gate in getPositionContext.
     const cont = Math.min(10, Math.max(0, ctx.continuousCount))
     const lW   = Math.min(4,  Math.max(0, ctx.lastWins))
     const lL   = Math.min(4,  Math.max(0, ctx.lastLosses))
