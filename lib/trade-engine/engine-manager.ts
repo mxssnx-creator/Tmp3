@@ -297,12 +297,26 @@ export class TradeEngineManager {
       const totalStrategies = strategyResults.reduce((sum, result) => sum + (result?.strategiesEvaluated || 0), 0)
 
       // Phase 5: Start realtime processor
-      await this.updateProgressionPhase("realtime", 85, "Monitoring real-time data and positions")
+      //
+      // IMPORTANT: The realtime processor is STARTED here (timer loop is
+      // armed immediately so the dashboard reports an active processor),
+      // but individual ticks SELF-GATE on the `prehistoric:{id}:done` flag
+      // written at the end of `loadPrehistoricData`. Until that flag is
+      // set the tick returns early with zero updates so the realtime logic
+      // never runs against an empty previous-position context.
+      //
+      // We deliberately DO NOT run a warm-up pass here: firing
+      // `processRealtimeUpdates()` before prehistoric is finished would
+      // evaluate live positions without any prehistoric-calculated prev-
+      // position context, producing TP/SL decisions on cold state. The
+      // self-gated loop will run the first productive pass the instant
+      // prehistoric completes.
+      await this.updateProgressionPhase(
+        "realtime",
+        85,
+        "Realtime processor armed — waiting for prehistoric calc to finish",
+      )
       this.startRealtimeProcessor(config.realtimeInterval)
-      // Run a realtime pass immediately
-      await this.realtimeProcessor.processRealtimeUpdates().catch((error) => {
-        console.warn(`[v0] [Engine] Realtime startup failed:`, error instanceof Error ? error.message : String(error))
-      })
 
       // Verify timers are running
       setTimeout(async () => {
@@ -468,13 +482,20 @@ export class TradeEngineManager {
   }
 
   /**
-   * Load prehistoric data (historical data before real-time processing)
-   * Default range: last 1 day, processed at 1-second timeframe intervals
-   * Runs in background - does not block engine startup
-   * Error handling: failures don't stop subsequent processing steps
+   * Load prehistoric data (historical data before real-time processing).
+   *
+   * Default range: last 8 HOURS, processed at 1-second timeframe intervals.
+   * (The range is user-tunable via `app_settings.prehistoric_range_hours`,
+   * bounded to 1-50h, step 1.) Prehistoric output drives the "prev position"
+   * context consumed by the realtime processor — see the `prehistoric:{id}:done`
+   * gate in `startRealtimeProcessor` below.
+   *
+   * Runs in background: the engine boot flow keeps progressing while we load,
+   * and the realtime processor self-gates until the "done" flag flips. Errors
+   * never stop subsequent processing.
    */
   private async loadPrehistoricData(): Promise<void> {
-    // Default: 8-hour look-back, 1-second timeframe interval.
+    // Default: 8-HOUR look-back, 1-second timeframe interval.
     // User can override via `app_settings.prehistoric_range_hours` (1-50h, step 1).
     // Legacy `trade_engine_state:{id}.prehistoric_range_days` is still respected for
     // backward compatibility.
@@ -1147,19 +1168,36 @@ export class TradeEngineManager {
   }
 
   /**
-   * Start realtime processor (async)
+   * Start realtime processor (async).
    *
    * Self-scheduling setTimeout loop — each cycle runs back-to-back with a
    * configurable pause (app_settings.cyclePauseMs, 10-200ms, default 50ms).
-   * Applies adaptive idle backoff (max 1s) once prehistoric calc is done and
-   * cycles repeatedly produce no realtime updates.
+   *
+   * ── Prehistoric gating ──────────────────────────────────────────────
+   * The loop is armed immediately, but individual ticks SELF-GATE on the
+   * `prehistoric:{id}:done` flag set by loadPrehistoricData. Until that
+   * flag flips we return a "gated" marker (no position processing) and
+   * re-poll the flag on a short cadence (500ms) so the first productive
+   * pass fires the instant prehistoric completes. This guarantees the
+   * realtime processor always has prehistoric-calculated prev-position
+   * context available when it evaluates positions.
+   *
+   * Once prehistoric is done the loop applies adaptive idle backoff
+   * (max 1s) across consecutive empty cycles.
    */
   private startRealtimeProcessor(_intervalSeconds: number = 1): void {
     let cycleCount = 0
+    let gatedCycles = 0
     let totalDuration = 0
     let errorCount = 0
 
     const MAX_IDLE_PAUSE_MS = 1000
+    // Fast-poll cadence while waiting for prehistoric to finish. Kept
+    // short (500ms) so the first productive realtime tick fires within
+    // half a second of prehistoric completing — but long enough to avoid
+    // hammering Redis with `GET prehistoric:{id}:done` during a long-
+    // running prehistoric load.
+    const PREHISTORIC_WAIT_POLL_MS = 500
     let consecutiveEmptyCycles = 0
     const connId = this.connectionId
     let prehistoricDoneFlag = false
@@ -1173,12 +1211,18 @@ export class TradeEngineManager {
     }
     void refreshPrehistoricDone()
 
-    const scheduleNext = (wasProductive: boolean) => {
+    const scheduleNext = (outcome: "productive" | "empty" | "gated") => {
       if (!this.isRunning) return
       const base = getCyclePauseMsSync()
       let pause = base
-      if (wasProductive) {
+      if (outcome === "productive") {
         consecutiveEmptyCycles = 0
+      } else if (outcome === "gated") {
+        // Prehistoric-pending backoff. Don't inflate `consecutiveEmpty-
+        // Cycles` — a gated cycle isn't an "empty" cycle; it was skipped
+        // on purpose. We just wait the fixed short interval so we pick
+        // up the done-flag flip promptly.
+        pause = PREHISTORIC_WAIT_POLL_MS
       } else {
         consecutiveEmptyCycles++
         if (prehistoricDoneFlag && consecutiveEmptyCycles > 2) {
@@ -1195,7 +1239,10 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
-      let producedRealtime = false
+      // Default outcome: "empty". Upgraded to "productive" when the
+      // processor reports real work, or demoted to "gated" when the
+      // prehistoric flag hasn't flipped yet.
+      let outcome: "productive" | "empty" | "gated" = "empty"
       // V8: Early exit if this timer is from a stale module version
       if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
         if (this.realtimeTimer) {
@@ -1206,9 +1253,36 @@ export class TradeEngineManager {
       }
       const startTime = Date.now()
 
-      if (startTime - prehistoricDoneCheckedAt > 3000) {
+      // While prehistoric is pending poll the flag every tick (cheap
+      // single-key GET on a 500ms cadence). After it flips we back off
+      // to the original 3s refresh to avoid needless reads.
+      const pollInterval = prehistoricDoneFlag ? 3000 : PREHISTORIC_WAIT_POLL_MS
+      if (startTime - prehistoricDoneCheckedAt > pollInterval) {
         prehistoricDoneCheckedAt = startTime
-        void refreshPrehistoricDone()
+        await refreshPrehistoricDone()
+      }
+
+      // ── Prehistoric gate ──────────────────────────────────────────
+      // Realtime processing MUST NOT run until prehistoric has produced
+      // the per-symbol Set calculations that provide the "prev position"
+      // context. Skip the cycle with a lightweight log and let
+      // scheduleNext() re-poll on the short cadence.
+      if (!prehistoricDoneFlag) {
+        gatedCycles++
+        // Emit a progression log at a very low rate so the dashboard can
+        // surface the wait state without drowning the log list.
+        if (gatedCycles === 1 || gatedCycles % 20 === 0) {
+          void logProgressionEvent(
+            this.connectionId,
+            "realtime_gated",
+            "info",
+            "Realtime tick skipped — waiting for prehistoric calculation to finish",
+            { gatedCycles },
+          ).catch(() => { /* non-critical */ })
+        }
+        outcome = "gated"
+        scheduleNext(outcome)
+        return
       }
 
       try {
@@ -1217,7 +1291,7 @@ export class TradeEngineManager {
         // Mark cycle productive when the processor returned some work.
         if (rtResult && typeof rtResult === "object") {
           const updates = Number(rtResult.updates ?? rtResult.processed ?? rtResult.positionsUpdated ?? 0)
-          producedRealtime = updates > 0
+          if (updates > 0) outcome = "productive"
         }
 
         const duration = Date.now() - startTime
@@ -1269,11 +1343,14 @@ export class TradeEngineManager {
           errorCount,
         })
       } finally {
-        scheduleNext(producedRealtime)
+        scheduleNext(outcome)
       }
     }
 
-    // Kick off the first cycle immediately.
+    // Kick off the first cycle immediately. The first tick will either
+    // report "gated" (prehistoric still running) and re-poll on
+    // PREHISTORIC_WAIT_POLL_MS, or run a full cycle if prehistoric is
+    // already complete.
     this.realtimeTimer = setTimeout(tick, 0)
     
     // Register timer for cleanup on module reload
