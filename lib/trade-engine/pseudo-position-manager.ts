@@ -7,6 +7,7 @@
 import { getRedisClient, getSettings, setSettings, createPosition as redisCreatePosition } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { emitPositionUpdate } from "@/lib/broadcast-helpers"
+import { StrategyConfigManager, type PseudoPosition as StrategyPseudoPosition } from "@/lib/strategy-config-manager"
 
 function nanoid(len = 12): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -43,6 +44,22 @@ export class PseudoPositionManager {
   /** Redis hash key for one position */
   private positionKey(id: string): string {
     return `pseudo_position:${this.connectionId}:${id}`
+  }
+
+  /**
+   * Extract the strategy-config id from a pseudo-position's
+   * `config_set_key`. The key is composite (historically written with
+   * extra scope segments — strategy id, variant, etc.) so we take the
+   * tail segment as the canonical config id. Mirrors the parse logic
+   * in `realtime-processor.getPrevSetPosition` so both readers and
+   * writers target the exact same Redis list
+   * `strategy:{connId}:config:{configId}:positions`.
+   */
+  private extractConfigId(configSetKey: string | undefined | null): string {
+    if (!configSetKey) return ""
+    const raw = String(configSetKey)
+    const idx = raw.lastIndexOf(":")
+    return idx >= 0 ? raw.slice(idx + 1) : raw
   }
 
   /** Read a single position hash from Redis */
@@ -309,13 +326,14 @@ export class PseudoPositionManager {
         : (entryPrice - currentPrice) * quantity
 
       const client = getRedisClient()
+      const closedAtIso = new Date().toISOString()
       await client.hset(this.positionKey(positionId), {
         status: "closed",
-        closed_at: new Date().toISOString(),
+        closed_at: closedAtIso,
         close_reason: reason,
         realized_pnl: String(pnl),
       })
-      
+
       // Remove closed position from the main index set
       await client.srem(this.positionsSetKey(), positionId)
       // Remove from the O(1) active-configSetKey index so the slot can be reused
@@ -325,6 +343,60 @@ export class PseudoPositionManager {
       }
       // Set TTL on the closed position hash so it auto-cleans (7 days)
       await client.expire(this.positionKey(positionId), 604800)
+
+      // ── Continuous Set update ─────────────────────────────────────────
+      // The realtime processor reads the HEAD of each strategy-config's
+      // position list (`strategy:{connId}:config:{configId}:positions`)
+      // as its "prev position" context. That list was initially populated
+      // by the prehistoric/historic calc in config-set-processor via
+      // StrategyConfigManager.addPositions. To keep the Set continuously
+      // current — not frozen at prehistoric-time — we append each closed
+      // live position back into the SAME uniquely-keyed list here.
+      //
+      // Entry format mirrors what the prehistoric processor writes, so a
+      // read-back via getPrevSetPosition in realtime-processor sees a
+      // consistent schema regardless of whether the prev-position came
+      // from prehistoric backfill or live trading. The Redis list is
+      // capped at 250 entries by the manager's ltrim, so memory is
+      // bounded; newest-first LPUSH order means realtime's "read HEAD"
+      // always reflects the most recent outcome.
+      //
+      // This write is best-effort: a failure to append to the set must
+      // NEVER fail position closure itself (position state is the
+      // authoritative record).
+      const configId = this.extractConfigId(configSetKey)
+      if (configId) {
+        try {
+          const entryPrice = parseFloat(position.entry_price || "0")
+          const tp = parseFloat(position.take_profit || "0")
+          const sl = parseFloat(position.stop_loss || "0")
+          // Result is expressed as percentage return on entry notional —
+          // matches the prehistoric writer's convention (see
+          // config-set-processor.calculateStrategyPositions).
+          const notional = entryPrice * quantity
+          const resultPct = notional > 0 ? (pnl / notional) * 100 : 0
+
+          const setEntry: StrategyPseudoPosition = {
+            entry_time:  String(position.created_at || position.entry_time || closedAtIso),
+            symbol:      String(position.symbol || ""),
+            entry_price: entryPrice,
+            take_profit: tp,
+            stop_loss:   sl,
+            status:      "closed",
+            result:      resultPct,
+            exit_time:   closedAtIso,
+            exit_price:  currentPrice,
+          }
+          const strategyManager = new StrategyConfigManager(this.connectionId)
+          await strategyManager.addPosition(configId, setEntry)
+        } catch (setErr) {
+          // Non-fatal: log and continue. The position is already closed.
+          console.warn(
+            `[v0] [PseudoPositionManager] Failed to append closed position to strategy set ${configId}:`,
+            setErr instanceof Error ? setErr.message : String(setErr),
+          )
+        }
+      }
 
       console.log(`[v0] Closed position ${positionId}: ${reason} (PnL: ${pnl.toFixed(4)})`)
 
