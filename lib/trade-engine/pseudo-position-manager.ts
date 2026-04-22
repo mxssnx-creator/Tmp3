@@ -46,22 +46,6 @@ export class PseudoPositionManager {
     return `pseudo_position:${this.connectionId}:${id}`
   }
 
-  /**
-   * Extract the strategy-config id from a pseudo-position's
-   * `config_set_key`. The key is composite (historically written with
-   * extra scope segments — strategy id, variant, etc.) so we take the
-   * tail segment as the canonical config id. Mirrors the parse logic
-   * in `realtime-processor.getPrevSetPosition` so both readers and
-   * writers target the exact same Redis list
-   * `strategy:{connId}:config:{configId}:positions`.
-   */
-  private extractConfigId(configSetKey: string | undefined | null): string {
-    if (!configSetKey) return ""
-    const raw = String(configSetKey)
-    const idx = raw.lastIndexOf(":")
-    return idx >= 0 ? raw.slice(idx + 1) : raw
-  }
-
   /** Read a single position hash from Redis */
   private async readPosition(id: string): Promise<any | null> {
     try {
@@ -364,10 +348,9 @@ export class PseudoPositionManager {
       // This write is best-effort: a failure to append to the set must
       // NEVER fail position closure itself (position state is the
       // authoritative record).
-      const configId = this.extractConfigId(configSetKey)
+      const configId = StrategyConfigManager.extractConfigId(configSetKey)
       if (configId) {
         try {
-          const entryPrice = parseFloat(position.entry_price || "0")
           const tp = parseFloat(position.take_profit || "0")
           const sl = parseFloat(position.stop_loss || "0")
           // Result is expressed as percentage return on entry notional —

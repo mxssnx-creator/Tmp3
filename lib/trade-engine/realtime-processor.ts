@@ -20,33 +20,26 @@
 import { getSettings, setSettings, getMarketData, getRedisClient } from "@/lib/redis-db"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
-
-// Parsed "prev-set position" record pulled from the prehistoric-calculated
-// strategy-config position list (`strategy:{connId}:config:{configId}:positions`).
-// Kept intentionally narrow — only the fields the realtime tick actually uses
-// to calibrate its TP/SL logic. See `getPrevSetPosition()` for parsing.
-interface PrevSetPosition {
-  symbol: string
-  entry_price: number
-  take_profit: number
-  stop_loss:   number
-  status:      "open" | "closed"
-  result:      number
-  exit_price?: number
-}
+import { StrategyConfigManager, type PseudoPosition } from "@/lib/strategy-config-manager"
 
 export class RealtimeProcessor {
   private connectionId: string
   private positionManager: PseudoPositionManager
+  // StrategyConfigManager owns the canonical Set schema (entry format,
+  // keyspace, trim cap). We hold a single instance per processor and
+  // delegate to it for all prev-position retrieval — zero duplicated
+  // parsing, zero key drift. Historic fill, realtime read, realtime
+  // write-back (on close) all share the exact same methods.
+  private strategy: StrategyConfigManager
   private priceCache: Map<string, { price: number; ts: number }> = new Map()
   private readonly PRICE_CACHE_TTL = 5000 // 5s
 
-  // Cache of prev-set positions keyed by the strategy-config id embedded
-  // in `pseudo_position.config_set_key`. Prehistoric-calculated sets are
-  // a slow-moving source (new entries appended only when indication/
-  // strategy processors run), so 10s TTL is ample.
-  private prevSetCache: Map<string, { pos: PrevSetPosition | null; ts: number }> = new Map()
-  private readonly PREV_SET_CACHE_TTL = 10_000
+  // Cache of prev-set positions keyed by strategy-config id. The Set is
+  // updated by the prehistoric fill path AND by live-close writebacks,
+  // so the TTL is deliberately short (2s) — a live TP/SL close must
+  // propagate into the realtime tick's context on the next cycle.
+  private prevSetCache: Map<string, { pos: PseudoPosition | null; ts: number }> = new Map()
+  private readonly PREV_SET_CACHE_TTL = 2_000
 
   // Cached prehistoric-ready flag (mirrors the gate in engine-manager).
   // Checked once per ~3s while serving ticks; flipped to `true` we skip
@@ -71,6 +64,7 @@ export class RealtimeProcessor {
   constructor(connectionId: string) {
     this.connectionId = connectionId
     this.positionManager = new PseudoPositionManager(connectionId)
+    this.strategy = new StrategyConfigManager(connectionId)
   }
 
   /**
@@ -100,26 +94,19 @@ export class RealtimeProcessor {
 
   /**
    * Read the latest prev-set position for a given pseudo-position's
-   * `config_set_key`. The prehistoric processor batch-pushes each
-   * strategy-config's pseudo positions into a "|"-delimited Redis list
-   * at `strategy:{connId}:config:{configId}:positions` via
-   * `StrategyConfigManager.addPositions` (see strategy-config-manager.ts
-   * for the exact layout). We read the HEAD of that list — the most
-   * recently appended position — and parse it into the narrow
-   * `PrevSetPosition` shape above.
+   * `config_set_key`. Delegates to `StrategyConfigManager.getLatestPosition`
+   * — the single canonical primitive that owns both the Redis keyspace
+   * (`strategy:{connId}:config:{configId}:positions`) and the entry
+   * schema used by every writer (prehistoric fill in
+   * `config-set-processor.calculateStrategyPositions` and live
+   * write-back in `pseudo-position-manager.closePosition`).
    *
-   * Returns `null` for missing/empty sets, unparseable entries, or when
-   * the `configSetKey` doesn't carry a strategy-config id. Short-TTL
-   * cached to keep the per-tick overhead minimal.
+   * No parsing, no key construction, no schema here — all of that lives
+   * on `StrategyConfigManager`. This method is just the per-tick cache
+   * in front of that single source of truth.
    */
-  async getPrevSetPosition(configSetKey: string | undefined): Promise<PrevSetPosition | null> {
-    if (!configSetKey) return null
-    // `config_set_key` is a composite; the strategy-config id is the
-    // last segment. We accept both a bare id and a "...:configId"
-    // pattern so future key-scheme changes don't silently break this.
-    const configId = configSetKey.includes(":")
-      ? configSetKey.slice(configSetKey.lastIndexOf(":") + 1)
-      : configSetKey
+  async getPrevSetPosition(configSetKey: string | undefined): Promise<PseudoPosition | null> {
+    const configId = StrategyConfigManager.extractConfigId(configSetKey)
     if (!configId) return null
 
     const now = Date.now()
@@ -127,30 +114,7 @@ export class RealtimeProcessor {
     if (cached && now - cached.ts < this.PREV_SET_CACHE_TTL) return cached.pos
 
     try {
-      const client = getRedisClient()
-      const key = `strategy:${this.connectionId}:config:${configId}:positions`
-      const rows = await client.lrange(key, 0, 0)
-      if (!rows || rows.length === 0) {
-        this.prevSetCache.set(configId, { pos: null, ts: now })
-        return null
-      }
-      // Entry format mirrors StrategyConfigManager.addPositions:
-      //   entry_time | symbol | entry_price | take_profit | stop_loss |
-      //   status | result | exit_time | exit_price
-      const parts = String(rows[0]).split("|")
-      if (parts.length < 7) {
-        this.prevSetCache.set(configId, { pos: null, ts: now })
-        return null
-      }
-      const pos: PrevSetPosition = {
-        symbol:      parts[1] || "",
-        entry_price: parseFloat(parts[2] || "0") || 0,
-        take_profit: parseFloat(parts[3] || "0") || 0,
-        stop_loss:   parseFloat(parts[4] || "0") || 0,
-        status:      (parts[5] as "open" | "closed") || "closed",
-        result:      parseFloat(parts[6] || "0") || 0,
-        exit_price:  parts[8] ? parseFloat(parts[8]) || undefined : undefined,
-      }
+      const pos = await this.strategy.getLatestPosition(configId)
       this.prevSetCache.set(configId, { pos, ts: now })
       return pos
     } catch (err) {

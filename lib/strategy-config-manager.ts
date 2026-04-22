@@ -190,20 +190,61 @@ export class StrategyConfigManager {
     const key = this.getPositionsKey(configId)
     const rawPositions = await client.lrange(key, 0, limit - 1)
 
-    return rawPositions.map((entry: string) => {
-      const parts = entry.split("|")
-      return {
-        entry_time: parts[0],
-        symbol: parts[1],
-        entry_price: parseFloat(parts[2]),
-        take_profit: parseFloat(parts[3]),
-        stop_loss: parseFloat(parts[4]),
-        status: parts[5] as "open" | "closed",
-        result: parseFloat(parts[6]),
-        exit_time: parts[7] || undefined,
-        exit_price: parseFloat(parts[8]) || undefined,
-      }
-    })
+    return rawPositions.map((entry: string) => StrategyConfigManager.parseEntry(entry)).filter(
+      (p): p is PseudoPosition => p !== null,
+    )
+  }
+
+  /**
+   * Return the most recently appended position (list HEAD) for a given
+   * config, or `null` if the set is empty. This is the single canonical
+   * "prev-position retrieval" primitive — both the historic fill path
+   * and the realtime tick use it, so we never drift on the entry
+   * schema. LRANGE 0..0 is O(1) on Upstash.
+   */
+  async getLatestPosition(configId: string): Promise<PseudoPosition | null> {
+    await initRedis()
+    const client = getRedisClient()
+    const key = this.getPositionsKey(configId)
+    const rows = await client.lrange(key, 0, 0)
+    if (!rows || rows.length === 0) return null
+    return StrategyConfigManager.parseEntry(String(rows[0]))
+  }
+
+  /**
+   * Parse one "|"-delimited position entry back into a `PseudoPosition`.
+   * Symmetric to the serialization used by `addPosition`/`addPositions`,
+   * so every reader and writer in the codebase shares the same schema.
+   */
+  static parseEntry(entry: string): PseudoPosition | null {
+    if (!entry) return null
+    const parts = entry.split("|")
+    if (parts.length < 6) return null
+    return {
+      entry_time:  parts[0] || "",
+      symbol:      parts[1] || "",
+      entry_price: parseFloat(parts[2] || "0") || 0,
+      take_profit: parseFloat(parts[3] || "0") || 0,
+      stop_loss:   parseFloat(parts[4] || "0") || 0,
+      status:      (parts[5] as "open" | "closed") || "closed",
+      result:      parseFloat(parts[6] || "0") || 0,
+      exit_time:   parts[7] || undefined,
+      exit_price:  parts[8] ? (parseFloat(parts[8]) || undefined) : undefined,
+    }
+  }
+
+  /**
+   * Extract the canonical configId embedded in a pseudo-position's
+   * composite `config_set_key`. The trailing segment is always the
+   * strategy-config id — see `config-set-processor` for how the key is
+   * assembled. Returns an empty string when absent so callers can
+   * short-circuit cheaply.
+   */
+  static extractConfigId(configSetKey: string | undefined | null): string {
+    if (!configSetKey) return ""
+    const raw = String(configSetKey)
+    const idx = raw.lastIndexOf(":")
+    return idx >= 0 ? raw.slice(idx + 1) : raw
   }
 
   async getPositionCount(configId: string): Promise<number> {
