@@ -9,6 +9,7 @@ import { DashboardActiveConnectionsManager } from "./dashboard-active-connection
 import { StatisticsOverviewV2 } from "./statistics-overview-v2"
 import { SystemMonitoringPanel } from "./system-monitoring-panel"
 import { VolatilityScreenerCard } from "./volatility-screener-card"
+import { EngineProgressionTestButton } from "./engine-progression-test-dialog"
 import { Card } from "@/components/ui/card"
 import { useIndicationGenerator } from "@/components/indication-generator-hook"
 
@@ -50,7 +51,16 @@ export function Dashboard() {
         title="CTS v3.2 Dashboard"
         description="Monitor and control your active exchange connections"
         showExchangeSelector
-      />
+      >
+        {/*
+         * Top-level "Run Engine Test" button — mirrors the same dialog that
+         * the QuickstartSection hosts, but rendered in the page header so
+         * operators can trigger a full 7-phase engine progression test
+         * without scrolling. `variant="header"` renders the slightly larger
+         * primary-accent pill used for header actions.
+         */}
+        <EngineProgressionTestButton variant="header" />
+      </PageHeader>
 
       <div className="flex-1 space-y-4 px-3 md:px-4 py-4 pb-8">
         <ErrorBoundary name="Quickstart">

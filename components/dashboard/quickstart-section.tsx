@@ -13,6 +13,7 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { QuickstartComprehensiveLogDialog } from "./quickstart-comprehensive-log-dialog"
 import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
+import { EngineProgressionTestButton } from "./engine-progression-test-dialog"
 import { useExchange } from "@/lib/exchange-context"
 
 // ─── types ────────────────────────────────────────────────────────────────────
@@ -841,6 +842,15 @@ export function QuickstartSection() {
           {/* dialog launchers */}
           <QuickstartOverviewDialog />
           <QuickstartComprehensiveLogDialog />
+          {/*
+           * Engine progression test — one-click runner for the 7-phase E2E
+           * test (health → preflight → enable(1 symbol) → progression poll
+           * → verify-engine → live-positions → disable). Streams per-phase
+           * PASS/WARN/FAIL into a detailed dialog so operators can spot
+           * regressions without dropping to a terminal. Same button is
+           * also mounted in the dashboard PageHeader for top-level access.
+           */}
+          <EngineProgressionTestButton />
 
           {/* legacy event buttons */}
           {[
