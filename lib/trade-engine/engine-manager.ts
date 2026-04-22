@@ -1546,10 +1546,14 @@ export class TradeEngineManager {
           if (Array.isArray(symbols) && symbols.length > 0) return symbols
         }
 
-        // Global main-symbols fallback
-        const useMainSymbols = await getSettings("useMainSymbols")
-        if (useMainSymbols === true || useMainSymbols === "true") {
-          const mainSymbols = await getSettings("mainSymbols")
+        // Global main-symbols fallback — the UI stores these as fields on
+        // the canonical `app_settings` hash, never as standalone Redis
+        // keys, so `getSettings("useMainSymbols")` would always return
+        // null. Use the mirror-aware scalar reader instead.
+        const { getAppSetting } = await import("@/lib/redis-db")
+        const useMainSymbols = await getAppSetting<boolean>("useMainSymbols", false)
+        if (useMainSymbols === true) {
+          const mainSymbols = await getAppSetting<string[]>("mainSymbols", [])
           if (Array.isArray(mainSymbols) && mainSymbols.length > 0) return mainSymbols
         }
 

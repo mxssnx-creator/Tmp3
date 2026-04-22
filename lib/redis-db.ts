@@ -923,6 +923,105 @@ export async function getAllSettings(): Promise<Record<string, any>> {
   return settings
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Canonical app-settings helpers
+//
+// The project historically drifted between two Redis hashes:
+//   - "app_settings" — written by /api/settings (GET/POST/PUT) from the UI
+//   - "all_settings" — read by several trade-engine modules
+// These helpers unify the view so any consumer gets the operator's saved
+// settings regardless of which key happens to hold them. The paired
+// `setAppSettings` writer mirrors to BOTH keys so legacy readers that
+// haven't been migrated yet (and any forks that expect one or the other)
+// continue to work.
+//
+// `getAppSettings()` returns a merged record with `app_settings` winning
+// on conflict (it's the canonical UI-facing key). Missing keys silently
+// fall back to an empty object so callers can use `?? default` patterns.
+// ─────────────────────────────────────────────────────────────────────
+
+const APP_SETTINGS_KEY_CANONICAL = "app_settings" as const
+const APP_SETTINGS_KEY_LEGACY    = "all_settings" as const
+
+let appSettingsCache: { value: Record<string, any>; ts: number } | null = null
+const APP_SETTINGS_CACHE_TTL_MS = 2000
+
+export async function getAppSettings(
+  options: { bypassCache?: boolean } = {},
+): Promise<Record<string, any>> {
+  const now = Date.now()
+  if (
+    !options.bypassCache &&
+    appSettingsCache &&
+    now - appSettingsCache.ts < APP_SETTINGS_CACHE_TTL_MS
+  ) {
+    return appSettingsCache.value
+  }
+  try {
+    const [canonical, legacy] = await Promise.all([
+      getSettings(APP_SETTINGS_KEY_CANONICAL),
+      getSettings(APP_SETTINGS_KEY_LEGACY),
+    ])
+    // Legacy provides fallback values — canonical overrides on conflict.
+    const merged = { ...(legacy || {}), ...(canonical || {}) }
+    appSettingsCache = { value: merged, ts: now }
+    return merged
+  } catch {
+    return appSettingsCache?.value ?? {}
+  }
+}
+
+/**
+ * Convenience scalar reader — falls back through:
+ *   1. Individual `settings:{field}` hash (legacy orphan-key path)
+ *   2. Canonical `app_settings.{field}`
+ *   3. Legacy `all_settings.{field}`
+ *   4. Caller-supplied default
+ */
+export async function getAppSetting<T = unknown>(
+  field: string,
+  fallback: T,
+): Promise<T> {
+  try {
+    // 1. Individual key (some historical code writes these as scalar hashes)
+    const individual = await getSettings(field)
+    if (individual !== null && individual !== undefined) {
+      const maybeScalar =
+        typeof individual === "object" && individual && "value" in individual
+          ? (individual as any).value
+          : individual
+      if (maybeScalar !== null && maybeScalar !== undefined) {
+        return maybeScalar as T
+      }
+    }
+  } catch {
+    /* non-critical */
+  }
+  const merged = await getAppSettings()
+  const value = merged[field]
+  if (value === undefined || value === null) return fallback
+  return value as T
+}
+
+/**
+ * Writer that keeps the canonical + legacy hashes in sync. Call this
+ * from the settings UI/API instead of `setSettings("app_settings", ...)`
+ * so trade-engine consumers that read `all_settings` also pick up the
+ * operator's latest values on the next cycle.
+ */
+export async function setAppSettings(value: Record<string, any>): Promise<void> {
+  await Promise.all([
+    setSettings(APP_SETTINGS_KEY_CANONICAL, value),
+    setSettings(APP_SETTINGS_KEY_LEGACY,    value),
+  ])
+  appSettingsCache = { value, ts: Date.now() }
+}
+
+/** Invalidates the in-process app-settings cache. Callable from any write path. */
+export function invalidateAppSettingsCache(): void {
+  appSettingsCache = null
+}
+
 // ========== Market Data Operations ==========
 
 export async function getMarketData(symbol: string, interval: string): Promise<any | null> {

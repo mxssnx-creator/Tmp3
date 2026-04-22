@@ -117,9 +117,10 @@ export async function getSettingsCached(): Promise<any> {
   }
 
   try {
-    const { getSettings } = await import("@/lib/redis-db")
+    const { getAppSettings } = await import("@/lib/redis-db")
     await initRedis()
-    const settings = await getSettings("all_settings") || {}
+    // Mirror-aware read — covers both `app_settings` and `all_settings`.
+    const settings = (await getAppSettings()) || {}
 
     const indicationSettings = {
       minProfitFactor: settings.minProfitFactor || 1.2,

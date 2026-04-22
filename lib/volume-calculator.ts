@@ -8,7 +8,7 @@
  * Redis-native: All data stored in Redis via redis-db
  */
 
-import { initRedis, getSettings, setSettings, getRedisClient, getConnection } from "@/lib/redis-db"
+import { initRedis, getSettings, getAppSettings, setSettings, getRedisClient, getConnection } from "@/lib/redis-db"
 
 interface VolumeCalculationParams {
   baseVolumeFactor?: number
@@ -134,15 +134,24 @@ export class VolumeCalculator {
       await initRedis()
       const client = getRedisClient()
 
-      // Get settings from Redis
-      const settings = await getSettings("system_settings") || {}
+      // Get settings from Redis via the mirror-aware reader. The volume
+      // calculator needs `exchangePositionCost`/`positionCost`,
+      // `leveragePercentage`, and `useMaximalLeverage` — all of which are
+      // managed from the main Settings UI (canonical `app_settings`).
+      // Previously this read `system_settings`, which is a different
+      // bundle (cleanup schedule, backup toggles) — so the operator's
+      // saved leverage/cost never reached volume calculations.
+      const settings = (await getAppSettings()) || {}
       const positionCostPercent = parseFloat(
-        String(settings.exchangePositionCost || settings.positionCost || "0.1")
+        String(settings.exchangePositionCost ?? settings.positionCost ?? "0.1")
       )
       const positionCost = positionCostPercent / 100
 
-      const leveragePercentage = parseFloat(String(settings.leveragePercentage || "100"))
-      const useMaxLeverage = settings.useMaximalLeverage === "true"
+      const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))
+      // `parseHash` coerces the stored "true"/"1" to boolean true, so a
+      // strict `=== true` check is now safe (the old
+      // `=== "true"` string compare would always miss).
+      const useMaxLeverage = settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
       const maxLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
 
       // Get exchange min volume from Redis trading pair data

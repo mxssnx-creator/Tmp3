@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
 import { PositionCalculator } from "@/lib/position-calculator"
-import { initRedis, getSettings } from "@/lib/redis-db"
+import { initRedis, getAppSetting } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
 
@@ -30,29 +30,35 @@ export async function GET() {
   try {
     await initRedis()
 
-    // Load individual settings in parallel — each is a small hash lookup.
-    // Using the same keys the engine reads (see indication-state-manager
-    // line 210: `getSettings("indicationRangeMin")`).
+    // Load individual settings via the mirror-aware scalar reader so the
+    // UI-saved values (which live on `app_settings.<field>`, NOT as
+    // standalone `settings:<field>` hashes) are picked up. Each call
+    // falls back through individual-key → app_settings → all_settings
+    // → supplied default, which also matches what
+    // `indication-state-manager.ts:210` now reads for `indicationRangeMin`.
     const [
-      rangeMin, rangeMax, rangeStep, tpDivisor,
-      optimalBase, autoHrs, autoWindows,
+      rawMin, rawMax, rawStep, rawTpDivisor,
+      rawOptimalBase, rawAutoHrs, rawAutoWins,
     ] = await Promise.all([
-      getSettings("indicationRangeMin").catch(() => null),
-      getSettings("indicationRangeMax").catch(() => null),
-      getSettings("indicationRangeStep").catch(() => null),
-      getSettings("takeProfitRangeDivisor").catch(() => null),
-      getSettings("optimalBasePositionsLimit").catch(() => null),
-      getSettings("autoDrawdownHours").catch(() => null),
-      getSettings("autoTimeWindows").catch(() => null),
+      getAppSetting<unknown>("indicationRangeMin", null),
+      getAppSetting<unknown>("indicationRangeMax", null),
+      getAppSetting<unknown>("indicationRangeStep", null),
+      getAppSetting<unknown>("takeProfitRangeDivisor", null),
+      getAppSetting<unknown>("optimalBasePositionsLimit", null),
+      getAppSetting<unknown>("autoDrawdownHours", null),
+      getAppSetting<unknown>("autoTimeWindows", null),
     ])
 
-    const indicationMin   = asPosInt(rangeMin, 3)
-    const indicationMax   = asPosInt(rangeMax, 30)
-    const indicationStep  = asPosInt(rangeStep, 1)
-    const tpDivisorVal    = asPosInt(tpDivisor, 3)
-    const optimalBaseCap  = asPosInt(optimalBase, 250)
-    const autoDrawdownHrs = asPosInt(autoHrs, 1)
-    const autoTimeWins    = asPosInt(autoWindows, 3)
+    // asPosInt guards against zeros / negatives / NaN that could leak
+    // through if a row was written with a malformed value (e.g. a hand-
+    // edited Redis hash). Keeps the combinatorial math well-defined.
+    const indicationMin   = asPosInt(rawMin, 3)
+    const indicationMax   = asPosInt(rawMax, 30)
+    const indicationStep  = asPosInt(rawStep, 1)
+    const tpDivisorVal    = asPosInt(rawTpDivisor, 3)
+    const optimalBaseCap  = asPosInt(rawOptimalBase, 250)
+    const autoDrawdownHrs = asPosInt(rawAutoHrs, 1)
+    const autoTimeWins    = asPosInt(rawAutoWins, 3)
 
     // Drive the calculator with the SAME settings so per-type config
     // counts reflect the live configuration. Passing the structured

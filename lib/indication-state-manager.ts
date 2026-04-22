@@ -5,7 +5,7 @@
  * With validation timeout (15s) and position cooldown (20s)
  */
 
-import { getSettings, setSettings } from "@/lib/redis-db"
+import { getSettings, setSettings, getAppSetting } from "@/lib/redis-db"
 import { BasePseudoPositionManager } from "./base-pseudo-position-manager"
 import { DataCleanupManager } from "./data-cleanup-manager"
 import { logProgressionEvent } from "./engine-progression-logs"
@@ -206,9 +206,10 @@ export class IndicationStateManager {
       return this.cachedRanges
     }
 
-    // Get from Redis settings
-    const minRangeSetting = await getSettings("indicationRangeMin")
-    const minRange = minRangeSetting ? Number.parseInt(String(minRangeSetting)) : 3
+    // Mirror-aware scalar read — falls back from the individual
+    // `settings:indicationRangeMin` hash (historical) to
+    // `app_settings.indicationRangeMin` (UI-saved) to the 3 default.
+    const minRange = await getAppSetting<number>("indicationRangeMin", 3)
     const maxRange = 30
 
     this.cachedRanges = { minRange, maxRange, timestamp: now }

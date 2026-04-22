@@ -10,7 +10,7 @@
  * 4. Indication timeout is applied after valid evaluation
  */
 
-import { getRedisClient, initRedis, getSettings, setSettings } from "@/lib/redis-db"
+import { getRedisClient, initRedis, getSettings, getAppSettings, setSettings } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { emitIndicationUpdate } from "@/lib/broadcast-helpers"
 
@@ -108,8 +108,11 @@ export class IndicationSetsProcessor {
 
   private async loadSettings(): Promise<void> {
     try {
-      const settings = await getSettings("all_settings")
-      if (settings) {
+      // Mirror-aware read so operator values saved via the UI
+      // (`app_settings`) apply even if the legacy `all_settings` hash
+      // is empty on a fresh install.
+      const settings = await getAppSettings()
+      if (settings && Object.keys(settings).length > 0) {
         // Load independent limits per type
         if (settings.databaseSizeDirection) this.limits.direction = Number(settings.databaseSizeDirection)
         if (settings.databaseSizeMove) this.limits.move = Number(settings.databaseSizeMove)

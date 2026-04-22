@@ -9,7 +9,7 @@
 // Force module rebuild timestamp: 1712341200000
 const _STRATEGY_BUILD_VERSION = "2.1.0"
 
-import { initRedis, getSettings, getIndications, createPosition } from "@/lib/redis-db"
+import { initRedis, getSettings, getAppSettings, getIndications, createPosition } from "@/lib/redis-db"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { StrategyCoordinator } from "@/lib/strategy-coordinator"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
@@ -394,7 +394,10 @@ export class StrategyProcessor {
    */
   private async getStrategySettings(): Promise<any> {
     try {
-      const settings = await getSettings("all_settings") || {}
+      // Mirror-aware read: picks up the operator's values whether the UI
+      // wrote them to the canonical (`app_settings`) or legacy
+      // (`all_settings`) hash.
+      const settings = (await getAppSettings()) || {}
 
       return {
         minProfitFactor: settings.strategyMinProfitFactor || 0.5,

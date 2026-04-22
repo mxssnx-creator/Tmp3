@@ -4,7 +4,7 @@
  * NOW: 100% Redis-backed, no SQL
  */
 
-import { getRedisClient, getSettings, setSettings, createPosition as redisCreatePosition } from "@/lib/redis-db"
+import { getRedisClient, getSettings, getAppSettings, setSettings, createPosition as redisCreatePosition } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { emitPositionUpdate } from "@/lib/broadcast-helpers"
 import { StrategyConfigManager, type PseudoPosition as StrategyPseudoPosition } from "@/lib/strategy-config-manager"
@@ -75,7 +75,10 @@ export class PseudoPositionManager {
       return cached.value
     }
     try {
-      const s = (await getSettings("all_settings")) || {}
+      // Use the mirror-aware app-settings reader so the operator's saved
+      // value applies whether it was written to the canonical
+      // (`app_settings`) or legacy (`all_settings`) hash.
+      const s = await getAppSettings()
       const raw = s.maxActiveBasePseudoPositionsPerDirection
       const parsed = Number(raw)
       const value =

@@ -3,7 +3,21 @@
  * Redis-native: Archives and cleans up old data from Redis
  */
 
-import { initRedis, getRedisClient, getSettings, setSettings } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getSettings, getAppSettings, setSettings } from "@/lib/redis-db"
+
+/**
+ * Merge cleanup-related settings from both the `app_settings` (main UI
+ * bundle) and `system_settings` (system PATCH route bundle) sources.
+ * `app_settings` fields win on conflict. This ensures cleanup toggles
+ * saved in either Settings tab apply correctly.
+ */
+async function loadCleanupSettings(): Promise<Record<string, any>> {
+  const [appBundle, systemBundle] = await Promise.all([
+    getAppSettings(),
+    getSettings("system_settings"),
+  ])
+  return { ...(systemBundle || {}), ...(appBundle || {}) }
+}
 
 export class DataCleanupManager {
   private static instance: DataCleanupManager | null = null
@@ -51,9 +65,16 @@ export class DataCleanupManager {
 
     try {
       await initRedis()
-      const settings = await getSettings("system_settings") || {}
-      const intervalHours = parseInt(String(settings.cleanupIntervalHours || "24"), 10)
-      const enabled = settings.enableAutoCleanup === "true" || settings.enableAutoCleanup === true
+      // Merge both settings bundles so the operator's cleanup toggles
+      // saved in EITHER the main Settings UI (`app_settings`) or the
+      // system PATCH route (`system_settings`) are picked up.
+      const settings = await loadCleanupSettings()
+      const intervalHours = parseInt(String(settings.cleanupIntervalHours ?? "24"), 10)
+      const enabled =
+        settings.enableAutoCleanup === true ||
+        settings.enableAutoCleanup === "true" ||
+        settings.automaticDatabaseCleanup === true ||
+        settings.automaticDatabaseCleanup === "true"
 
       if (!enabled) {
         console.log("[v0] Auto cleanup is disabled in settings")
@@ -79,9 +100,9 @@ export class DataCleanupManager {
     try {
       await initRedis()
       const client = getRedisClient()
-      const settings = await getSettings("system_settings") || {}
-      const maxPositionAgeDays = parseInt(String(settings.maxPositionAgeDays || "90"), 10)
-      const maxMarketDataAgeDays = parseInt(String(settings.maxMarketDataDays || "30"), 10)
+      const settings = await loadCleanupSettings()
+      const maxPositionAgeDays = parseInt(String(settings.maxPositionAgeDays ?? "90"), 10)
+      const maxMarketDataAgeDays = parseInt(String(settings.maxMarketDataDays ?? "30"), 10)
 
       const now = Date.now()
       const positionCutoff = now - maxPositionAgeDays * 24 * 60 * 60 * 1000
