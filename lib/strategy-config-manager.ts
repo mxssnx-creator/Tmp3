@@ -219,19 +219,44 @@ export class StrategyConfigManager {
   }
 
   /**
-   * Return the most recently appended position (list HEAD) for a given
-   * config, or `null` if the set is empty. This is the single canonical
-   * "prev-position retrieval" primitive — both the historic fill path
-   * and the realtime tick use it, so we never drift on the entry
-   * schema. LRANGE 0..0 is O(1) on Upstash.
+   * Return the most recently appended CLOSED position for a given
+   * config, or `null` if the set has no closed rows. This is the single
+   * canonical "prev-position retrieval" primitive — both the historic
+   * fill path and the realtime tick use it, so we never drift on the
+   * entry schema.
+   *
+   * ── P2-2: closed-only enforcement ─────────────────────────────────
+   * The strategy config positions list mixes open + closed entries
+   * (the prehistoric fill path appends every pseudo trade it creates,
+   * including ones that were still open at snapshot time). The Main-
+   * stage position-factor coordination must calibrate against CLOSED
+   * outcomes only (spec: *"Calculations of Sets on Main of Pos Factors
+   * Coordinations have to Base on Closed Pseudo Positions Only, dont
+   * include Open ones"*), so this reader now scans up to 20 HEAD rows
+   * for the first `status==="closed"` entry. Fast path stays O(1)
+   * when HEAD is already closed (the common case because new rows are
+   * appended open-then-updated-to-closed in the same tick); worst
+   * case is a bounded 20-row scan to skip a cluster of still-open
+   * entries.
    */
   async getLatestPosition(configId: string): Promise<PseudoPosition | null> {
     await initRedis()
     const client = getRedisClient()
     const key = this.getPositionsKey(configId)
-    const rows = await client.lrange(key, 0, 0)
+    // Scan a small HEAD window so the common "HEAD is closed" fast path
+    // stays O(1) while still being able to skip a burst of still-open
+    // rows at the top of the list.
+    const SCAN_WINDOW = 20
+    const rows = await client.lrange(key, 0, SCAN_WINDOW - 1)
     if (!rows || rows.length === 0) return null
-    return StrategyConfigManager.parseEntry(String(rows[0]))
+    for (const row of rows) {
+      const parsed = StrategyConfigManager.parseEntry(String(row))
+      if (parsed && parsed.status === "closed") return parsed
+    }
+    // No closed row in the head window — treat as "no prior outcome"
+    // rather than returning an open row that would pollute downstream
+    // calibration.
+    return null
   }
 
   /**
