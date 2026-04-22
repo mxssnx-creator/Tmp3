@@ -46,6 +46,24 @@ const MAX_POSITIONS = 250
 export class StrategyConfigManager {
   private connectionId: string
 
+  /**
+   * Exposed cap so callers building their own pipelined writes (e.g.
+   * PseudoPositionManager.closePosition, which composes the LPUSH +
+   * LTRIM into the same close-path pipeline to save a round-trip) can
+   * trim to the same bound without duplicating the constant.
+   */
+  static readonly MAX_POSITIONS = MAX_POSITIONS
+
+  /**
+   * Public serializer for pipeline composition. Identical to the
+   * private `serializeEntry` used by `addPosition` / `addPositions` —
+   * exposed so external pipelines never diverge from the canonical
+   * "|"-delimited entry schema owned by this class.
+   */
+  static serializeSetEntry(p: PseudoPosition): string {
+    return StrategyConfigManager.serializeEntry(p)
+  }
+
   constructor(connectionId: string) {
     this.connectionId = connectionId
   }
@@ -134,53 +152,58 @@ export class StrategyConfigManager {
     console.log(`[v0] [StrategyConfigManager] Deleted config ${configId}`)
   }
 
-  async addPosition(configId: string, position: PseudoPosition): Promise<void> {
-    await initRedis()
-    const client = getRedisClient()
-
-    const key = this.getPositionsKey(configId)
-    const entry = [
-      position.entry_time,
-      position.symbol,
-      position.entry_price.toString(),
-      position.take_profit.toString(),
-      position.stop_loss.toString(),
-      position.status,
-      position.result?.toString() || "0",
-      position.exit_time || "",
-      position.exit_price?.toString() || "0",
+  /**
+   * Serialize one `PseudoPosition` into the canonical "|"-delimited
+   * entry string. Kept as a static so every writer (live writeback,
+   * prehistoric fill) and every reader (`parseEntry`) shares the exact
+   * same schema with zero drift.
+   */
+  private static serializeEntry(p: PseudoPosition): string {
+    return [
+      p.entry_time,
+      p.symbol,
+      p.entry_price.toString(),
+      p.take_profit.toString(),
+      p.stop_loss.toString(),
+      p.status,
+      p.result?.toString() || "0",
+      p.exit_time || "",
+      p.exit_price?.toString() || "0",
     ].join("|")
-
-    await client.lpush(key, entry)
-    await client.ltrim(key, 0, MAX_POSITIONS - 1)
   }
 
   /**
-   * Batch variant — pushes many positions for a config with a single lpush
-   * and a single ltrim. Used by the prehistoric processor to cut per-position
-   * Redis round-trips by a factor of N.
+   * Append one position to the config's Set. LPUSH + LTRIM are issued
+   * as a single Redis pipeline (one RTT) instead of two serial awaits —
+   * the tradeoff of going from 2 RTTs to 1 is material on the realtime
+   * close path where this is called on every TP/SL hit.
+   */
+  async addPosition(configId: string, position: PseudoPosition): Promise<void> {
+    await initRedis()
+    const client = getRedisClient()
+    const key = this.getPositionsKey(configId)
+    const entry = StrategyConfigManager.serializeEntry(position)
+    const pipeline = client.multi()
+    pipeline.lpush(key, entry)
+    pipeline.ltrim(key, 0, MAX_POSITIONS - 1)
+    await pipeline.exec()
+  }
+
+  /**
+   * Batch variant — pushes many positions for a config with a single
+   * pipelined LPUSH + LTRIM. Used by the prehistoric processor to cut
+   * per-position Redis round-trips by a factor of N.
    */
   async addPositions(configId: string, positions: PseudoPosition[]): Promise<void> {
     if (!positions || positions.length === 0) return
     await initRedis()
     const client = getRedisClient()
-
     const key = this.getPositionsKey(configId)
-    const entries = positions.map((p) =>
-      [
-        p.entry_time,
-        p.symbol,
-        p.entry_price.toString(),
-        p.take_profit.toString(),
-        p.stop_loss.toString(),
-        p.status,
-        p.result?.toString() || "0",
-        p.exit_time || "",
-        p.exit_price?.toString() || "0",
-      ].join("|"),
-    )
-    await client.lpush(key, ...entries)
-    await client.ltrim(key, 0, MAX_POSITIONS - 1)
+    const entries = positions.map((p) => StrategyConfigManager.serializeEntry(p))
+    const pipeline = client.multi()
+    pipeline.lpush(key, ...entries)
+    pipeline.ltrim(key, 0, MAX_POSITIONS - 1)
+    await pipeline.exec()
   }
 
   async getPositions(configId: string, limit = 50): Promise<PseudoPosition[]> {

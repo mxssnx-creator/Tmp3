@@ -22,6 +22,14 @@ export class PseudoPositionManager {
   private cacheTimestamp = 0
   private readonly CACHE_TTL_MS = 1000 // 1 second cache
 
+  // ── Hot-path write elision ─────────────────────────────────────────
+  // Per-position last-written price. The realtime tick compares the
+  // incoming market price against this memo before issuing an HSET, so
+  // sub-epsilon ticks on quiet symbols produce zero Redis writes. Entry
+  // is cleared on close via invalidatePriceMemo() so a reopened id with
+  // the same position key starts fresh.
+  private lastWrittenPrice: Map<string, number> = new Map()
+
   constructor(connectionId: string) {
     this.connectionId = connectionId
   }
@@ -249,55 +257,108 @@ export class PseudoPositionManager {
   }
 
   /**
-   * Update position with current price
+   * Update a pseudo-position with the latest market price.
+   *
+   * Hot-path optimisations (critical at 100ms tick intervals):
+   *
+   *   1. **Pre-loaded position object.** The realtime processor already
+   *      has the full position hash in-memory from `getActivePositions`,
+   *      so we accept it as an optional `existingPosition` and skip the
+   *      redundant `readPosition` HGETALL round-trip. Legacy callers
+   *      that don't pass one fall back to the old behaviour.
+   *
+   *   2. **Write elision.** Prices do NOT move on every 100ms tick —
+   *      the market-data feed typically refreshes at sub-second cadence
+   *      with many consecutive ticks returning identical prices. We
+   *      skip the Redis HSET entirely when the incoming price matches
+   *      the last-known `current_price` within a tight epsilon
+   *      (0.0001%). The broadcast is also skipped in that case, since
+   *      dashboards have nothing new to render. This turns a "N-RTT-
+   *      per-tick" cost into "only when price actually moved."
+   *
+   *   3. **Last-written memoisation.** We track per-position last-seen
+   *      price in-memory to avoid parsing the previous `current_price`
+   *      string out of the hash on every tick.
    */
-  async updatePosition(positionId: string, currentPrice: number): Promise<void> {
+  async updatePosition(
+    positionId: string,
+    currentPrice: number,
+    existingPosition?: Record<string, string> | null,
+  ): Promise<void> {
     try {
       const client = getRedisClient()
 
-      // Get position data before updating to calculate PnL
-      const position = await this.readPosition(positionId)
+      // Prefer the caller-supplied position to avoid an extra HGETALL.
+      const position = existingPosition ?? (await this.readPosition(positionId))
       if (!position) return
 
-      await client.hset(this.positionKey(positionId), {
-        current_price: String(currentPrice),
-        updated_at: new Date().toISOString(),
-      })
+      // Compare against last-written price. First tick (no memo) uses
+      // the persisted `current_price` so we don't fire a redundant
+      // write just because the processor restarted.
+      const memoPrice = this.lastWrittenPrice.get(positionId)
+      const prevPrice = memoPrice ?? parseFloat(position.current_price || "0")
+      const epsilon = prevPrice > 0 ? Math.max(prevPrice * 1e-6, 1e-9) : 0
+      const priceMoved = Math.abs(currentPrice - prevPrice) > epsilon
 
-      // Calculate unrealized PnL
-      const entryPrice = parseFloat(position.entry_price || '0')
-      const quantity = parseFloat(position.quantity || '0')
-      const side = position.side || 'long'
+      if (priceMoved) {
+        await client.hset(this.positionKey(positionId), {
+          current_price: String(currentPrice),
+          updated_at: new Date().toISOString(),
+        })
+        this.lastWrittenPrice.set(positionId, currentPrice)
 
-      let unrealizedPnl = 0
-      if (side === 'long') {
-        unrealizedPnl = (currentPrice - entryPrice) * quantity
-      } else {
-        unrealizedPnl = (entryPrice - currentPrice) * quantity
+        // Calculate unrealized PnL for the broadcast only — skipping
+        // the broadcast when nothing moved eliminates a huge amount of
+        // WebSocket chatter on quiet symbols.
+        const entryPrice = parseFloat(position.entry_price || "0")
+        const quantity = parseFloat(position.quantity || "0")
+        const side = position.side || "long"
+        const unrealizedPnl = side === "long"
+          ? (currentPrice - entryPrice) * quantity
+          : (entryPrice - currentPrice) * quantity
+        const unrealizedPnlPercent =
+          entryPrice > 0 && quantity > 0
+            ? (unrealizedPnl / (entryPrice * quantity)) * 100
+            : 0
+
+        emitPositionUpdate(this.connectionId, {
+          id: positionId,
+          symbol: position.symbol,
+          currentPrice,
+          unrealizedPnl,
+          unrealizedPnlPercent,
+          status: "open",
+        })
       }
-
-      const unrealizedPnlPercent = entryPrice > 0 ? (unrealizedPnl / (entryPrice * quantity)) * 100 : 0
-
-      // Broadcast position update to connected clients
-      emitPositionUpdate(this.connectionId, {
-        id: positionId,
-        symbol: position.symbol,
-        currentPrice,
-        unrealizedPnl,
-        unrealizedPnlPercent,
-        status: 'open',
-      })
     } catch (error) {
       console.error(`[v0] Failed to update position ${positionId}:`, error)
     }
   }
 
   /**
-   * Close position with reason
+   * Close a pseudo-position with the given reason.
+   *
+   * Accepts an optional pre-loaded `existingPosition` hash (mirrors the
+   * `updatePosition` optimisation) so the realtime processor can reuse
+   * the object it already holds instead of issuing an extra HGETALL on
+   * every TP/SL hit.
+   *
+   * All state-mutation writes for this connection (status flip, index
+   * removals, TTL, Set append for prev-position context, heartbeat) are
+   * issued as a SINGLE Redis pipeline via `client.multi()`. The previous
+   * serial implementation paid 6–7 RTTs per close which was material on
+   * hot symbols — pipelining collapses that to one. The strategy-Set
+   * append is composed into the same pipeline rather than going through
+   * `StrategyConfigManager.addPosition` (which would open its own
+   * second pipeline) to keep everything in one atomic batch.
    */
-  async closePosition(positionId: string, reason: string): Promise<void> {
+  async closePosition(
+    positionId: string,
+    reason: string,
+    existingPosition?: Record<string, string> | null,
+  ): Promise<void> {
     try {
-      const position = await this.readPosition(positionId)
+      const position = existingPosition ?? (await this.readPosition(positionId))
       if (!position) return
 
       const entryPrice = parseFloat(position.entry_price || "0")
@@ -311,75 +372,56 @@ export class PseudoPositionManager {
 
       const client = getRedisClient()
       const closedAtIso = new Date().toISOString()
-      await client.hset(this.positionKey(positionId), {
+      const configSetKey = position.config_set_key || ""
+      const configId = StrategyConfigManager.extractConfigId(configSetKey)
+
+      // Build the single close-path pipeline.
+      const pipeline = client.multi()
+      pipeline.hset(this.positionKey(positionId), {
         status: "closed",
         closed_at: closedAtIso,
         close_reason: reason,
         realized_pnl: String(pnl),
       })
-
-      // Remove closed position from the main index set
-      await client.srem(this.positionsSetKey(), positionId)
-      // Remove from the O(1) active-configSetKey index so the slot can be reused
-      const configSetKey = position.config_set_key || ""
+      pipeline.srem(this.positionsSetKey(), positionId)
       if (configSetKey) {
-        await client.srem(this.activeConfigKeysSetKey(), configSetKey)
+        pipeline.srem(this.activeConfigKeysSetKey(), configSetKey)
       }
-      // Set TTL on the closed position hash so it auto-cleans (7 days)
-      await client.expire(this.positionKey(positionId), 604800)
+      // 7-day TTL on the closed hash for operator forensics.
+      pipeline.expire(this.positionKey(positionId), 604800)
 
-      // ── Continuous Set update ─────────────────────────────────────────
+      // ── Continuous Set update (in same pipeline) ──────────────────
       // The realtime processor reads the HEAD of each strategy-config's
-      // position list (`strategy:{connId}:config:{configId}:positions`)
-      // as its "prev position" context. That list was initially populated
-      // by the prehistoric/historic calc in config-set-processor via
-      // StrategyConfigManager.addPositions. To keep the Set continuously
-      // current — not frozen at prehistoric-time — we append each closed
-      // live position back into the SAME uniquely-keyed list here.
-      //
-      // Entry format mirrors what the prehistoric processor writes, so a
-      // read-back via getPrevSetPosition in realtime-processor sees a
-      // consistent schema regardless of whether the prev-position came
-      // from prehistoric backfill or live trading. The Redis list is
-      // capped at 250 entries by the manager's ltrim, so memory is
-      // bounded; newest-first LPUSH order means realtime's "read HEAD"
-      // always reflects the most recent outcome.
-      //
-      // This write is best-effort: a failure to append to the set must
-      // NEVER fail position closure itself (position state is the
-      // authoritative record).
-      const configId = StrategyConfigManager.extractConfigId(configSetKey)
+      // position list as its "prev position" context (first filled by
+      // the prehistoric processor via StrategyConfigManager.addPositions).
+      // We append each closed live position back into the SAME uniquely-
+      // keyed list here so the Set stays continuously current, not
+      // frozen at prehistoric-time. Entry serialisation goes through
+      // the canonical static on StrategyConfigManager so writer and
+      // reader never drift.
       if (configId) {
-        try {
-          const tp = parseFloat(position.take_profit || "0")
-          const sl = parseFloat(position.stop_loss || "0")
-          // Result is expressed as percentage return on entry notional —
-          // matches the prehistoric writer's convention (see
-          // config-set-processor.calculateStrategyPositions).
-          const notional = entryPrice * quantity
-          const resultPct = notional > 0 ? (pnl / notional) * 100 : 0
-
-          const setEntry: StrategyPseudoPosition = {
-            entry_time:  String(position.created_at || position.entry_time || closedAtIso),
-            symbol:      String(position.symbol || ""),
-            entry_price: entryPrice,
-            take_profit: tp,
-            stop_loss:   sl,
-            status:      "closed",
-            result:      resultPct,
-            exit_time:   closedAtIso,
-            exit_price:  currentPrice,
-          }
-          const strategyManager = new StrategyConfigManager(this.connectionId)
-          await strategyManager.addPosition(configId, setEntry)
-        } catch (setErr) {
-          // Non-fatal: log and continue. The position is already closed.
-          console.warn(
-            `[v0] [PseudoPositionManager] Failed to append closed position to strategy set ${configId}:`,
-            setErr instanceof Error ? setErr.message : String(setErr),
-          )
+        const notional = entryPrice * quantity
+        const resultPct = notional > 0 ? (pnl / notional) * 100 : 0
+        const setEntry: StrategyPseudoPosition = {
+          entry_time:  String(position.created_at || position.entry_time || closedAtIso),
+          symbol:      String(position.symbol || ""),
+          entry_price: entryPrice,
+          take_profit: parseFloat(position.take_profit || "0"),
+          stop_loss:   parseFloat(position.stop_loss || "0"),
+          status:      "closed",
+          result:      resultPct,
+          exit_time:   closedAtIso,
+          exit_price:  currentPrice,
         }
+        const setKey = `strategy:${this.connectionId}:config:${configId}:positions`
+        pipeline.lpush(setKey, StrategyConfigManager.serializeSetEntry(setEntry))
+        pipeline.ltrim(setKey, 0, StrategyConfigManager.MAX_POSITIONS - 1)
       }
+
+      await pipeline.exec()
+
+      // Clear the per-tick price memo so a reused id can't be elided.
+      this.lastWrittenPrice.delete(positionId)
 
       console.log(`[v0] Closed position ${positionId}: ${reason} (PnL: ${pnl.toFixed(4)})`)
 
@@ -392,8 +434,9 @@ export class PseudoPositionManager {
         symbol: position.symbol,
         currentPrice,
         unrealizedPnl: pnl,
-        unrealizedPnlPercent: entryPrice > 0 ? (pnl / (entryPrice * quantity)) * 100 : 0,
-        status: 'closed',
+        unrealizedPnlPercent:
+          entryPrice > 0 && quantity > 0 ? (pnl / (entryPrice * quantity)) * 100 : 0,
+        status: "closed",
       })
     } catch (error) {
       console.error(`[v0] Failed to close position ${positionId}:`, error)

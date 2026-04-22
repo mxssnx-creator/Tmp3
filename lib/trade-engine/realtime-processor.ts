@@ -17,10 +17,17 @@
  * NOW: 100% Redis-backed, no SQL.
  */
 
-import { getSettings, setSettings, getMarketData, getRedisClient } from "@/lib/redis-db"
+import { getSettings, setSettings, getRedisClient } from "@/lib/redis-db"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { StrategyConfigManager, type PseudoPosition } from "@/lib/strategy-config-manager"
+// Shared module-level market-data cache with a 200ms TTL, in-flight
+// deduplication, and pipelined batch prefetch. We delegate price reads
+// to it instead of maintaining a second per-processor cache — a single
+// 200ms-TTL cache aligns with the market-data feed cadence and lets
+// multiple processors (indication, strategy, realtime) share the same
+// warm entries.
+import { getMarketDataCached, prefetchMarketDataBatch } from "./market-data-cache"
 
 export class RealtimeProcessor {
   private connectionId: string
@@ -31,8 +38,10 @@ export class RealtimeProcessor {
   // parsing, zero key drift. Historic fill, realtime read, realtime
   // write-back (on close) all share the exact same methods.
   private strategy: StrategyConfigManager
-  private priceCache: Map<string, { price: number; ts: number }> = new Map()
-  private readonly PRICE_CACHE_TTL = 5000 // 5s
+  // Price reads go through the shared module-level `getMarketDataCached`
+  // (200ms TTL, in-flight dedup, pipelined prefetch). No per-processor
+  // price cache — a second cache here would just add a staleness layer
+  // on top of the shared one.
 
   // Cache of prev-set positions keyed by strategy-config id. The Set is
   // updated by the prehistoric fill path AND by live-close writebacks,
@@ -200,23 +209,24 @@ export class RealtimeProcessor {
         return { updates: 0 }
       }
 
-      // Pre-warm the price cache for every unique symbol in parallel before
-      // fanning out the per-position work. Previously every position paid
-      // its own `getMarketData` round-trip on the first cycle after the
-      // TTL expired (even though most positions share a symbol). Fetching
-      // the distinct set first collapses those N reads into M << N.
+      // Pre-warm the shared market-data cache for every unique symbol
+      // in a SINGLE pipelined batch (one Redis RTT regardless of symbol
+      // count). Subsequent per-position price lookups hit the module-
+      // level cache synchronously with zero round-trips until the 200ms
+      // TTL expires. This is the single biggest win for dense ticks:
+      // 100 positions across 30 symbols = 1 RTT here + 0 during the fan-
+      // out, vs. the previous 30 RTTs just to warm prices.
       const uniqueSymbols = new Set<string>()
       for (const p of activePositions) {
         if (p?.symbol) uniqueSymbols.add(p.symbol)
       }
       if (uniqueSymbols.size > 0) {
-        await Promise.all(
-          Array.from(uniqueSymbols).map((sym) => this.getCurrentPrice(sym).catch(() => null)),
-        )
+        await prefetchMarketDataBatch(Array.from(uniqueSymbols))
       }
 
-      // Process each position in parallel — every call now hits the
-      // freshly-warmed price cache synchronously.
+      // Process each position in parallel. Each call carries the
+      // position object through — no second HGETALL in updatePosition
+      // or closePosition, since the caller already has the hash.
       await Promise.all(activePositions.map((position) => this.processPosition(position)))
       return { updates: count }
     } catch (error) {
@@ -262,8 +272,10 @@ export class RealtimeProcessor {
         position._prev_set_position = prevSetPos
       }
 
-      // Update position with current price
-      await this.positionManager.updatePosition(position.id, currentPrice)
+      // Update position with current price. Pass the in-memory hash
+      // through so the manager skips a redundant HGETALL round-trip
+      // (see PseudoPositionManager.updatePosition hot-path notes).
+      await this.positionManager.updatePosition(position.id, currentPrice, position)
 
       // Calculate profit/loss
       const entryPrice = parseFloat(position.entry_price || "0")
@@ -287,16 +299,22 @@ export class RealtimeProcessor {
         )
       }
 
+      // Before handing to closePosition, stamp the latest market price
+      // onto the position object so the manager's PnL calculation uses
+      // the live price (not the potentially-stale `current_price` hash
+      // field) without needing an extra HGETALL.
+      position.current_price = String(currentPrice)
+
       // Check take profit
       if (this.shouldCloseTakeProfit(position, currentPrice)) {
-        await this.positionManager.closePosition(position.id, "take_profit")
+        await this.positionManager.closePosition(position.id, "take_profit", position)
         console.log(`[v0] [Realtime] TP hit for ${position.symbol} ${side} | PnL: ${pnl.toFixed(4)}`)
         return
       }
 
       // Check stop loss
       if (this.shouldCloseStopLoss(position, currentPrice)) {
-        await this.positionManager.closePosition(position.id, "stop_loss")
+        await this.positionManager.closePosition(position.id, "stop_loss", position)
         console.log(`[v0] [Realtime] SL hit for ${position.symbol} ${side} | PnL: ${pnl.toFixed(4)}`)
         return
       }
@@ -312,28 +330,17 @@ export class RealtimeProcessor {
   }
 
   /**
-   * Get current price from Redis market data (cached)
+   * Get the current price for a symbol via the shared 200ms market-
+   * data cache. The cache handles in-flight dedup and pipelined batch
+   * prefetch, so every realtime tick pays at most ONE Redis RTT per
+   * 200ms window regardless of how many positions share the symbol.
    */
   private async getCurrentPrice(symbol: string): Promise<number | null> {
     try {
-      const now = Date.now()
-      const cached = this.priceCache.get(symbol)
-      if (cached && now - cached.ts < this.PRICE_CACHE_TTL) {
-        return cached.price
-      }
-
-      const marketData = await getMarketData(symbol)
-      if (!marketData) return null
-
-      const data = Array.isArray(marketData) ? marketData[0] : marketData
+      const data = await getMarketDataCached(symbol)
+      if (!data) return null
       const price = parseFloat(data?.close || data?.price || "0")
-
-      if (price > 0) {
-        this.priceCache.set(symbol, { price, ts: now })
-        return price
-      }
-
-      return null
+      return price > 0 ? price : null
     } catch (error) {
       console.error(`[v0] Failed to get current price for ${symbol}:`, error)
       return null
