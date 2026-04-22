@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
 import { PositionCalculator } from "@/lib/position-calculator"
-import { initRedis, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getSettings } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
 
@@ -18,89 +18,78 @@ export const dynamic = "force-dynamic"
  * purely derived from the current settings, so they do NOT reflect live
  * runtime activity — they answer "how many Sets COULD the engine create?"
  *
- * Settings are loaded from `settings:global` in Redis (indication range
- * min / max / step, takeProfitRangeDivisor, optimal base position limit,
- * auto-indication drawdown & time windows), falling back to the defaults
- * baked into PositionCalculator when unset.
+ * ── Settings source ──────────────────────────────────────────────────
+ * Settings are loaded via `getSettings(key)` which reads the
+ * `settings:<key>` hashes written by the Settings UI. The keys we use here
+ * (e.g. `indicationRangeMin`) match the camelCase names the settings
+ * coordinator and indication-state-manager already consume, so this
+ * endpoint sees the same values the engine uses. Missing values fall back
+ * to the PositionCalculator defaults (3..30 step 1, tp-divisor 3, 250 cap).
  */
 export async function GET() {
   try {
     await initRedis()
 
-    // Pull the subset of settings that feeds the calculator.
-    // Missing values fall back to the PositionCalculator defaults.
-    let settings: any = null
-    let optimalBaseCap = 250
-    let autoDrawdownHours = 1
-    let autoTimeWindows = 3
-    try {
-      const client = getRedisClient()
-      const raw = await client.hgetall("settings:global")
-      if (raw && Object.keys(raw).length > 0) {
-        const n = (k: string, d: number) => {
-          const v = Number(raw[k])
-          return Number.isFinite(v) && v > 0 ? v : d
-        }
-        settings = {
-          indicationRangeMin:      n("indication_range_min", 3),
-          indicationRangeMax:      n("indication_range_max", 30),
-          indicationRangeStep:     n("indication_range_step", 1),
-          takeProfitRangeDivisor:  n("takeprofit_range_divisor", 3),
-        }
-        optimalBaseCap       = n("optimal_base_positions_limit", 250)
-        autoDrawdownHours    = n("auto_drawdown_hours", 1)
-        autoTimeWindows      = n("auto_time_windows", 3)
-      }
-    } catch {
-      /* settings optional — fall back to defaults */
-    }
+    // Load individual settings in parallel — each is a small hash lookup.
+    // Using the same keys the engine reads (see indication-state-manager
+    // line 210: `getSettings("indicationRangeMin")`).
+    const [
+      rangeMin, rangeMax, rangeStep, tpDivisor,
+      optimalBase, autoHrs, autoWindows,
+    ] = await Promise.all([
+      getSettings("indicationRangeMin").catch(() => null),
+      getSettings("indicationRangeMax").catch(() => null),
+      getSettings("indicationRangeStep").catch(() => null),
+      getSettings("takeProfitRangeDivisor").catch(() => null),
+      getSettings("optimalBasePositionsLimit").catch(() => null),
+      getSettings("autoDrawdownHours").catch(() => null),
+      getSettings("autoTimeWindows").catch(() => null),
+    ])
 
-    const calc = new PositionCalculator(settings ?? undefined)
-    // We pass a dummy symbol — the calculator's per-type outputs are
-    // symbol-independent (they depend only on settings).
+    const indicationMin   = asPosInt(rangeMin, 3)
+    const indicationMax   = asPosInt(rangeMax, 30)
+    const indicationStep  = asPosInt(rangeStep, 1)
+    const tpDivisorVal    = asPosInt(tpDivisor, 3)
+    const optimalBaseCap  = asPosInt(optimalBase, 250)
+    const autoDrawdownHrs = asPosInt(autoHrs, 1)
+    const autoTimeWins    = asPosInt(autoWindows, 3)
+
+    // Drive the calculator with the SAME settings so per-type config
+    // counts reflect the live configuration. Passing the structured
+    // object keeps PositionCalculator.getConfigurableRanges() aligned.
+    const calc = new PositionCalculator({
+      indicationRangeMin:     indicationMin,
+      indicationRangeMax:     indicationMax,
+      indicationRangeStep:    indicationStep,
+      takeProfitRangeDivisor: tpDivisorVal,
+    })
+    // Symbol-independent — calculator derives per-type configs purely from
+    // settings. Pass a placeholder symbol to satisfy the API.
     const analysis = calc.calculateSymbolPositions("__DERIVED__")
 
-    // Extract the raw per-type calc internals so the UI can render a
-    // formula row (ranges × price_ratios × variations, etc.). The
-    // calculator already stores these in its `description` strings, but
-    // we rebuild structured objects here for the UI.
-    //
-    // ── Helper to rebuild the parameter object without re-running the
-    // full enumeration (keeps this endpoint cheap enough to call every
-    // 30s from the dashboard without a Redis round-trip per symbol).
-    const indicationMin   = settings?.indicationRangeMin ?? 3
-    const indicationMax   = settings?.indicationRangeMax ?? 30
-    const indicationStep  = settings?.indicationRangeStep ?? 1
-    const tpDivisor       = settings?.takeProfitRangeDivisor ?? 3
-    const rawRangeCount   = Math.max(0, Math.floor((indicationMax - indicationMin) / indicationStep) + 1)
-    // Ranges pruned by the take-profit coordination filter — count
-    // only those that survive the `minTakeProfit >= 1 && <= range/2` gate.
-    const validRangeCount = (() => {
-      let c = 0
-      for (let r = indicationMin; r <= indicationMax; r += indicationStep) {
-        const minTp = Math.max(1, Math.floor(r / tpDivisor))
-        if (minTp >= 1 && minTp <= r / 2) c++
-      }
-      return c
-    })()
+    // ── Rebuild the raw range counts for the UI hint line ──────────────
+    const rawRangeCount = Math.max(
+      0,
+      Math.floor((indicationMax - indicationMin) / indicationStep) + 1,
+    )
+    // Only count ranges that survive PositionCalculator's tp-coordination
+    // gate (tp ≥ 1 and tp ≤ range/2).
+    let validRangeCount = 0
+    for (let r = indicationMin; r <= indicationMax; r += indicationStep) {
+      const minTp = Math.max(1, Math.floor(r / tpDivisorVal))
+      if (minTp >= 1 && minTp <= r / 2) validRangeCount++
+    }
 
     const directionCat = analysis.categories.find((c) => c.subcategory === "Direction Change")
     const moveCat      = analysis.categories.find((c) => c.subcategory === "Move Detection")
     const activeCat    = analysis.categories.find((c) => c.subcategory === "Active Trading")
 
-    // Optimal & Auto are not emitted by the PositionCalculator (they are
-    // runtime-adaptive rather than purely combinatorial), so we compute
-    // representative counts directly from their settings.
-    //
-    // Optimal: 1 Set per configurable "step" across the range, gated by
-    //          drawdown & performance filters at runtime. Capacity = 250
-    //          positions per Set by default.
-    // Auto:    1 Set per (drawdown window × time window × direction),
-    //          where direction ∈ {long, short} and the windows come from
-    //          the auto-indication engine's multi-timeframe analysis
-    //          (8h / 1h / 30min / 1-20min).
-    const optimalConfigs = validRangeCount * 2   // 2 variations (tight / wide drawdown)
-    const autoConfigs    = Math.max(1, autoTimeWindows) * 2 * Math.max(1, Math.round(autoDrawdownHours)) // 2 dirs × N timeframes × drawdown-tiers
+    // Optimal & Auto are runtime-adaptive rather than combinatorial, so
+    // we derive representative counts directly from their settings.
+    //   Optimal: valid ranges × 2 drawdown tiers
+    //   Auto:    time windows × 2 directions × drawdown tiers
+    const optimalConfigs = validRangeCount * 2
+    const autoConfigs    = Math.max(1, autoTimeWins) * 2 * Math.max(1, autoDrawdownHrs)
 
     const totalConfigs =
       (directionCat?.configurations ?? 0) +
@@ -110,24 +99,21 @@ export async function GET() {
       autoConfigs
 
     return NextResponse.json({
-      // Top-level summary for at-a-glance display
       totalPossibleSets: totalConfigs,
-      perSetDbCapacity: optimalBaseCap,             // 250 default — per-Set position history length
+      perSetDbCapacity:  optimalBaseCap,
       maxStorablePositions: totalConfigs * optimalBaseCap,
       settings: {
-        indicationRangeMin:     indicationMin,
-        indicationRangeMax:     indicationMax,
-        indicationRangeStep:    indicationStep,
-        takeProfitRangeDivisor: tpDivisor,
+        indicationRangeMin:        indicationMin,
+        indicationRangeMax:        indicationMax,
+        indicationRangeStep:       indicationStep,
+        takeProfitRangeDivisor:    tpDivisorVal,
         rawRangeCount,
         validRangeCount,
         optimalBasePositionsLimit: optimalBaseCap,
-        autoDrawdownHours,
-        autoTimeWindows,
+        autoDrawdownHours:         autoDrawdownHrs,
+        autoTimeWindows:           autoTimeWins,
       },
-      // Per-type breakdown — this is what the dashboard renders as 5 rows.
-      // Each row shows the RESULT and the FORMULA so the user understands
-      // where the number came from (and how changing settings affects it).
+      // Per-type breakdown rendered as 5 rows on the dashboard.
       types: [
         {
           type: "direction",
@@ -136,8 +122,8 @@ export async function GET() {
           formula: `${validRangeCount} valid ranges × 5 price ratios × 6 time variations`,
           params: {
             validRanges:    validRangeCount,
-            priceRatios:    5,         // [0.2, 0.4, 0.6, 0.8, 1.0]
-            timeVariations: 6,         // 6 time/direction variations
+            priceRatios:    5,        // [0.2, 0.4, 0.6, 0.8, 1.0]
+            timeVariations: 6,
             drawdownGate:   "tp ≥ 1 and ≤ range/2",
           },
           description: directionCat?.description ?? "",
@@ -159,10 +145,10 @@ export async function GET() {
           type: "active",
           label: "Active Trading",
           possibleSets: activeCat?.configurations ?? 0,
-          formula: `${validRangeCount} valid ranges × 5 active thresholds (1.0–3.0%) × 2 time variations`,
+          formula: `${validRangeCount} valid ranges × 5 active thresholds × 2 time variations`,
           params: {
             validRanges:    validRangeCount,
-            thresholds:     5,         // [1.0, 1.5, 2.0, 2.5, 3.0]
+            thresholds:     5,        // [1.0, 1.5, 2.0, 2.5, 3.0]
             timeVariations: 2,
             drawdownGate:   "active-volatility ≥ threshold",
           },
@@ -174,25 +160,27 @@ export async function GET() {
           possibleSets: optimalConfigs,
           formula: `${validRangeCount} valid ranges × 2 drawdown tiers`,
           params: {
-            validRanges:      validRangeCount,
-            drawdownTiers:    2,
-            dbCapacity:       optimalBaseCap,
-            drawdownGate:     "PF ≥ 1.2 & drawdown ≤ tier",
+            validRanges:   validRangeCount,
+            drawdownTiers: 2,
+            dbCapacity:    optimalBaseCap,
+            drawdownGate:  "PF ≥ 1.2 & drawdown ≤ tier",
           },
-          description: "Adaptive Sets gated by runtime PF + drawdown thresholds; each Set keeps up to the configured DB capacity in history.",
+          description:
+            "Adaptive Sets gated by runtime PF + drawdown thresholds; each Set keeps up to the configured DB capacity in history.",
         },
         {
           type: "auto",
           label: "Auto (multi-timeframe)",
           possibleSets: autoConfigs,
-          formula: `${autoTimeWindows} timeframes × 2 directions × ${Math.max(1, Math.round(autoDrawdownHours))} drawdown windows`,
+          formula: `${autoTimeWins} timeframes × 2 directions × ${autoDrawdownHrs} drawdown windows`,
           params: {
-            timeWindows:      autoTimeWindows,   // 8h / 1h / 30min / 1-20min
-            directions:       2,                 // long / short
-            drawdownHours:    autoDrawdownHours,
-            drawdownGate:     "directionAlignment + optimalSituation",
+            timeWindows:   autoTimeWins,   // 8h / 1h / 30min / 1-20min
+            directions:    2,              // long / short
+            drawdownHours: autoDrawdownHrs,
+            drawdownGate:  "directionAlignment + optimalSituation",
           },
-          description: "Multi-timeframe adaptive Sets; the auto engine uses 8h/1h/30min/1–20min windows with alignment and drawdown gates.",
+          description:
+            "Multi-timeframe adaptive Sets; the auto engine uses 8h/1h/30min/1–20min windows with alignment and drawdown gates.",
         },
       ],
       timestamp: new Date().toISOString(),
@@ -204,4 +192,14 @@ export async function GET() {
       { status: 500 },
     )
   }
+}
+
+/** Coerce a setting value (scalar, string, or { value }) to a positive integer. */
+function asPosInt(raw: any, fallback: number): number {
+  if (raw === null || raw === undefined) return fallback
+  // getSettings() sometimes returns an object like { value: 30 } depending
+  // on how the setting was written — unwrap that shape too.
+  const v = typeof raw === "object" && raw !== null && "value" in raw ? (raw as any).value : raw
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
 }
