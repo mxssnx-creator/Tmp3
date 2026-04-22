@@ -543,6 +543,38 @@ export class PseudoPositionManager {
       this.invalidateCache()
       await this.updateActivePositionsCount()
 
+      // ── P1-2: Propagate close into BasePseudoPositionManager counters ──
+      // Keeps Base-level win-rate / avg-profit / avg-loss / max-drawdown
+      // stats up-to-date on every close so the Base → Main promotion
+      // filter operates on current performance. If the pseudo row has no
+      // `base_position_id` (legacy / unlinked positions), skip silently
+      // — those rows never had a parent Base record to update.
+      const basePositionId = String(position.base_position_id || "").trim()
+      if (basePositionId) {
+        try {
+          const notional = entryPrice * quantity
+          // Use any already-tracked adverse excursion, otherwise fall back
+          // to `max(0, -pnl)` as a coarse loss-only proxy. Realtime
+          // processor writes `max_drawdown` on every tick when the live
+          // unrealised PnL is lower than any prior sample.
+          const storedDrawdown = parseFloat(position.max_drawdown || "0")
+          const currentDrawdown = storedDrawdown > 0
+            ? storedDrawdown
+            : (pnl < 0 && notional > 0 ? Math.abs(pnl / notional) : 0)
+          const { BasePseudoPositionManager } = await import(
+            "@/lib/base-pseudo-position-manager"
+          )
+          const baseMgr = new BasePseudoPositionManager(this.connectionId)
+          await baseMgr.updatePerformance(basePositionId, pnl, pnl > 0, currentDrawdown)
+        } catch (err) {
+          // Non-critical — Base counters will simply stay one cycle behind.
+          console.error(
+            `[v0] [P1-2] Failed to propagate close into Base performance (${basePositionId}):`,
+            err,
+          )
+        }
+      }
+
       // Broadcast position closure to connected clients
       emitPositionUpdate(this.connectionId, {
         id: positionId,

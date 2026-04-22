@@ -941,6 +941,50 @@ export class StrategyCoordinator {
       const liveAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
       const passRatioLive = realSets.length > 0 ? qualifying.length / realSets.length : 0
 
+      // ── P1-1: Live-stage per-variant aggregation ──────────────────────
+      // Same bucket shape as Main/Real. Drives the stats API's breakdown
+      // of which variant family (Default / Trailing / Block / DCA) is
+      // contributing Sets to the live mirror. Kept as a single Promise.all
+      // so we still land in one network hop.
+      type LiveVariantAgg = {
+        sumPF: number; sumDDT: number; entries: number; setsContaining: number
+      }
+      const liveVariantAgg: Record<string, LiveVariantAgg> = {
+        default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+      }
+      for (const set of qualifying) {
+        const variant = (set.variant as keyof typeof liveVariantAgg) ?? "default"
+        liveVariantAgg[variant].setsContaining += 1
+        for (const entry of set.entries) {
+          liveVariantAgg[variant].entries += 1
+          liveVariantAgg[variant].sumPF   += Number(entry.profitFactor || 0)
+          liveVariantAgg[variant].sumDDT  += Number(entry.drawdownTime || 0)
+        }
+      }
+
+      const liveVariantWrites: Promise<any>[] = []
+      for (const variant of ["default", "trailing", "block", "dca"] as const) {
+        const agg = liveVariantAgg[variant]
+        if (agg.entries === 0) continue
+        const vKey = `strategy_variant_live:${this.connectionId}:${variant}`
+        const avgPF  = agg.sumPF  / agg.entries
+        const avgDDT = agg.sumDDT / agg.entries
+        liveVariantWrites.push(
+          client.hset(vKey, {
+            created_sets:      String(agg.setsContaining),
+            entries_count:     String(agg.entries),
+            avg_profit_factor: avgPF.toFixed(4),
+            avg_drawdown_time: avgDDT.toFixed(2),
+            avg_pos_per_set:   (agg.entries / agg.setsContaining).toFixed(2),
+            updated_at:        String(Date.now()),
+          }),
+          client.expire(vKey, 7 * 24 * 60 * 60),
+        )
+      }
+
       await Promise.all([
         client.hset(redisKey, "strategies_live_total", String(qualifying.length)),
         client.expire(redisKey, 7 * 24 * 60 * 60),
@@ -956,6 +1000,7 @@ export class StrategyCoordinator {
         client.expire(liveDetailKey, 86400),
         // `set` with EX in a single command avoids the separate expire round-trip.
         client.set(liveCountKey, String(qualifying.length), { EX: 86400 } as any),
+        ...liveVariantWrites,
       ])
     } catch { /* non-critical */ }
 
