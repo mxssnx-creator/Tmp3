@@ -128,6 +128,48 @@ export default function BaseStrategySettings({
             </div>
           </div>
 
+          {/*
+           * P0-4: Max active pseudo positions per direction.
+           *
+           * Hard cap enforced by `PseudoPositionManager.canCreatePosition`
+           * before a new pseudo position is created. Applies at Base level
+           * — stops Main/Real/Live from instantiating more than N positions
+           * per direction regardless of how many config Sets qualify.
+           *
+           * Spec default = 1 (Long and Short each capped at 1 concurrent
+           * pseudo across ALL Sets). Range 1–10 to give operators headroom
+           * for symbol-diverse portfolios without uncapping entirely.
+           */}
+          <div className="border-t pt-6 space-y-4">
+            <h3 className="text-lg font-semibold border-b pb-2">
+              Active Pseudo Position Limit
+            </h3>
+
+            <div className="space-y-2">
+              <Label>Max Active Pseudo Positions Per Direction</Label>
+              <Input
+                type="number"
+                min="1"
+                max="10"
+                step="1"
+                value={settings.maxActiveBasePseudoPositionsPerDirection ?? 1}
+                onChange={(e) =>
+                  handleSettingChange(
+                    "maxActiveBasePseudoPositionsPerDirection",
+                    Math.max(1, Math.floor(Number.parseFloat(e.target.value) || 1)),
+                  )
+                }
+              />
+              <p className="text-xs text-muted-foreground">
+                Hard cap on concurrent pseudo positions in each direction
+                (Long / Short) across all config Sets. Enforced at Base
+                level — prevents Main/Real/Live from instantiating more
+                than N positions per direction regardless of how many
+                Sets qualify. Spec default: 1.
+              </p>
+            </div>
+          </div>
+
           <div className="p-4 bg-muted rounded-lg space-y-3">
             <h4 className="text-sm font-semibold">Base Strategy Overview</h4>
             <div className="space-y-2 text-xs text-muted-foreground">

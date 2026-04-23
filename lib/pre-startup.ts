@@ -1,4 +1,4 @@
-import { getSettings, getAllConnections, initRedis, saveMarketData, setSettings, updateConnection } from "@/lib/redis-db"
+import { getSettings, getAllConnections, initRedis, saveMarketData, setAppSettings, updateConnection } from "@/lib/redis-db"
 import { runMigrations } from "@/lib/redis-migrations"
 
 let ran = false
@@ -10,10 +10,19 @@ function shouldRunPreStartup(): boolean {
 }
 
 async function initializeDefaultSettings() {
-  const existing = await getSettings("app_settings")
-  if (existing) return
+  // Check canonical first; if empty, check legacy before giving up so we
+  // don't stomp a migration-in-progress state where only `all_settings`
+  // has been seeded.
+  const canonical = await getSettings("app_settings")
+  if (canonical && Object.keys(canonical).length > 0) return
+  const legacy = await getSettings("all_settings")
   const { getDefaultSettings } = await import("@/lib/settings-storage")
-  await setSettings("app_settings", getDefaultSettings())
+  // `setAppSettings` mirrors the defaults to BOTH the canonical
+  // (`app_settings`) and legacy (`all_settings`) keys in one go, so
+  // trade-engine consumers reading `all_settings` boot with populated
+  // values without waiting for the operator to hit Save.
+  const seed = legacy && Object.keys(legacy).length > 0 ? legacy : getDefaultSettings()
+  await setAppSettings(seed)
 }
 
 async function seedPredefinedConnections() {

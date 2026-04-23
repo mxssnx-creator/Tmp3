@@ -1,18 +1,63 @@
 /**
  * Realtime Processor
- * Processes real-time updates for active positions with market data
- * NOW: 100% Redis-backed, no SQL
+ * Processes real-time updates for active positions with market data.
+ *
+ * ── Prehistoric dependency ─────────────────────────────────────────────
+ * This processor is SELF-GATED in `engine-manager.startRealtimeProcessor`
+ * on the `prehistoric:{id}:done` Redis flag, and additionally verifies
+ * readiness at the entry of every cycle in `processRealtimeUpdates()`.
+ * Until prehistoric has finished it returns `{ updates: 0 }` and skips
+ * all per-position work. This guarantees that when a tick evaluates a
+ * live pseudo-position we can always enrich it with the "prev position"
+ * context derived from the prehistoric Set calculations — see
+ * `getPrevSetPosition()` below. Previous-position context feeds into
+ * TP/SL calibration and prevents cold-start TP/SL decisions running
+ * against an empty history.
+ *
+ * NOW: 100% Redis-backed, no SQL.
  */
 
-import { getSettings, setSettings, getMarketData, getRedisClient } from "@/lib/redis-db"
+import { getSettings, setSettings, getRedisClient } from "@/lib/redis-db"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { StrategyConfigManager, type PseudoPosition } from "@/lib/strategy-config-manager"
+// Shared module-level market-data cache with a 200ms TTL, in-flight
+// deduplication, and pipelined batch prefetch. We delegate price reads
+// to it instead of maintaining a second per-processor cache — a single
+// 200ms-TTL cache aligns with the market-data feed cadence and lets
+// multiple processors (indication, strategy, realtime) share the same
+// warm entries.
+import { getMarketDataCached, prefetchMarketDataBatch } from "./market-data-cache"
 
 export class RealtimeProcessor {
   private connectionId: string
   private positionManager: PseudoPositionManager
-  private priceCache: Map<string, { price: number; ts: number }> = new Map()
-  private readonly PRICE_CACHE_TTL = 5000 // 5s
+  // StrategyConfigManager owns the canonical Set schema (entry format,
+  // keyspace, trim cap). We hold a single instance per processor and
+  // delegate to it for all prev-position retrieval — zero duplicated
+  // parsing, zero key drift. Historic fill, realtime read, realtime
+  // write-back (on close) all share the exact same methods.
+  private strategy: StrategyConfigManager
+  // Price reads go through the shared module-level `getMarketDataCached`
+  // (200ms TTL, in-flight dedup, pipelined prefetch). No per-processor
+  // price cache — a second cache here would just add a staleness layer
+  // on top of the shared one.
+
+  // Cache of prev-set positions keyed by strategy-config id. The Set is
+  // updated by the prehistoric fill path AND by live-close writebacks,
+  // so the TTL is deliberately short (2s) — a live TP/SL close must
+  // propagate into the realtime tick's context on the next cycle.
+  private prevSetCache: Map<string, { pos: PseudoPosition | null; ts: number }> = new Map()
+  private readonly PREV_SET_CACHE_TTL = 2_000
+
+  // Cached prehistoric-ready flag (mirrors the gate in engine-manager).
+  // Checked once per ~3s while serving ticks; flipped to `true` we skip
+  // re-reading Redis entirely. If we ever see a cycle *after* the flag
+  // flipped to false again (cache flush, manual reset) the next
+  // processRealtimeUpdates call will correctly re-gate.
+  private prehistoricReady = false
+  private prehistoricCheckedAt = 0
+  private static readonly PREHISTORIC_RECHECK_MS = 3000
 
   // Heartbeat throttling: the realtime loop ticks multiple times per second.
   // Previously every tick performed a getSettings + setSettings round-trip on
@@ -28,15 +73,130 @@ export class RealtimeProcessor {
   constructor(connectionId: string) {
     this.connectionId = connectionId
     this.positionManager = new PseudoPositionManager(connectionId)
+    this.strategy = new StrategyConfigManager(connectionId)
+  }
+
+  /**
+   * Returns `true` once the prehistoric calc has written its "done"
+   * marker. Cached for `PREHISTORIC_RECHECK_MS` to avoid hammering Redis.
+   * The engine-manager tick loop ALSO gates on this flag (belt-and-
+   * braces); this check is the second layer so callers of
+   * `processRealtimeUpdates` directly (e.g. startup warm-up) can never
+   * bypass the gate.
+   */
+  async isPrehistoricReady(): Promise<boolean> {
+    if (this.prehistoricReady) return true
+    const now = Date.now()
+    if (now - this.prehistoricCheckedAt < RealtimeProcessor.PREHISTORIC_RECHECK_MS) {
+      return this.prehistoricReady
+    }
+    this.prehistoricCheckedAt = now
+    try {
+      const client = getRedisClient()
+      const v = await client.get(`prehistoric:${this.connectionId}:done`)
+      this.prehistoricReady = v === "1"
+    } catch {
+      // Keep last-known value on transient failures.
+    }
+    return this.prehistoricReady
+  }
+
+  /**
+   * Read the latest prev-set position for a live pseudo-position.
+   *
+   * Resolution order for the target `configId`:
+   *   1. Explicit `strategy_config_id` field on the position hash (set
+   *      by `createPosition` when the caller knows the DB primary key).
+   *      This is the authoritative link into the historic-fill keyspace.
+   *   2. Tail segment of `config_set_key` (legacy fallback, may be a
+   *      fingerprint rather than a real configId).
+   *
+   * Delegates to `StrategyConfigManager.getLatestPosition` — the single
+   * canonical primitive that owns both the Redis keyspace
+   * (`strategy:{connId}:config:{configId}:positions`) and the entry
+   * schema used by every writer.
+   *
+   * Cache is bounded to `MAX_PREV_SET_CACHE` entries using a simple FIFO
+   * eviction so long-running engines with many distinct config ids can't
+   * grow the map unboundedly. Also exposes `invalidatePrevSet` so the
+   * close path can drop stale entries the moment the underlying Set is
+   * mutated.
+   */
+  async getPrevSetPosition(
+    position: { config_set_key?: string; strategy_config_id?: string } | string | undefined,
+  ): Promise<PseudoPosition | null> {
+    let configId = ""
+    if (typeof position === "string" || position == null) {
+      configId = StrategyConfigManager.extractConfigId(position)
+    } else {
+      const explicit = String(position.strategy_config_id || "").trim()
+      configId = explicit || StrategyConfigManager.extractConfigId(position.config_set_key)
+    }
+    if (!configId) return null
+
+    const now = Date.now()
+    const cached = this.prevSetCache.get(configId)
+    if (cached && now - cached.ts < this.PREV_SET_CACHE_TTL) return cached.pos
+
+    try {
+      const pos = await this.strategy.getLatestPosition(configId)
+      this.setPrevSetCache(configId, pos, now)
+      return pos
+    } catch (err) {
+      // On transient failure we negative-cache briefly so bursty traffic
+      // doesn't stampede Redis with the same lookup.
+      this.setPrevSetCache(configId, null, now)
+      console.warn(
+        `[v0] [Realtime] getPrevSetPosition(${configId}) failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      return null
+    }
+  }
+
+  /** Hard cap on `prevSetCache` entries. Exceeded entries are FIFO-evicted. */
+  private readonly MAX_PREV_SET_CACHE = 2048
+
+  /** Insert with FIFO-eviction when the cache is full. */
+  private setPrevSetCache(configId: string, pos: PseudoPosition | null, ts: number): void {
+    if (this.prevSetCache.size >= this.MAX_PREV_SET_CACHE && !this.prevSetCache.has(configId)) {
+      // Map iteration is insertion order — drop the oldest entry.
+      const oldest = this.prevSetCache.keys().next().value
+      if (oldest !== undefined) this.prevSetCache.delete(oldest)
+    }
+    this.prevSetCache.set(configId, { pos, ts })
+  }
+
+  /** Drop a cached prev-set entry. Called from the close path to avoid
+   *  serving stale context for the remainder of the TTL window. */
+  invalidatePrevSet(configId: string | undefined): void {
+    if (!configId) return
+    this.prevSetCache.delete(configId)
   }
 
   /**
    * Process real-time updates for all active positions.
-   * Returns the number of positions actually processed so callers can gate
-   * follow-up work (telemetry, backoff) without re-querying Redis.
+   *
+   * ── Decoupling contract (P0-5) ────────────────────────────────────
+   * Per the architectural spec — *"Open Pseudo positions get updated
+   * handled on each cycle, Independent of active indication process"* —
+   * this loop MUST update every open position every tick regardless of
+   * whether indication/strategy/prehistoric phases have produced any
+   * work. The prehistoric-ready flag used to be a HARD gate here; it
+   * is now an ADVISORY flag, passed to `processPosition` to decide
+   * whether to also do prev-set enrichment (Phase B). The mark-to-
+   * market update (Phase A — `current_price`, `unrealized_pnl`,
+   * trailing stop, TP/SL check) ALWAYS runs.
+   *
+   * Returns the number of positions actually processed so callers can
+   * gate follow-up work (telemetry, backoff) without re-querying Redis.
    */
   async processRealtimeUpdates(): Promise<{ updates: number }> {
     try {
+      // Advisory readiness flag — tells processPosition whether it's
+      // safe to attach prev-set context. Never blocks Phase A work.
+      const prehistoricReady = await this.isPrehistoricReady()
+
       const activePositions = await this.positionManager.getActivePositions()
       const count = activePositions.length
       const now = Date.now()
@@ -82,24 +242,32 @@ export class RealtimeProcessor {
         return { updates: 0 }
       }
 
-      // Pre-warm the price cache for every unique symbol in parallel before
-      // fanning out the per-position work. Previously every position paid
-      // its own `getMarketData` round-trip on the first cycle after the
-      // TTL expired (even though most positions share a symbol). Fetching
-      // the distinct set first collapses those N reads into M << N.
+      // Pre-warm the shared market-data cache for every unique symbol
+      // in a SINGLE pipelined batch (one Redis RTT regardless of symbol
+      // count). Subsequent per-position price lookups hit the module-
+      // level cache synchronously with zero round-trips until the 200ms
+      // TTL expires. This is the single biggest win for dense ticks:
+      // 100 positions across 30 symbols = 1 RTT here + 0 during the fan-
+      // out, vs. the previous 30 RTTs just to warm prices.
       const uniqueSymbols = new Set<string>()
       for (const p of activePositions) {
         if (p?.symbol) uniqueSymbols.add(p.symbol)
       }
       if (uniqueSymbols.size > 0) {
-        await Promise.all(
-          Array.from(uniqueSymbols).map((sym) => this.getCurrentPrice(sym).catch(() => null)),
-        )
+        await prefetchMarketDataBatch(Array.from(uniqueSymbols))
       }
 
-      // Process each position in parallel — every call now hits the
-      // freshly-warmed price cache synchronously.
-      await Promise.all(activePositions.map((position) => this.processPosition(position)))
+      // Process each position in parallel. Each call carries the
+      // position object through — no second HGETALL in updatePosition
+      // or closePosition, since the caller already has the hash.
+      // `prehistoricReady` is passed as an advisory flag so Phase B
+      // (prev-set enrichment) can be conditionally skipped without
+      // blocking Phase A (mark-to-market + TP/SL).
+      await Promise.all(
+        activePositions.map((position) =>
+          this.processPosition(position, prehistoricReady),
+        ),
+      )
       return { updates: count }
     } catch (error) {
       console.error("[v0] Failed to process realtime updates:", error)
@@ -111,18 +279,61 @@ export class RealtimeProcessor {
   }
 
   /**
-   * Process individual position
+   * Process an individual active pseudo-position.
+   *
+   * ── Two-phase execution (P0-5) ─────────────────────────────────────
+   * Every open pseudo-position gets a Phase A pass on every tick,
+   * REGARDLESS of indication / strategy / prehistoric state. Phase B
+   * enrichment is advisory and only runs when prehistoric has produced
+   * the prev-set Sets.
+   *
+   *   Phase A — mark-to-market (ALWAYS):
+   *     - refresh `current_price` from the 200ms market-data cache
+   *     - recompute `unrealized_pnl`
+   *     - update `trailing_stop_price` when trailing is enabled
+   *     - check TP / SL and dispatch close
+   *
+   *   Phase B — prev-set enrichment (ONLY when prehistoricReady):
+   *     - fetch the latest prev-set position via the 2s prev-set cache
+   *     - attach it to the position as `_prev_set_position` so the
+   *       TP/SL helpers can calibrate against the most recent closed
+   *       position from the same strategy config
+   *
+   * This guarantees open positions always get mark-to-market updates
+   * and timely TP/SL enforcement, even during the prehistoric warm-up
+   * window or if any position somehow exists before prehistoric has
+   * finished. Prev-set-calibrated decisions (a small refinement, not
+   * the core safety mechanism) gracefully degrade to defaults when
+   * prehistoric is not yet ready.
    */
-  private async processPosition(position: any): Promise<void> {
+  private async processPosition(position: any, prehistoricReady: boolean): Promise<void> {
     try {
-      const currentPrice = await this.getCurrentPrice(position.symbol)
+      // Phase A is the critical path — always kick off the price fetch.
+      // Phase B (prev-set) only fires when prehistoric is ready, and
+      // runs in parallel with the price fetch to avoid sequential
+      // latency under high symbol counts.
+      const pricePromise = this.getCurrentPrice(position.symbol)
+      const prevSetPromise: Promise<PseudoPosition | null> = prehistoricReady
+        ? this.getPrevSetPosition(position)
+        : Promise.resolve(null)
+
+      const [currentPrice, prevSetPos] = await Promise.all([pricePromise, prevSetPromise])
 
       if (!currentPrice) {
         return
       }
 
-      // Update position with current price
-      await this.positionManager.updatePosition(position.id, currentPrice)
+      // Phase B attachment — only when prehistoric produced something.
+      // Underscore prefix makes clear this is transient enrichment,
+      // not persisted state.
+      if (prevSetPos) {
+        position._prev_set_position = prevSetPos
+      }
+
+      // Update position with current price. Pass the in-memory hash
+      // through so the manager skips a redundant HGETALL round-trip
+      // (see PseudoPositionManager.updatePosition hot-path notes).
+      await this.positionManager.updatePosition(position.id, currentPrice, position)
 
       // Calculate profit/loss
       const entryPrice = parseFloat(position.entry_price || "0")
@@ -133,26 +344,52 @@ export class RealtimeProcessor {
         ? (currentPrice - entryPrice) * quantity
         : (entryPrice - currentPrice) * quantity
 
-      // Log position monitoring (reduced frequency to avoid spam)
+      // Log position monitoring (reduced frequency to avoid spam). Also
+      // surface prev-set outcome so operators can see the context
+      // feeding the decision.
       if (Math.random() < 0.01) { // Log ~1% of cycles
-        console.log(`[v0] [Realtime] Monitoring ${position.symbol} ${side}: Price=${currentPrice.toFixed(2)}, PnL=${pnl.toFixed(4)}`)
+        const prevTag = prevSetPos
+          ? ` | prevSet=${prevSetPos.status}/${prevSetPos.result.toFixed(2)}`
+          : " | prevSet=none"
+        console.log(
+          `[v0] [Realtime] Monitoring ${position.symbol} ${side}: ` +
+          `Price=${currentPrice.toFixed(2)}, PnL=${pnl.toFixed(4)}${prevTag}`,
+        )
       }
+
+      // Before handing to closePosition, stamp the latest market price
+      // onto the position object so the manager's PnL calculation uses
+      // the live price (not the potentially-stale `current_price` hash
+      // field) without needing an extra HGETALL.
+      position.current_price = String(currentPrice)
+
+      // Resolve the target configId ONCE so we can invalidate the
+      // prev-set cache entry the instant the underlying Set is mutated
+      // by closePosition. Without this, the processor would serve the
+      // stale (pre-close) prev-set record for up to PREV_SET_CACHE_TTL
+      // to any other position pointing at the same config.
+      const cacheConfigId =
+        String(position.strategy_config_id || "").trim() ||
+        StrategyConfigManager.extractConfigId(position.config_set_key)
 
       // Check take profit
       if (this.shouldCloseTakeProfit(position, currentPrice)) {
-        await this.positionManager.closePosition(position.id, "take_profit")
+        await this.positionManager.closePosition(position.id, "take_profit", position)
+        this.invalidatePrevSet(cacheConfigId)
         console.log(`[v0] [Realtime] TP hit for ${position.symbol} ${side} | PnL: ${pnl.toFixed(4)}`)
         return
       }
 
       // Check stop loss
       if (this.shouldCloseStopLoss(position, currentPrice)) {
-        await this.positionManager.closePosition(position.id, "stop_loss")
+        await this.positionManager.closePosition(position.id, "stop_loss", position)
+        this.invalidatePrevSet(cacheConfigId)
         console.log(`[v0] [Realtime] SL hit for ${position.symbol} ${side} | PnL: ${pnl.toFixed(4)}`)
         return
       }
 
-      // Update trailing stop if enabled
+      // Update trailing stop if enabled — the prev-set context is on
+      // the position object so `updateTrailingStop` can honour it.
       if (position.trailing_enabled === "1" || position.trailing_enabled === true) {
         await this.updateTrailingStop(position, currentPrice)
       }
@@ -162,28 +399,17 @@ export class RealtimeProcessor {
   }
 
   /**
-   * Get current price from Redis market data (cached)
+   * Get the current price for a symbol via the shared 200ms market-
+   * data cache. The cache handles in-flight dedup and pipelined batch
+   * prefetch, so every realtime tick pays at most ONE Redis RTT per
+   * 200ms window regardless of how many positions share the symbol.
    */
   private async getCurrentPrice(symbol: string): Promise<number | null> {
     try {
-      const now = Date.now()
-      const cached = this.priceCache.get(symbol)
-      if (cached && now - cached.ts < this.PRICE_CACHE_TTL) {
-        return cached.price
-      }
-
-      const marketData = await getMarketData(symbol)
-      if (!marketData) return null
-
-      const data = Array.isArray(marketData) ? marketData[0] : marketData
+      const data = await getMarketDataCached(symbol)
+      if (!data) return null
       const price = parseFloat(data?.close || data?.price || "0")
-
-      if (price > 0) {
-        this.priceCache.set(symbol, { price, ts: now })
-        return price
-      }
-
-      return null
+      return price > 0 ? price : null
     } catch (error) {
       console.error(`[v0] Failed to get current price for ${symbol}:`, error)
       return null

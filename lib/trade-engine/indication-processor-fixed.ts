@@ -66,7 +66,7 @@ import { trackIndicationStats } from "@/lib/statistics-tracker"
 import { StepBasedIndicators } from "@/lib/step-based-indicators"
 
 // Pre-import modules at module load time (not per-call)
-import { initRedis, getRedisClient, getMarketData, saveIndication, getSettings, storeIndications } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getMarketData, saveIndication, getSettings, getAppSettings, storeIndications } from "@/lib/redis-db"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 // Import standalone cache module to avoid this.marketDataCache issues
@@ -152,7 +152,8 @@ async function getSettingsCachedModule(): Promise<any> {
 
   try {
     await initRedis()
-    const settings = await getSettings("all_settings") || {}
+    // Mirror-aware read (covers both app_settings + all_settings).
+    const settings = (await getAppSettings()) || {}
 
     const indicationSettings = {
       minProfitFactor: settings.minProfitFactor || 1.2,

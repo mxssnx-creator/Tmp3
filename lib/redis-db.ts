@@ -588,6 +588,77 @@ export class InlineLocalRedis {
     
     return Math.floor((expireAt - now) / 1000)
   }
+
+  /**
+   * Pipeline / MULTI compatibility shim.
+   *
+   * The in-memory `InlineLocalRedis` has zero network round-trips — every
+   * op resolves in microseconds against a `Map`. Real pipelining (batching
+   * commands into one RTT) is therefore meaningless for this backend.
+   * BUT several call sites (and every real Upstash/ioredis client in the
+   * wild) expect a chainable `client.multi()` that queues commands and
+   * executes them on `.exec()`. Without a compatible shim here, callers
+   * crash with "client.multi is not a function" and — because most of
+   * those call sites wrap in try/catch that swallow errors — the failures
+   * go undetected (e.g. prefetchMarketDataBatch, close-path pipelines).
+   *
+   * This shim records `(method, args)` pairs and dispatches them
+   * sequentially on `.exec()` via the real method on the same instance,
+   * returning an array of results in order — same contract as upstash's
+   * and ioredis's pipeline APIs. Sequential execution is correct (Map
+   * ops are synchronous) and still zero-RTT. If this project ever swaps
+   * in a network Redis client, the caller code is already shaped for a
+   * real pipeline.
+   */
+  multi(): {
+    [k: string]: any
+    exec: () => Promise<any[]>
+  } {
+    const ops: Array<{ method: string; args: any[] }> = []
+    const self = this as unknown as Record<string, any>
+    const queue = new Proxy(
+      {},
+      {
+        get: (_target, prop: string) => {
+          if (prop === "exec") {
+            return async (): Promise<any[]> => {
+              const results: any[] = []
+              for (const { method, args } of ops) {
+                const fn = self[method]
+                if (typeof fn !== "function") {
+                  // Unknown command: push a null result so caller index
+                  // alignment isn't broken.
+                  results.push(null)
+                  continue
+                }
+                try {
+                  results.push(await fn.apply(self, args))
+                } catch (err) {
+                  // Match upstash/ioredis: include the error per-slot.
+                  results.push(err)
+                }
+              }
+              return results
+            }
+          }
+          // Chainable command recorder.
+          return (...args: any[]) => {
+            ops.push({ method: prop, args })
+            return queue
+          }
+        },
+      },
+    ) as { [k: string]: any; exec: () => Promise<any[]> }
+    return queue
+  }
+
+  /**
+   * Alias for `multi()` — upstash-redis's client exposes both names. Keeps
+   * any caller that happened to standardize on `pipeline()` working.
+   */
+  pipeline(): ReturnType<InlineLocalRedis["multi"]> {
+    return this.multi()
+  }
 }
 
 let redisInstance: InlineLocalRedis | null = null
@@ -839,17 +910,252 @@ export async function getAllSettings(): Promise<Record<string, any>> {
   await initRedis()
   const client = getClient()
   const keys = await client.keys("settings:*")
+  if (keys.length === 0) return {}
+
+  // Fan out every hgetall in parallel — sequential awaits compounded
+  // latency linearly with the number of settings hashes, which showed
+  // up in export and admin-dashboard endpoints.
+  const hashes = await Promise.all(
+    keys.map((k) => client.hgetall(k).catch(() => null)),
+  )
   const settings: Record<string, any> = {}
-  
-  for (const key of keys) {
-    const settingKey = key.replace("settings:", "")
-    const hash = await client.hgetall(key)
-    if (hash) {
-      settings[settingKey] = parseHash(hash)
-    }
+  for (let i = 0; i < keys.length; i++) {
+    const hash = hashes[i]
+    if (!hash) continue
+    settings[keys[i].replace("settings:", "")] = parseHash(hash)
   }
-  
   return settings
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Canonical app-settings helpers
+//
+// The project historically drifted between two Redis hashes:
+//   - "app_settings" — written by /api/settings (GET/POST/PUT) from the UI
+//   - "all_settings" — read by several trade-engine modules
+// These helpers unify the view so any consumer gets the operator's saved
+// settings regardless of which key happens to hold them. The paired
+// `setAppSettings` writer mirrors to BOTH keys so legacy readers that
+// haven't been migrated yet (and any forks that expect one or the other)
+// continue to work.
+//
+// `getAppSettings()` returns a merged record with `app_settings` winning
+// on conflict (it's the canonical UI-facing key). Missing keys silently
+// fall back to an empty object so callers can use `?? default` patterns.
+// ─────────────────────────────────────────────────────────────────────
+
+const APP_SETTINGS_KEY_CANONICAL = "app_settings" as const
+const APP_SETTINGS_KEY_LEGACY    = "all_settings" as const
+
+let appSettingsCache: { value: Record<string, any>; ts: number; version: number } | null = null
+// Hard-refresh deadline — picks up silent Redis writes that happened
+// without going through our mirror writer (e.g. an out-of-band SET from
+// a migration script or another Vercel region). The version-counter
+// check below handles the common case in single-digit milliseconds.
+const APP_SETTINGS_HARD_REFRESH_MS = 30_000
+
+export async function getAppSettings(
+  options: { bypassCache?: boolean } = {},
+): Promise<Record<string, any>> {
+  const now = Date.now()
+  const liveVersion = getSettingsVersionCachedSync()
+  if (
+    !options.bypassCache &&
+    appSettingsCache &&
+    appSettingsCache.version === liveVersion &&
+    now - appSettingsCache.ts < APP_SETTINGS_HARD_REFRESH_MS
+  ) {
+    return appSettingsCache.value
+  }
+  try {
+    const [canonical, legacy] = await Promise.all([
+      getSettings(APP_SETTINGS_KEY_CANONICAL),
+      getSettings(APP_SETTINGS_KEY_LEGACY),
+    ])
+    // Legacy provides fallback values — canonical overrides on conflict.
+    const merged = { ...(legacy || {}), ...(canonical || {}) }
+    appSettingsCache = { value: merged, ts: now, version: liveVersion }
+    return merged
+  } catch {
+    return appSettingsCache?.value ?? {}
+  }
+}
+
+/**
+ * Convenience scalar reader — falls back through:
+ *   1. Individual `settings:{field}` hash (legacy orphan-key path)
+ *   2. Canonical `app_settings.{field}`
+ *   3. Legacy `all_settings.{field}`
+ *   4. Caller-supplied default
+ */
+export async function getAppSetting<T = unknown>(
+  field: string,
+  fallback: T,
+): Promise<T> {
+  try {
+    // 1. Individual key (some historical code writes these as scalar hashes)
+    const individual = await getSettings(field)
+    if (individual !== null && individual !== undefined) {
+      const maybeScalar =
+        typeof individual === "object" && individual && "value" in individual
+          ? (individual as any).value
+          : individual
+      if (maybeScalar !== null && maybeScalar !== undefined) {
+        return maybeScalar as T
+      }
+    }
+  } catch {
+    /* non-critical */
+  }
+  const merged = await getAppSettings()
+  const value = merged[field]
+  if (value === undefined || value === null) return fallback
+  return value as T
+}
+
+/**
+ * Writer that keeps the canonical + legacy hashes in sync. Call this
+ * from the settings UI/API instead of `setSettings("app_settings", ...)`
+ * so trade-engine consumers that read `all_settings` also pick up the
+ * operator's latest values on the next cycle. Also bumps the global
+ * `settings_version` counter so long-running processors detect the
+ * change without waiting for their local TTL to expire.
+ */
+export async function setAppSettings(value: Record<string, any>): Promise<void> {
+  await Promise.all([
+    setSettings(APP_SETTINGS_KEY_CANONICAL, value),
+    setSettings(APP_SETTINGS_KEY_LEGACY,    value),
+  ])
+  // Bump first so the new version number is known before we stamp the
+  // cache; otherwise the same-process cache would look "stale" to the
+  // next reader and cause an unnecessary Redis re-read.
+  const newVersion = await bumpSettingsVersion()
+  appSettingsCache = { value, ts: Date.now(), version: newVersion }
+}
+
+/** Invalidates the in-process app-settings cache. Callable from any write path. */
+export function invalidateAppSettingsCache(): void {
+  appSettingsCache = null
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Live-settings version counter
+//
+// When an operator hits Save in the Settings UI, the server updates the
+// canonical + legacy Redis hashes. But the trade engine is a long-running
+// process on its own timers (possibly on another serverless instance),
+// so it needs a CHEAP signal that "something changed, bust your cache".
+//
+// Pattern: a monotonic integer counter at key `settings_version`.
+//   - Writers call `bumpSettingsVersion()` (INCR) after every save.
+//   - Consumers call `getSettingsVersion()` once per cycle (O(1) GET)
+//     and compare against their last-seen value. On mismatch they
+//     invalidate their cache of parsed settings fields.
+//
+// The counter read is itself cached in-process for 250 ms so a tight
+// inner loop doing many reads doesn't hammer Redis on every call.
+// ─────────────────────────────────────────────────────────────────────
+
+const SETTINGS_VERSION_KEY = "settings_version" as const
+let _settingsVersionCached: number = 0
+let _settingsVersionFetchedAt = 0
+let _settingsVersionRefreshing = false
+const SETTINGS_VERSION_READ_TTL_MS = 250
+
+/**
+ * Synchronous snapshot of the latest settings version. Used by hot-path
+ * cycle loops that can't await. Never hits Redis — returns the value
+ * maintained by the most recent call to `getSettingsVersion()` (or the
+ * background poll). Callers that see a stale value will simply get a
+ * belated refresh on the next cycle, which is acceptable because the
+ * soft-refresh deadline kicks in anyway.
+ */
+export function getSettingsVersionCachedSync(): number {
+  // Opportunistically fire a background refresh if the snapshot is
+  // older than the read TTL so cycle loops that never call the async
+  // variant still see updates within ~250 ms + one cycle.
+  const now = Date.now()
+  if (
+    !_settingsVersionRefreshing &&
+    now - _settingsVersionFetchedAt > SETTINGS_VERSION_READ_TTL_MS
+  ) {
+    _settingsVersionRefreshing = true
+    ;(async () => {
+      try {
+        await initRedis()
+        const client = getClient()
+        const raw = await client.get(SETTINGS_VERSION_KEY)
+        const parsed = Number(raw)
+        _settingsVersionCached = Number.isFinite(parsed) ? parsed : _settingsVersionCached
+        _settingsVersionFetchedAt = Date.now()
+      } catch {
+        _settingsVersionFetchedAt = Date.now()
+      } finally {
+        _settingsVersionRefreshing = false
+      }
+    })()
+  }
+  return _settingsVersionCached
+}
+
+/**
+ * Returns the latest settings version. Cheap — cached for 250 ms. Safe
+ * to call on every engine cycle. A strictly monotonic-increasing
+ * integer; any change means "something changed, refresh your cache".
+ */
+export async function getSettingsVersion(): Promise<number> {
+  const now = Date.now()
+  if (now - _settingsVersionFetchedAt < SETTINGS_VERSION_READ_TTL_MS) {
+    return _settingsVersionCached
+  }
+  if (_settingsVersionRefreshing) {
+    // Another in-flight refresh is already going to land shortly; skip
+    // the duplicate Redis call and return whatever we had.
+    return _settingsVersionCached
+  }
+  _settingsVersionRefreshing = true
+  try {
+    await initRedis()
+    const client = getClient()
+    const raw = await client.get(SETTINGS_VERSION_KEY)
+    const parsed = Number(raw)
+    _settingsVersionCached = Number.isFinite(parsed) ? parsed : 0
+    _settingsVersionFetchedAt = now
+  } catch {
+    // Keep the last-known value on a transient Redis error.
+    _settingsVersionFetchedAt = now
+  } finally {
+    _settingsVersionRefreshing = false
+  }
+  return _settingsVersionCached
+}
+
+/**
+ * Bumps the settings version counter. Call this from every write path
+ * that mutates settings (including system settings, per-connection
+ * settings, etc.) so cache holders know to refresh. Also invalidates
+ * the in-process `appSettingsCache` so the next read in this process
+ * is guaranteed fresh without waiting for the 2 s TTL.
+ */
+export async function bumpSettingsVersion(): Promise<number> {
+  try {
+    await initRedis()
+    const client = getClient()
+    const next = await client.incr(SETTINGS_VERSION_KEY)
+    const parsed = Number(next)
+    _settingsVersionCached = Number.isFinite(parsed) ? parsed : _settingsVersionCached + 1
+    _settingsVersionFetchedAt = Date.now()
+    // Flush the in-process caches immediately so the same process that
+    // wrote the value doesn't hand out stale merged data to readers
+    // that call `getAppSettings()` within the 2 s TTL window.
+    invalidateAppSettingsCache()
+    return _settingsVersionCached
+  } catch {
+    // If Redis is briefly unavailable, at least invalidate the local
+    // cache so the same process re-fetches on next read.
+    invalidateAppSettingsCache()
+    return _settingsVersionCached
+  }
 }
 
 // ========== Market Data Operations ==========
@@ -885,15 +1191,16 @@ export async function getAllPositions(): Promise<any[]> {
   await initRedis()
   const client = getClient()
   const keys = await client.keys("position:*")
+  if (keys.length === 0) return []
+
+  const hashes = await Promise.all(
+    keys.map((k) => client.hgetall(k).catch(() => null)),
+  )
   const positions: any[] = []
-  
-  for (const key of keys) {
-    const hash = await client.hgetall(key)
-    if (hash) {
-      positions.push(parseHash(hash))
-    }
+  for (const hash of hashes) {
+    if (!hash) continue
+    positions.push(parseHash(hash))
   }
-  
   return positions
 }
 
@@ -932,15 +1239,16 @@ export async function getAllTrades(): Promise<any[]> {
   await initRedis()
   const client = getClient()
   const keys = await client.keys("trade:*")
+  if (keys.length === 0) return []
+
+  const hashes = await Promise.all(
+    keys.map((k) => client.hgetall(k).catch(() => null)),
+  )
   const trades: any[] = []
-  
-  for (const key of keys) {
-    const hash = await client.hgetall(key)
-    if (hash) {
-      trades.push(parseHash(hash))
-    }
+  for (const hash of hashes) {
+    if (!hash) continue
+    trades.push(parseHash(hash))
   }
-  
   return trades
 }
 
@@ -973,15 +1281,16 @@ export async function getAllIndications(): Promise<any[]> {
   await initRedis()
   const client = getClient()
   const keys = await client.keys("indication:*")
+  if (keys.length === 0) return []
+
+  const hashes = await Promise.all(
+    keys.map((k) => client.hgetall(k).catch(() => null)),
+  )
   const indications: any[] = []
-  
-  for (const key of keys) {
-    const hash = await client.hgetall(key)
-    if (hash) {
-      indications.push(parseHash(hash))
-    }
+  for (const hash of hashes) {
+    if (!hash) continue
+    indications.push(parseHash(hash))
   }
-  
   return indications
 }
 
@@ -1014,15 +1323,16 @@ export async function getAllStrategies(): Promise<any[]> {
   await initRedis()
   const client = getClient()
   const keys = await client.keys("strategy:*")
+  if (keys.length === 0) return []
+
+  const hashes = await Promise.all(
+    keys.map((k) => client.hgetall(k).catch(() => null)),
+  )
   const strategies: any[] = []
-  
-  for (const key of keys) {
-    const hash = await client.hgetall(key)
-    if (hash) {
-      strategies.push(parseHash(hash))
-    }
+  for (const hash of hashes) {
+    if (!hash) continue
+    strategies.push(parseHash(hash))
   }
-  
   return strategies
 }
 
@@ -1205,8 +1515,29 @@ export async function getAllConnectionsWithStatus(): Promise<any[]> {
 // ========== Additional CRUD Operations ==========
 
 export async function createConnection(data: any): Promise<any> {
+  await initRedis()
   const client = getRedisClient()
   const id = data.id || `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+
+  // Check if connection already exists to prevent duplicates — if it
+  // does, update it in place rather than producing a conflicting
+  // second row. This is the behaviour the orphan block below was
+  // trying to express before it was accidentally left outside the
+  // function body (which broke the build with "Return statement is
+  // not allowed here" at the module top level).
+  const existingConnection = await client.hgetall(`connection:${id}`)
+  if (existingConnection && Object.keys(existingConnection).length > 0) {
+    console.log(`[v0] [Redis] Connection already exists with id ${id}, updating instead of creating duplicate`)
+    const merged = {
+      ...data,
+      id,
+      updated_at: new Date().toISOString(),
+    }
+    await client.hset(`connection:${id}`, merged)
+    invalidateConnectionsCache()
+    return merged
+  }
+
   const connectionData = {
     ...data,
     id,
@@ -1217,33 +1548,6 @@ export async function createConnection(data: any): Promise<any> {
   invalidateConnectionsCache()
   return connectionData
 }
-   await initRedis()
-   const client = getRedisClient()
-   const id = data.id || `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-   
-   // Check if connection already exists to prevent duplicates
-   const existingConnection = await client.hgetall(`connection:${id}`)
-   if (existingConnection && Object.keys(existingConnection).length > 0) {
-     console.log(`[v0] [Redis] Connection already exists with id ${id}, updating instead of creating duplicate`)
-     // Update existing connection
-     const connectionData = {
-       ...data,
-       id,
-       updated_at: new Date().toISOString(),
-     }
-     await client.hset(`connection:${id}`, connectionData)
-     return connectionData
-   }
-   
-   const connectionData = {
-     ...data,
-     id,
-     created_at: new Date().toISOString(),
-     updated_at: new Date().toISOString(),
-   }
-   await client.hset(`connection:${id}`, connectionData)
-   return connectionData
- }
 
 export async function updateConnection(id: string, updates: any): Promise<any> {
   const client = getRedisClient()
@@ -1393,7 +1697,10 @@ export async function storeIndications(connectionId: string, symbol: string, ind
     // Save to main key with 1-hour TTL
     await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
     
-    // Also maintain per-type independent sets for high-frequency lookups
+    // Also maintain per-type independent sets for high-frequency lookups.
+    // Note: iterating once over unique types would be slightly more efficient,
+    // but `indications` is always a small batch (<=10), so the clarity of a
+    // per-indication pass is preferred.
     for (const ind of indications) {
       const typeKey = `indications:${connectionId}:${ind.type}`
       const typeIndications = indications.filter(i => i.type === ind.type)
@@ -1401,36 +1708,6 @@ export async function storeIndications(connectionId: string, symbol: string, ind
         await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
       }
     }
-// Add new indications with metadata for per-config tracking
-     const newIndications = indications.map(ind => ({
-       ...ind,
-       symbol,
-       connectionId,
-       timestamp: new Date().toISOString(),
-       configSet: getConfigurationSet(ind.type, ind.value), // Track which config set this belongs to
-     }))
-     
-     existing.push(...newIndications)
-     
-     // Keep only latest 2500 indications per connection (250 per symbol × 10 symbols typical)
-     if (existing.length > 2500) {
-       existing = existing.slice(-2500)
-     }
-     
-     // Save to main key with 1-hour TTL
-     await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
-     
-     // Also maintain per-type independent sets for high-frequency lookups
-     await Promise.all(
-       indications.map(async (indication) => {
-         const typeKey = `indications:${connectionId}:${indication.type}`
-         const typeIndications = indications.filter(i => i.type === indication.type)
-         if (typeIndications.length > 0) {
-           await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
-         }
-       })
-     )
-    
   } catch (error) {
     console.error(`[v0] Error storing indications for ${connectionId}:`, error)
   }
@@ -1622,9 +1899,19 @@ export async function deleteSettings(key: string): Promise<void> {
 }
 
 export async function flushAll(): Promise<void> {
-   const client = getRedisClient()
-   await client.flushDb()
- }
+  const client = getRedisClient()
+  await client.flushDb()
+}
+
+// Cache getRedisStats for 5 s. The underlying `client.keys("*")` is an
+// O(N) scan over the entire keyspace, so hammering it from a polling
+// monitoring dashboard would be a foot-gun. The cached value is plenty
+// fresh for a "connected + key count" display.
+let _redisStatsCache: {
+  value: { connected: boolean; memoryUsage: number; keyCount: number; uptime: number }
+  ts: number
+} | null = null
+const REDIS_STATS_CACHE_TTL_MS = 5000
 
 export async function getRedisStats(): Promise<{
   connected: boolean
@@ -1632,22 +1919,33 @@ export async function getRedisStats(): Promise<{
   keyCount: number
   uptime: number
 }> {
+  const now = Date.now()
+  if (_redisStatsCache && now - _redisStatsCache.ts < REDIS_STATS_CACHE_TTL_MS) {
+    return _redisStatsCache.value
+  }
   try {
     const client = getRedisClient()
     const keys = await client.keys("*")
-    return {
+    const value = {
       connected: true,
       memoryUsage: 0, // In-memory implementation doesn't track this
       keyCount: keys.length,
       uptime: Date.now() - (globalThis as any).__redis_start_time || 0,
     }
+    _redisStatsCache = { value, ts: now }
+    return value
   } catch {
-    return {
+    const value = {
       connected: false,
       memoryUsage: 0,
       keyCount: 0,
       uptime: 0,
     }
+    // Cache failures briefly too so a broken Redis doesn't pin the CPU
+    // retrying connection on every polling request. Shorter TTL so
+    // recovery is still detected quickly.
+    _redisStatsCache = { value, ts: now - (REDIS_STATS_CACHE_TTL_MS - 1000) }
+    return value
   }
 }
 

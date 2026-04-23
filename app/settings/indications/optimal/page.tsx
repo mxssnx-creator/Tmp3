@@ -122,8 +122,8 @@ export default function OptimalIndicationSettingsPage() {
             Optimal Indication Settings
           </h1>
           <p className="text-muted-foreground mt-2">
-            Advanced indication type with base pseudo positions (max 250), performance tracking, and consecutive step
-            detection
+            Advanced indication type with independent Sets (per-Set DB capacity up to 250 positions, tunable),
+            performance tracking, and consecutive step detection
           </p>
         </div>
         <Button onClick={handleSave} disabled={isSaving}>
@@ -135,8 +135,10 @@ export default function OptimalIndicationSettingsPage() {
       <Alert>
         <Info className="h-4 w-4" />
         <AlertDescription>
-          Optimal indications use a multi-phase evaluation system with up to 250 base pseudo positions per indication.
-          Each configuration is tested through evaluation phases before creating full position matrices.
+          Optimal indications use a multi-phase evaluation system. Each configuration is an Independent Set
+          whose position history is capped at the Set DB capacity (default 250 positions per Set — this is database
+          length, not an indication-count limit). Sets are tested through evaluation phases before creating full
+          position matrices.
         </AlertDescription>
       </Alert>
 
@@ -238,9 +240,9 @@ export default function OptimalIndicationSettingsPage() {
             </p>
           </div>
 
-          {/* Base Positions Limit */}
+          {/* Set DB Capacity */}
           <div className="space-y-2">
-            <Label className="text-base font-semibold">Base Positions Limit</Label>
+            <Label className="text-base font-semibold">Set DB Capacity (positions per Independent Set)</Label>
             <Input
               type="number"
               step="10"
@@ -250,8 +252,9 @@ export default function OptimalIndicationSettingsPage() {
               onChange={(e) => updateSetting("base_positions_limit", "", e.target.value)}
             />
             <p className="text-xs text-muted-foreground">
-              Maximum base pseudo positions per indication (default: 250). Each base position represents a unique
-              configuration set.
+              Database length per Set — maximum pseudo-positions this Set can store before rearrangement (default 250,
+              tunable 50–500). This is storage capacity, NOT an indication-count limit. Each Set is an independent
+              unit; capacity is not shared across Sets.
             </p>
           </div>
 

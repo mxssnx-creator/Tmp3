@@ -187,6 +187,15 @@ export function ActiveConnectionCard({
     liveVolumeUsdTotal: number
     liveFillRate: number
     liveWinRate: number
+    // ── Mirroring pipeline: open-position counts + Live USD ─────
+    // Pseudo / Real / Live are the SAME signal mirrored through
+    // evaluation stages — not additive pools. Volume lives only on
+    // the Live exchange (real money). Pseudo and Real expose counts.
+    pseudoOpen: number
+    pseudoRunningSets: number
+    realOpen: number
+    liveOpenPositions: number
+    liveVolumeUsd: number
     // Prehistoric metadata
     rangeDays: number
     timeframeSeconds: number
@@ -344,14 +353,14 @@ export function ActiveConnectionCard({
       }
     }
 
+    // Subscribe to cross-component events so this card re-fetches when
+    // the operator toggles a connection, enables live trading, or
+    // changes the global engine state elsewhere in the app. All three
+    // listeners are cleaned up in the returned teardown below.
     if (typeof window !== "undefined") {
       window.addEventListener("connection-toggled", handleConnectionToggled)
       window.addEventListener("live-trade-toggled", handleLiveTradeToggled)
-    
-    if (typeof window !== 'undefined') {
-      window.addEventListener('connection-toggled', handleConnectionToggled)
-      window.addEventListener('live-trade-toggled', handleLiveTradeToggled)
-      window.addEventListener('engine-state-changed', handleConnectionToggled)
+      window.addEventListener("engine-state-changed", handleConnectionToggled)
     }
 
     return () => {
@@ -359,17 +368,10 @@ export function ActiveConnectionCard({
       if (typeof window !== "undefined") {
         window.removeEventListener("connection-toggled", handleConnectionToggled)
         window.removeEventListener("live-trade-toggled", handleLiveTradeToggled)
+        window.removeEventListener("engine-state-changed", handleConnectionToggled)
       }
     }
   }, [fetchProgression, connection.connectionId])
-      clearInterval(interval)
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('connection-toggled', handleConnectionToggled)
-        window.removeEventListener('live-trade-toggled', handleLiveTradeToggled)
-        window.removeEventListener('engine-state-changed', handleConnectionToggled)
-      }
-    }
-  }, [fetchProgression, progression?.phase, globalEngineRunning, connection.isActive])
 
   // Fetch live stats every 4s from the canonical /stats endpoint (per-connection, cumulative)
   useEffect(() => {
@@ -454,6 +456,15 @@ export function ActiveConnectionCard({
           liveVolumeUsdTotal:    data?.liveExecution?.volumeUsdTotal   || 0,
           liveFillRate:          data?.liveExecution?.fillRate         || 0,
           liveWinRate:           data?.liveExecution?.winRate          || 0,
+          // ── Mirroring pipeline open-position counts ─────────────
+          // Counts only for pseudo/real; volume only at the live
+          // exchange layer (real USD). See /stats openPositions
+          // block for the authoritative semantics.
+          pseudoOpen:            Number(data?.openPositions?.pseudo?.open)        || 0,
+          pseudoRunningSets:     Number(data?.openPositions?.pseudo?.runningSets) || 0,
+          realOpen:              Number(data?.openPositions?.real?.open)          || 0,
+          liveOpenPositions:     Number(data?.openPositions?.live?.open)          || 0,
+          liveVolumeUsd:         Number(data?.openPositions?.live?.volumeUsd)     || 0,
           rangeDays:               pm.rangeDays              || 1,
           timeframeSeconds:        pm.timeframeSeconds        || 1,
           intervalsProcessed:      pm.intervalsProcessed      || 0,
@@ -881,6 +892,65 @@ export function ActiveConnectionCard({
                         </span>
                       </div>
                     ))}
+                  </div>
+                )}
+
+                {/* ── Mirroring pipeline counts ──────────────────────
+                    Base → Main → Real → Exchange flow. Pseudo/Real
+                    are eval stages (count only — no real USD); Live
+                    is the exchange itself (count + real USD volume).
+                    Do NOT sum across stages — they mirror the same
+                    signal. */}
+                {prehistoricStats && (
+                  prehistoricStats.pseudoOpen > 0 ||
+                  prehistoricStats.realOpen > 0 ||
+                  prehistoricStats.liveOpenPositions > 0 ||
+                  prehistoricStats.liveVolumeUsd > 0
+                ) && (
+                  <div className="flex items-center gap-3 mt-1 flex-wrap text-[10px]">
+                    <div
+                      className="flex items-center gap-1"
+                      title={
+                        `${prehistoricStats.pseudoOpen} pseudo positions under continuous strategy evaluation\n` +
+                        `across ${prehistoricStats.pseudoRunningSets} running Set${prehistoricStats.pseudoRunningSets === 1 ? "" : "s"}. No real USD at this stage.`
+                      }
+                    >
+                      <span className="text-muted-foreground">Pseudo</span>
+                      <span className="font-semibold text-green-700 dark:text-green-400 tabular-nums">
+                        {prehistoricStats.pseudoOpen}
+                      </span>
+                    </div>
+                    <div
+                      className="flex items-center gap-1"
+                      title="Main→Real promotions awaiting mirror into exchange orders — count only."
+                    >
+                      <span className="text-muted-foreground">Real</span>
+                      <span className="font-semibold text-emerald-700 dark:text-emerald-400 tabular-nums">
+                        {prehistoricStats.realOpen}
+                      </span>
+                    </div>
+                    <div
+                      className="flex items-center gap-1"
+                      title="Open positions actually on the exchange. Equivalent Sets with the same ranges consolidate into a single exchange order."
+                    >
+                      <span className="text-muted-foreground">Exchange</span>
+                      <span className="font-semibold text-amber-700 dark:text-amber-400 tabular-nums">
+                        {prehistoricStats.liveOpenPositions}
+                      </span>
+                    </div>
+                    <div
+                      className="flex items-center gap-1"
+                      title="Cumulative live-trade USD volume on the exchange (the only authoritative exposure figure)."
+                    >
+                      <span className="text-muted-foreground">Live Vol</span>
+                      <span className="font-semibold text-amber-700 dark:text-amber-400 tabular-nums">
+                        {prehistoricStats.liveVolumeUsd >= 1_000_000
+                          ? `$${(prehistoricStats.liveVolumeUsd / 1_000_000).toFixed(2)}M`
+                          : prehistoricStats.liveVolumeUsd >= 1_000
+                            ? `$${(prehistoricStats.liveVolumeUsd / 1_000).toFixed(1)}K`
+                            : `$${prehistoricStats.liveVolumeUsd.toFixed(0)}`}
+                      </span>
+                    </div>
                   </div>
                 )}
 

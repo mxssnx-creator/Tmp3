@@ -5,7 +5,7 @@
  */
 
 import { type NextRequest, NextResponse } from "next/server"
-import { initRedis, getSettings, setSettings } from "@/lib/redis-db"
+import { initRedis, getSettings, setSettings, bumpSettingsVersion } from "@/lib/redis-db"
 
 export const dynamic = "force-dynamic"
 
@@ -124,6 +124,15 @@ export async function POST(request: NextRequest) {
       updates.push("logs")
     }
     
+    // Bump the global settings-version counter if any bundle was
+    // updated — the sets-processor + log-retention loops read these
+    // configs on each cycle via the version-aware cache, so the
+    // operator's change takes effect on the next cycle without an
+    // engine restart.
+    if (updates.length > 0) {
+      await bumpSettingsVersion()
+    }
+
     return NextResponse.json({
       success: true,
       updated: updates,

@@ -534,7 +534,7 @@ export function QuickstartComprehensiveLogDialog() {
                   </div>
                   <div className="grid grid-cols-2 gap-1">
                     <Row label="Strategy Cycles" value={fmt(rt?.strategyCycles || 0)} />
-                    <Row label="Total"           value={fmt(bd?.strategies.total || 0)} />
+                    <Row label="Final (Real)"    value={fmt(bd?.strategies.total || 0)} />
                     {(win?.strategies.last5m  || 0) > 0 && <Row label="Strat 5m"  value={fmt(win!.strategies.last5m)} />}
                     {(win?.strategies.last60m || 0) > 0 && <Row label="Strat 60m" value={fmt(win!.strategies.last60m)} />}
                     {(bd?.strategies.live || 0) > 0 && (

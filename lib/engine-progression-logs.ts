@@ -17,12 +17,26 @@ export interface ProgressionLogEntry {
 const LOG_RETENTION_HOURS = 24
 const MAX_LOGS_PER_CONNECTION = 500
 
-// In-memory buffer for batch logging (reduces Redis writes significantly)
-const logBuffer: Map<string, string[]> = new Map()
+// In-memory buffer for batch logging (reduces Redis writes significantly).
+//
+// HMR SAFETY: in Next.js dev mode every save hot-reloads the module,
+// which would leak a fresh `setInterval` on every reload if state were
+// kept in plain module-scoped `let`s. We pin the buffer and timer on
+// `globalThis` so they survive reloads, and we clear any pre-existing
+// timer before scheduling a new one.
+type ProgressionGlobals = {
+  logBuffer?: Map<string, string[]>
+  flushTimer?: NodeJS.Timeout | null
+  flushTimerStarted?: boolean
+}
+const g = globalThis as unknown as { __v0_progression?: ProgressionGlobals }
+if (!g.__v0_progression) g.__v0_progression = {}
+const PG = g.__v0_progression
+
+const logBuffer: Map<string, string[]> =
+  PG.logBuffer ?? (PG.logBuffer = new Map<string, string[]>())
 const BUFFER_FLUSH_SIZE = 10 // Flush every 10 logs (reduced for more responsive logging)
 const BUFFER_FLUSH_INTERVAL = 3000 // Or every 3 seconds (reduced for more responsive logging)
-let flushTimerStarted = false
-let flushTimer: NodeJS.Timeout | null = null
 
 // Important phases that should flush immediately
 const IMMEDIATE_FLUSH_PHASES = [
@@ -56,12 +70,18 @@ export async function logProgressionEvent(
     const buffer = logBuffer.get(logKey)!
     buffer.push(logEntry)
     
-    // Start flush timer if not started
-    if (!flushTimerStarted) {
-      flushTimerStarted = true
-      flushTimer = setInterval(flushAllLogBuffers, BUFFER_FLUSH_INTERVAL)
+    // Start flush timer if not started. The `PG.flushTimerStarted`
+    // flag is keyed on globalThis so HMR module reloads don't spawn
+    // duplicate timers; if a stale timer somehow survives in
+    // `PG.flushTimer`, clear it before installing the new one.
+    if (!PG.flushTimerStarted) {
+      if (PG.flushTimer) {
+        clearInterval(PG.flushTimer)
+      }
+      PG.flushTimerStarted = true
+      PG.flushTimer = setInterval(flushAllLogBuffers, BUFFER_FLUSH_INTERVAL)
       // Avoid preventing process exit in scripts/tests.
-      flushTimer.unref?.()
+      PG.flushTimer.unref?.()
     }
     
     // Immediate flush for important phases or errors

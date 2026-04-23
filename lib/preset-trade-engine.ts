@@ -848,8 +848,29 @@ export class PresetTradeEngine {
           continue // Skip if already have active position for this symbol
         }
 
-        // Create Main pseudo positions from validated Base positions
-        for (const basePosition of validatedPositions.slice(0, 10)) {
+        // Create Main pseudo positions from validated Base positions.
+        //
+        // Previously this silently truncated `validatedPositions` to the
+        // first 10 entries, meaning that if a symbol produced 25 Base
+        // positions that passed the profit-factor filter, 15 of them
+        // were discarded with no log, no config, and no way for the
+        // operator to tell. That's a real data-loss bug — downstream
+        // consumers expect every qualifying Base promotion to produce
+        // a corresponding Main row. The outer `activeCount >= 1` gate
+        // above already limits this loop to the single-active-position
+        // invariant, so the per-iteration cap was also redundant.
+        //
+        // We keep a very high safety ceiling (500) purely as a
+        // defence-in-depth against a runaway filter returning an
+        // absurd list — if we ever hit it, emit a warning so the
+        // operator can investigate rather than fail silently.
+        const SAFETY_CEILING = 500
+        if (validatedPositions.length > SAFETY_CEILING) {
+          console.warn(
+            `[v0] [preset-trade-engine] Symbol ${symbol} produced ${validatedPositions.length} validated base positions, exceeding safety ceiling of ${SAFETY_CEILING}. Processing first ${SAFETY_CEILING}; investigate the profit-factor filter.`,
+          )
+        }
+        for (const basePosition of validatedPositions.slice(0, SAFETY_CEILING)) {
           const isSqlite = getDatabaseType() === "sqlite"
           const queryText = isSqlite
             ? `

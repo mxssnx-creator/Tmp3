@@ -77,6 +77,13 @@ export interface Settings {
   positionCooldownMs: number
   maxPositionsPerConfigDirection: number
   maxConcurrentOperations: number
+  /**
+   * P0-4 spec cap. Maximum concurrent active pseudo positions in EACH
+   * direction (Long / Short) across ALL config Sets. Hard-enforced by
+   * `PseudoPositionManager.canCreatePosition`. Default 1 per spec:
+   * *"Active Pseudo Position Limit for each direction Long,short maximal 1"*.
+   */
+  maxActiveBasePseudoPositionsPerDirection: number
 
   // System Configuration
   autoRestartOnErrors: boolean

@@ -69,18 +69,29 @@ function unregisterEngineTimer(timer: ReturnType<typeof setInterval>): void {
  * Configurable pause (ms) between engine cycles.
  *
  * Value comes from the `app_settings.cyclePauseMs` key in Redis, clamped to
- * [10, 200]. Default 50 ms. Cached in-memory for 10 s to avoid hitting Redis
- * on every cycle of every loop. A synchronous getter (`getCyclePauseMsSync`)
- * returns the last-known value and triggers an async refresh when the cache
- * has expired, so cycle scheduling never blocks on Redis I/O.
+ * [10, 200]. Default 50 ms.
+ *
+ * ── Live-settings contract ────────────────────────────────────────────
+ * Cached in-memory so cycle scheduling never blocks on Redis I/O, BUT the
+ * cache is tied to the global `settings_version` counter (bumped by every
+ * write via `setAppSettings` / `bumpSettingsVersion`), not a wall-clock
+ * TTL. The synchronous getter returns the last-known value and fires an
+ * async refresh whenever:
+ *   (a) the counter has changed since the last refresh   → operator saved
+ *   (b) 30 s have elapsed without any version bump       → defence-in-
+ *       depth against a missed signal (Redis flush, lost INCR, etc.)
+ * This makes saved settings take effect on the very next cycle (typically
+ * < 300 ms later, bounded by SETTINGS_VERSION_READ_TTL_MS + cycle pause)
+ * with NO engine restart required.
  */
 const DEFAULT_CYCLE_PAUSE_MS = 50
 const CYCLE_PAUSE_MIN = 10
 const CYCLE_PAUSE_MAX = 200
-const CYCLE_PAUSE_CACHE_TTL_MS = 10_000
+const CYCLE_PAUSE_HARD_REFRESH_MS = 30_000
 
 let _cyclePauseMsCached: number = DEFAULT_CYCLE_PAUSE_MS
 let _cyclePauseMsFetchedAt = 0
+let _cyclePauseMsVersion = -1
 let _cyclePauseMsRefreshing = false
 
 function clampCyclePauseMs(n: unknown): number {
@@ -94,14 +105,23 @@ function refreshCyclePauseMsAsync(): void {
   _cyclePauseMsRefreshing = true
   ;(async () => {
     try {
-      const { getSettings } = await import("@/lib/redis-db")
-      const s = (await getSettings("app_settings")) || {}
+      // `getAppSettings` / `getSettingsVersion` are statically imported
+      // at the top of the module — hoisted out of the hot path to avoid
+      // a per-cycle `await import()` round-trip that was previously
+      // costing ~1 ms every time the settings version advanced.
+      //
+      // Snapshot the version BEFORE the read so any further bump that
+      // lands mid-read still triggers a subsequent refresh.
+      const version = await getSettingsVersion()
+      const s = (await getAppSettings()) || {}
       if (s && typeof s === "object" && "cyclePauseMs" in s) {
         _cyclePauseMsCached = clampCyclePauseMs((s as any).cyclePauseMs)
       }
+      _cyclePauseMsVersion = version
       _cyclePauseMsFetchedAt = Date.now()
     } catch {
-      // Keep last-known value on error
+      // Keep last-known value on error; still stamp the clock so we
+      // don't stampede the refresh on every cycle.
       _cyclePauseMsFetchedAt = Date.now()
     } finally {
       _cyclePauseMsRefreshing = false
@@ -109,9 +129,22 @@ function refreshCyclePauseMsAsync(): void {
   })()
 }
 
+/**
+ * Synchronous read used by every cycle loop. Hot path — must not await.
+ * Checks the version-counter cache (maintained by getSettingsVersion's
+ * own 250 ms in-process cache) and fires a background refresh whenever
+ * the counter has advanced OR the hard-refresh deadline has passed.
+ */
 function getCyclePauseMsSync(): number {
-  if (Date.now() - _cyclePauseMsFetchedAt > CYCLE_PAUSE_CACHE_TTL_MS) {
-    // Fire-and-forget refresh; return the cached value immediately.
+  const now = Date.now()
+  // Read the cached version synchronously via the non-blocking snapshot
+  // maintained in redis-db.ts. `getSettingsVersionCachedSync` never
+  // awaits — it opportunistically schedules a background refresh when
+  // its own 250 ms TTL has lapsed and returns the last-known value.
+  const liveVersion = getSettingsVersionCachedSync()
+  if (liveVersion !== _cyclePauseMsVersion) {
+    refreshCyclePauseMsAsync()
+  } else if (now - _cyclePauseMsFetchedAt > CYCLE_PAUSE_HARD_REFRESH_MS) {
     refreshCyclePauseMsAsync()
   }
   return _cyclePauseMsCached
@@ -120,7 +153,7 @@ function getCyclePauseMsSync(): number {
 // Prime the cache on module load so the first cycle uses a recent value.
 refreshCyclePauseMsAsync()
 
-import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis } from "@/lib/redis-db"
+import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis, getSettingsVersionCachedSync, getAppSettings, getAppSetting, getSettingsVersion } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
 import { IndicationProcessor } from "./indication-processor-fixed"
 import { StrategyProcessor } from "./strategy-processor"
@@ -266,6 +299,21 @@ export class TradeEngineManager {
           prehistoric_data_source: "cache",
           updated_at: new Date().toISOString(),
         })
+        // CRITICAL: Re-arm the `prehistoric:{id}:done` gate flag in the cache
+        // path. Without this, the realtime processor stays gated forever after
+        // an engine restart inside the 24h TTL window of
+        // `prehistoric_loaded:{id}` — because the `done` flag lives on a
+        // separate key with an independent TTL and was never set in this
+        // path. The fix is idempotent (same value, 24h re-expire) and costs
+        // exactly one Redis SET per engine boot.
+        try {
+          await redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 } as any)
+        } catch (gateErr) {
+          console.warn(
+            `[v0] [Engine] Failed to re-arm prehistoric done gate on cache hit:`,
+            gateErr instanceof Error ? gateErr.message : String(gateErr),
+          )
+        }
       } else {
         // Non-blocking prehistoric loading
         await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
@@ -297,12 +345,26 @@ export class TradeEngineManager {
       const totalStrategies = strategyResults.reduce((sum, result) => sum + (result?.strategiesEvaluated || 0), 0)
 
       // Phase 5: Start realtime processor
-      await this.updateProgressionPhase("realtime", 85, "Monitoring real-time data and positions")
+      //
+      // IMPORTANT: The realtime processor is STARTED here (timer loop is
+      // armed immediately so the dashboard reports an active processor),
+      // but individual ticks SELF-GATE on the `prehistoric:{id}:done` flag
+      // written at the end of `loadPrehistoricData`. Until that flag is
+      // set the tick returns early with zero updates so the realtime logic
+      // never runs against an empty previous-position context.
+      //
+      // We deliberately DO NOT run a warm-up pass here: firing
+      // `processRealtimeUpdates()` before prehistoric is finished would
+      // evaluate live positions without any prehistoric-calculated prev-
+      // position context, producing TP/SL decisions on cold state. The
+      // self-gated loop will run the first productive pass the instant
+      // prehistoric completes.
+      await this.updateProgressionPhase(
+        "realtime",
+        85,
+        "Realtime processor armed — waiting for prehistoric calc to finish",
+      )
       this.startRealtimeProcessor(config.realtimeInterval)
-      // Run a realtime pass immediately
-      await this.realtimeProcessor.processRealtimeUpdates().catch((error) => {
-        console.warn(`[v0] [Engine] Realtime startup failed:`, error instanceof Error ? error.message : String(error))
-      })
 
       // Verify timers are running
       setTimeout(async () => {
@@ -468,13 +530,20 @@ export class TradeEngineManager {
   }
 
   /**
-   * Load prehistoric data (historical data before real-time processing)
-   * Default range: last 1 day, processed at 1-second timeframe intervals
-   * Runs in background - does not block engine startup
-   * Error handling: failures don't stop subsequent processing steps
+   * Load prehistoric data (historical data before real-time processing).
+   *
+   * Default range: last 8 HOURS, processed at 1-second timeframe intervals.
+   * (The range is user-tunable via `app_settings.prehistoric_range_hours`,
+   * bounded to 1-50h, step 1.) Prehistoric output drives the "prev position"
+   * context consumed by the realtime processor — see the `prehistoric:{id}:done`
+   * gate in `startRealtimeProcessor` below.
+   *
+   * Runs in background: the engine boot flow keeps progressing while we load,
+   * and the realtime processor self-gates until the "done" flag flips. Errors
+   * never stop subsequent processing.
    */
   private async loadPrehistoricData(): Promise<void> {
-    // Default: 8-hour look-back, 1-second timeframe interval.
+    // Default: 8-HOUR look-back, 1-second timeframe interval.
     // User can override via `app_settings.prehistoric_range_hours` (1-50h, step 1).
     // Legacy `trade_engine_state:{id}.prehistoric_range_days` is still respected for
     // backward compatibility.
@@ -486,9 +555,14 @@ export class TradeEngineManager {
     const calcStartTs = Date.now()
 
     try {
+      // Use the mirror-aware reader so the operator's prehistoric_range_hours
+      // applies whether it was saved to the canonical (`app_settings`) or
+      // legacy (`all_settings`) hash. Read the `getAppSettings` lazily from
+      // redis-db to avoid adding another top-level import round-trip.
+      const { getAppSettings } = await import("@/lib/redis-db")
       const [engineState, appSettings] = await Promise.all([
         getSettings(`trade_engine_state:${this.connectionId}`),
-        getSettings("app_settings"),
+        getAppSettings(),
       ])
 
       // Resolve range in hours — priority: app_settings > engine state (hours) >
@@ -584,6 +658,33 @@ export class TradeEngineManager {
       // is finished. The interval itself stays effective whenever productive
       // work is available.
       await redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 })
+
+      // Emit a log event (NOT a phase overwrite) so the dashboard can show
+      // prehistoric completion in its event stream without clobbering the
+      // main `engine_progression:{id}` phase hash — which by this point has
+      // already advanced to `live_trading @ 100%` (set during boot while
+      // prehistoric was running in the background). Rolling the phase
+      // backward would be confusing UX; an explicit event is the right
+      // channel for this one-shot milestone.
+      try {
+        await logProgressionEvent(
+          this.connectionId,
+          "prehistoric_complete",
+          processingResult.errors > 0 ? "warning" : "info",
+          `Prehistoric calc done — ${processingResult.symbolsProcessed}/${processingResult.symbolsTotal} symbols, ` +
+          `${processingResult.candlesProcessed} candles, ${processingResult.indicationResults} indications, ` +
+          `${processingResult.strategyPositions} positions in ${totalPrehistoricDurationMs}ms`,
+          {
+            symbolsTotal: processingResult.symbolsTotal,
+            symbolsProcessed: processingResult.symbolsProcessed,
+            candlesProcessed: processingResult.candlesProcessed,
+            indicationResults: processingResult.indicationResults,
+            strategyPositions: processingResult.strategyPositions,
+            errors: processingResult.errors,
+            durationMs: totalPrehistoricDurationMs,
+          },
+        )
+      } catch { /* non-critical */ }
 
       console.log(
         `[v0] [Prehistoric] ✓ complete in ${totalPrehistoricDurationMs}ms | ` +
@@ -1068,6 +1169,11 @@ export class TradeEngineManager {
         // See indication-processor comment above for counter taxonomy:
         //   strategy_cycle_count          = every tick (churn)
         //   strategy_live_cycle_count     = only ticks that evaluated at least 1 strategy
+        //   strategies_count              = canonical TOTAL strategies produced.
+        //     `evaluatedThisCycle` sums strategy-processor results across symbols,
+        //     where each result's `strategiesEvaluated` is the REAL-stage (final)
+        //     count only — Base/Main are intermediate filter stages of the SAME
+        //     pipeline and are NOT added here, so cross-symbol sums are safe.
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
@@ -1142,19 +1248,36 @@ export class TradeEngineManager {
   }
 
   /**
-   * Start realtime processor (async)
+   * Start realtime processor (async).
    *
    * Self-scheduling setTimeout loop — each cycle runs back-to-back with a
    * configurable pause (app_settings.cyclePauseMs, 10-200ms, default 50ms).
-   * Applies adaptive idle backoff (max 1s) once prehistoric calc is done and
-   * cycles repeatedly produce no realtime updates.
+   *
+   * ── Prehistoric gating ──────────────────────────────────────────────
+   * The loop is armed immediately, but individual ticks SELF-GATE on the
+   * `prehistoric:{id}:done` flag set by loadPrehistoricData. Until that
+   * flag flips we return a "gated" marker (no position processing) and
+   * re-poll the flag on a short cadence (500ms) so the first productive
+   * pass fires the instant prehistoric completes. This guarantees the
+   * realtime processor always has prehistoric-calculated prev-position
+   * context available when it evaluates positions.
+   *
+   * Once prehistoric is done the loop applies adaptive idle backoff
+   * (max 1s) across consecutive empty cycles.
    */
   private startRealtimeProcessor(_intervalSeconds: number = 1): void {
     let cycleCount = 0
+    let gatedCycles = 0
     let totalDuration = 0
     let errorCount = 0
 
     const MAX_IDLE_PAUSE_MS = 1000
+    // Fast-poll cadence while waiting for prehistoric to finish. Kept
+    // short (500ms) so the first productive realtime tick fires within
+    // half a second of prehistoric completing — but long enough to avoid
+    // hammering Redis with `GET prehistoric:{id}:done` during a long-
+    // running prehistoric load.
+    const PREHISTORIC_WAIT_POLL_MS = 500
     let consecutiveEmptyCycles = 0
     const connId = this.connectionId
     let prehistoricDoneFlag = false
@@ -1168,12 +1291,18 @@ export class TradeEngineManager {
     }
     void refreshPrehistoricDone()
 
-    const scheduleNext = (wasProductive: boolean) => {
+    const scheduleNext = (outcome: "productive" | "empty" | "gated") => {
       if (!this.isRunning) return
       const base = getCyclePauseMsSync()
       let pause = base
-      if (wasProductive) {
+      if (outcome === "productive") {
         consecutiveEmptyCycles = 0
+      } else if (outcome === "gated") {
+        // Prehistoric-pending backoff. Don't inflate `consecutiveEmpty-
+        // Cycles` — a gated cycle isn't an "empty" cycle; it was skipped
+        // on purpose. We just wait the fixed short interval so we pick
+        // up the done-flag flip promptly.
+        pause = PREHISTORIC_WAIT_POLL_MS
       } else {
         consecutiveEmptyCycles++
         if (prehistoricDoneFlag && consecutiveEmptyCycles > 2) {
@@ -1190,7 +1319,10 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
-      let producedRealtime = false
+      // Default outcome: "empty". Upgraded to "productive" when the
+      // processor reports real work, or demoted to "gated" when the
+      // prehistoric flag hasn't flipped yet.
+      let outcome: "productive" | "empty" | "gated" = "empty"
       // V8: Early exit if this timer is from a stale module version
       if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
         if (this.realtimeTimer) {
@@ -1201,18 +1333,51 @@ export class TradeEngineManager {
       }
       const startTime = Date.now()
 
-      if (startTime - prehistoricDoneCheckedAt > 3000) {
+      // While prehistoric is pending poll the flag every tick (cheap
+      // single-key GET on a 500ms cadence). After it flips we back off
+      // to the original 3s refresh to avoid needless reads.
+      const pollInterval = prehistoricDoneFlag ? 3000 : PREHISTORIC_WAIT_POLL_MS
+      if (startTime - prehistoricDoneCheckedAt > pollInterval) {
         prehistoricDoneCheckedAt = startTime
-        void refreshPrehistoricDone()
+        await refreshPrehistoricDone()
+      }
+
+      // ── Prehistoric advisory (P0-5) ──────────────────────────────
+      // The realtime loop USED to hard-skip ticks until the
+      // `prehistoric:{id}:done` flag flipped. That's no longer correct
+      // because open pseudo positions must get mark-to-market updates
+      // on every tick regardless of prehistoric state (spec: "Open
+      // Pseudo positions get updated handled on each cycle, Independent
+      // of active indication process"). The realtime processor now
+      // internally treats the flag as advisory — Phase A (TP/SL,
+      // trailing, unrealised PnL) always runs; Phase B (prev-set
+      // enrichment) is the only part that gates. We just log the first
+      // few gated cycles for visibility.
+      if (!prehistoricDoneFlag) {
+        gatedCycles++
+        if (gatedCycles === 1 || gatedCycles % 50 === 0) {
+          void logProgressionEvent(
+            this.connectionId,
+            "realtime_prev_set_pending",
+            "info",
+            "Realtime tick running without prev-set enrichment — waiting for prehistoric calc",
+            { gatedCycles },
+          ).catch(() => { /* non-critical */ })
+        }
       }
 
       try {
         // Process realtime updates for active positions
         const rtResult: any = await this.realtimeProcessor.processRealtimeUpdates()
         // Mark cycle productive when the processor returned some work.
+        // Cadence guarantee (P0-5): any tick that touched open positions
+        // counts as productive so idle backoff never kicks in while
+        // positions are open. The processor returns `updates` = number
+        // of positions processed, so `updates > 0` already implies open
+        // positions exist.
         if (rtResult && typeof rtResult === "object") {
           const updates = Number(rtResult.updates ?? rtResult.processed ?? rtResult.positionsUpdated ?? 0)
-          producedRealtime = updates > 0
+          if (updates > 0) outcome = "productive"
         }
 
         const duration = Date.now() - startTime
@@ -1264,11 +1429,14 @@ export class TradeEngineManager {
           errorCount,
         })
       } finally {
-        scheduleNext(producedRealtime)
+        scheduleNext(outcome)
       }
     }
 
-    // Kick off the first cycle immediately.
+    // Kick off the first cycle immediately. The first tick will either
+    // report "gated" (prehistoric still running) and re-poll on
+    // PREHISTORIC_WAIT_POLL_MS, or run a full cycle if prehistoric is
+    // already complete.
     this.realtimeTimer = setTimeout(tick, 0)
     
     // Register timer for cleanup on module reload
@@ -1416,10 +1584,15 @@ export class TradeEngineManager {
           if (Array.isArray(symbols) && symbols.length > 0) return symbols
         }
 
-        // Global main-symbols fallback
-        const useMainSymbols = await getSettings("useMainSymbols")
-        if (useMainSymbols === true || useMainSymbols === "true") {
-          const mainSymbols = await getSettings("mainSymbols")
+        // Global main-symbols fallback — the UI stores these as fields on
+        // the canonical `app_settings` hash, never as standalone Redis
+        // keys, so `getSettings("useMainSymbols")` would always return
+        // null. Use the mirror-aware scalar reader (statically imported
+        // at the top of the module; avoids a `await import()` on this
+        // cycle-hot path).
+        const useMainSymbols = await getAppSetting<boolean>("useMainSymbols", false)
+        if (useMainSymbols === true) {
+          const mainSymbols = await getAppSetting<string[]>("mainSymbols", [])
           if (Array.isArray(mainSymbols) && mainSymbols.length > 0) return mainSymbols
         }
 

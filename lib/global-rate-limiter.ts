@@ -103,18 +103,31 @@ export class TokenBucketRateLimiter {
   }
 
   /**
-   * Wait for rate limit to allow request (blocking)
+   * Wait for rate limit to allow request (blocking).
+   *
+   * Bounded by `maxWaitMs` (default 30 s) so a misconfigured bucket
+   * (retryAfterMs always positive, tokens never refilling due to a
+   * clock skew, etc.) can never hang the caller indefinitely. If the
+   * deadline is exceeded, resolves without enforcing the limit and
+   * emits a warning — the caller continues but the operator gets a
+   * signal that something is wrong with the rate limiter.
    */
-  async waitForLimit(key: string = 'global'): Promise<void> {
-    while (true) {
+  async waitForLimit(key: string = 'global', maxWaitMs: number = 30_000): Promise<void> {
+    const deadline = Date.now() + maxWaitMs
+    // Bound per-iteration sleep so we can't overshoot the deadline by
+    // a ridiculous amount on a large retryAfterMs.
+    while (Date.now() < deadline) {
       const result = this.checkLimit(key)
       if (result.allowed) {
         return
       }
 
-      // Wait before retrying
-      await new Promise(resolve => setTimeout(resolve, result.retryAfterMs || 100))
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) break
+      const sleepFor = Math.min(remaining, result.retryAfterMs || 100)
+      await new Promise(resolve => setTimeout(resolve, sleepFor))
     }
+    console.warn(`[v0] [global-rate-limiter] waitForLimit('${key}') exceeded ${maxWaitMs}ms deadline; releasing without enforcement`)
   }
 
   /**
@@ -361,17 +374,25 @@ export class GlobalRateLimiter {
   }
 
   /**
-   * Wait for rate limit
+   * Wait for rate limit.
+   *
+   * Bounded by `maxWaitMs` for the same reason as the sibling class's
+   * `waitForLimit` — no caller should be hangable-forever by a
+   * pathological bucket state.
    */
-  async waitForLimit(key: string = 'global'): Promise<void> {
-    while (true) {
+  async waitForLimit(key: string = 'global', maxWaitMs: number = 60_000): Promise<void> {
+    const deadline = Date.now() + maxWaitMs
+    while (Date.now() < deadline) {
       const result = this.checkLimit(key)
       if (result.allowed) {
         return
       }
-
-      await new Promise(resolve => setTimeout(resolve, result.retryAfterMs || 1000))
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) break
+      const sleepFor = Math.min(remaining, result.retryAfterMs || 1000)
+      await new Promise(resolve => setTimeout(resolve, sleepFor))
     }
+    console.warn(`[v0] [exchange-rate-limiter] waitForLimit('${key}') exceeded ${maxWaitMs}ms deadline; releasing without enforcement`)
   }
 
   /**

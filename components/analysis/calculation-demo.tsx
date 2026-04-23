@@ -23,123 +23,107 @@ export function CalculationDemo() {
   const calculationSteps: CalculationStep[] = [
     {
       category: "Indications",
-      step: "Direction Indication Configs",
+      step: "Direction Indication Sets",
       formula: "6 ranges × 5 price_ratios × 2 variations",
       calculation: "6 × 5 × 2",
       result: 60,
-      description: "Each config generates up to 250 pseudo positions",
+      description: "Independent Sets — each has its own position DB (capacity 250)",
     },
     {
       category: "Indications",
-      step: "Direction Pseudo Positions",
-      formula: "60 configs × 250 positions",
+      step: "Direction Set DB Capacity",
+      formula: "60 Sets × 250 DB slots per Set",
       calculation: "60 × 250",
       result: 15000,
-      description: "Total pseudo positions for direction indications",
+      description: "Max positions STORABLE across all Direction Sets (250 = per-Set DB length, NOT an indication count limit)",
     },
     {
       category: "Indications",
-      step: "Move Indication Configs",
+      step: "Move Indication Sets",
       formula: "6 ranges × 5 price_ratios × 2 variations",
       calculation: "6 × 5 × 2",
       result: 60,
-      description: "Move detection configurations",
+      description: "Independent Move-detection Sets",
     },
     {
       category: "Indications",
-      step: "Move Pseudo Positions",
-      formula: "60 configs × 250 positions",
+      step: "Move Set DB Capacity",
+      formula: "60 Sets × 250 DB slots per Set",
       calculation: "60 × 250",
       result: 15000,
-      description: "Total pseudo positions for move indications",
+      description: "Max storable positions across all Move Sets",
     },
     {
       category: "Indications",
-      step: "Active Indication Configs",
+      step: "Active Indication Sets",
       formula: "5 thresholds × 3 time_variations",
       calculation: "5 × 3",
       result: 15,
-      description: "Active trading threshold configurations",
+      description: "Active trading threshold Sets",
     },
     {
       category: "Indications",
-      step: "Active Pseudo Positions",
-      formula: "15 configs × 250 positions",
+      step: "Active Set DB Capacity",
+      formula: "15 Sets × 250 DB slots per Set",
       calculation: "15 × 250",
       result: 3750,
-      description: "Total pseudo positions for active indications",
+      description: "Max storable positions across all Active Sets",
     },
     {
       category: "Strategies",
-      step: "Base Strategy Configs",
-      formula: "21 TP × 21 SL × 10 trailing (limited to 50)",
+      step: "Base Sets (stage 1: eval)",
+      formula: "21 TP × 21 SL × 10 trailing (capped at 50)",
       calculation: "min(21 × 21 × 10, 50)",
       result: 50,
-      description: "Base strategy parameter combinations",
+      description: "Stage 1 of the cascade filter — Base Sets enter evaluation",
     },
     {
       category: "Strategies",
-      step: "Base Strategy Positions",
-      formula: "50 configs × 150 positions",
-      calculation: "50 × 150",
-      result: 7500,
-      description: "Pseudo positions for base strategies",
+      step: "Main Sets (stage 2: filter)",
+      formula: "Base Sets that passed PF & drawdown filters",
+      calculation: "≈ 50 → 25 (50% pass rate)",
+      result: 25,
+      description: "Stage 2 — same Sets, filtered. NOT added to Base — they ARE the Base survivors",
     },
     {
       category: "Strategies",
-      step: "Count Strategy Configs",
-      formula: "50 base_configs × 4 count_variations",
-      calculation: "50 × 4",
-      result: 200,
-      description: "Count strategies (2,4,6,8 positions)",
+      step: "Real Sets (stage 3: adjust)",
+      formula: "Main Sets that passed strict PF≥1.4 + confidence≥0.65",
+      calculation: "≈ 25 → 10 (40% pass rate)",
+      result: 10,
+      description: "Stage 3 — final filtered output. This is the canonical strategy count",
     },
     {
       category: "Strategies",
-      step: "Count Strategy Positions",
-      formula: "200 configs × 150 positions",
-      calculation: "200 × 150",
-      result: 30000,
-      description: "Pseudo positions for count strategies",
-    },
-    {
-      category: "Strategies",
-      step: "Block Strategy Configs",
-      formula: "50 base × 3 block_sizes × 3 factors",
-      calculation: "50 × 3 × 3",
-      result: 450,
-      description: "Block strategies with volume adjustments",
-    },
-    {
-      category: "Strategies",
-      step: "Block Strategy Positions",
-      formula: "450 configs × 150 positions",
-      calculation: "450 × 150",
-      result: 67500,
-      description: "Pseudo positions for block strategies",
+      step: "Set DB Capacity (per Real Set)",
+      formula: "10 Real Sets × 250 DB slots per Set",
+      calculation: "10 × 250",
+      result: 2500,
+      description: "Max positions STORABLE per Real Set (250 = Independent Set DB length, per-Set capacity)",
     },
     {
       category: "Summary",
-      step: "Total XRPUSDT Positions",
-      formula: "Sum of all position types",
-      calculation: "15000 + 15000 + 3750 + 7500 + 30000 + 67500",
-      result: 138750,
-      description: "Complete pseudo position count for one symbol",
+      step: "Total Independent Sets (XRPUSDT)",
+      formula: "Indication Sets + Real-stage Strategy Sets",
+      calculation: "(60 + 60 + 15) + 10",
+      result: 145,
+      description: "Sets are independent pipelines. Strategy Sets are the REAL-stage output only (Base/Main are intermediate filter stages of the same pipeline, never summed)",
     },
     {
       category: "Database",
-      step: "DB Entries Per Minute",
-      formula: "Total positions + 10% new positions",
-      calculation: "138750 + (138750 × 0.1)",
-      result: 152625,
-      description: "Database writes per minute for real-time updates",
+      step: "Max Storable Positions (XRPUSDT)",
+      formula: "Sum of (each Set × its 250 DB capacity)",
+      calculation: "(60+60+15+10) × 250",
+      result: 36250,
+      description: "Theoretical DB capacity — NOT throughput, NOT indication count, NOT strategy count. 250 is the per-Set pseudo-position history length.",
     },
     {
       category: "Scaling",
-      step: "10 Symbols Total",
-      formula: "138750 positions × 10 symbols",
-      calculation: "138750 × 10",
-      result: 1387500,
-      description: "System-wide pseudo positions across multiple symbols",
+      step: "10 Symbols × Max DB Capacity",
+      formula: "36,250 positions × 10 symbols",
+      calculation: "36250 × 10",
+      result: 362500,
+      description: "System-wide pseudo-position DB capacity across symbols. Actual live counts are typically far lower — 250 is a CEILING, not a target.",
     },
   ]
 
@@ -182,8 +166,11 @@ export function CalculationDemo() {
     <div className="space-y-6">
       <Card>
         <CardHeader>
-          <CardTitle>Live Position Calculation Demo</CardTitle>
-          <CardDescription>Watch how CTS v3 calculates pseudo positions for XRPUSDT in real-time</CardDescription>
+          <CardTitle>Set Topology &amp; DB-Capacity Calculator</CardTitle>
+          <CardDescription>
+            How Independent Sets are enumerated (Indications) and cascade-filtered (Strategies: Base → Main → Real),
+            and what the 250 per-Set DB capacity actually represents
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <div className="flex items-center gap-4 mb-6">
@@ -238,58 +225,62 @@ export function CalculationDemo() {
       {completedSteps.length === calculationSteps.length && (
         <Card>
           <CardHeader>
-            <CardTitle>Key Insights from Calculation</CardTitle>
+            <CardTitle>Key Insights — 250, Sets, and the Pipeline</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="space-y-3">
-                <h4 className="font-semibold text-green-600">Position Limits Explained</h4>
+                <h4 className="font-semibold text-green-600">What 250 Actually Means</h4>
                 <ul className="space-y-2 text-sm">
                   <li className="flex items-start gap-2">
                     <span className="w-2 h-2 bg-blue-500 rounded-full mt-2 flex-shrink-0"></span>
                     <span>
-                      <strong>250 limit per indication config:</strong> Each of the 135 indication configurations can
-                      generate up to 250 pseudo positions independently
+                      <strong>250 = per-Set database length (position-history capacity):</strong> Each Independent Set
+                      stores up to 250 pseudo-positions. It is NOT an indication count limit, NOT a strategy count
+                      limit, NOT a per-cycle throughput target.
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="w-2 h-2 bg-green-500 rounded-full mt-2 flex-shrink-0"></span>
                     <span>
-                      <strong>150 limit per strategy config:</strong> Each of the 700 strategy configurations manages up
-                      to 150 positions separately
+                      <strong>Each Set is independent:</strong> Sets have their own position DB (capacity 250 by
+                      default, tunable 50–750 in Settings). Sets are never pooled into a shared 250-slot cap.
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="w-2 h-2 bg-purple-500 rounded-full mt-2 flex-shrink-0"></span>
                     <span>
-                      <strong>Limits are NOT shared:</strong> Total system can handle 138,750+ positions per symbol
-                      because each config has its own limit
+                      <strong>Strategy pipeline is a cascade, not a sum:</strong> Base → Main → Real are evaluation,
+                      filter, and adjust stages of the SAME logical strategy. The canonical &quot;total strategies&quot;
+                      count is the Real-stage output only — never Base+Main+Real added together.
                     </span>
                   </li>
                 </ul>
               </div>
 
               <div className="space-y-3">
-                <h4 className="font-semibold text-orange-600">System Performance</h4>
+                <h4 className="font-semibold text-orange-600">Counts vs Capacity</h4>
                 <ul className="space-y-2 text-sm">
                   <li className="flex items-start gap-2">
                     <span className="w-2 h-2 bg-orange-500 rounded-full mt-2 flex-shrink-0"></span>
                     <span>
-                      <strong>152,625 DB writes/minute:</strong> For continuous real-time position updates on XRPUSDT
-                      alone
+                      <strong>Indication / strategy counts</strong> live in the progression hash
+                      (<code className="text-xs">indications_count</code>, <code className="text-xs">strategies_count</code>).
+                      These track CYCLE OUTPUT, not DB capacity.
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="w-2 h-2 bg-red-500 rounded-full mt-2 flex-shrink-0"></span>
                     <span>
-                      <strong>1.38M+ positions total:</strong> When trading 10 symbols simultaneously with full
-                      configuration coverage
+                      <strong>Set DB capacity (250)</strong> is a ceiling on position history per Set. Live usage is
+                      usually far lower — old entries are pruned by rearrangement when PF improves.
                     </span>
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="w-2 h-2 bg-gray-500 rounded-full mt-2 flex-shrink-0"></span>
                     <span>
-                      <strong>20% rearrangement:</strong> Positions automatically optimized when 20% become profitable
+                      <strong>20% rearrangement:</strong> Sets automatically repack position history when 20% become
+                      profitable, keeping the most informative entries within the 250 slots.
                     </span>
                   </li>
                 </ul>

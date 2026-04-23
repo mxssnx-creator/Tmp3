@@ -10,6 +10,7 @@ import { IndicationConfigManager, IndicationResult, IndicationConfig } from "@/l
 import { StrategyConfigManager, PseudoPosition, StrategyConfig } from "@/lib/strategy-config-manager"
 import { getRedisClient, initRedis, getSettings } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 export interface ProcessingResult {
   indicationConfigs: number
@@ -295,6 +296,15 @@ export class ConfigSetProcessor {
             intervals_processed: String(totalIntervalsProcessed),
             missing_intervals: String(missingIntervalsLoaded),
           }),
+          // Bump the canonical `prehistoric_cycles_completed` counter and
+          // mirror the processed symbols into the hash via the shared
+          // ProgressionStateManager primitive. Without this call, the
+          // engine-boot prehistoric path wrote per-field stats directly
+          // but left `prehistoric_cycles_completed` at 0 forever — which
+          // broke `/api/system/verify-engine` (reads the field), the
+          // `progression/[id]/stats` route, and every dashboard that
+          // distinguishes "prehistoric done" from "never ran".
+          ProgressionStateManager.incrementPrehistoricCycle(this.connectionId, symbol).catch(() => { /* non-critical */ }),
         ]).catch(() => { /* non-critical */ })
 
         const tSymMs = Date.now() - tSymStart
@@ -368,6 +378,58 @@ export class ConfigSetProcessor {
       errors: result.errors,
       durationMs: result.duration,
     })
+
+    // Flip `prehistoric_phase_active` to "false" and refresh last_update.
+    // Downstream readers (verify-engine API, progression stats API, the
+    // dashboard prehistoric card) use this as the authoritative "historical
+    // calc is done" signal. Without this call the phase stayed `active`
+    // forever even though processing had finished.
+    try {
+      await ProgressionStateManager.completePrehistoricPhase(this.connectionId)
+    } catch (err) {
+      console.warn(
+        `[v0] [ConfigSetProcessor] completePrehistoricPhase failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
+
+    // Persist the authoritative "historical processing last-run" metadata.
+    // Lives at `prehistoric:{connId}` (same hash that carries counters
+    // like `candles_loaded` and `symbols_processed`) so every consumer
+    // that already reads that hash picks up the timestamps for free:
+    //
+    //   - last_run_at          : ISO timestamp of the run END
+    //   - last_run_started_at  : ISO timestamp of the run START
+    //   - processing_duration_ms : total ms spent in processPrehistoricData
+    //   - last_run_errors      : error count from the just-finished run
+    //   - last_run_symbols     : symbols actually processed this run
+    //
+    // The UI prehistoric card / progression dashboard surfaces these
+    // directly. Prior behaviour: no timestamps at all — the "last
+    // processed" column was permanently blank. TTL matches the sibling
+    // keys (24h) so state doesn't linger forever after a disconnect.
+    try {
+      const client = getRedisClient()
+      const finishedAt = new Date()
+      await client.hset(`prehistoric:${this.connectionId}`, {
+        last_run_at: finishedAt.toISOString(),
+        last_run_at_ms: String(finishedAt.getTime()),
+        last_run_started_at: new Date(startTime).toISOString(),
+        last_run_started_at_ms: String(startTime),
+        processing_duration_ms: String(duration),
+        last_run_errors: String(errors),
+        last_run_symbols: String(symbolsProcessed),
+        last_run_candles: String(candlesProcessed),
+        last_run_indication_results: String(totalIndicationResults),
+        last_run_strategy_positions: String(totalStrategyPositions),
+      })
+      await client.expire(`prehistoric:${this.connectionId}`, 86400)
+    } catch (err) {
+      console.warn(
+        `[v0] [ConfigSetProcessor] Failed to persist last-run metadata:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
 
     return result
   }

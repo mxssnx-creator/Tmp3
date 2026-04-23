@@ -168,7 +168,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         setsBaseCount: sanitizeNonNegative(baseSetCount),
         setsMainCount: sanitizeNonNegative(mainSetCount),
         setsRealCount: sanitizeNonNegative(realSetCount),
-        setsTotalCount: sanitizeNonNegative(baseSetCount + mainSetCount + realSetCount),
+        // `setsTotalCount` is the pipeline's final-stage output (Real).
+        // Base → Main → Real is a cascade filter — the SAME logical Sets
+        // survive each stage — so stages must not be summed.
+        setsTotalCount: sanitizeNonNegative(realSetCount),
         redisDbEntries: sanitizeNonNegative(redisDbSize),
         redisDbSizeMb: Number(dbSizeMb.toFixed(2)),
         processingCompleteness: {

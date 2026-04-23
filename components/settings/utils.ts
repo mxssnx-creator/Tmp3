@@ -81,6 +81,10 @@ export const initialSettings: Settings = {
   positionCooldownMs: 100, // 50-3000ms, default 100ms
   maxPositionsPerConfigDirection: 2, // default 2
   maxConcurrentOperations: 100, // 10-250, default 100
+  // P0-4: Spec-mandated per-direction cap on active pseudo positions.
+  // Default 1 (Long/Short each capped at 1 concurrent pseudo position
+  // across ALL Sets). Operator-tunable in Settings → Strategy → Base.
+  maxActiveBasePseudoPositionsPerDirection: 1,
 
   // System Configuration
   autoRestartOnErrors: true,

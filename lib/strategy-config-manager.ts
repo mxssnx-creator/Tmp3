@@ -46,6 +46,24 @@ const MAX_POSITIONS = 250
 export class StrategyConfigManager {
   private connectionId: string
 
+  /**
+   * Exposed cap so callers building their own pipelined writes (e.g.
+   * PseudoPositionManager.closePosition, which composes the LPUSH +
+   * LTRIM into the same close-path pipeline to save a round-trip) can
+   * trim to the same bound without duplicating the constant.
+   */
+  static readonly MAX_POSITIONS = MAX_POSITIONS
+
+  /**
+   * Public serializer for pipeline composition. Identical to the
+   * private `serializeEntry` used by `addPosition` / `addPositions` —
+   * exposed so external pipelines never diverge from the canonical
+   * "|"-delimited entry schema owned by this class.
+   */
+  static serializeSetEntry(p: PseudoPosition): string {
+    return StrategyConfigManager.serializeEntry(p)
+  }
+
   constructor(connectionId: string) {
     this.connectionId = connectionId
   }
@@ -134,53 +152,58 @@ export class StrategyConfigManager {
     console.log(`[v0] [StrategyConfigManager] Deleted config ${configId}`)
   }
 
-  async addPosition(configId: string, position: PseudoPosition): Promise<void> {
-    await initRedis()
-    const client = getRedisClient()
-
-    const key = this.getPositionsKey(configId)
-    const entry = [
-      position.entry_time,
-      position.symbol,
-      position.entry_price.toString(),
-      position.take_profit.toString(),
-      position.stop_loss.toString(),
-      position.status,
-      position.result?.toString() || "0",
-      position.exit_time || "",
-      position.exit_price?.toString() || "0",
+  /**
+   * Serialize one `PseudoPosition` into the canonical "|"-delimited
+   * entry string. Kept as a static so every writer (live writeback,
+   * prehistoric fill) and every reader (`parseEntry`) shares the exact
+   * same schema with zero drift.
+   */
+  private static serializeEntry(p: PseudoPosition): string {
+    return [
+      p.entry_time,
+      p.symbol,
+      p.entry_price.toString(),
+      p.take_profit.toString(),
+      p.stop_loss.toString(),
+      p.status,
+      p.result?.toString() || "0",
+      p.exit_time || "",
+      p.exit_price?.toString() || "0",
     ].join("|")
-
-    await client.lpush(key, entry)
-    await client.ltrim(key, 0, MAX_POSITIONS - 1)
   }
 
   /**
-   * Batch variant — pushes many positions for a config with a single lpush
-   * and a single ltrim. Used by the prehistoric processor to cut per-position
-   * Redis round-trips by a factor of N.
+   * Append one position to the config's Set. LPUSH + LTRIM are issued
+   * as a single Redis pipeline (one RTT) instead of two serial awaits —
+   * the tradeoff of going from 2 RTTs to 1 is material on the realtime
+   * close path where this is called on every TP/SL hit.
+   */
+  async addPosition(configId: string, position: PseudoPosition): Promise<void> {
+    await initRedis()
+    const client = getRedisClient()
+    const key = this.getPositionsKey(configId)
+    const entry = StrategyConfigManager.serializeEntry(position)
+    const pipeline = client.multi()
+    pipeline.lpush(key, entry)
+    pipeline.ltrim(key, 0, MAX_POSITIONS - 1)
+    await pipeline.exec()
+  }
+
+  /**
+   * Batch variant — pushes many positions for a config with a single
+   * pipelined LPUSH + LTRIM. Used by the prehistoric processor to cut
+   * per-position Redis round-trips by a factor of N.
    */
   async addPositions(configId: string, positions: PseudoPosition[]): Promise<void> {
     if (!positions || positions.length === 0) return
     await initRedis()
     const client = getRedisClient()
-
     const key = this.getPositionsKey(configId)
-    const entries = positions.map((p) =>
-      [
-        p.entry_time,
-        p.symbol,
-        p.entry_price.toString(),
-        p.take_profit.toString(),
-        p.stop_loss.toString(),
-        p.status,
-        p.result?.toString() || "0",
-        p.exit_time || "",
-        p.exit_price?.toString() || "0",
-      ].join("|"),
-    )
-    await client.lpush(key, ...entries)
-    await client.ltrim(key, 0, MAX_POSITIONS - 1)
+    const entries = positions.map((p) => StrategyConfigManager.serializeEntry(p))
+    const pipeline = client.multi()
+    pipeline.lpush(key, ...entries)
+    pipeline.ltrim(key, 0, MAX_POSITIONS - 1)
+    await pipeline.exec()
   }
 
   async getPositions(configId: string, limit = 50): Promise<PseudoPosition[]> {
@@ -190,20 +213,86 @@ export class StrategyConfigManager {
     const key = this.getPositionsKey(configId)
     const rawPositions = await client.lrange(key, 0, limit - 1)
 
-    return rawPositions.map((entry: string) => {
-      const parts = entry.split("|")
-      return {
-        entry_time: parts[0],
-        symbol: parts[1],
-        entry_price: parseFloat(parts[2]),
-        take_profit: parseFloat(parts[3]),
-        stop_loss: parseFloat(parts[4]),
-        status: parts[5] as "open" | "closed",
-        result: parseFloat(parts[6]),
-        exit_time: parts[7] || undefined,
-        exit_price: parseFloat(parts[8]) || undefined,
-      }
-    })
+    return rawPositions.map((entry: string) => StrategyConfigManager.parseEntry(entry)).filter(
+      (p): p is PseudoPosition => p !== null,
+    )
+  }
+
+  /**
+   * Return the most recently appended CLOSED position for a given
+   * config, or `null` if the set has no closed rows. This is the single
+   * canonical "prev-position retrieval" primitive — both the historic
+   * fill path and the realtime tick use it, so we never drift on the
+   * entry schema.
+   *
+   * ── P2-2: closed-only enforcement ─────────────────────────────────
+   * The strategy config positions list mixes open + closed entries
+   * (the prehistoric fill path appends every pseudo trade it creates,
+   * including ones that were still open at snapshot time). The Main-
+   * stage position-factor coordination must calibrate against CLOSED
+   * outcomes only (spec: *"Calculations of Sets on Main of Pos Factors
+   * Coordinations have to Base on Closed Pseudo Positions Only, dont
+   * include Open ones"*), so this reader now scans up to 20 HEAD rows
+   * for the first `status==="closed"` entry. Fast path stays O(1)
+   * when HEAD is already closed (the common case because new rows are
+   * appended open-then-updated-to-closed in the same tick); worst
+   * case is a bounded 20-row scan to skip a cluster of still-open
+   * entries.
+   */
+  async getLatestPosition(configId: string): Promise<PseudoPosition | null> {
+    await initRedis()
+    const client = getRedisClient()
+    const key = this.getPositionsKey(configId)
+    // Scan a small HEAD window so the common "HEAD is closed" fast path
+    // stays O(1) while still being able to skip a burst of still-open
+    // rows at the top of the list.
+    const SCAN_WINDOW = 20
+    const rows = await client.lrange(key, 0, SCAN_WINDOW - 1)
+    if (!rows || rows.length === 0) return null
+    for (const row of rows) {
+      const parsed = StrategyConfigManager.parseEntry(String(row))
+      if (parsed && parsed.status === "closed") return parsed
+    }
+    // No closed row in the head window — treat as "no prior outcome"
+    // rather than returning an open row that would pollute downstream
+    // calibration.
+    return null
+  }
+
+  /**
+   * Parse one "|"-delimited position entry back into a `PseudoPosition`.
+   * Symmetric to the serialization used by `addPosition`/`addPositions`,
+   * so every reader and writer in the codebase shares the same schema.
+   */
+  static parseEntry(entry: string): PseudoPosition | null {
+    if (!entry) return null
+    const parts = entry.split("|")
+    if (parts.length < 6) return null
+    return {
+      entry_time:  parts[0] || "",
+      symbol:      parts[1] || "",
+      entry_price: parseFloat(parts[2] || "0") || 0,
+      take_profit: parseFloat(parts[3] || "0") || 0,
+      stop_loss:   parseFloat(parts[4] || "0") || 0,
+      status:      (parts[5] as "open" | "closed") || "closed",
+      result:      parseFloat(parts[6] || "0") || 0,
+      exit_time:   parts[7] || undefined,
+      exit_price:  parts[8] ? (parseFloat(parts[8]) || undefined) : undefined,
+    }
+  }
+
+  /**
+   * Extract the canonical configId embedded in a pseudo-position's
+   * composite `config_set_key`. The trailing segment is always the
+   * strategy-config id — see `config-set-processor` for how the key is
+   * assembled. Returns an empty string when absent so callers can
+   * short-circuit cheaply.
+   */
+  static extractConfigId(configSetKey: string | undefined | null): string {
+    if (!configSetKey) return ""
+    const raw = String(configSetKey)
+    const idx = raw.lastIndexOf(":")
+    return idx >= 0 ? raw.slice(idx + 1) : raw
   }
 
   async getPositionCount(configId: string): Promise<number> {

@@ -112,30 +112,38 @@ export class StrategyCoordinator {
   private readonly PF_REAL_MIN = 1.4    // Main sets must have avgPF >= 1.4 to enter REAL
   private readonly PF_LIVE_MIN = 1.4    // Real sets must have avgPF >= 1.4 to enter LIVE
 
+  // ── Filter axes (P0-2) ──────────────────────────────────────────────
+  // Spec: *"filtering by Profitfactor Minimum, DrawdownTime Maximum"*.
+  // The canonical Main/Real/Live filter axes are PF-min + DDT-max ONLY.
+  // `confidence` is retained here as advisory metadata (it's shown in
+  // diagnostic logs and used by the Live stage's trailing-variant
+  // selector `bestEntry.confidence >= 0.85`), but it is NOT a filter
+  // axis at any stage. The filter code below reads `minProfitFactor`
+  // and `maxDrawdownTime` only.
   private readonly METRICS: Record<string, EvaluationMetrics> = {
     base: {
       maxDrawdownTime: 999999,
       minProfitFactor: 1.0,
-      confidence: 0.3,
+      confidence: 0.3,  // advisory only
       description: "One Set per (indication_type × direction) — all qualifying",
     },
     main: {
       maxDrawdownTime: 1440,  // 24 hours
       minProfitFactor: 1.2,   // Base sets with avgPF >= 1.2 → promoted to MAIN
-      confidence: 0.5,
-      description: "Sets promoted from BASE with profitFactor >= 1.2",
+      confidence: 0.5,        // advisory only
+      description: "Sets promoted from BASE with profitFactor >= 1.2 + DDT <= 24h",
     },
     real: {
       maxDrawdownTime: 960,   // 16 hours
       minProfitFactor: 1.4,   // Main sets with avgPF >= 1.4 → promoted to REAL
-      confidence: 0.65,
-      description: "Sets promoted from MAIN with profitFactor >= 1.4",
+      confidence: 0.65,       // advisory only
+      description: "Sets promoted from MAIN with profitFactor >= 1.4 + DDT <= 16h",
     },
     live: {
       maxDrawdownTime: 120,   // 2 hours — realistic for current strategy output
       minProfitFactor: 1.4,   // Match REAL stage minimum so Sets can flow through
-      confidence: 0.65,       // Match REAL stage confidence floor
-      description: "Best 500 Sets ready for real trading (PF≥1.4, conf≥0.65)",
+      confidence: 0.65,       // advisory only
+      description: "Best 500 Sets from REAL (PF >= 1.4 + DDT <= 2h) ready for live trading",
     },
   }
 
@@ -433,9 +441,13 @@ export class StrategyCoordinator {
     const activeVariants = this.selectActiveVariants(ctx)
 
     for (const baseSet of baseSets) {
-      // Base-level validation — rejected Sets produce NO Main variants
+      // Base-level validation — P0-2: PF + DDT are the ONLY filter axes.
+      // Confidence is advisory metadata (used by Live stage's trailing-
+      // variant selector) and is NOT a gate here. A high-PF / low-DDT
+      // base Set with low confidence STILL promotes to Main for
+      // downstream variant expansion.
       if (baseSet.avgProfitFactor < metrics.minProfitFactor) continue
-      if (baseSet.avgConfidence  < metrics.confidence)      continue
+      if (baseSet.avgDrawdownTime > metrics.maxDrawdownTime) continue
 
       for (const profile of activeVariants) {
         const fingerprint = this.variantFingerprint(baseSet, profile.name, ctx)
@@ -713,17 +725,18 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.real
 
+    // P0-2: Real filter axes are PF-min + DDT-max ONLY. Confidence is
+    // advisory metadata and is not part of the filter predicate.
     const realSets = mainSets.filter(
       (s) =>
         s.avgProfitFactor >= metrics.minProfitFactor &&
-        s.avgDrawdownTime <= metrics.maxDrawdownTime &&
-        s.avgConfidence >= metrics.confidence
+        s.avgDrawdownTime <= metrics.maxDrawdownTime,
     )
 
     // Debug: show why sets failed REAL filter
     if (mainSets.length > 0 && realSets.length === 0) {
       const sample = mainSets[0]
-      console.log(`[v0] [StrategyFlow] ${symbol} REAL filter rejected all: sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}} threshold={minPF=${metrics.minProfitFactor}, conf=${metrics.confidence}, maxDDT=${metrics.maxDrawdownTime}}`)
+      console.log(`[v0] [StrategyFlow] ${symbol} REAL filter rejected all: sample={pf=${sample.avgProfitFactor.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}, conf=${sample.avgConfidence.toFixed(2)} (advisory)} threshold={minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime}}`)
     }
 
     // Persist REAL sets
@@ -774,11 +787,80 @@ export class StrategyCoordinator {
       ]
       if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", mainSets.length))
       if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realSets.length))
+
+      // ── P1-1: Real-stage per-variant aggregation ────────────────────
+      // Same shape as Main's `variantAgg` but computed over the Real
+      // output (post-PF/DDT filter). Lets the stats API answer "how
+      // much of Real is Default vs Adjust{Block, DCA} vs Trailing?"
+      // without re-scanning every set on read.
+      type RealVariantAgg = {
+        sumPF: number; sumDDT: number; entries: number; setsContaining: number; passedSets: number
+      }
+      const realVariantAgg: Record<string, RealVariantAgg> = {
+        default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+      }
+      for (const set of realSets) {
+        const setVariant = (set.variant as keyof typeof realVariantAgg) ?? "default"
+        realVariantAgg[setVariant].setsContaining += 1
+        realVariantAgg[setVariant].passedSets     += 1
+        for (const entry of set.entries) {
+          realVariantAgg[setVariant].entries += 1
+          realVariantAgg[setVariant].sumPF   += Number(entry.profitFactor || 0)
+          realVariantAgg[setVariant].sumDDT  += Number(entry.drawdownTime || 0)
+        }
+      }
+      for (const variant of ["default", "trailing", "block", "dca"] as const) {
+        const agg = realVariantAgg[variant]
+        if (agg.entries === 0) continue
+        const vKey = `strategy_variant_real:${this.connectionId}:${variant}`
+        writes.push(
+          client.hincrby(vKey, "entries_count",  agg.entries),
+          client.hincrby(vKey, "created_sets",   agg.setsContaining),
+          client.hincrby(vKey, "passed_sets",    agg.passedSets),
+          client.hincrby(vKey, "sum_pf_x1000",   Math.round(agg.sumPF * 1000)),
+          client.hincrby(vKey, "sum_ddt_x10",    Math.round(agg.sumDDT * 10)),
+          client.hset(vKey, { updated_at: new Date().toISOString() }),
+          client.expire(vKey, 7 * 24 * 60 * 60),
+        )
+      }
       await Promise.all(writes)
+
+      // Second pass — derive averages from freshly-incremented counters
+      // so the stats API can read them without recomputing.
+      try {
+        const recompute: Promise<any>[] = []
+        for (const variant of ["default", "trailing", "block", "dca"] as const) {
+          if (realVariantAgg[variant].entries === 0) continue
+          const vKey = `strategy_variant_real:${this.connectionId}:${variant}`
+          recompute.push(
+            (async () => {
+              const h = ((await client.hgetall(vKey).catch(() => null)) || {}) as Record<string, string>
+              const entriesCount = Number(h.entries_count  || "0")
+              const createdSets  = Number(h.created_sets   || "0")
+              const sumPfX1000   = Number(h.sum_pf_x1000   || "0")
+              const sumDdtX10    = Number(h.sum_ddt_x10    || "0")
+              const avgPF  = entriesCount > 0 ? (sumPfX1000  / 1000) / entriesCount : 0
+              const avgDDT = entriesCount > 0 ? (sumDdtX10   / 10)   / entriesCount : 0
+              const avgPosPerSet = createdSets > 0 ? entriesCount / createdSets : 0
+              const passRate = createdSets > 0 ? (Number(h.passed_sets || "0") / createdSets) : 0
+              await client.hset(vKey, {
+                avg_profit_factor: avgPF.toFixed(4),
+                avg_drawdown_time: avgDDT.toFixed(2),
+                avg_pos_per_set:   avgPosPerSet.toFixed(2),
+                pass_rate:         passRate.toFixed(4),
+              })
+            })(),
+          )
+        }
+        await Promise.all(recompute)
+      } catch { /* non-critical */ }
     } catch { /* non-critical */ }
 
     console.log(
-      `[v0] [StrategyFlow] ${symbol} REAL: ${realSets.length}/${mainSets.length} Sets promoted (minPF=${metrics.minProfitFactor}, conf=${metrics.confidence})`
+      `[v0] [StrategyFlow] ${symbol} REAL: ${realSets.length}/${mainSets.length} Sets promoted (minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime})`
     )
 
     return {
@@ -796,7 +878,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ────────────────────��──────��──────────────────────���────────
+  // ─── STAGE 4: LIVE ─────────��──────────��──────��──────────────────────���────────
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -818,21 +900,21 @@ export class StrategyCoordinator {
     const metrics = this.METRICS.live
     const maxLive = this.config.maxLiveSets || 500
 
-    // Filter by LIVE thresholds then rank by avgProfitFactor, take top N
+    // P0-2: Live filter axes are PF-min + DDT-max ONLY (then rank by
+    // avgProfitFactor and take top N). Confidence is advisory metadata.
     const qualifying = realSets
       .filter(
         (s) =>
           s.avgProfitFactor >= metrics.minProfitFactor &&
-          s.avgDrawdownTime <= metrics.maxDrawdownTime &&
-          s.avgConfidence >= metrics.confidence
+          s.avgDrawdownTime <= metrics.maxDrawdownTime,
       )
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
 
-    console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor}, minConf=${metrics.confidence}, maxDDT=${metrics.maxDrawdownTime})`)
+    console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime})`)
     if (realSets.length > 0 && qualifying.length === 0) {
       const sample = realSets[0]
-      console.log(`[v0] [StrategyFlow] ${symbol} LIVE filter rejected all real sets: sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}}`)
+      console.log(`[v0] [StrategyFlow] ${symbol} LIVE filter rejected all real sets: sample={pf=${sample.avgProfitFactor.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}, conf=${sample.avgConfidence.toFixed(2)} (advisory)}`)
     }
 
     // Persist LIVE sets
@@ -859,6 +941,50 @@ export class StrategyCoordinator {
       const liveAvgDDT = qualifying.length > 0 ? qualifying.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / qualifying.length : 0
       const passRatioLive = realSets.length > 0 ? qualifying.length / realSets.length : 0
 
+      // ── P1-1: Live-stage per-variant aggregation ──────────────────────
+      // Same bucket shape as Main/Real. Drives the stats API's breakdown
+      // of which variant family (Default / Trailing / Block / DCA) is
+      // contributing Sets to the live mirror. Kept as a single Promise.all
+      // so we still land in one network hop.
+      type LiveVariantAgg = {
+        sumPF: number; sumDDT: number; entries: number; setsContaining: number
+      }
+      const liveVariantAgg: Record<string, LiveVariantAgg> = {
+        default:  { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+      }
+      for (const set of qualifying) {
+        const variant = (set.variant as keyof typeof liveVariantAgg) ?? "default"
+        liveVariantAgg[variant].setsContaining += 1
+        for (const entry of set.entries) {
+          liveVariantAgg[variant].entries += 1
+          liveVariantAgg[variant].sumPF   += Number(entry.profitFactor || 0)
+          liveVariantAgg[variant].sumDDT  += Number(entry.drawdownTime || 0)
+        }
+      }
+
+      const liveVariantWrites: Promise<any>[] = []
+      for (const variant of ["default", "trailing", "block", "dca"] as const) {
+        const agg = liveVariantAgg[variant]
+        if (agg.entries === 0) continue
+        const vKey = `strategy_variant_live:${this.connectionId}:${variant}`
+        const avgPF  = agg.sumPF  / agg.entries
+        const avgDDT = agg.sumDDT / agg.entries
+        liveVariantWrites.push(
+          client.hset(vKey, {
+            created_sets:      String(agg.setsContaining),
+            entries_count:     String(agg.entries),
+            avg_profit_factor: avgPF.toFixed(4),
+            avg_drawdown_time: avgDDT.toFixed(2),
+            avg_pos_per_set:   (agg.entries / agg.setsContaining).toFixed(2),
+            updated_at:        String(Date.now()),
+          }),
+          client.expire(vKey, 7 * 24 * 60 * 60),
+        )
+      }
+
       await Promise.all([
         client.hset(redisKey, "strategies_live_total", String(qualifying.length)),
         client.expire(redisKey, 7 * 24 * 60 * 60),
@@ -874,6 +1000,7 @@ export class StrategyCoordinator {
         client.expire(liveDetailKey, 86400),
         // `set` with EX in a single command avoids the separate expire round-trip.
         client.set(liveCountKey, String(qualifying.length), { EX: 86400 } as any),
+        ...liveVariantWrites,
       ])
     } catch { /* non-critical */ }
 
@@ -1200,9 +1327,33 @@ export class StrategyCoordinator {
 
         for (const h of hashes) {
           if (!h) continue
-          const closedAt = Number(h.closed_at || h.closedAt || h.opened_at || 0)
-          if (!closedAt || closedAt < cutoff) continue
-          const pnl = Number(h.pnl ?? h.realized_pnl ?? h.profit ?? 0)
+          // ── P2-1: Strict closed-only gate ──────────────────────────────
+          // Main variant gating (prevLosses, lastWins, lastLosses,
+          // prevPosCount, lastPosCount) MUST be computed from closed
+          // pseudo positions ONLY. Previously this block used the
+          // `opened_at` value as a fallback for the close timestamp and
+          // read `h.pnl` blindly — both of which made floating open
+          // positions (their mark-to-market PnL) leak into the stats
+          // that drive fingerprint buckets and `selectActiveVariants`
+          // gates. Now we enforce three explicit conditions:
+          //   (1) `status === "closed"` — hard gate. Any other value
+          //       (open, pending, rejected, error, partial) is ignored.
+          //   (2) a valid numeric `closed_at` / `closedAt` within the
+          //       lookback window. `opened_at` is NO LONGER a fallback.
+          //   (3) a realized-pnl field (`realized_pnl` or `pnl` written
+          //       AT close) — not the live unrealised value.
+          const status = String(h.status || "").toLowerCase()
+          if (status !== "closed") continue
+          const closedAtRaw = h.closed_at ?? h.closedAt ?? 0
+          const closedAt = Number(closedAtRaw)
+          if (!Number.isFinite(closedAt) || closedAt <= 0) continue
+          if (closedAt < cutoff) continue
+          // Prefer `realized_pnl`; fall back to `pnl` only when the row
+          // is marked closed (the closePosition pipeline writes `pnl`
+          // to the realized value at close time).
+          const pnlRaw = h.realized_pnl ?? h.pnl ?? h.profit ?? 0
+          const pnl = Number(pnlRaw)
+          if (!Number.isFinite(pnl)) continue
           prevPosCount++
           if (pnl < 0) prevLosses++
           lastN.push({ closedAt, pnl })
@@ -1243,6 +1394,24 @@ export class StrategyCoordinator {
    * related Set for that variant this cycle (keeps work proportional to
    * context). The `default` variant is always on — it mirrors the original
    * one-Set-per-base behaviour and is what Real/Live have always consumed.
+   *
+   * ── P2-3: Closed-only contract for statistics-driven gates ────────
+   * The `ctx` input here comes from `getPositionContext()`, which (as
+   * of P2-1) enforces a strict `status==="closed"` filter on every
+   * statistical field it builds:
+   *   - prevPosCount, prevLosses, lastPosCount, lastWins, lastLosses
+   *     → closed pseudo positions within a 24h lookback window.
+   * Intentional exceptions (fields based on OPEN state by design, per
+   * spec) — gates on these fields are NOT closed-only:
+   *   - continuousCount  → # currently-open pseudo positions
+   *                        (spec: "Continuous Positions" are active)
+   *   - perSymbolOpen    → per-symbol open count (feeds `block` gate
+   *                        which explicitly needs an open position to
+   *                        continue into)
+   * Every other axis used below is closed-only. This invariant keeps
+   * Main-stage factor coordination free of floating mark-to-market
+   * pollution while allowing the few gates that MUST reference live
+   * open state to do so cleanly.
    */
   private selectActiveVariants(ctx: PositionContext): Array<ReturnType<StrategyCoordinator["variantProfiles"]>[number]> {
     return this.variantProfiles().filter((p) => p.gate(ctx))
@@ -1308,20 +1477,49 @@ export class StrategyCoordinator {
 
   /**
    * Deterministic fingerprint of {base Set × variant × position context}.
-   * Drives the "IF NOT ALREADY CREATED" dedup check. Position context is
-   * bucketised (continuousCount bucket, lastWins bucket, prevLosses bucket)
-   * so small count changes don't invalidate the cache on every tick.
+   * Drives the "IF NOT ALREADY CREATED" dedup check.
+   *
+   * ── Bucket ranges (P0-3, spec-aligned) ─────────────────────────────
+   * Spec ranges:
+   *   - Prev Positions         1-12   (13 buckets 0-12)
+   *   - Last Positions W/L     1-4    (5 buckets each 0-4)
+   *   - Continuous Positions   1-10   (11 buckets 0-10)
+   *
+   * The previous implementation under-bucketed (Math.min(5,...) for all
+   * three context dimensions), which collapsed distinct spec-level
+   * contexts into the same cache entry and silently reused stale Sets.
+   * Now each dimension is clamped to its spec maximum so every
+   * semantically distinct context produces a distinct fingerprint.
+   *
+   * Coordinated-vars vs. materialised-Sets: we chose the coordinated
+   * approach — each qualifying base Set expands into at most
+   * 13×5×5×11 = 3,575 theoretical fingerprints, but in practice the
+   * operator only visits O(20-80) of them per symbol per run. The
+   * alternative (materialising Sets for every combo) would blow the
+   * 250-entry cap and thrash Redis with no accuracy win.
+   *
+   * ── P2-3: Closed-only contract for statistics-driven buckets ──────
+   * `lastWins`, `lastLosses`, `prevPosCount`, `prevLosses` below are
+   * closed-only by construction (see `getPositionContext` P2-1 gate).
+   * `continuousCount` is intentionally live — Continuous Positions
+   * denote currently-open pseudo positions per spec.
    */
   private variantFingerprint(
     baseSet: StrategySet,
     variant: "default" | "trailing" | "block" | "dca",
     ctx: PositionContext,
   ): string {
-    // Bucket helpers — compress near-equal inputs so the cache key is stable
-    // across minor context jitter (e.g. 3→4 open positions keeps same bucket).
-    const bPF    = Math.round(baseSet.avgProfitFactor * 10) / 10
-    const bEC    = baseSet.entryCount
-    const bCtx   = `${Math.min(5, ctx.continuousCount)}/${Math.min(5, ctx.lastWins)}/${Math.min(5, ctx.lastLosses)}/${Math.min(10, ctx.prevLosses)}`
+    const bPF = Math.round(baseSet.avgProfitFactor * 10) / 10
+    const bEC = baseSet.entryCount
+    // Clamp each context dimension to its spec maximum.
+    // cont is live-open by spec; the other four are closed-only via
+    // the P2-1 gate in getPositionContext.
+    const cont = Math.min(10, Math.max(0, ctx.continuousCount))
+    const lW   = Math.min(4,  Math.max(0, ctx.lastWins))
+    const lL   = Math.min(4,  Math.max(0, ctx.lastLosses))
+    const pP   = Math.min(12, Math.max(0, ctx.prevPosCount))
+    const pL   = Math.min(12, Math.max(0, ctx.prevLosses))
+    const bCtx = `c${cont}/lw${lW}/ll${lL}/pp${pP}/pl${pL}`
     return `${baseSet.setKey}#${variant}#pf=${bPF}#ec=${bEC}#ctx=${bCtx}`
   }
 

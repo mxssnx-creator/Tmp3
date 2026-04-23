@@ -13,6 +13,7 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { QuickstartComprehensiveLogDialog } from "./quickstart-comprehensive-log-dialog"
 import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
+import { EngineProgressionTestButton } from "./engine-progression-test-dialog"
 import { useExchange } from "@/lib/exchange-context"
 
 // ─── types ────────────────────────────────────────────────────────────────────
@@ -43,6 +44,59 @@ interface VariantDetail {
   avgProfitFactor: number
   avgDrawdownTime: number
   passRate: number
+}
+
+// Indication configuration Set-count snapshot — how many DISTINCT Sets the
+// engine could enumerate per Main indication type, given the current settings.
+// This is a *static* enumeration (possible configurations), not live runtime
+// counts. Renders as a row per type at the top of the expanded stats area.
+interface IndicationConfigCounts {
+  totalPossibleSets: number
+  perSetDbCapacity:  number   // 250 default — per-Set position history length
+  maxStorablePositions: number
+  settings: {
+    indicationRangeMin:        number
+    indicationRangeMax:        number
+    indicationRangeStep:       number
+    takeProfitRangeDivisor:    number
+    validRangeCount:           number
+    optimalBasePositionsLimit: number
+  }
+  types: Array<{
+    type: "direction" | "move" | "active" | "optimal" | "auto"
+    label: string
+    possibleSets: number
+    formula: string
+    params: Record<string, string | number>
+    description: string
+  }>
+}
+
+// Live exchange footer — aggregates REAL-exchange positions & account balance
+// across every enabled connection. Not the same as pseudo-position counts.
+interface ExchangeLiveSummary {
+  connections: Array<{
+    connectionId: string
+    name: string
+    exchange: string
+    openPositions: number
+    longPositions: number
+    shortPositions: number
+    unrealizedPnl: number
+    balance: { total: number; available: number; equity: number; currency: string }
+    positions: Array<{ symbol: string; side: string; qty: number; entry: number; mark: number; pnl: number }>
+  }>
+  totals: {
+    openPositions: number
+    longPositions: number
+    shortPositions: number
+    unrealizedPnl: number
+    totalBalance:  number
+    availableBalance: number
+    equity:        number
+    currency:      string
+  }
+  updatedAt: number
 }
 
 // Main-stage coordination snapshot — surfaces the per-cycle position context
@@ -123,6 +177,15 @@ interface LiveStats {
   liveOrdersPlaced: number
   liveOrdersFilled: number
   liveWinRate: number
+  // ── Open positions through the mirroring pipeline ───────────────
+  // Pseudo / Real / Live are NOT additive pools — they're the same
+  // signal mirrored through evaluation stages into a final exchange
+  // order. Only the Live stage carries real USD exposure; Pseudo and
+  // Real report counts only (pipeline health). No cross-stage total.
+  pseudoOpen: number
+  pseudoRunningSets: number
+  realOpen: number
+  liveVolumeUsd: number
   // windows
   indLast5m: number
   indLast60m: number
@@ -168,6 +231,7 @@ const EMPTY_STATS: LiveStats = {
   },
   livePositionsOpen: 0, livePositionsCreated: 0, livePositionsClosed: 0,
   liveOrdersPlaced: 0, liveOrdersFilled: 0, liveWinRate: 0,
+  pseudoOpen: 0, pseudoRunningSets: 0, realOpen: 0, liveVolumeUsd: 0,
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
 }
 
@@ -175,6 +239,16 @@ function fmt(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}K`
   return String(n)
+}
+
+// USD-formatter for accumulated-volume displays. K/M-scaled to fit the
+// same tight layouts as `fmt` but prefixed with $ for readability.
+// Values < $1 show `$0` so idle connections stay visually quiet.
+function fmtUsd(n: number): string {
+  if (!Number.isFinite(n) || n < 1) return "$0"
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1_000)     return `$${(n / 1_000).toFixed(1)}K`
+  return `$${n.toFixed(0)}`
 }
 
 // ─── sub-components ───────────────────────────────────────────────────────────
@@ -195,7 +269,7 @@ function MiniStat({ label, value, sub }: { label: string; value: string; sub?: s
   )
 }
 
-// ─── main component ───────────────────────────────────────────────────────────
+// ─── main component ─�����─────────────────────────────────────────────────────────
 
 export function QuickstartSection() {
   const { selectedConnectionId, selectedExchange } = useExchange()
@@ -223,8 +297,20 @@ export function QuickstartSection() {
   // component default) — used as the target for the Live toggle.
   const [activeConnectionId, setActiveConnectionId] = useState<string>(connectionId)
 
+  // ── Indication configuration Set-count snapshot (static enumeration) ─
+  // Pulled from /api/indications/config-counts. Refreshed every 60s since it
+  // is derived from settings — not runtime state — so it rarely changes.
+  const [configCounts, setConfigCounts] = useState<IndicationConfigCounts | null>(null)
+
+  // ── Live exchange summary (positions + balance) ──────────────────────
+  // Pulled from /api/exchange/live-summary. Polled every 10s whenever the
+  // expanded panel is open so the footer feels live without hammering Redis.
+  const [liveSummary, setLiveSummary] = useState<ExchangeLiveSummary | null>(null)
+
   const logsEndRef = useRef<HTMLDivElement>(null)
   const pollRef    = useRef<NodeJS.Timeout>()
+  const configPollRef = useRef<NodeJS.Timeout>()
+  const livePollRef   = useRef<NodeJS.Timeout>()
 
   // ── fetch live stats ──────────────────────────────────────────────────────
   const fetchStats = useCallback(async (silent = false) => {
@@ -366,6 +452,14 @@ export function QuickstartSection() {
         liveOrdersPlaced:      s.liveExecution?.ordersPlaced     || 0,
         liveOrdersFilled:      s.liveExecution?.ordersFilled     || 0,
         liveWinRate:           s.liveExecution?.winRate          || 0,
+        // ── Mirroring-pipeline open positions ─────────────────────
+        // Counts-only for pseudo/real; volume exposed only for live
+        // (the real exchange). See /stats openPositions block for the
+        // authoritative semantics.
+        pseudoOpen:            Number(s.openPositions?.pseudo?.open)         || 0,
+        pseudoRunningSets:     Number(s.openPositions?.pseudo?.runningSets)  || 0,
+        realOpen:              Number(s.openPositions?.real?.open)           || 0,
+        liveVolumeUsd:         Number(s.openPositions?.live?.volumeUsd)      || 0,
         indLast5m:             s.windows?.indications?.last5m     || 0,
         indLast60m:            s.windows?.indications?.last60m    || 0,
         phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
@@ -440,11 +534,43 @@ export function QuickstartSection() {
     return () => clearInterval(pollRef.current)
   }, [expanded, isRunning, fetchStats])
 
+  // ── Poll indication config-counts (settings-derived, slow cadence) ────────
+  // 60s when expanded, 5min otherwise. This endpoint only changes when the
+  // operator edits connection settings, so aggressive polling would be waste.
+  useEffect(() => {
+    clearInterval(configPollRef.current)
+    const fetchConfig = () =>
+      fetch("/api/indications/config-counts", { cache: "no-store" })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d: IndicationConfigCounts | null) => { if (d) setConfigCounts(d) })
+        .catch(() => { /* non-critical */ })
+    fetchConfig()
+    const interval = expanded ? 60_000 : 300_000
+    configPollRef.current = setInterval(fetchConfig, interval)
+    return () => clearInterval(configPollRef.current)
+  }, [expanded])
+
+  // ── Poll live exchange summary (positions + balance) ──────────────────────
+  // 10s when expanded, 30s otherwise. Kept lightweight — this endpoint just
+  // reads already-materialised Redis hashes, so frequent polling is fine.
+  useEffect(() => {
+    clearInterval(livePollRef.current)
+    const fetchLive = () =>
+      fetch("/api/exchange/live-summary", { cache: "no-store" })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d: ExchangeLiveSummary | null) => { if (d) setLiveSummary(d) })
+        .catch(() => { /* non-critical */ })
+    fetchLive()
+    const interval = expanded ? 10_000 : 30_000
+    livePollRef.current = setInterval(fetchLive, interval)
+    return () => clearInterval(livePollRef.current)
+  }, [expanded])
+
   // ── log helper ─────────────────────────────────────────────────────────────
   const addLog = (msg: string, type: LogEntry["type"] = "info") =>
     setLogs(prev => [...prev, { id: Math.random().toString(), message: msg, type, timestamp: new Date() }])
 
-  // ── start / stop ───────────────────────────────────────────────────────────
+  // ── start / stop ─────────────────────────────────────────��─────────────────
   const handleStart = async () => {
     if (starting || isRunning) return
     setStarting(true)
@@ -744,6 +870,15 @@ export function QuickstartSection() {
           {/* dialog launchers */}
           <QuickstartOverviewDialog />
           <QuickstartComprehensiveLogDialog />
+          {/*
+           * Engine progression test — one-click runner for the 7-phase E2E
+           * test (health → preflight → enable(1 symbol) → progression poll
+           * → verify-engine → live-positions → disable). Streams per-phase
+           * PASS/WARN/FAIL into a detailed dialog so operators can spot
+           * regressions without dropping to a terminal. Same button is
+           * also mounted in the dashboard PageHeader for top-level access.
+           */}
+          <EngineProgressionTestButton />
 
           {/* legacy event buttons */}
           {[
@@ -879,6 +1014,67 @@ export function QuickstartSection() {
           )}
         </div>
 
+        {/* ── Mirroring pipeline — counts only, plus Live USD exposure ─
+            Same signal flows Base → Main → Real → Exchange. Pseudo
+            and Real report pipeline-health counts; volume belongs
+            exclusively to the Live exchange (real money). No cross-
+            stage "total" — it would double-count mirrored signals. */}
+        {(stats.pseudoOpen > 0 ||
+          stats.realOpen > 0 ||
+          stats.livePositionsOpen > 0 ||
+          stats.liveVolumeUsd > 0) && (
+          <div className="rounded-md border bg-muted/20 p-2 space-y-1">
+            <div className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground/80">
+              Mirroring Pipeline &mdash; Open Positions
+            </div>
+            <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4 text-[10px]">
+              <div
+                className="flex flex-col gap-0.5"
+                title={
+                  `${fmt(stats.pseudoOpen)} pseudo positions currently under continuous strategy evaluation.\n` +
+                  `Spread across ${fmt(stats.pseudoRunningSets)} running Set${stats.pseudoRunningSets === 1 ? "" : "s"}.\n` +
+                  `No real USD exposure at this stage.`
+                }
+              >
+                <span className="text-muted-foreground">Pseudo (eval)</span>
+                <span className="font-bold text-green-700 dark:text-green-400 tabular-nums">
+                  {fmt(stats.pseudoOpen)}
+                  <span className="ml-1 text-[9px] font-normal text-muted-foreground">
+                    / {fmt(stats.pseudoRunningSets)} set{stats.pseudoRunningSets === 1 ? "" : "s"}
+                  </span>
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title="Main → Real promotions that cleared ratio gating, awaiting mirror into exchange orders. Count only — no real USD until Live."
+              >
+                <span className="text-muted-foreground">Real (mirror)</span>
+                <span className="font-bold text-emerald-700 dark:text-emerald-400 tabular-nums">
+                  {fmt(stats.realOpen)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title="Live positions currently open on the exchange. Multiple equivalent Sets may consolidate into a single exchange order (mirroring coordination)."
+              >
+                <span className="text-muted-foreground">Exchange</span>
+                <span className="font-bold text-amber-700 dark:text-amber-400 tabular-nums">
+                  {fmt(stats.livePositionsOpen)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title="Cumulative live-trade USD volume transacted on the exchange (the only authoritative exposure figure)."
+              >
+                <span className="text-muted-foreground">Live Volume</span>
+                <span className="font-bold text-amber-700 dark:text-amber-400 tabular-nums">
+                  {fmtUsd(stats.liveVolumeUsd)}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* ── expanded panel ─────────────────────────────────────────────── */}
         {expanded && (
           <div className="space-y-2 pt-1 border-t border-border/40">
@@ -940,6 +1136,103 @@ export function QuickstartSection() {
               </div>
             </div>
 
+            {/* ── Indication Configuration Possible Counts (Sets) ────────
+                Renders the *possible* Set enumeration per Main indication
+                type (direction / move / active / optimal / auto), derived
+                purely from the current settings. Each row shows:
+                  • the number of Independent Sets this type could spawn
+                  • the formula (ranges × ratios × variations, etc.)
+                  • the calc parameters (ranges, steps, time windows,
+                    drawdown gate) so the operator understands what drives
+                    the number.
+                NOTE: this is CAPACITY — the engine may generate fewer at
+                runtime based on live gating. Summing the five type totals
+                gives the theoretical ceiling of Sets per symbol.
+             */}
+            {configCounts && (
+              <div className="rounded-md border bg-muted/20 p-2.5 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                    <Database className="w-3.5 h-3.5 text-cyan-500" />
+                    Indication Config — Possible Sets
+                  </div>
+                  <span
+                    className="text-[10px] text-muted-foreground tabular-nums"
+                    title="Sum of possible Independent Sets across all 5 Main indication types, per symbol. Each Set has its own position DB (capacity shown)."
+                  >
+                    Total {fmt(configCounts.totalPossibleSets)} Sets
+                    {" · "}
+                    <span className="text-muted-foreground/70">
+                      {configCounts.perSetDbCapacity}/Set DB
+                    </span>
+                  </span>
+                </div>
+
+                {/* Settings-drive hint row: ranges & divisor */}
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[9px] text-muted-foreground">
+                  <span>
+                    range <span className="text-foreground tabular-nums">
+                      {configCounts.settings.indicationRangeMin}–{configCounts.settings.indicationRangeMax}
+                    </span> step <span className="text-foreground tabular-nums">
+                      {configCounts.settings.indicationRangeStep}
+                    </span>
+                  </span>
+                  <span>
+                    tp-divisor <span className="text-foreground tabular-nums">
+                      {configCounts.settings.takeProfitRangeDivisor}
+                    </span>
+                  </span>
+                  <span>
+                    valid ranges <span className="text-foreground tabular-nums">
+                      {configCounts.settings.validRangeCount}
+                    </span>
+                  </span>
+                </div>
+
+                {/* Per-type rows */}
+                <div className="space-y-1">
+                  {configCounts.types.map((t) => {
+                    const pct = configCounts.totalPossibleSets > 0
+                      ? Math.min(100, (t.possibleSets / configCounts.totalPossibleSets) * 100)
+                      : 0
+                    // color-code each indication type with a distinct hue so the
+                    // row reads at a glance.
+                    const hue: Record<string, string> = {
+                      direction: "bg-violet-500/70",
+                      move:      "bg-sky-500/70",
+                      active:    "bg-amber-500/70",
+                      optimal:   "bg-emerald-500/70",
+                      auto:      "bg-rose-500/70",
+                    }
+                    return (
+                      <div key={t.type} className="space-y-0.5">
+                        <div className="flex items-center gap-2 text-[10px]">
+                          <span className="w-14 text-foreground shrink-0 font-medium capitalize">
+                            {t.type}
+                          </span>
+                          <div className="flex-1 h-1 bg-muted rounded-full overflow-hidden">
+                            <div className={`h-full rounded-full ${hue[t.type] ?? "bg-muted-foreground/40"}`} style={{ width: `${pct}%` }} />
+                          </div>
+                          <span className="w-12 text-right tabular-nums font-semibold">
+                            {fmt(t.possibleSets)}
+                          </span>
+                          <span className="w-10 text-right tabular-nums text-muted-foreground">
+                            {pct.toFixed(0)}%
+                          </span>
+                        </div>
+                        <div
+                          className="pl-16 text-[9px] text-muted-foreground/80 truncate"
+                          title={`${t.formula}${t.description ? " — " + t.description : ""}`}
+                        >
+                          {t.formula}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
             {/* indications breakdown */}
             <div className="rounded-md border bg-muted/20 p-2.5 space-y-2">
               <div className="flex items-center justify-between">
@@ -970,25 +1263,39 @@ export function QuickstartSection() {
               </div>
             </div>
 
-            {/* strategies breakdown */}
+            {/* strategies breakdown
+                Base → Main → Real → Live is a CASCADE FILTER (eval → filter →
+                adjust → promote). Each stage operates on the SURVIVORS of the
+                previous stage, so the four counters are NOT additive — each
+                ratio below is stage-over-previous pass rate. The header total
+                is the canonical strategy count = Real-stage output only. */}
             <div className="rounded-md border bg-muted/20 p-2.5 space-y-1.5">
               <div className="flex items-center gap-1.5 text-[11px] font-semibold">
                 <BarChart3 className="w-3.5 h-3.5 text-amber-500" />
                 Strategies
-                <span className="ml-auto text-[10px] text-muted-foreground font-normal">
-                  Total {fmt(stats.stratBase + stats.stratMain + stats.stratReal + stats.stratLive)}
+                <span
+                  className="ml-auto text-[10px] text-muted-foreground font-normal"
+                  title="Canonical total = Real-stage output. Base/Main are intermediate filter stages of the same strategy, not separate counts."
+                >
+                  Final (Real) {fmt(stats.stratReal)}
                 </span>
               </div>
+              <p className="text-[9px] text-muted-foreground/80 -mt-1 leading-tight">
+                Cascade filter — each stage filters the survivors of the previous stage. Counts are <em>not</em> added together.
+              </p>
               <div className="grid grid-cols-4 gap-1.5 text-center text-[10px]">
                 {[
-                  { label: "Base", value: stats.stratBase, color: "text-orange-600 dark:text-orange-400", ratio: null },
-                  { label: "Main", value: stats.stratMain, color: "text-yellow-600 dark:text-yellow-400", ratio: stats.stratBase > 0 ? `${((stats.stratMain / stats.stratBase) * 100).toFixed(0)}%` : null },
-                  { label: "Real", value: stats.stratReal, color: "text-green-600 dark:text-green-400",   ratio: stats.stratMain > 0 ? `${((stats.stratReal / stats.stratMain) * 100).toFixed(0)}%` : null },
-                  { label: "Live", value: stats.stratLive, color: "text-blue-600 dark:text-blue-400",     ratio: stats.stratReal > 0 ? `${((stats.stratLive / stats.stratReal) * 100).toFixed(0)}%` : null },
-                ].map(({ label, value, color, ratio }) => (
+                  { label: "Base",   sub: "eval",    value: stats.stratBase, color: "text-orange-600 dark:text-orange-400", ratio: null },
+                  { label: "Main",   sub: "filter",  value: stats.stratMain, color: "text-yellow-600 dark:text-yellow-400", ratio: stats.stratBase > 0 ? `${((stats.stratMain / stats.stratBase) * 100).toFixed(0)}% pass` : null },
+                  { label: "Real",   sub: "adjust",  value: stats.stratReal, color: "text-green-600 dark:text-green-400",   ratio: stats.stratMain > 0 ? `${((stats.stratReal / stats.stratMain) * 100).toFixed(0)}% pass` : null },
+                  { label: "Live",   sub: "promote", value: stats.stratLive, color: "text-blue-600 dark:text-blue-400",     ratio: stats.stratReal > 0 ? `${((stats.stratLive / stats.stratReal) * 100).toFixed(0)}% live` : null },
+                ].map(({ label, sub, value, color, ratio }) => (
                   <div key={label} className="rounded bg-muted/60 py-1.5 px-1">
                     <div className={`text-sm font-bold tabular-nums ${color}`}>{fmt(value)}</div>
-                    <div className="text-muted-foreground">{label}</div>
+                    <div className="text-muted-foreground">
+                      {label}
+                      <span className="text-[9px] text-muted-foreground/70"> ({sub})</span>
+                    </div>
                     {ratio && <div className="text-[9px] text-muted-foreground/70">{ratio}</div>}
                   </div>
                 ))}
@@ -998,7 +1305,7 @@ export function QuickstartSection() {
             {/* ── Strategy Stages — detailed per-stage metrics ───────────
                 Shows sets validated from prev stage (passed count), avg
                 positions per Set, avg profit factor and avg drawdown time
-                for each stage of the BASE → MAIN → REAL → LIVE flow.
+                for each stage of the BASE → MAIN → REAL �� LIVE flow.
 
                 These values come from `strategy_detail:{connId}:{stage}`
                 Redis hashes, written by StrategyCoordinator after each
@@ -1235,6 +1542,125 @@ export function QuickstartSection() {
                 <div className="flex items-center gap-1 px-2 py-0.5 rounded-full border border-border bg-muted/30 text-muted-foreground">
                   <Clock className="w-2.5 h-2.5" />
                   {stats.avgCycleMs}ms avg
+                </div>
+              )}
+            </div>
+
+            {/* ── Live Exchange Positions & Account Balance (footer) ───
+                Real-exchange snapshot across ALL enabled connections. This
+                is intentionally the LAST block in the quickstart card so
+                the operator can see, at the end of the status scroll, what
+                is actually live on the exchange right now.
+
+                Totals row renders: total open positions (long/short split),
+                unrealised PnL, total + available balance, equity. Below it
+                we show a compact row per connection with its own open-
+                position count, PnL and balance — useful when running
+                multiple accounts simultaneously.
+             */}
+            <div className="rounded-md border bg-muted/20 p-2.5 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                  <Activity className="w-3.5 h-3.5 text-emerald-500" />
+                  Live Exchange — Positions &amp; Balance
+                </div>
+                <span className="text-[10px] text-muted-foreground">
+                  {liveSummary
+                    ? `${liveSummary.connections.length} conn${liveSummary.connections.length === 1 ? "" : "s"}`
+                    : "loading…"}
+                </span>
+              </div>
+
+              {/* Totals row — top-level roll-up across connections */}
+              <div className="flex flex-wrap gap-1.5">
+                <MiniStat
+                  label="Open Pos"
+                  value={fmt(liveSummary?.totals.openPositions ?? 0)}
+                  sub={liveSummary
+                    ? `${liveSummary.totals.longPositions}L / ${liveSummary.totals.shortPositions}S`
+                    : undefined}
+                />
+                <MiniStat
+                  label="Unrealised PnL"
+                  value={(() => {
+                    const v = liveSummary?.totals.unrealizedPnl ?? 0
+                    return `${v >= 0 ? "+" : ""}${v.toFixed(2)}`
+                  })()}
+                  sub={liveSummary?.totals.currency}
+                />
+                <MiniStat
+                  label="Balance"
+                  value={(liveSummary?.totals.totalBalance ?? 0).toFixed(2)}
+                  sub={liveSummary?.totals.currency}
+                />
+                <MiniStat
+                  label="Available"
+                  value={(liveSummary?.totals.availableBalance ?? 0).toFixed(2)}
+                  sub={liveSummary?.totals.currency}
+                />
+                <MiniStat
+                  label="Equity"
+                  value={(liveSummary?.totals.equity ?? 0).toFixed(2)}
+                  sub={liveSummary?.totals.currency}
+                />
+              </div>
+
+              {/* Per-connection compact rows (only when >1 connection or >0 positions) */}
+              {liveSummary && liveSummary.connections.length > 0 && (
+                <div className="space-y-0.5 pt-1">
+                  <div className="grid grid-cols-[1fr_auto_auto_auto] gap-x-2 text-[9px] uppercase tracking-wide text-muted-foreground/70 pb-0.5 border-b border-border/40">
+                    <span>Connection</span>
+                    <span className="text-right">Pos</span>
+                    <span className="text-right">PnL</span>
+                    <span className="text-right">Balance</span>
+                  </div>
+                  {liveSummary.connections.map((c) => (
+                    <div
+                      key={c.connectionId}
+                      className="grid grid-cols-[1fr_auto_auto_auto] gap-x-2 text-[10px] items-baseline"
+                    >
+                      <span className="truncate">
+                        <span className="font-medium">{c.name}</span>
+                        {c.exchange && (
+                          <span className="text-muted-foreground/70 ml-1">
+                            {c.exchange}
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-right tabular-nums">
+                        {c.openPositions}
+                        {c.openPositions > 0 && (
+                          <span className="text-muted-foreground/70 ml-1">
+                            {c.longPositions}L/{c.shortPositions}S
+                          </span>
+                        )}
+                      </span>
+                      <span
+                        className={
+                          "text-right tabular-nums " +
+                          (c.unrealizedPnl > 0
+                            ? "text-emerald-600 dark:text-emerald-400"
+                            : c.unrealizedPnl < 0
+                              ? "text-rose-600 dark:text-rose-400"
+                              : "text-muted-foreground")
+                        }
+                      >
+                        {c.unrealizedPnl >= 0 ? "+" : ""}{c.unrealizedPnl.toFixed(2)}
+                      </span>
+                      <span className="text-right tabular-nums">
+                        {c.balance.total.toFixed(2)}
+                        <span className="text-muted-foreground/70 ml-0.5">
+                          {c.balance.currency}
+                        </span>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {liveSummary && liveSummary.connections.length === 0 && (
+                <div className="text-[10px] text-muted-foreground text-center py-1">
+                  No enabled connections — enable a connection to see live positions &amp; balance.
                 </div>
               )}
             </div>

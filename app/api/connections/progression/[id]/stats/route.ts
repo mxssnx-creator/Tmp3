@@ -33,16 +33,33 @@ function pick(...values: unknown[]): number {
  * Falls back to trade_engine_state:{connId} (flushed every 50-100 cycles)
  * only when the primary sources return zero.
  *
+ * ── IMPORTANT: Pipeline semantics (applies to every stage total below) ─
+ * Base → Main → Real → Live is a CASCADE FILTER pipeline:
+ *   Base  = initial Set enumeration (eval)
+ *   Main  = Base Sets that survived the Main PF/DDT filter
+ *   Real  = Main Sets that survived the strict Real filter (adjust)
+ *   Live  = Real Sets promoted to the exchange (runtime subset of Real)
+ * Each downstream stage contains the SAME logical strategies that survived
+ * the upstream stage — it is NOT a separate population. Therefore:
+ *
+ *   canonical "strategies total" = Real-stage count (final filtered output)
+ *
+ * and stage counters MUST NEVER be summed together. Ratios between adjacent
+ * stages (e.g. main/base) express pass-through rate, not additive totals.
+ * The same rule applies to pseudo-position base/main/real counts.
+ *
  * Response shape:
  * {
  *   historic: { symbolsProcessed, symbolsTotal, candlesLoaded, indicatorsCalculated,
  *               cyclesCompleted, isComplete, progressPercent }
  *   realtime: { indicationCycles, strategyCycles, realtimeCycles, indicationsTotal,
  *               strategiesTotal, positionsOpen, isActive, successRate, avgCycleTimeMs }
+ *               ↑ strategiesTotal = Real-stage output (NOT sum of stages)
  *   breakdown: {
  *     indications: { direction, move, active, optimal, auto, total }
  *     strategies:  { base, main, real, live, total,
  *                    baseEvaluated, mainEvaluated, realEvaluated }
+ *                    ↑ `total` = Real-stage count only, per pipeline rule above
  *   }
  *   metadata: { engineRunning, phase, progress, message, lastUpdate, redisDbEntries }
  * }
@@ -197,15 +214,428 @@ export async function GET(
       n(es.total_strategies_evaluated)
     )
 
-    // Open positions: check pseudo_positions:{connId} set
-    let positionsOpen = 0
+    // ── OPEN POSITIONS + ACCUMULATED VOLUME (per-Set rollup) ────────────
+    //
+    // We track *two* independent open-position namespaces because they
+    // answer different questions:
+    //
+    //   1. PseudoPositionManager rows at `pseudo_position:{connId}:{id}`
+    //      — every live Base-stage pseudo position carries its full
+    //      sizing (`position_cost`, `quantity`, `entry_price`) plus the
+    //      `config_set_key` that identifies which strategy Set created
+    //      it. Summing `position_cost` gives the accumulated notional
+    //      USD across every *running* pseudo position, and grouping by
+    //      `config_set_key` gives a per-Set rollup so the operator can
+    //      see "Set X currently has 3 positions worth $1,200".
+    //      Running Sets = SCARD of `pseudo_positions:{connId}:active_config_keys`.
+    //
+    //   2. Real-stage positions at `real:position:real:{connId}:*` —
+    //      these carry `quantity * entryPrice` notional but no
+    //      per-Set key; they represent Main → Real promotions that
+    //      survived ratio gating. We report count + accumulated USD
+    //      volume so the Strategies → Real tile can show the same
+    //      "currently holding" picture as Main/Live.
+    //
+    // Live exchange accumulated volume is already exposed via
+    // progHash.live_volume_usd_total (cumulative) and derived into
+    // `openPositions.live` below.
+    let pseudoOpen = 0
+    let pseudoRunningSets = 0
+    // Per-Set open-position counts (pseudo evaluation stage).
+    // Volume is intentionally NOT tracked here — pseudo is a
+    // simulated-sizing evaluation stage, not real exchange exposure.
+    // Count is the only meaningful metric for the mirroring pipeline
+    // health view.
+    const pseudoSetAgg = new Map<string, { count: number }>()
+    // ── Symbol+direction → setKey lookup index ───────────────────────
+    // Built during the pseudo-position scan so the live-stage
+    // Set-relation join below can identify which Set an exchange
+    // position was mirrored from WITHOUT requiring new fields on the
+    // LivePosition schema. Keyed as `SYMBOL:direction` (upper-cased
+    // symbol, lowercase direction). Value = candidate setKeys
+    // currently holding open pseudo positions for that pair; ranking
+    // is by pseudo-position count (how many eval positions the Set
+    // carries). In practice a live position maps to exactly one Set
+    // (the one whose Real promotion triggered the exchange order) —
+    // we expose candidates regardless so the operator sees the
+    // relationship even when multiple equivalent Sets overlap on the
+    // same symbol/direction (the consolidation case).
+    const pseudoSymDirIdx = new Map<
+      string,
+      Array<{ setKey: string; count: number }>
+    >()
+
     try {
-      const posIds = await client.smembers(`pseudo_positions:${connectionId}`).catch(() => [] as string[])
-      for (const posId of posIds.slice(0, 200)) {
-        const h = (await client.hgetall(`pseudo_position:${connectionId}:${posId}`).catch(() => null)) || {}
-        if ((h as any)?.status === "active" || !(h as any)?.status) positionsOpen++
+      const posIds = (await client
+        .smembers(`pseudo_positions:${connectionId}`)
+        .catch(() => [] as string[])) || []
+      // Parallel hgetall for every id — matches the fan-out pattern in
+      // stages/real-stage.ts etc. A sequential loop here dominated
+      // /stats latency when pseudo positions accumulated.
+      const hashes = await Promise.all(
+        posIds.slice(0, 500).map((id) =>
+          client.hgetall(`pseudo_position:${connectionId}:${id}`).catch(() => null),
+        ),
+      )
+      for (const h of hashes) {
+        if (!h) continue
+        const hh = h as Record<string, any>
+        const status = hh.status ?? "active"
+        // Only "open" rows count — status="active" (PseudoPositionManager
+        // default) and status="open" (legacy) are both live; everything
+        // else (closed, cancelled, rejected) is excluded.
+        if (status !== "active" && status !== "open") continue
+        pseudoOpen++
+
+        const setKey = String(hh.config_set_key || "").trim()
+        if (setKey) {
+          const prev = pseudoSetAgg.get(setKey) || { count: 0 }
+          prev.count++
+          pseudoSetAgg.set(setKey, prev)
+
+          // Populate symbol+direction → setKey join index for live
+          // position coordination (see openPositions.live.positions
+          // downstream). Same per-hash pass — no extra Redis work.
+          // Equivalent upstream Sets sharing the same symbol+direction
+          // appear in this list and will be consolidated into a single
+          // exchange position downstream (the mirroring principle).
+          const sym = String(hh.symbol || "").trim().toUpperCase()
+          const dir = String(hh.direction || "").trim().toLowerCase()
+          if (sym && (dir === "long" || dir === "short")) {
+            const joinKey = `${sym}:${dir}`
+            const arr = pseudoSymDirIdx.get(joinKey) || []
+            const existing = arr.find((e) => e.setKey === setKey)
+            if (existing) {
+              existing.count++
+            } else {
+              arr.push({ setKey, count: 1 })
+            }
+            pseudoSymDirIdx.set(joinKey, arr)
+          }
+        }
+      }
+
+      // Running Sets = distinct config_set_keys currently active. This
+      // is the set PseudoPositionManager maintains for O(1) duplicate
+      // detection; it's the ground truth for "valid Running Sets".
+      pseudoRunningSets = Number(
+        await client
+          .scard(`pseudo_positions:${connectionId}:active_config_keys`)
+          .catch(() => 0),
+      ) || 0
+    } catch { /* non-critical */ }
+
+    // Back-compat: the historic `positionsOpen` field always referred
+    // to the pseudo total, so keep that contract.
+    const positionsOpen = pseudoOpen
+
+    // Top-5 per-Set rollup sorted by POSITION COUNT — pseudo positions
+    // are evaluation-stage exposure, not real money, so sorting by count
+    // (how many eval positions the Set carries) is the meaningful metric.
+    // Volume is intentionally NOT surfaced here; it would conflate
+    // simulated-sizing eval with actual exchange exposure. Real USD
+    // exposure lives on the live branch below.
+    const pseudoTopSets = Array.from(pseudoSetAgg.entries())
+      .map(([setKey, agg]) => ({ setKey, count: agg.count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5)
+
+    // ── Real-stage open positions ────────────────────────────────────
+    //
+    // Real positions are Main→Real promotions awaiting mirror into
+    // exchange orders. Count only — USD volume is NOT tracked here
+    // either; Real is still a pipeline stage, not the exchange. The
+    // only authoritative USD exposure is live.volumeUsd below.
+    // Bounded by a 500-key safety ceiling — anything beyond that
+    // is a data-hygiene issue the operator needs to fix independently.
+    let realOpen = 0
+    // ── Symbol+direction → candidate Real positions index ─────────
+    // Populated alongside the Real scan so live-position resolution
+    // can fall back to Real when the pseudo ledger has no matching
+    // entry (e.g. Set was closed before the exchange position did).
+    // No volume tracked — resolution just needs existence + id.
+    const realSymDirIdx = new Map<
+      string,
+      Array<{ realPositionId: string }>
+    >()
+    try {
+      const realKeys = await client.keys(`real:position:real:${connectionId}:*`)
+      if (realKeys.length > 0) {
+        const caps = realKeys.slice(0, 500)
+        const raws = await Promise.all(
+          caps.map((k: string) => client.get(k).catch(() => null)),
+        )
+        for (const raw of raws) {
+          if (!raw) continue
+          try {
+            const pos = JSON.parse(raw as string)
+            if (pos.status === "closed") continue
+            realOpen++
+            // Index for live position join (fallback path)
+            const sym = String(pos.symbol || "").trim().toUpperCase()
+            const dir = String(pos.direction || "").trim().toLowerCase()
+            if (sym && (dir === "long" || dir === "short") && pos.id) {
+              const joinKey = `${sym}:${dir}`
+              const arr = realSymDirIdx.get(joinKey) || []
+              arr.push({ realPositionId: String(pos.id) })
+              realSymDirIdx.set(joinKey, arr)
+            }
+          } catch { /* skip malformed */ }
+        }
       }
     } catch { /* non-critical */ }
+
+    // ── Live-stage OPEN positions + Set-relation join ────────────────
+    //
+    // The operator asked for a coordination view that identifies which
+    // Set each live exchange position came from. The live-stage
+    // persists positions at `live:position:{id}` with
+    // `{ symbol, direction, realPositionId, quantity, entryPrice,
+    //    exchangeData: { unrealizedPnl, markPrice }, status, ... }`.
+    //
+    // The live ledger does NOT natively carry `config_set_key` (the
+    // Set identifier lives on pseudo rows upstream). We resolve the
+    // relationship here, server-side, by joining on
+    // `symbol + direction` against the pseudoSymDirIdx built during
+    // the Base scan above. For any live position whose pseudo join
+    // returns no candidates, we fall back to the Real-stage index —
+    // useful when the Set closed its pseudo row between order
+    // placement and the stats request. Each live position is exposed
+    // with its top-3 candidate setKeys (ordered by per-set USD
+    // exposure), giving the UI everything it needs to render a
+    // "which Set does this live position belong to?" tooltip without
+    // extra API round-trips.
+    const livePositionSetRelations: Array<{
+      id: string
+      symbol: string
+      direction: "long" | "short"
+      // ── Exchange exposure (the ONLY authoritative real-money figures) ──
+      volumeUsd: number
+      quantity: number
+      leverage: number
+      marginType: "cross" | "isolated"
+      marginUsd: number               // volumeUsd / leverage — actual capital at risk
+      // ── Price tracking ────────────────────────────────────────────────
+      entryPrice: number
+      markPrice: number
+      liquidationPrice: number        // from exchange sync (critical safety info)
+      liquidationDistancePct: number  // % distance mark → liq (negative = dangerous)
+      // ── PnL ──────────────────────────────────────────────────────────
+      unrealizedPnl: number
+      roiPct: number                  // unrealizedPnl / marginUsd × 100 (matches ROE)
+      // ── Risk-management levels ───────────────────────────────────────
+      stopLossPrice: number
+      takeProfitPrice: number
+      // ── Exchange order references ────────────────────────────────────
+      orderId?: string
+      stopLossOrderId?: string
+      takeProfitOrderId?: string
+      // ── Lifecycle ────────────────────────────────────────────────────
+      status: string
+      createdAt: number
+      updatedAt: number
+      syncedAt: number                // last exchange reconciliation (staleness check)
+      realPositionId?: string
+      // ── Coordination (mirroring fan-in) ──────────────────────────────
+      // Equivalent upstream Sets mirrored into this ONE exchange order.
+      // Count = how many pseudo eval positions that Set is currently
+      // holding. No per-Set USD (eval-stage notionals are NOT real
+      // exposure and would be misleading).
+      setKeys: Array<{ setKey: string; count: number }>
+      // `resolution` tells the UI exactly HOW the Set was identified:
+      //   • "pseudo"        — exact pseudo row exists for this symbol+dir
+      //   • "real-fallback" — no pseudo match; resolved via Real ledger
+      //   • "unresolved"    — nothing upstream matched (stale or manual)
+      resolution: "pseudo" | "real-fallback" | "unresolved"
+    }> = []
+    try {
+      const liveOpenIds = ((await client
+        .lrange(`live:positions:${connectionId}`, 0, 499)
+        .catch(() => [])) || []) as string[]
+
+      if (liveOpenIds.length > 0) {
+        const rawList = await Promise.all(
+          liveOpenIds.map((id) =>
+            client.get(`live:position:${id}`).catch(() => null),
+          ),
+        )
+        for (const raw of rawList) {
+          if (!raw) continue
+          try {
+            const pos = JSON.parse(raw as string)
+            // Exclude closed/cancelled; accept every in-flight state
+            // where exchange exposure is still on the books.
+            const status = String(pos.status || "").toLowerCase()
+            if (status === "closed" || status === "cancelled" || status === "error") continue
+
+            const sym = String(pos.symbol || "").trim().toUpperCase()
+            const dir = String(pos.direction || "").trim().toLowerCase()
+            if (!sym || (dir !== "long" && dir !== "short")) continue
+
+            const qty = Number(pos.executedQuantity || pos.quantity) || 0
+            const px  = Number(pos.averageExecutionPrice || pos.entryPrice) || 0
+            const volumeUsd = qty > 0 && px > 0 ? Math.round(qty * px * 100) / 100 : 0
+
+            const joinKey = `${sym}:${dir}`
+            let setKeys: Array<{ setKey: string; count: number }> = []
+            let resolution: "pseudo" | "real-fallback" | "unresolved" = "unresolved"
+
+            const pseudoMatches = pseudoSymDirIdx.get(joinKey)
+            if (pseudoMatches && pseudoMatches.length > 0) {
+              // Rank by pseudo-position count (how many eval positions
+              // the Set is holding) — count is the only meaningful
+              // eval-stage metric, since USD notionals at this stage
+              // are simulated-sizing not real exposure. All equivalent
+              // Sets on the same symbol+dir are surfaced so the UI can
+              // render "N Sets → 1 exchange order" consolidation.
+              setKeys = [...pseudoMatches]
+                .sort((a, b) => b.count - a.count)
+                .slice(0, 3)
+                .map((s) => ({ setKey: s.setKey, count: s.count }))
+              resolution = "pseudo"
+            } else {
+              const realMatches = realSymDirIdx.get(joinKey)
+              if (realMatches && realMatches.length > 0) {
+                // Real-stage fallback: we don't have the setKey itself,
+                // only that one exists upstream. Surface a synthetic
+                // marker so the UI can distinguish "no Set found" from
+                // "Set existed but Base row already closed".
+                resolution = "real-fallback"
+                setKeys = [{
+                  setKey: `real:${realMatches[0].realPositionId}`,
+                  count: realMatches.length,
+                }]
+              }
+            }
+
+            // ── Enrich the per-position row with complete exchange-
+            //    side details so the UI can render full Position
+            //    Details (leverage, margin at risk, liq distance,
+            //    SL/TP levels, ROI) WITHOUT a second API round-trip.
+            const leverage = Math.max(1, Number(pos.leverage) || 1)
+            const marginType: "cross" | "isolated" =
+              (pos.exchangeData?.marginType as "cross" | "isolated") ||
+              (pos.marginType as "cross" | "isolated") ||
+              "cross"
+            const markPrice = Math.round(
+              (Number(pos.exchangeData?.markPrice) || 0) * 1e8,
+            ) / 1e8
+            const liquidationPrice = Math.round(
+              (Number(pos.exchangeData?.liquidationPrice) || 0) * 1e8,
+            ) / 1e8
+            const unrealizedPnl = Math.round(
+              (Number(pos.exchangeData?.unrealizedPnl ?? pos.exchangeData?.unrealizedPnL) || 0) * 100,
+            ) / 100
+            // Actual margin at risk = exposure / leverage (not
+            // notional). This is what the operator has skin in the
+            // game for; ROI is computed against it to match exchange
+            // ROE semantics.
+            const marginUsd = leverage > 0
+              ? Math.round((volumeUsd / leverage) * 100) / 100
+              : 0
+            const roiPct = marginUsd > 0
+              ? Math.round((unrealizedPnl / marginUsd) * 10000) / 100
+              : 0
+            // Liquidation distance: +% = safe headroom, −% = mark
+            // already past liq (auto-close imminent / processing).
+            let liquidationDistancePct = 0
+            if (markPrice > 0 && liquidationPrice > 0) {
+              const raw =
+                dir === "long"
+                  ? (markPrice - liquidationPrice) / markPrice
+                  : (liquidationPrice - markPrice) / markPrice
+              liquidationDistancePct = Math.round(raw * 10000) / 100
+            }
+
+            livePositionSetRelations.push({
+              id: String(pos.id || ""),
+              symbol: sym,
+              direction: dir as "long" | "short",
+              volumeUsd,
+              quantity: Math.round(qty * 1e8) / 1e8,
+              leverage,
+              marginType,
+              marginUsd,
+              entryPrice: Math.round(px * 1e8) / 1e8,
+              markPrice,
+              liquidationPrice,
+              liquidationDistancePct,
+              unrealizedPnl,
+              roiPct,
+              stopLossPrice:   Math.round((Number(pos.stopLossPrice)   || 0) * 1e8) / 1e8,
+              takeProfitPrice: Math.round((Number(pos.takeProfitPrice) || 0) * 1e8) / 1e8,
+              orderId:            pos.orderId            ? String(pos.orderId)            : undefined,
+              stopLossOrderId:    pos.stopLossOrderId    ? String(pos.stopLossOrderId)    : undefined,
+              takeProfitOrderId:  pos.takeProfitOrderId  ? String(pos.takeProfitOrderId)  : undefined,
+              status,
+              createdAt: Number(pos.createdAt) || 0,
+              updatedAt: Number(pos.updatedAt) || 0,
+              syncedAt:  Number(pos.exchangeData?.syncedAt) || 0,
+              realPositionId: pos.realPositionId ? String(pos.realPositionId) : undefined,
+              setKeys,
+              resolution,
+            })
+          } catch { /* skip malformed */ }
+        }
+      }
+    } catch { /* non-critical */ }
+
+    // Derived aggregates for the openPositions.live branch below.
+    // Kept separate from progHash counters because the hash is
+    // write-heavy and occasionally lags the actual live:position:* rows
+    // by a few seconds. These scan-derived values are the authoritative
+    // "right now" view for the coordination UI.
+    const liveOpenScanned = livePositionSetRelations.length
+    const liveResolvedViaPseudo = livePositionSetRelations.filter(
+      (p) => p.resolution === "pseudo",
+    ).length
+    const liveResolvedViaReal = livePositionSetRelations.filter(
+      (p) => p.resolution === "real-fallback",
+    ).length
+    const liveUnresolvedCount = livePositionSetRelations.filter(
+      (p) => p.resolution === "unresolved",
+    ).length
+
+    // ── Exchange-wide aggregates for the Live summary strip ──────────
+    // Computed from the SAME scan-derived snapshot that drives the
+    // per-position rows — guarantees the summary totals always equal
+    // the sum of what's visible in the coordination panel. These are
+    // the authoritative portfolio figures the operator needs to make
+    // risk decisions.
+    let liveAggTotalUnrealizedPnl = 0
+    let liveAggTotalMarginUsd = 0
+    let liveAggTotalVolumeUsd = 0
+    let liveAggInProfit = 0
+    let liveAggInLoss = 0
+    let liveAggNearLiquidation = 0   // mark within ≤ 5% of liq price
+    let liveAggStaleSync = 0         // no exchange sync in >60s
+    const liveAggConsolidatedSets = livePositionSetRelations.reduce(
+      (sum, p) => sum + (p.setKeys?.length || 0),
+      0,
+    )
+    const nowMsAgg = Date.now()
+    for (const p of livePositionSetRelations) {
+      liveAggTotalUnrealizedPnl += p.unrealizedPnl || 0
+      liveAggTotalMarginUsd     += p.marginUsd || 0
+      liveAggTotalVolumeUsd     += p.volumeUsd || 0
+      if ((p.unrealizedPnl || 0) > 0) liveAggInProfit++
+      else if ((p.unrealizedPnl || 0) < 0) liveAggInLoss++
+      if (
+        p.liquidationPrice > 0 &&
+        p.markPrice > 0 &&
+        p.liquidationDistancePct !== 0 &&
+        p.liquidationDistancePct <= 5
+      ) {
+        liveAggNearLiquidation++
+      }
+      if (p.syncedAt > 0 && nowMsAgg - p.syncedAt > 60_000) liveAggStaleSync++
+    }
+    liveAggTotalUnrealizedPnl = Math.round(liveAggTotalUnrealizedPnl * 100) / 100
+    liveAggTotalMarginUsd     = Math.round(liveAggTotalMarginUsd * 100) / 100
+    liveAggTotalVolumeUsd     = Math.round(liveAggTotalVolumeUsd * 100) / 100
+    const liveAggPortfolioRoiPct = liveAggTotalMarginUsd > 0
+      ? Math.round((liveAggTotalUnrealizedPnl / liveAggTotalMarginUsd) * 10000) / 100
+      : 0
 
     const realtimeIsActive =
       realtimeIndicationCycles > 0 ||
@@ -246,7 +676,18 @@ export async function GET(
         stratEvaluated[type] = Math.max(evalFromHash, evalFromKey)
       })
     )
-    const stratTotal = Object.values(stratCounts).reduce((s, v) => s + v, 0) || strategiesTotal
+    // ── Pipeline-aware "total strategies" ────────────────────────────────
+    // Base → Main → Real → Live is a CASCADE FILTER (eval → filter → adjust).
+    // Each stage operates on the output of the previous stage, so the SAME
+    // logical strategy exists at every stage it survives. Summing the four
+    // stage counters would triple/quadruple-count the same strategy.
+    //
+    // The canonical total is the REAL-stage count (the final filtered output
+    // before live promotion). Live is a runtime-only subset derived from Real
+    // and is shown separately in the breakdown; it is NOT part of the total.
+    // Fall back to `strategies_count` (which is written with the same
+    // pipeline-aware semantic by the engine & cron) if Real is zero.
+    const stratTotal = stratCounts.real || strategiesTotal
 
     // ── STRATEGY VARIANT breakdown ───────────────────────────────────────────
     // The Main stage expands each promoted Base Set into position-variant
@@ -566,7 +1007,11 @@ export async function GET(
           base:  stratCounts.base  || 0,
           main:  stratCounts.main  || 0,
           real:  stratCounts.real  || 0,
-          total: (stratCounts.base || 0) + (stratCounts.main || 0) + (stratCounts.real || 0),
+          // `total` is the pipeline's final-stage output (Real), NOT a sum of
+          // Base+Main+Real. See `stratTotal` derivation above — Base and Main
+          // are intermediate filter stages of the SAME logical strategy, so
+          // they must not be summed with Real.
+          total: stratCounts.real || 0,
         },
         positions: {
           opened:    n(progHash.live_positions_created_count),
@@ -667,11 +1112,146 @@ export async function GET(
         }
       })(),
 
-      // ── Live Exchange Execution metrics ─────────────────────────────────
+      // ��─ Live Exchange Execution metrics ─────────────────────────────────
       // Read directly from progression hash counters written by the live-stage
       // pipeline (see lib/trade-engine/stages/live-stage.ts). Every stage of
       // the pipeline increments one of these so the UI can show a real-time
       // picture of exchange-level activity.
+      // ── OPEN POSITIONS & ACCUMULATED VOLUME ─────────────────────────────
+      // Snapshot of every "currently holding exposure" layer of the
+      // mirroring pipeline. CRITICAL semantics — pseudo/real/live are
+      // NOT independent pools: they represent the SAME trading signal
+      // being mirrored down through evaluation stages before finally
+      // becoming an exchange order. Therefore:
+      //
+      //   • Volume is a LIVE-ONLY concept. The only USD exposure that
+      //     matters is what actually sits on the exchange. Pseudo and
+      //     Real positions carry evaluation-only notionals that MUST
+      //     NOT be summed with live volume — doing so would grossly
+      //     overstate real exposure. We surface counts for pseudo/
+      //     real (pipeline health), and volume only for live.
+      //
+      //   • Layers:
+      //       pseudo — Strategy-level continuous evaluation (Base).
+      //                Count only. Running-sets index feeds the live
+      //                coordination join.
+      //       real   — Main→Real promotions that cleared gating.
+      //                Count only.
+      //       live   — Actual exchange positions. Count + USD volume
+      //                (progHash.live_volume_usd_total is the single
+      //                authoritative exposure figure).
+      //
+      //   • Coordination principle: multiple equivalent Sets that
+      //     share the same Base + ranges produce ONE consolidated
+      //     exchange position, not N duplicate orders. The
+      //     `live.positions[].mirroredSets` array carries those
+      //     equivalent Sets so the UI can render "N Sets → 1 Order".
+      openPositions: (() => {
+        const liveOpen = Math.max(
+          0,
+          n(progHash.live_positions_created_count) -
+            n(progHash.live_positions_closed_count),
+        )
+        const liveVolumeUsd = n(progHash.live_volume_usd_total)
+        const liveVolumeUsdR = Math.round(liveVolumeUsd * 100) / 100
+
+        // Full Exchange Position Details per live position. Contains
+        // everything the operator needs to evaluate trade health
+        // (leverage, margin at risk, liquidation distance, SL/TP,
+        // ROI) WITHOUT having to hit /api/trading/live-positions
+        // separately. Also carries the mirroring coordination payload
+        // (`mirroredSets`) so the UI can render "N equivalent Sets
+        // consolidated into this 1 exchange order" without a second
+        // join against the pseudo ledger.
+        const liveMirroring = livePositionSetRelations
+          .slice(0, 50)
+          .map((p) => ({
+            id:            p.id,
+            symbol:        p.symbol,
+            direction:     p.direction,
+            // Exchange exposure
+            volumeUsd:     p.volumeUsd,
+            quantity:      p.quantity,
+            leverage:      p.leverage,
+            marginType:    p.marginType,
+            marginUsd:     p.marginUsd,
+            // Prices
+            entryPrice:    p.entryPrice,
+            markPrice:     p.markPrice,
+            liquidationPrice:       p.liquidationPrice,
+            liquidationDistancePct: p.liquidationDistancePct,
+            // PnL
+            unrealizedPnl: p.unrealizedPnl,
+            roiPct:        p.roiPct,
+            // Risk management
+            stopLossPrice:   p.stopLossPrice,
+            takeProfitPrice: p.takeProfitPrice,
+            // Exchange references
+            orderId:            p.orderId,
+            stopLossOrderId:    p.stopLossOrderId,
+            takeProfitOrderId:  p.takeProfitOrderId,
+            // Lifecycle
+            status:        p.status,
+            createdAt:     p.createdAt,
+            updatedAt:     p.updatedAt,
+            syncedAt:      p.syncedAt,
+            realPositionId: p.realPositionId,
+            // Coordination fan-in
+            mirroredSetCount: p.setKeys.length,
+            mirroredSets:     p.setKeys.map((s) => ({
+              setKey: s.setKey,
+              count:  s.count,
+            })),
+            resolution: p.resolution,
+          }))
+
+        return {
+          pseudo: {
+            open:         pseudoOpen,                // count only
+            runningSets:  pseudoRunningSets,
+            topSets:      pseudoTopSets,             // { setKey, count }
+          },
+          real: {
+            open:         realOpen,                  // count only
+          },
+          live: {
+            open:         liveOpen,                  // count
+            volumeUsd:    liveVolumeUsdR,            // exchange USD exposure (only real figure)
+            openScanned:  liveOpenScanned,
+            positions:    liveMirroring,
+            resolution: {
+              pseudo:       liveResolvedViaPseudo,
+              realFallback: liveResolvedViaReal,
+              unresolved:   liveUnresolvedCount,
+            },
+            // ── Portfolio-wide exchange aggregates ──────────────
+            // Sum of `positions[]` — guarantees the Live strip
+            // totals always equal what's visible in the rows.
+            aggregate: {
+              totalUnrealizedPnl: liveAggTotalUnrealizedPnl,
+              totalMarginUsd:     liveAggTotalMarginUsd,
+              totalVolumeUsd:     liveAggTotalVolumeUsd,
+              portfolioRoiPct:    liveAggPortfolioRoiPct,
+              inProfit:           liveAggInProfit,
+              inLoss:             liveAggInLoss,
+              nearLiquidation:    liveAggNearLiquidation,
+              staleSync:          liveAggStaleSync,
+              consolidatedSetsTotal: liveAggConsolidatedSets,
+            },
+          },
+          overall: {
+            // Pipeline-health counters. Semantically distinct from
+            // each other — do NOT sum.
+            pipelineEvalOpen: pseudoOpen,   // strategies evaluating
+            exchangeOpen:     liveOpen,     // orders actually on exchange
+            exchangeVolumeUsd: liveVolumeUsdR,
+            exchangeUnrealizedPnl: liveAggTotalUnrealizedPnl,
+            exchangeMarginUsd:     liveAggTotalMarginUsd,
+            runningSetsCount: pseudoRunningSets,
+          },
+        }
+      })(),
+
       liveExecution: {
         // Orders
         ordersPlaced:     n(progHash.live_orders_placed_count),

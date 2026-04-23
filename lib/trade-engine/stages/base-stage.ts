@@ -186,15 +186,20 @@ export async function getBasePositions(connectionId: string): Promise<BasePositi
 
   try {
     const keys = await client.keys(`base:position:${connectionId}:*`)
+    if (keys.length === 0) return []
+
+    // Batch GETs into a single fan-out instead of a sequential await
+    // loop. See real-stage / main-stage / live-stage for the same
+    // pattern — at 250 positions this drops getBasePositions() from
+    // ~250 RTTs down to roughly one RTT window.
+    const rawValues = await Promise.all(
+      keys.map((k: string) => client.get(k).catch(() => null)),
+    )
     const positions: BasePosition[] = []
-
-    for (const key of keys) {
-      const data = await client.get(key)
-      if (data) {
-        positions.push(JSON.parse(data))
-      }
+    for (const data of rawValues) {
+      if (!data) continue
+      try { positions.push(JSON.parse(data as string)) } catch { /* ignore */ }
     }
-
     return positions
   } catch (err) {
     console.warn(`${LOG_PREFIX} Error getting base positions: ${err}`)
@@ -299,20 +304,31 @@ export async function cleanupOldBasePositions(connectionId: string): Promise<num
 
   try {
     const keys = await client.keys(`base:position:${connectionId}:*`)
+    if (keys.length === 0) return 0
+
     const now = Date.now()
     const maxAge = 24 * 60 * 60 * 1000 // 24 hours
 
-    for (const key of keys) {
-      const data = await client.get(key)
-      if (data) {
-        const position: BasePosition = JSON.parse(data)
+    // Phase 1: batch-fetch every row in parallel.
+    const rawValues = await Promise.all(
+      keys.map((k: string) => client.get(k).catch(() => null)),
+    )
 
-        // Clean up closed positions older than 24 hours
+    // Phase 2: collect the deletable keys, then DEL them in parallel.
+    const deletable: string[] = []
+    for (let i = 0; i < keys.length; i++) {
+      const data = rawValues[i]
+      if (!data) continue
+      try {
+        const position: BasePosition = JSON.parse(data as string)
         if (position.status === "closed" && now - position.updatedAt > maxAge) {
-          await client.del(key)
-          cleaned++
+          deletable.push(keys[i])
         }
-      }
+      } catch { /* skip malformed rows */ }
+    }
+    if (deletable.length > 0) {
+      await Promise.all(deletable.map((k) => client.del(k).catch(() => 0)))
+      cleaned = deletable.length
     }
 
     console.log(`${LOG_PREFIX} Cleaned up ${cleaned} old base positions`)

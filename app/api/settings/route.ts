@@ -1,5 +1,37 @@
 import { NextResponse } from "next/server"
-import { getSettings, setSettings, initRedis } from "@/lib/redis-db"
+import {
+  getAppSettings,
+  setAppSettings,
+  initRedis,
+  getAllConnections,
+} from "@/lib/redis-db"
+import { logProgressionEvent } from "@/lib/engine-progression-logs"
+
+/**
+ * Fan out a single "settings_changed" progression log event to every
+ * active connection so the operator sees confirmation in the Engine
+ * Progression dashboard that their saved change was detected by the
+ * running engine on the very next cycle. Errors are swallowed — a log
+ * failure must never cause a settings save to 500.
+ */
+async function emitSettingsChanged(keyCount: number): Promise<void> {
+  try {
+    const connections = await getAllConnections().catch(() => [])
+    await Promise.all(
+      (connections || []).map((conn: any) =>
+        logProgressionEvent(
+          conn.id,
+          "settings_changed",
+          "info",
+          `Operator saved ${keyCount} setting${keyCount === 1 ? "" : "s"} — change will apply on the next cycle`,
+          { keyCount },
+        ).catch(() => { /* non-critical */ }),
+      ),
+    )
+  } catch {
+    /* non-critical */
+  }
+}
 
 export const runtime = "nodejs"
 
@@ -30,6 +62,10 @@ function getDefaultSettings(): Record<string, any> {
     // causing a brief off-by-one between what the UI shows and what the
     // engine actually applies until the user hits Save.
     prehistoric_range_hours: 8,
+    // P0-4 spec cap — hard cap on concurrent pseudo positions per direction
+    // (Long / Short). Kept in the defaults so fresh installs boot with the
+    // spec-mandated value instead of an undefined sentinel.
+    maxActiveBasePseudoPositionsPerDirection: 1,
   }
 }
 
@@ -37,16 +73,22 @@ export async function GET() {
   try {
     await initRedis()
 
-    let settings = await getSettings("app_settings")
-    
+    // Mirror-aware read: merges `app_settings` (canonical / UI-facing) and
+    // `all_settings` (legacy — still read by several trade-engine modules).
+    // This unifies the view so the UI always shows what the engine will
+    // actually apply, regardless of which key a setting happens to live in.
+    let settings = await getAppSettings({ bypassCache: true })
+
     if (!settings || Object.keys(settings).length === 0) {
-      // Auto-seed default settings if none exist
+      // Auto-seed defaults when BOTH keys are empty. `setAppSettings` writes
+      // to canonical + legacy in one go so legacy consumers also boot with
+      // the defaults applied.
       const defaults = getDefaultSettings()
-      await setSettings("app_settings", defaults)
+      await setAppSettings(defaults)
       settings = defaults
       console.log("[v0] Settings auto-seeded with", Object.keys(defaults).length, "default keys")
     }
-    
+
     return NextResponse.json({ settings })
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : "Unknown error"
@@ -62,12 +104,19 @@ export async function POST(request: Request) {
 
     console.log("[v0] Saving settings to Redis (POST):", Object.keys(body).length, "keys")
 
-    // Initialize Redis connection first
     await initRedis()
 
-    await setSettings("app_settings", body)
+    // Mirror-write: writes to BOTH `app_settings` and `all_settings` so the
+    // Settings UI and every trade-engine module (strategy-processor,
+    // pseudo-position-manager, market-data-cache, indication-processor-fixed,
+    // indication-sets-processor — all of which read `all_settings`) see the
+    // same snapshot on the next cycle.
+    await setAppSettings(body)
+    // Fan out a progression event so the operator can confirm the new
+    // values reached every running engine.
+    await emitSettingsChanged(Object.keys(body || {}).length)
 
-    console.log("[v0] Settings saved successfully to Redis")
+    console.log("[v0] Settings saved successfully to Redis (canonical + legacy mirror)")
 
     return NextResponse.json({ success: true })
   } catch (error) {
@@ -84,20 +133,22 @@ export async function POST(request: Request) {
 export async function PUT(request: Request) {
   try {
     const body = await request.json()
-    const settings = body.settings || body
+    const incoming = body.settings || body
 
-    console.log("[v0] Saving settings to Redis (PUT):", Object.keys(settings).length, "keys")
+    console.log("[v0] Saving settings to Redis (PUT):", Object.keys(incoming).length, "keys")
 
-    // Initialize Redis connection first
     await initRedis()
 
-    // Get existing settings and merge with new ones
-    const existingSettings = (await getSettings("app_settings")) || {}
-    const mergedSettings = { ...existingSettings, ...settings }
-    
-    await setSettings("app_settings", mergedSettings)
+    // Merge with the FULL current view (canonical + legacy merged) so PUT
+    // semantics stay correct even if a setting currently lives only in the
+    // legacy hash.
+    const existingSettings = (await getAppSettings({ bypassCache: true })) || {}
+    const mergedSettings = { ...existingSettings, ...incoming }
 
-    console.log("[v0] Settings updated successfully in Redis")
+    await setAppSettings(mergedSettings)
+    await emitSettingsChanged(Object.keys(incoming || {}).length)
+
+    console.log("[v0] Settings updated successfully in Redis (canonical + legacy mirror)")
 
     return NextResponse.json({ success: true, settings: mergedSettings })
   } catch (error) {

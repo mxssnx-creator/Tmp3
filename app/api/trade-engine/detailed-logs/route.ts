@@ -482,7 +482,9 @@ export async function GET(request: Request) {
         base: normalizedPseudoHierarchy.base,
         main: normalizedPseudoHierarchy.main,
         real: normalizedPseudoHierarchy.real,
-        total: normalizedPseudoHierarchy.base + normalizedPseudoHierarchy.main + normalizedPseudoHierarchy.real,
+        // Cascade pipeline — NOT a sum. `total` is the final-stage (Real) count;
+        // Base and Main are intermediate filter stages of the SAME pseudo-positions.
+        total: normalizedPseudoHierarchy.real,
       },
       // Extended stats
       prehistoricSymbols: aggregatedPrehistoric.symbols,
@@ -527,7 +529,10 @@ export async function GET(request: Request) {
         durationMs: aggregatedPrehistoric.durationMs,
       },
       configsProcessed: perConnection.reduce((sum, item) => sum + item.prehistoric.indicationResults + item.prehistoric.strategyPositions, 0),
-      evalsCompleted: aggregatedStrategyCounts.base + aggregatedStrategyCounts.main + aggregatedStrategyCounts.real,
+      // `evalsCompleted` = canonical strategies-evaluated count = Real-stage output.
+      // Base and Main are upstream filter stages in the SAME pipeline; summing
+      // them would triple-count the same logical strategies.
+      evalsCompleted: aggregatedStrategyCounts.real,
       avgCycleDuration,
       lastUpdate: new Date().toISOString(),
       errors: logs.filter((log: any) => log.type === "error").length,
