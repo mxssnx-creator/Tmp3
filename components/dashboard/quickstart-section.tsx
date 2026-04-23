@@ -177,6 +177,19 @@ interface LiveStats {
   liveOrdersPlaced: number
   liveOrdersFilled: number
   liveWinRate: number
+  // ── Open positions & accumulated volume (mirror of /stats openPositions branch)
+  // Pseudo = Base-stage volume-aware ledger. Real = Main→Real promotions.
+  // Live = cumulative exchange volume. Overall = server-computed rollup
+  // covering every "currently holding" bucket across all ledgers.
+  pseudoOpen: number
+  pseudoVolumeUsd: number
+  pseudoRunningSets: number
+  pseudoTopSets: Array<{ setKey: string; count: number; volumeUsd: number }>
+  realOpen: number
+  realVolumeUsd: number
+  liveVolumeUsd: number
+  totalOpenPositions: number
+  totalVolumeUsd: number
   // windows
   indLast5m: number
   indLast60m: number
@@ -222,6 +235,9 @@ const EMPTY_STATS: LiveStats = {
   },
   livePositionsOpen: 0, livePositionsCreated: 0, livePositionsClosed: 0,
   liveOrdersPlaced: 0, liveOrdersFilled: 0, liveWinRate: 0,
+  pseudoOpen: 0, pseudoVolumeUsd: 0, pseudoRunningSets: 0, pseudoTopSets: [],
+  realOpen: 0, realVolumeUsd: 0, liveVolumeUsd: 0,
+  totalOpenPositions: 0, totalVolumeUsd: 0,
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
 }
 
@@ -229,6 +245,16 @@ function fmt(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}K`
   return String(n)
+}
+
+// USD-formatter for accumulated-volume displays. K/M-scaled to fit the
+// same tight layouts as `fmt` but prefixed with $ for readability.
+// Values < $1 show `$0` so idle connections stay visually quiet.
+function fmtUsd(n: number): string {
+  if (!Number.isFinite(n) || n < 1) return "$0"
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1_000)     return `$${(n / 1_000).toFixed(1)}K`
+  return `$${n.toFixed(0)}`
 }
 
 // ─── sub-components ───────────────────────────────────────────────────────────
@@ -432,6 +458,24 @@ export function QuickstartSection() {
         liveOrdersPlaced:      s.liveExecution?.ordersPlaced     || 0,
         liveOrdersFilled:      s.liveExecution?.ordersFilled     || 0,
         liveWinRate:           s.liveExecution?.winRate          || 0,
+        // ── Open positions & accumulated volume ───────────────────
+        // Server exposes this as `s.openPositions` with the shape:
+        //   { pseudo: { open, volumeUsd, runningSets, topSets[] },
+        //     real:   { open, volumeUsd },
+        //     live:   { open, volumeUsd },
+        //     overall:{ totalOpenPositions, totalVolumeUsd, ... } }
+        // All values are pre-rounded server-side — we just surface them.
+        pseudoOpen:            Number(s.openPositions?.pseudo?.open)         || 0,
+        pseudoVolumeUsd:       Number(s.openPositions?.pseudo?.volumeUsd)    || 0,
+        pseudoRunningSets:     Number(s.openPositions?.pseudo?.runningSets)  || 0,
+        pseudoTopSets:         Array.isArray(s.openPositions?.pseudo?.topSets)
+                                 ? s.openPositions.pseudo.topSets
+                                 : [],
+        realOpen:              Number(s.openPositions?.real?.open)           || 0,
+        realVolumeUsd:         Number(s.openPositions?.real?.volumeUsd)      || 0,
+        liveVolumeUsd:         Number(s.openPositions?.live?.volumeUsd)      || 0,
+        totalOpenPositions:    Number(s.openPositions?.overall?.totalOpenPositions) || 0,
+        totalVolumeUsd:        Number(s.openPositions?.overall?.totalVolumeUsd)     || 0,
         indLast5m:             s.windows?.indications?.last5m     || 0,
         indLast60m:            s.windows?.indications?.last60m    || 0,
         phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
@@ -542,7 +586,7 @@ export function QuickstartSection() {
   const addLog = (msg: string, type: LogEntry["type"] = "info") =>
     setLogs(prev => [...prev, { id: Math.random().toString(), message: msg, type, timestamp: new Date() }])
 
-  // ── start / stop ───────────────────────────────────────────────────────────
+  // ── start / stop ─────────────────────────────────────────��─────────────────
   const handleStart = async () => {
     if (starting || isRunning) return
     setStarting(true)
@@ -985,6 +1029,92 @@ export function QuickstartSection() {
             <MiniStat label="60m Ind"    value={fmt(stats.indLast60m)}         sub="last 60min" />
           )}
         </div>
+
+        {/* ── Accumulated Positions & Volume strip ──────────────────────────
+            Single-glance view of every "currently holding exposure"
+            ledger: pseudo (Base-stage), Real (Main→Real promotions),
+            and live exchange — with Running Sets and a Total Vol
+            rollup. Shown whenever ANY ledger has activity, even when
+            the quickstart card is collapsed, so the operator can
+            always see where the money is without expanding. */}
+        {(stats.totalOpenPositions > 0 ||
+          stats.pseudoOpen > 0 ||
+          stats.realOpen > 0 ||
+          stats.livePositionsOpen > 0 ||
+          stats.totalVolumeUsd > 0) && (
+          <div className="rounded-md border bg-gradient-to-r from-emerald-50/60 to-amber-50/40 dark:from-emerald-950/20 dark:to-amber-950/10 p-2 space-y-1">
+            <div className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground/80">
+              Accumulated — Open Positions &amp; Volume
+            </div>
+            <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-6 text-[10px]">
+              <div
+                className="flex flex-col gap-0.5"
+                title="Total currently-open positions across all ledgers (pseudo + live exchange)"
+              >
+                <span className="text-muted-foreground">Total Open</span>
+                <span className="font-bold text-green-700 dark:text-green-400 tabular-nums">
+                  {fmt(stats.totalOpenPositions)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title={(() => {
+                  if (!stats.pseudoTopSets || stats.pseudoTopSets.length === 0) {
+                    return `${stats.pseudoRunningSets} Sets currently hold open pseudo positions`
+                  }
+                  return [
+                    `${stats.pseudoRunningSets} Sets with open positions — top 5 by exposure:`,
+                    ...stats.pseudoTopSets.map(
+                      (s) =>
+                        `• ${s.setKey.slice(0, 28)}${s.setKey.length > 28 ? "…" : ""}  (${s.count}×  ${fmtUsd(s.volumeUsd)})`,
+                    ),
+                  ].join("\n")
+                })()}
+              >
+                <span className="text-muted-foreground">Running Sets</span>
+                <span className="font-bold text-green-700 dark:text-green-400 tabular-nums">
+                  {fmt(stats.pseudoRunningSets)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title={`Pseudo (Base) open: ${fmt(stats.pseudoOpen)} positions · ${fmtUsd(stats.pseudoVolumeUsd)} accumulated`}
+              >
+                <span className="text-muted-foreground">Pseudo Vol</span>
+                <span className="font-semibold text-green-700 dark:text-green-400 tabular-nums">
+                  {fmtUsd(stats.pseudoVolumeUsd)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title={`Real open: ${fmt(stats.realOpen)} positions · ${fmtUsd(stats.realVolumeUsd)} accumulated`}
+              >
+                <span className="text-muted-foreground">Real Vol</span>
+                <span className="font-semibold text-emerald-700 dark:text-emerald-400 tabular-nums">
+                  {fmtUsd(stats.realVolumeUsd)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title={`Live exchange open: ${fmt(stats.livePositionsOpen)} positions · ${fmtUsd(stats.liveVolumeUsd)} cumulative`}
+              >
+                <span className="text-muted-foreground">Live Vol</span>
+                <span className="font-semibold text-amber-700 dark:text-amber-400 tabular-nums">
+                  {fmtUsd(stats.liveVolumeUsd)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title="Total accumulated USD across all ledgers (pseudo + real + live)"
+              >
+                <span className="text-muted-foreground">Total Vol</span>
+                <span className="font-bold text-primary tabular-nums">
+                  {fmtUsd(stats.totalVolumeUsd)}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* ── expanded panel ─────────────────────────────────────────────── */}
         {expanded && (
