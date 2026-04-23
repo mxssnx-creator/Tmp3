@@ -56,46 +56,27 @@ export function StatisticsOverviewV2() {
   useEffect(() => {
     let mounted = true
 
+    // Single canonical loader — fetches the per-connection stats
+    // endpoint, parses the `liveExecution` / `strategyDetail.live` /
+    // `realtime` / `breakdown` / `metadata` branches, and pushes into
+    // local state. Called on mount, every 5s, and on global engine /
+    // connection / live-trade toggle events for immediate refresh.
     const load = async () => {
       try {
         const res = await fetch(
           `/api/connections/progression/${connectionId}/stats`,
-          { cache: "no-store" }
+          { cache: "no-store" },
         )
         if (!res.ok || !mounted) return
         const d = await res.json()
 
-        // Live execution metrics are exposed at `liveExecution` (preferred)
-        // and `strategyDetail.live` (extra fields) by the /stats endpoint.
-        const liveExec   = d.liveExecution       || {}
+        // Live execution metrics are exposed at `liveExecution`
+        // (preferred) and `strategyDetail.live` (extra fields) by the
+        // /stats endpoint.
+        const liveExec = d.liveExecution || {}
         const liveDetail = d.strategyDetail?.live || {}
-    loadStats()
-    const interval = setInterval(loadStats, 5000) // Reduced to 5s for real-time updates
-    
-    // Listen for engine state changes to refresh immediately
-    const handleEngineStateChanged = () => loadStats()
-    
-    if (typeof window !== 'undefined') {
-      window.addEventListener('engine-state-changed', handleEngineStateChanged)
-      window.addEventListener('connection-toggled', handleEngineStateChanged)
-      window.addEventListener('live-trade-toggled', handleEngineStateChanged)
-    }
-    
-    return () => {
-      clearInterval(interval)
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('engine-state-changed', handleEngineStateChanged)
-        window.removeEventListener('connection-toggled', handleEngineStateChanged)
-        window.removeEventListener('live-trade-toggled', handleEngineStateChanged)
-      }
-    }
-  }, [])
 
-  const loadStats = async () => {
-    try {
-      const res = await fetch("/api/monitoring/stats", { cache: "no-store" })
-      if (res.ok) {
-        const data = await res.json()
+        if (!mounted) return
         setStats({
           indicationCycles: d.realtime?.indicationCycles || 0,
           indicationsTotal: d.realtime?.indicationsTotal || 0,
@@ -115,15 +96,31 @@ export function StatisticsOverviewV2() {
           isActive:         d.metadata?.engineRunning || false,
         })
       } catch {
-        // non-critical
+        // Non-critical polling — swallow silently so a blip doesn't
+        // blank the dashboard strip.
       }
     }
 
     load()
     const interval = setInterval(load, 5000)
+
+    // Event-driven refresh so toggles surface immediately rather than
+    // waiting up to 5 seconds for the next interval tick.
+    const handleEngineStateChanged = () => { load() }
+    if (typeof window !== "undefined") {
+      window.addEventListener("engine-state-changed", handleEngineStateChanged)
+      window.addEventListener("connection-toggled", handleEngineStateChanged)
+      window.addEventListener("live-trade-toggled", handleEngineStateChanged)
+    }
+
     return () => {
       mounted = false
       clearInterval(interval)
+      if (typeof window !== "undefined") {
+        window.removeEventListener("engine-state-changed", handleEngineStateChanged)
+        window.removeEventListener("connection-toggled", handleEngineStateChanged)
+        window.removeEventListener("live-trade-toggled", handleEngineStateChanged)
+      }
     }
   }, [connectionId])
 

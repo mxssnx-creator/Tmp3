@@ -1515,8 +1515,29 @@ export async function getAllConnectionsWithStatus(): Promise<any[]> {
 // ========== Additional CRUD Operations ==========
 
 export async function createConnection(data: any): Promise<any> {
+  await initRedis()
   const client = getRedisClient()
   const id = data.id || `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+
+  // Check if connection already exists to prevent duplicates — if it
+  // does, update it in place rather than producing a conflicting
+  // second row. This is the behaviour the orphan block below was
+  // trying to express before it was accidentally left outside the
+  // function body (which broke the build with "Return statement is
+  // not allowed here" at the module top level).
+  const existingConnection = await client.hgetall(`connection:${id}`)
+  if (existingConnection && Object.keys(existingConnection).length > 0) {
+    console.log(`[v0] [Redis] Connection already exists with id ${id}, updating instead of creating duplicate`)
+    const merged = {
+      ...data,
+      id,
+      updated_at: new Date().toISOString(),
+    }
+    await client.hset(`connection:${id}`, merged)
+    invalidateConnectionsCache()
+    return merged
+  }
+
   const connectionData = {
     ...data,
     id,
@@ -1527,33 +1548,6 @@ export async function createConnection(data: any): Promise<any> {
   invalidateConnectionsCache()
   return connectionData
 }
-   await initRedis()
-   const client = getRedisClient()
-   const id = data.id || `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-   
-   // Check if connection already exists to prevent duplicates
-   const existingConnection = await client.hgetall(`connection:${id}`)
-   if (existingConnection && Object.keys(existingConnection).length > 0) {
-     console.log(`[v0] [Redis] Connection already exists with id ${id}, updating instead of creating duplicate`)
-     // Update existing connection
-     const connectionData = {
-       ...data,
-       id,
-       updated_at: new Date().toISOString(),
-     }
-     await client.hset(`connection:${id}`, connectionData)
-     return connectionData
-   }
-   
-   const connectionData = {
-     ...data,
-     id,
-     created_at: new Date().toISOString(),
-     updated_at: new Date().toISOString(),
-   }
-   await client.hset(`connection:${id}`, connectionData)
-   return connectionData
- }
 
 export async function updateConnection(id: string, updates: any): Promise<any> {
   const client = getRedisClient()
