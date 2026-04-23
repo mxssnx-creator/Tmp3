@@ -240,24 +240,29 @@ export async function GET(
     // progHash.live_volume_usd_total (cumulative) and derived into
     // `openPositions.live` below.
     let pseudoOpen = 0
-    let pseudoVolumeUsd = 0
     let pseudoRunningSets = 0
-    const pseudoSetAgg = new Map<string, { count: number; volumeUsd: number }>()
+    // Per-Set open-position counts (pseudo evaluation stage).
+    // Volume is intentionally NOT tracked here — pseudo is a
+    // simulated-sizing evaluation stage, not real exchange exposure.
+    // Count is the only meaningful metric for the mirroring pipeline
+    // health view.
+    const pseudoSetAgg = new Map<string, { count: number }>()
     // ── Symbol+direction → setKey lookup index ───────────────────────
     // Built during the pseudo-position scan so the live-stage
     // Set-relation join below can identify which Set an exchange
-    // position was spawned from WITHOUT requiring new fields on the
+    // position was mirrored from WITHOUT requiring new fields on the
     // LivePosition schema. Keyed as `SYMBOL:direction` (upper-cased
-    // symbol, lowercase direction). Value is the list of candidate
-    // setKeys currently holding open pseudo exposure for that pair,
-    // with the per-set share so the UI can rank them. In practice a
-    // live position maps to exactly one Set (the one whose Real
-    // promotion triggered the exchange order) — we expose candidates
-    // regardless so the operator sees the relationship even when
-    // multiple Sets overlap on the same symbol/direction.
+    // symbol, lowercase direction). Value = candidate setKeys
+    // currently holding open pseudo positions for that pair; ranking
+    // is by pseudo-position count (how many eval positions the Set
+    // carries). In practice a live position maps to exactly one Set
+    // (the one whose Real promotion triggered the exchange order) —
+    // we expose candidates regardless so the operator sees the
+    // relationship even when multiple equivalent Sets overlap on the
+    // same symbol/direction (the consolidation case).
     const pseudoSymDirIdx = new Map<
       string,
-      Array<{ setKey: string; count: number; volumeUsd: number }>
+      Array<{ setKey: string; count: number }>
     >()
 
     try {
@@ -282,27 +287,18 @@ export async function GET(
         if (status !== "active" && status !== "open") continue
         pseudoOpen++
 
-        // Prefer the pre-computed position_cost written at creation;
-        // fall back to qty * entry for defensive compatibility with
-        // older rows that may not have it.
-        let cost = Number(hh.position_cost)
-        if (!Number.isFinite(cost) || cost <= 0) {
-          const qty = Number(hh.quantity) || 0
-          const px  = Number(hh.entry_price) || 0
-          cost = qty * px
-        }
-        if (Number.isFinite(cost) && cost > 0) pseudoVolumeUsd += cost
-
         const setKey = String(hh.config_set_key || "").trim()
         if (setKey) {
-          const prev = pseudoSetAgg.get(setKey) || { count: 0, volumeUsd: 0 }
+          const prev = pseudoSetAgg.get(setKey) || { count: 0 }
           prev.count++
-          prev.volumeUsd += (Number.isFinite(cost) && cost > 0 ? cost : 0)
           pseudoSetAgg.set(setKey, prev)
 
           // Populate symbol+direction → setKey join index for live
           // position coordination (see openPositions.live.positions
           // downstream). Same per-hash pass — no extra Redis work.
+          // Equivalent upstream Sets sharing the same symbol+direction
+          // appear in this list and will be consolidated into a single
+          // exchange position downstream (the mirroring principle).
           const sym = String(hh.symbol || "").trim().toUpperCase()
           const dir = String(hh.direction || "").trim().toLowerCase()
           if (sym && (dir === "long" || dir === "short")) {
@@ -311,13 +307,8 @@ export async function GET(
             const existing = arr.find((e) => e.setKey === setKey)
             if (existing) {
               existing.count++
-              existing.volumeUsd += (Number.isFinite(cost) && cost > 0 ? cost : 0)
             } else {
-              arr.push({
-                setKey,
-                count: 1,
-                volumeUsd: Number.isFinite(cost) && cost > 0 ? cost : 0,
-              })
+              arr.push({ setKey, count: 1 })
             }
             pseudoSymDirIdx.set(joinKey, arr)
           }
@@ -349,22 +340,23 @@ export async function GET(
       .sort((a, b) => b.count - a.count)
       .slice(0, 5)
 
-    // ── Real-stage open positions + accumulated volume ──────────────────
+    // ── Real-stage open positions ────────────────────────────────────
     //
-    // Unlike Base/Main (which are evaluation tiers with no per-position
-    // quantity), Real positions carry `{ quantity, entryPrice, status }`.
-    // We scan the namespace once and sum notional for all non-closed
-    // rows. Bounded by a 500-key safety ceiling — anything beyond that
+    // Real positions are Main→Real promotions awaiting mirror into
+    // exchange orders. Count only — USD volume is NOT tracked here
+    // either; Real is still a pipeline stage, not the exchange. The
+    // only authoritative USD exposure is live.volumeUsd below.
+    // Bounded by a 500-key safety ceiling — anything beyond that
     // is a data-hygiene issue the operator needs to fix independently.
     let realOpen = 0
-    let realVolumeUsd = 0
     // ── Symbol+direction → candidate Real positions index ─────────
-    // Populated alongside the real scan so live-position resolution
+    // Populated alongside the Real scan so live-position resolution
     // can fall back to Real when the pseudo ledger has no matching
     // entry (e.g. Set was closed before the exchange position did).
+    // No volume tracked — resolution just needs existence + id.
     const realSymDirIdx = new Map<
       string,
-      Array<{ realPositionId: string; volumeUsd: number }>
+      Array<{ realPositionId: string }>
     >()
     try {
       const realKeys = await client.keys(`real:position:real:${connectionId}:*`)
@@ -379,17 +371,13 @@ export async function GET(
             const pos = JSON.parse(raw as string)
             if (pos.status === "closed") continue
             realOpen++
-            const qty = Number(pos.quantity)  || 0
-            const px  = Number(pos.entryPrice) || 0
-            const volume = qty > 0 && px > 0 ? qty * px : 0
-            if (volume > 0) realVolumeUsd += volume
-            // Index for live position join
+            // Index for live position join (fallback path)
             const sym = String(pos.symbol || "").trim().toUpperCase()
             const dir = String(pos.direction || "").trim().toLowerCase()
             if (sym && (dir === "long" || dir === "short") && pos.id) {
               const joinKey = `${sym}:${dir}`
               const arr = realSymDirIdx.get(joinKey) || []
-              arr.push({ realPositionId: String(pos.id), volumeUsd: volume })
+              arr.push({ realPositionId: String(pos.id) })
               realSymDirIdx.set(joinKey, arr)
             }
           } catch { /* skip malformed */ }
@@ -421,15 +409,19 @@ export async function GET(
       id: string
       symbol: string
       direction: "long" | "short"
-      volumeUsd: number
+      volumeUsd: number        // ← the ONLY real-money figure (exchange-side)
       unrealizedPnl: number
       entryPrice: number
       markPrice: number
       status: string
       createdAt: number
       realPositionId?: string
-      setKeys: Array<{ setKey: string; count: number; volumeUsd: number }>
-      // `resolution` lets the UI say exactly HOW the Set was identified:
+      // Equivalent upstream Sets mirrored into this ONE exchange
+      // order. Count = how many pseudo eval positions that Set is
+      // currently holding. No per-Set USD (eval-stage notionals are
+      // not real exposure and would be misleading).
+      setKeys: Array<{ setKey: string; count: number }>
+      // `resolution` tells the UI exactly HOW the Set was identified:
       //   • "pseudo"        — exact pseudo row exists for this symbol+dir
       //   • "real-fallback" — no pseudo match; resolved via Real ledger
       //   • "unresolved"    — nothing upstream matched (stale or manual)
@@ -464,19 +456,21 @@ export async function GET(
             const volumeUsd = qty > 0 && px > 0 ? Math.round(qty * px * 100) / 100 : 0
 
             const joinKey = `${sym}:${dir}`
-            let setKeys: Array<{ setKey: string; count: number; volumeUsd: number }> = []
+            let setKeys: Array<{ setKey: string; count: number }> = []
             let resolution: "pseudo" | "real-fallback" | "unresolved" = "unresolved"
 
             const pseudoMatches = pseudoSymDirIdx.get(joinKey)
             if (pseudoMatches && pseudoMatches.length > 0) {
+              // Rank by pseudo-position count (how many eval positions
+              // the Set is holding) — count is the only meaningful
+              // eval-stage metric, since USD notionals at this stage
+              // are simulated-sizing not real exposure. All equivalent
+              // Sets on the same symbol+dir are surfaced so the UI can
+              // render "N Sets → 1 exchange order" consolidation.
               setKeys = [...pseudoMatches]
-                .sort((a, b) => b.volumeUsd - a.volumeUsd)
+                .sort((a, b) => b.count - a.count)
                 .slice(0, 3)
-                .map((s) => ({
-                  setKey: s.setKey,
-                  count: s.count,
-                  volumeUsd: Math.round(s.volumeUsd * 100) / 100,
-                }))
+                .map((s) => ({ setKey: s.setKey, count: s.count }))
               resolution = "pseudo"
             } else {
               const realMatches = realSymDirIdx.get(joinKey)
@@ -489,9 +483,6 @@ export async function GET(
                 setKeys = [{
                   setKey: `real:${realMatches[0].realPositionId}`,
                   count: realMatches.length,
-                  volumeUsd: Math.round(
-                    realMatches.reduce((s, m) => s + m.volumeUsd, 0) * 100,
-                  ) / 100,
                 }]
               }
             }
