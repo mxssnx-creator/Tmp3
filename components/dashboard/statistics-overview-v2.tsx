@@ -43,26 +43,56 @@ interface CompactStats {
   liveClosed: number
   liveWinRate: number
   liveFillRate: number
-  // ── Live-exchange position → mirrored Sets coordination ──────────
-  // Each live exchange position is the consolidation of one or more
-  // equivalent upstream Sets (same base + same ranges). The server
-  // returns the list of Sets mirrored into each live position via a
-  // symbol+direction join against the pseudo ledger. Volume applies
-  // only to the live position itself (exchange exposure) — per-set
-  // entries carry count only (how many eval positions that Set is
-  // holding upstream). `mirroredSetCount` = how many equivalent Sets
-  // were consolidated into this single exchange order.
+  // ── Portfolio-wide exchange aggregates (scan-derived) ────────────
+  // Summed across every open exchange position. Optional because the
+  // server may lag behind schema changes; defaults to 0 via setStats
+  // normalization so the Live strip always renders deterministically.
+  liveUnrealizedPnl: number
+  liveMarginUsd: number
+  livePortfolioRoiPct: number
+  liveInProfit: number
+  liveInLoss: number
+  liveNearLiquidation: number
+  liveStaleSync: number
+  liveConsolidatedSetsTotal: number
+  // ── Per-position exchange details + mirroring coordination ───────
+  // Each entry carries the FULL exchange Position Details (leverage,
+  // margin at risk, liquidation distance, SL/TP levels, ROI) plus
+  // the list of equivalent upstream Sets mirrored into it. Every
+  // numeric field is guaranteed to be a finite number (normalized
+  // in setStats) so render logic can read directly without `??`.
   livePositions: Array<{
     id: string
     symbol: string
     direction: "long" | "short"
+    // Exchange exposure
     volumeUsd: number
-    unrealizedPnl: number
+    quantity: number
+    leverage: number
+    marginType: "cross" | "isolated"
+    marginUsd: number
+    // Prices
     entryPrice: number
     markPrice: number
+    liquidationPrice: number
+    liquidationDistancePct: number
+    // PnL
+    unrealizedPnl: number
+    roiPct: number
+    // Risk management levels
+    stopLossPrice: number
+    takeProfitPrice: number
+    // Exchange references (optional — may not be surfaced by all connectors)
+    orderId?: string
+    stopLossOrderId?: string
+    takeProfitOrderId?: string
+    // Lifecycle
     status: string
     createdAt: number
+    updatedAt: number
+    syncedAt: number
     realPositionId?: string
+    // Coordination fan-in
     mirroredSetCount: number
     mirroredSets: Array<{ setKey: string; count: number }>
     resolution: "pseudo" | "real-fallback" | "unresolved"
@@ -95,6 +125,14 @@ const EMPTY: CompactStats = {
   liveClosed: 0,
   liveWinRate: 0,
   liveFillRate: 0,
+  liveUnrealizedPnl: 0,
+  liveMarginUsd: 0,
+  livePortfolioRoiPct: 0,
+  liveInProfit: 0,
+  liveInLoss: 0,
+  liveNearLiquidation: 0,
+  liveStaleSync: 0,
+  liveConsolidatedSetsTotal: 0,
   livePositions: [],
   liveResolution: { pseudo: 0, realFallback: 0, unresolved: 0 },
   phase: "",
@@ -510,12 +548,71 @@ export function StatisticsOverviewV2() {
           liveClosed:       liveExec.positionsClosed  || 0,
           liveWinRate:      liveExec.winRate          || liveDetail.winRate  || 0,
           liveFillRate:     liveExec.fillRate         || liveDetail.passRatio || 0,
-          // Mirroring coordination payload: for each live exchange
-          // position, which equivalent Sets are mirrored into it, plus
-          // resolution provenance (pseudo / real-fallback /
-          // unresolved). `mirroredSetCount` is the deduplication
-          // metric — N Sets consolidated into 1 exchange order.
-          livePositions:    Array.isArray(opLive.positions) ? opLive.positions : [],
+          // Exchange-wide aggregates (scan-derived on the server).
+          // Each field falls back to 0 when the server hasn't emitted
+          // it yet (e.g. during a staged schema rollout), keeping the
+          // Live strip render deterministic and crash-free.
+          liveUnrealizedPnl:         Number(opLive.aggregate?.totalUnrealizedPnl) || 0,
+          liveMarginUsd:             Number(opLive.aggregate?.totalMarginUsd)     || 0,
+          livePortfolioRoiPct:       Number(opLive.aggregate?.portfolioRoiPct)    || 0,
+          liveInProfit:              Number(opLive.aggregate?.inProfit)           || 0,
+          liveInLoss:                Number(opLive.aggregate?.inLoss)             || 0,
+          liveNearLiquidation:       Number(opLive.aggregate?.nearLiquidation)    || 0,
+          liveStaleSync:             Number(opLive.aggregate?.staleSync)          || 0,
+          liveConsolidatedSetsTotal: Number(opLive.aggregate?.consolidatedSetsTotal) || 0,
+          // Mirroring coordination payload: each live position row
+          // normalized to a COMPLETE shape (every numeric field
+          // coerced to a finite number, optional strings kept as-is).
+          // This is the crash-immune invariant — render code can read
+          // `lp.leverage.toFixed(...)` without any defensive guard,
+          // even when the server omits newer fields.
+          livePositions: Array.isArray(opLive.positions)
+            ? opLive.positions.map((p: any) => {
+                const leverage = Math.max(1, Number(p.leverage) || 1)
+                const volumeUsd = Number(p.volumeUsd) || 0
+                // Derive margin at risk if server didn't compute it
+                const marginUsd = Number(p.marginUsd) > 0
+                  ? Number(p.marginUsd)
+                  : leverage > 0
+                    ? Math.round((volumeUsd / leverage) * 100) / 100
+                    : 0
+                const unrealizedPnl = Number(p.unrealizedPnl) || 0
+                const roiPct = Number(p.roiPct) !== 0
+                  ? Number(p.roiPct)
+                  : marginUsd > 0
+                    ? Math.round((unrealizedPnl / marginUsd) * 10000) / 100
+                    : 0
+                return {
+                  id:                    String(p.id || ""),
+                  symbol:                String(p.symbol || ""),
+                  direction:             (p.direction === "short" ? "short" : "long") as "long" | "short",
+                  volumeUsd,
+                  quantity:              Number(p.quantity) || 0,
+                  leverage,
+                  marginType:            (p.marginType === "isolated" ? "isolated" : "cross") as "cross" | "isolated",
+                  marginUsd,
+                  entryPrice:            Number(p.entryPrice) || 0,
+                  markPrice:             Number(p.markPrice)  || 0,
+                  liquidationPrice:      Number(p.liquidationPrice) || 0,
+                  liquidationDistancePct: Number(p.liquidationDistancePct) || 0,
+                  unrealizedPnl,
+                  roiPct,
+                  stopLossPrice:         Number(p.stopLossPrice)   || 0,
+                  takeProfitPrice:       Number(p.takeProfitPrice) || 0,
+                  orderId:               p.orderId ? String(p.orderId) : undefined,
+                  stopLossOrderId:       p.stopLossOrderId ? String(p.stopLossOrderId) : undefined,
+                  takeProfitOrderId:     p.takeProfitOrderId ? String(p.takeProfitOrderId) : undefined,
+                  status:                String(p.status || "open"),
+                  createdAt:             Number(p.createdAt) || 0,
+                  updatedAt:             Number(p.updatedAt) || 0,
+                  syncedAt:              Number(p.syncedAt)  || 0,
+                  realPositionId:        p.realPositionId ? String(p.realPositionId) : undefined,
+                  mirroredSetCount:      Number(p.mirroredSetCount) || (Array.isArray(p.mirroredSets) ? p.mirroredSets.length : 0),
+                  mirroredSets:          Array.isArray(p.mirroredSets) ? p.mirroredSets : [],
+                  resolution:            (p.resolution === "real-fallback" || p.resolution === "unresolved" ? p.resolution : "pseudo") as "pseudo" | "real-fallback" | "unresolved",
+                }
+              })
+            : [],
           liveResolution: {
             pseudo:       Number(opLive.resolution?.pseudo)       || 0,
             realFallback: Number(opLive.resolution?.realFallback) || 0,
@@ -688,36 +785,122 @@ export function StatisticsOverviewV2() {
           </div>
         )}
 
-        {/* Live exchange metrics strip — only shown when there is live activity */}
-        {stats.stratLive > 0 && (
+        {/* Live exchange metrics strip — shown whenever live activity
+            has occurred (stratLive > 0) OR anything is currently open.
+            Six-column portfolio view: Live Open / Live Vol / Unr. PnL /
+            Margin / ROI / Win·Fill. The PnL / Margin / ROI triplet is
+            the authoritative real-money picture derived from the same
+            per-position snapshot used in the coordination panel below
+            — guarantees summary totals equal the sum of visible rows. */}
+        {(stats.stratLive > 0 || stats.livePositions.length > 0) && (
           <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-3 gap-2 text-[10px] sm:grid-cols-6">
-            <div className="flex flex-col gap-0.5">
-              <span className="text-muted-foreground">Filled</span>
-              <span className="font-semibold text-amber-700 tabular-nums">{fmt(stats.liveFilled)}</span>
-            </div>
-            <div className="flex flex-col gap-0.5">
-              <span className="text-muted-foreground">Closed</span>
-              <span className="font-semibold text-amber-700 tabular-nums">{fmt(stats.liveClosed)}</span>
-            </div>
-            <div className="flex flex-col gap-0.5" title="Live positions currently open on the exchange (created − closed)">
+            <div
+              className="flex flex-col gap-0.5"
+              title="Live positions currently open on the exchange (created − closed)"
+            >
               <span className="text-muted-foreground">Live Open</span>
               <span className="font-semibold text-amber-700 tabular-nums">{fmt(stats.liveOpen)}</span>
             </div>
             <div
               className="flex flex-col gap-0.5"
-              title="Cumulative exchange-side trading volume in USD (progHash.live_volume_usd_total)"
+              title="Cumulative exchange-side trading volume in USD (progHash.live_volume_usd_total). The single authoritative notional figure."
             >
               <span className="text-muted-foreground">Live Vol</span>
               <span className="font-semibold text-amber-700 tabular-nums">{fmtUsd(stats.liveVolumeUsd)}</span>
             </div>
-            <div className="flex flex-col gap-0.5">
-              <span className="text-muted-foreground">Fill %</span>
-              <span className="font-semibold text-amber-700 tabular-nums">{stats.liveFillRate.toFixed(1)}%</span>
+            <div
+              className="flex flex-col gap-0.5"
+              title={
+                `Portfolio unrealized PnL across ${stats.livePositions.length} open exchange position${stats.livePositions.length === 1 ? "" : "s"}\n` +
+                `${stats.liveInProfit} in profit · ${stats.liveInLoss} in loss`
+              }
+            >
+              <span className="text-muted-foreground">Unr. PnL</span>
+              <span
+                className={`font-semibold tabular-nums ${
+                  stats.liveUnrealizedPnl > 0
+                    ? "text-green-600"
+                    : stats.liveUnrealizedPnl < 0
+                      ? "text-red-600"
+                      : "text-muted-foreground"
+                }`}
+              >
+                {stats.liveUnrealizedPnl > 0 ? "+" : ""}
+                {fmtUsd(stats.liveUnrealizedPnl)}
+              </span>
             </div>
-            <div className="flex flex-col gap-0.5">
-              <span className="text-muted-foreground">Win %</span>
-              <span className={`font-semibold tabular-nums ${stats.liveWinRate >= 50 ? "text-green-600" : "text-amber-700"}`}>{stats.liveWinRate.toFixed(1)}%</span>
+            <div
+              className="flex flex-col gap-0.5"
+              title="Total margin at risk across all open exchange positions (sum of volumeUsd / leverage per position). This is the actual capital committed, not the notional exposure."
+            >
+              <span className="text-muted-foreground">Margin</span>
+              <span className="font-semibold text-amber-700 tabular-nums">{fmtUsd(stats.liveMarginUsd)}</span>
             </div>
+            <div
+              className="flex flex-col gap-0.5"
+              title="Portfolio ROI = totalUnrealizedPnl / totalMargin × 100 (matches exchange ROE semantics)"
+            >
+              <span className="text-muted-foreground">ROI</span>
+              <span
+                className={`font-semibold tabular-nums ${
+                  stats.livePortfolioRoiPct > 0
+                    ? "text-green-600"
+                    : stats.livePortfolioRoiPct < 0
+                      ? "text-red-600"
+                      : "text-muted-foreground"
+                }`}
+              >
+                {stats.livePortfolioRoiPct > 0 ? "+" : ""}
+                {stats.livePortfolioRoiPct.toFixed(2)}%
+              </span>
+            </div>
+            <div
+              className="flex flex-col gap-0.5"
+              title={`Win rate: ${stats.liveWinRate.toFixed(1)}% · Fill rate: ${stats.liveFillRate.toFixed(1)}% · Filled: ${fmt(stats.liveFilled)} · Closed: ${fmt(stats.liveClosed)}`}
+            >
+              <span className="text-muted-foreground">Win / Fill</span>
+              <span className="font-semibold text-amber-700 tabular-nums">
+                <span className={stats.liveWinRate >= 50 ? "text-green-600" : "text-amber-700"}>
+                  {stats.liveWinRate.toFixed(0)}%
+                </span>
+                <span className="text-muted-foreground mx-0.5">/</span>
+                {stats.liveFillRate.toFixed(0)}%
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Risk-alert row — surfaces near-liquidation + stale-sync
+            situations the operator needs to act on immediately. Only
+            rendered when there's something to warn about. */}
+        {(stats.liveNearLiquidation > 0 || stats.liveStaleSync > 0 ||
+          (stats.liveConsolidatedSetsTotal > stats.livePositions.length && stats.livePositions.length > 0)) && (
+          <div className="mt-1 flex items-center gap-3 flex-wrap text-[9px]">
+            {stats.liveNearLiquidation > 0 && (
+              <span
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300 font-semibold"
+                title={`${stats.liveNearLiquidation} exchange position${stats.liveNearLiquidation === 1 ? " is" : "s are"} within 5% of the liquidation price — reduce leverage or add margin`}
+              >
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                {stats.liveNearLiquidation} near-liq
+              </span>
+            )}
+            {stats.liveStaleSync > 0 && (
+              <span
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
+                title={`${stats.liveStaleSync} position${stats.liveStaleSync === 1 ? "" : "s"} not reconciled with the exchange in >60s — sync may be lagging`}
+              >
+                {stats.liveStaleSync} stale sync
+              </span>
+            )}
+            {stats.liveConsolidatedSetsTotal > stats.livePositions.length && stats.livePositions.length > 0 && (
+              <span
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-primary/15 text-primary"
+                title={`Across ${stats.livePositions.length} exchange order${stats.livePositions.length === 1 ? "" : "s"}, ${stats.liveConsolidatedSetsTotal} equivalent Sets were consolidated — ${stats.liveConsolidatedSetsTotal - stats.livePositions.length} duplicate exchange orders avoided.`}
+              >
+                {stats.liveConsolidatedSetsTotal} Sets &rarr; {stats.livePositions.length} order{stats.livePositions.length === 1 ? "" : "s"}
+              </span>
+            )}
           </div>
         )}
 

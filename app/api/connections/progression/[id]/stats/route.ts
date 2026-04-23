@@ -409,17 +409,38 @@ export async function GET(
       id: string
       symbol: string
       direction: "long" | "short"
-      volumeUsd: number        // ← the ONLY real-money figure (exchange-side)
-      unrealizedPnl: number
+      // ── Exchange exposure (the ONLY authoritative real-money figures) ──
+      volumeUsd: number
+      quantity: number
+      leverage: number
+      marginType: "cross" | "isolated"
+      marginUsd: number               // volumeUsd / leverage — actual capital at risk
+      // ── Price tracking ────────────────────────────────────────────────
       entryPrice: number
       markPrice: number
+      liquidationPrice: number        // from exchange sync (critical safety info)
+      liquidationDistancePct: number  // % distance mark → liq (negative = dangerous)
+      // ── PnL ──────────────────────────────────────────────────────────
+      unrealizedPnl: number
+      roiPct: number                  // unrealizedPnl / marginUsd × 100 (matches ROE)
+      // ── Risk-management levels ───────────────────────────────────────
+      stopLossPrice: number
+      takeProfitPrice: number
+      // ── Exchange order references ────────────────────────────────────
+      orderId?: string
+      stopLossOrderId?: string
+      takeProfitOrderId?: string
+      // ── Lifecycle ────────────────────────────────────────────────────
       status: string
       createdAt: number
+      updatedAt: number
+      syncedAt: number                // last exchange reconciliation (staleness check)
       realPositionId?: string
-      // Equivalent upstream Sets mirrored into this ONE exchange
-      // order. Count = how many pseudo eval positions that Set is
-      // currently holding. No per-Set USD (eval-stage notionals are
-      // not real exposure and would be misleading).
+      // ── Coordination (mirroring fan-in) ──────────────────────────────
+      // Equivalent upstream Sets mirrored into this ONE exchange order.
+      // Count = how many pseudo eval positions that Set is currently
+      // holding. No per-Set USD (eval-stage notionals are NOT real
+      // exposure and would be misleading).
       setKeys: Array<{ setKey: string; count: number }>
       // `resolution` tells the UI exactly HOW the Set was identified:
       //   • "pseudo"        — exact pseudo row exists for this symbol+dir
@@ -487,20 +508,69 @@ export async function GET(
               }
             }
 
+            // ── Enrich the per-position row with complete exchange-
+            //    side details so the UI can render full Position
+            //    Details (leverage, margin at risk, liq distance,
+            //    SL/TP levels, ROI) WITHOUT a second API round-trip.
+            const leverage = Math.max(1, Number(pos.leverage) || 1)
+            const marginType: "cross" | "isolated" =
+              (pos.exchangeData?.marginType as "cross" | "isolated") ||
+              (pos.marginType as "cross" | "isolated") ||
+              "cross"
+            const markPrice = Math.round(
+              (Number(pos.exchangeData?.markPrice) || 0) * 1e8,
+            ) / 1e8
+            const liquidationPrice = Math.round(
+              (Number(pos.exchangeData?.liquidationPrice) || 0) * 1e8,
+            ) / 1e8
+            const unrealizedPnl = Math.round(
+              (Number(pos.exchangeData?.unrealizedPnl ?? pos.exchangeData?.unrealizedPnL) || 0) * 100,
+            ) / 100
+            // Actual margin at risk = exposure / leverage (not
+            // notional). This is what the operator has skin in the
+            // game for; ROI is computed against it to match exchange
+            // ROE semantics.
+            const marginUsd = leverage > 0
+              ? Math.round((volumeUsd / leverage) * 100) / 100
+              : 0
+            const roiPct = marginUsd > 0
+              ? Math.round((unrealizedPnl / marginUsd) * 10000) / 100
+              : 0
+            // Liquidation distance: +% = safe headroom, −% = mark
+            // already past liq (auto-close imminent / processing).
+            let liquidationDistancePct = 0
+            if (markPrice > 0 && liquidationPrice > 0) {
+              const raw =
+                dir === "long"
+                  ? (markPrice - liquidationPrice) / markPrice
+                  : (liquidationPrice - markPrice) / markPrice
+              liquidationDistancePct = Math.round(raw * 10000) / 100
+            }
+
             livePositionSetRelations.push({
               id: String(pos.id || ""),
               symbol: sym,
               direction: dir as "long" | "short",
               volumeUsd,
-              unrealizedPnl: Math.round(
-                (Number(pos.exchangeData?.unrealizedPnl ?? pos.exchangeData?.unrealizedPnL) || 0) * 100,
-              ) / 100,
+              quantity: Math.round(qty * 1e8) / 1e8,
+              leverage,
+              marginType,
+              marginUsd,
               entryPrice: Math.round(px * 1e8) / 1e8,
-              markPrice:  Math.round(
-                (Number(pos.exchangeData?.markPrice) || 0) * 1e8,
-              ) / 1e8,
+              markPrice,
+              liquidationPrice,
+              liquidationDistancePct,
+              unrealizedPnl,
+              roiPct,
+              stopLossPrice:   Math.round((Number(pos.stopLossPrice)   || 0) * 1e8) / 1e8,
+              takeProfitPrice: Math.round((Number(pos.takeProfitPrice) || 0) * 1e8) / 1e8,
+              orderId:            pos.orderId            ? String(pos.orderId)            : undefined,
+              stopLossOrderId:    pos.stopLossOrderId    ? String(pos.stopLossOrderId)    : undefined,
+              takeProfitOrderId:  pos.takeProfitOrderId  ? String(pos.takeProfitOrderId)  : undefined,
               status,
               createdAt: Number(pos.createdAt) || 0,
+              updatedAt: Number(pos.updatedAt) || 0,
+              syncedAt:  Number(pos.exchangeData?.syncedAt) || 0,
               realPositionId: pos.realPositionId ? String(pos.realPositionId) : undefined,
               setKeys,
               resolution,
@@ -525,6 +595,47 @@ export async function GET(
     const liveUnresolvedCount = livePositionSetRelations.filter(
       (p) => p.resolution === "unresolved",
     ).length
+
+    // ── Exchange-wide aggregates for the Live summary strip ──────────
+    // Computed from the SAME scan-derived snapshot that drives the
+    // per-position rows — guarantees the summary totals always equal
+    // the sum of what's visible in the coordination panel. These are
+    // the authoritative portfolio figures the operator needs to make
+    // risk decisions.
+    let liveAggTotalUnrealizedPnl = 0
+    let liveAggTotalMarginUsd = 0
+    let liveAggTotalVolumeUsd = 0
+    let liveAggInProfit = 0
+    let liveAggInLoss = 0
+    let liveAggNearLiquidation = 0   // mark within ≤ 5% of liq price
+    let liveAggStaleSync = 0         // no exchange sync in >60s
+    const liveAggConsolidatedSets = livePositionSetRelations.reduce(
+      (sum, p) => sum + (p.setKeys?.length || 0),
+      0,
+    )
+    const nowMsAgg = Date.now()
+    for (const p of livePositionSetRelations) {
+      liveAggTotalUnrealizedPnl += p.unrealizedPnl || 0
+      liveAggTotalMarginUsd     += p.marginUsd || 0
+      liveAggTotalVolumeUsd     += p.volumeUsd || 0
+      if ((p.unrealizedPnl || 0) > 0) liveAggInProfit++
+      else if ((p.unrealizedPnl || 0) < 0) liveAggInLoss++
+      if (
+        p.liquidationPrice > 0 &&
+        p.markPrice > 0 &&
+        p.liquidationDistancePct !== 0 &&
+        p.liquidationDistancePct <= 5
+      ) {
+        liveAggNearLiquidation++
+      }
+      if (p.syncedAt > 0 && nowMsAgg - p.syncedAt > 60_000) liveAggStaleSync++
+    }
+    liveAggTotalUnrealizedPnl = Math.round(liveAggTotalUnrealizedPnl * 100) / 100
+    liveAggTotalMarginUsd     = Math.round(liveAggTotalMarginUsd * 100) / 100
+    liveAggTotalVolumeUsd     = Math.round(liveAggTotalVolumeUsd * 100) / 100
+    const liveAggPortfolioRoiPct = liveAggTotalMarginUsd > 0
+      ? Math.round((liveAggTotalUnrealizedPnl / liveAggTotalMarginUsd) * 10000) / 100
+      : 0
 
     const realtimeIsActive =
       realtimeIndicationCycles > 0 ||
@@ -1044,27 +1155,48 @@ export async function GET(
         const liveVolumeUsd = n(progHash.live_volume_usd_total)
         const liveVolumeUsdR = Math.round(liveVolumeUsd * 100) / 100
 
-        // Rename setKeys → mirroredSets on each live position and
-        // drop per-set volumeUsd (Set-level eval volume is noise at
-        // this layer; we only care about WHICH Sets are being
-        // mirrored into this one exchange position, i.e. the
-        // deduplication fan-in).
+        // Full Exchange Position Details per live position. Contains
+        // everything the operator needs to evaluate trade health
+        // (leverage, margin at risk, liquidation distance, SL/TP,
+        // ROI) WITHOUT having to hit /api/trading/live-positions
+        // separately. Also carries the mirroring coordination payload
+        // (`mirroredSets`) so the UI can render "N equivalent Sets
+        // consolidated into this 1 exchange order" without a second
+        // join against the pseudo ledger.
         const liveMirroring = livePositionSetRelations
           .slice(0, 50)
           .map((p) => ({
             id:            p.id,
             symbol:        p.symbol,
             direction:     p.direction,
-            volumeUsd:     p.volumeUsd,      // this live position's exchange exposure
-            unrealizedPnl: p.unrealizedPnl,
+            // Exchange exposure
+            volumeUsd:     p.volumeUsd,
+            quantity:      p.quantity,
+            leverage:      p.leverage,
+            marginType:    p.marginType,
+            marginUsd:     p.marginUsd,
+            // Prices
             entryPrice:    p.entryPrice,
             markPrice:     p.markPrice,
+            liquidationPrice:       p.liquidationPrice,
+            liquidationDistancePct: p.liquidationDistancePct,
+            // PnL
+            unrealizedPnl: p.unrealizedPnl,
+            roiPct:        p.roiPct,
+            // Risk management
+            stopLossPrice:   p.stopLossPrice,
+            takeProfitPrice: p.takeProfitPrice,
+            // Exchange references
+            orderId:            p.orderId,
+            stopLossOrderId:    p.stopLossOrderId,
+            takeProfitOrderId:  p.takeProfitOrderId,
+            // Lifecycle
             status:        p.status,
             createdAt:     p.createdAt,
+            updatedAt:     p.updatedAt,
+            syncedAt:      p.syncedAt,
             realPositionId: p.realPositionId,
-            // How many equivalent upstream Sets mirror into THIS one
-            // exchange position. This is the consolidation metric —
-            // higher = more deduplication work saved on the exchange.
+            // Coordination fan-in
             mirroredSetCount: p.setKeys.length,
             mirroredSets:     p.setKeys.map((s) => ({
               setKey: s.setKey,
@@ -1092,6 +1224,20 @@ export async function GET(
               realFallback: liveResolvedViaReal,
               unresolved:   liveUnresolvedCount,
             },
+            // ── Portfolio-wide exchange aggregates ──────────────
+            // Sum of `positions[]` — guarantees the Live strip
+            // totals always equal what's visible in the rows.
+            aggregate: {
+              totalUnrealizedPnl: liveAggTotalUnrealizedPnl,
+              totalMarginUsd:     liveAggTotalMarginUsd,
+              totalVolumeUsd:     liveAggTotalVolumeUsd,
+              portfolioRoiPct:    liveAggPortfolioRoiPct,
+              inProfit:           liveAggInProfit,
+              inLoss:             liveAggInLoss,
+              nearLiquidation:    liveAggNearLiquidation,
+              staleSync:          liveAggStaleSync,
+              consolidatedSetsTotal: liveAggConsolidatedSets,
+            },
           },
           overall: {
             // Pipeline-health counters. Semantically distinct from
@@ -1099,6 +1245,8 @@ export async function GET(
             pipelineEvalOpen: pseudoOpen,   // strategies evaluating
             exchangeOpen:     liveOpen,     // orders actually on exchange
             exchangeVolumeUsd: liveVolumeUsdR,
+            exchangeUnrealizedPnl: liveAggTotalUnrealizedPnl,
+            exchangeMarginUsd:     liveAggTotalMarginUsd,
             runningSetsCount: pseudoRunningSets,
           },
         }
