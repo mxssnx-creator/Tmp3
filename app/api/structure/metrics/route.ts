@@ -220,9 +220,9 @@ export async function GET(request: NextRequest) {
           pseudoRealPF25: pfByType.real.pf25,
           pseudoActivePF20h: pfByType.active.pf20h,
           pseudoActivePF25: pfByType.active.pf25,
-        },
         }
       }
+    }
     })
   } catch (error) {
     console.error("[v0] Error fetching structure metrics:", error)
