@@ -1926,9 +1926,9 @@ export async function deleteSettings(key: string): Promise<void> {
 }
 
 export async function flushAll(): Promise<void> {
-   const client = getRedisClient()
-   await client.flushDb()
- }
+  const client = getRedisClient()
+  await client.flushDb()
+}
 
 // Cache getRedisStats for 5 s. The underlying `client.keys("*")` is an
 // O(N) scan over the entire keyspace, so hammering it from a polling
