@@ -344,14 +344,14 @@ export function ActiveConnectionCard({
       }
     }
 
+    // Subscribe to cross-component events so this card re-fetches when
+    // the operator toggles a connection, enables live trading, or
+    // changes the global engine state elsewhere in the app. All three
+    // listeners are cleaned up in the returned teardown below.
     if (typeof window !== "undefined") {
       window.addEventListener("connection-toggled", handleConnectionToggled)
       window.addEventListener("live-trade-toggled", handleLiveTradeToggled)
-    
-    if (typeof window !== 'undefined') {
-      window.addEventListener('connection-toggled', handleConnectionToggled)
-      window.addEventListener('live-trade-toggled', handleLiveTradeToggled)
-      window.addEventListener('engine-state-changed', handleConnectionToggled)
+      window.addEventListener("engine-state-changed", handleConnectionToggled)
     }
 
     return () => {
@@ -359,17 +359,10 @@ export function ActiveConnectionCard({
       if (typeof window !== "undefined") {
         window.removeEventListener("connection-toggled", handleConnectionToggled)
         window.removeEventListener("live-trade-toggled", handleLiveTradeToggled)
+        window.removeEventListener("engine-state-changed", handleConnectionToggled)
       }
     }
   }, [fetchProgression, connection.connectionId])
-      clearInterval(interval)
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('connection-toggled', handleConnectionToggled)
-        window.removeEventListener('live-trade-toggled', handleLiveTradeToggled)
-        window.removeEventListener('engine-state-changed', handleConnectionToggled)
-      }
-    }
-  }, [fetchProgression, progression?.phase, globalEngineRunning, connection.isActive])
 
   // Fetch live stats every 4s from the canonical /stats endpoint (per-connection, cumulative)
   useEffect(() => {
