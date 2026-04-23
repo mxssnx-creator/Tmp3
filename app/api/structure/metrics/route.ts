@@ -3,9 +3,9 @@ import { query, queryOne, getDatabaseType } from "@/lib/db"
 import { getDashboardWorkflowSnapshot } from "@/lib/dashboard-workflow"
 import { buildLogisticsQueuePayload } from "@/lib/logistics-workflow"
 import { getActiveIndications, getActiveStrategies, getAllPositions } from "@/lib/db-helpers"
+import { getRedisClient } from "@/lib/redis-db"
 
 export async function GET(request: NextRequest) {
-  try {
     // Scope metrics to a specific exchange connection when the sidebar page
     // has one selected. When omitted, we report globally (previous behavior).
     const connectionId = request.nextUrl.searchParams.get("connectionId")
@@ -116,10 +116,27 @@ export async function GET(request: NextRequest) {
       WHERE status = 'open'
     `)
 
-    const metrics = result || {}
+    const metrics = (result && Object.keys(result).length > 0) ? result : {
+      active_connections: 0,
+      total_strategies: 0,
+      active_strategies: 0,
+      active_positions: 0,
+      total_volume_24h: 0,
+      trades_per_hour: 0,
+      active_indications: 0,
+      total_indications: 0,
+      active_symbols: 0,
+      real_positions: 0,
+      base_positions: 0,
+      main_positions: 0,
+      real_positions: 0,
+    }
     const profitMetrics = profitFactorResult || {}
     const profitMetrics25Result = profitMetrics25 || {}
     const liveMetricsResult = liveMetrics || {}
+    // Get progression state data from Redis
+    const progression = await getRedisClient().hgetall(`settings:engine_progression:${connectionId}`).catch(() => ({}))
+
 
     const pfByType = {
       base: { pf20h: 0, pf25: 0 },
@@ -203,6 +220,7 @@ export async function GET(request: NextRequest) {
           pseudoRealPF25: pfByType.real.pf25,
           pseudoActivePF20h: pfByType.active.pf20h,
           pseudoActivePF25: pfByType.active.pf25,
+        },
         },
       },
     })

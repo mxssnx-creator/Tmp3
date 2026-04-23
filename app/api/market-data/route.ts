@@ -54,12 +54,12 @@ export async function GET(request: NextRequest) {
           }
         } else {
           // Fallback to real price fetch without credentials if possible
-          const connector = await createExchangeConnector(exchange, { isTestnet: false })
+          const connector = await createExchangeConnector(exchange, { apiKey: "test", apiSecret: "test", isTestnet: false })
           marketData = await connector.getTicker(symbol)
         }
 
         // Cache for 3 seconds for real data
-        await setSettings(cacheKey, JSON.stringify(marketData), { EX: 3 })
+        await setSettings(cacheKey, JSON.stringify(marketData))
       } catch (fetchError) {
         console.warn("[Market Data] Failed to fetch real data, using fallback:", fetchError)
         // Fallback - still generate but don't use random values, use static base prices

@@ -171,7 +171,7 @@ async function generateIndicationsForConnection(
     // If still no data, skip this symbol
     if (!marketData) return result
 
-    const { close, open, high, low } = marketData
+    const { close, open, high, low, volume = 0 } = marketData
     const direction    = close >= open ? "long" : "short"
     const range        = high - low
     const rangePercent = close > 0 ? (range / close) * 100 : 0

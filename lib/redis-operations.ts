@@ -306,6 +306,12 @@ export const RedisMonitoring = {
       trades: tradesCount,
       positions: positionsCount,
       timestamp: Date.now(),
+      avgCycleDuration: 0,
+      winRate250: 0.5,
+      profitFactor250: 1.0,
+      winRate50: 0.5,
+      profitFactor50: 1.0,
+      uptime: "Starting...",
     }
   },
 }

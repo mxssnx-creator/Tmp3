@@ -31,3 +31,25 @@
 - Added high-performance sync-range coordination in `DataSyncManager` with merged coverage intervals and true missing-range detection, enabling partial backfills instead of full reloads.
 - Updated symbol data loading to fetch/store only missing market-data ranges, append range metadata, and keep incremental sync logs for faster repeated runs.
 - Integrated preset historical loading with batched symbol coordination, `DataSyncManager` range checks, per-range sync logging, and progression events for large-scale backfill visibility.
+
+## 2026-04-23
+- Added Add Database recipe at `.kilocode/recipes/add-database.md` for data persistence guidance.
+- Updated memory bank structure to organize optional feature guides.
+- Feature documentation now follows recipes pattern with update checklists.
+- Added connection state management references to quickstart documentation.
+- Updated memory bank context tracking for feature implementation status.
+
+## Update Procedures
+
+### After Implementing New Features
+1. Update this context file with implementation date and description
+2. Add feature reference in AGENTS.md table
+3. Update relevant rules in `.kilocode/rules/` directory
+4. Mark checklist items as complete in recipe files
+5. Update quickstart readiness checks if needed
+
+### Memory Bank File Locations
+- Context file: `.kilocode/rules/memory-bank/context.md`
+- Feature guides: `.kilocode/recipes/`
+- Feature references: `AGENTS.md`
+- Rules documentation: `.kilocode/rules/<category>/`

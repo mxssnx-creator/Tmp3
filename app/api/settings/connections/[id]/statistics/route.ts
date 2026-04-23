@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
-import { initRedis, getRedisClient, redisGetSettings, redisSetSettings } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getSettings, setSettings } from "@/lib/redis-db"
 
 /**
  * GET /api/settings/connections/[id]/statistics
@@ -68,7 +68,7 @@ export async function GET(
 
     // Get progression data
     const progressionKey = `settings:engine_progression:${connectionId}`
-    const progression = await redisGetSettings(progressionKey) || {}
+    const progression = await getSettings(progressionKey) || {}
 
     // Get trading metrics
     const metricsKey = `trading_metrics:${connectionId}`
