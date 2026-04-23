@@ -28,6 +28,22 @@ interface CompactStats {
   mainEvaluated: number
   mainCoordCreated: number
   mainBlockDcaSets: number
+  // ── OPEN POSITIONS + ACCUMULATED VOLUME ──────────────────────────
+  // Sourced from `/stats`'s new `openPositions` branch. Two parallel
+  // ledgers: Pseudo (Base-stage volume-aware; has per-Set rollup) and
+  // Real (Main→Real promotions; count + notional). Live comes from
+  // the exchange progression counters. Overall roll-up is server-
+  // computed so the dashboard never has to sum it client-side.
+  pseudoOpen: number
+  pseudoVolumeUsd: number
+  pseudoRunningSets: number
+  pseudoTopSets: Array<{ setKey: string; count: number; volumeUsd: number }>
+  realOpen: number
+  realVolumeUsd: number
+  liveOpen: number
+  liveVolumeUsd: number
+  totalOpenPositions: number
+  totalVolumeUsd: number
   liveFilled: number
   liveClosed: number
   liveWinRate: number
@@ -50,6 +66,16 @@ const EMPTY: CompactStats = {
   mainEvaluated: 0,
   mainCoordCreated: 0,
   mainBlockDcaSets: 0,
+  pseudoOpen: 0,
+  pseudoVolumeUsd: 0,
+  pseudoRunningSets: 0,
+  pseudoTopSets: [],
+  realOpen: 0,
+  realVolumeUsd: 0,
+  liveOpen: 0,
+  liveVolumeUsd: 0,
+  totalOpenPositions: 0,
+  totalVolumeUsd: 0,
   liveFilled: 0,
   liveClosed: 0,
   liveWinRate: 0,
@@ -62,6 +88,17 @@ function fmt(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
   return String(n)
+}
+
+// USD-formatter used for the accumulated-volume strips. Mirrors the
+// short-form scale used by `fmt` (K/M) so the number stays readable
+// on a single line on a 10-column strip. Always prefixed with `$`.
+// Values < $1 show `0` to avoid visual clutter when an engine is idle.
+function fmtUsd(n: number): string {
+  if (!Number.isFinite(n) || n < 1) return "$0"
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`
+  return `$${n.toFixed(0)}`
 }
 
 export function StatisticsOverviewV2() {
@@ -113,6 +150,22 @@ export function StatisticsOverviewV2() {
         const dcaSets   = d.strategyVariants?.dca?.createdSets   ?? 0
         const mainBlockDcaSets    = blockSets + dcaSets
 
+        // ── Open positions + accumulated volume ─────────────────────
+        // Full shape lives at d.openPositions:
+        //   { pseudo: { open, volumeUsd, runningSets, topSets[] },
+        //     real:   { open, volumeUsd },
+        //     live:   { open, volumeUsd },
+        //     overall:{ totalOpenPositions, pseudoVolumeUsd,
+        //               realVolumeUsd, liveVolumeUsd,
+        //               totalVolumeUsd, runningSetsCount } }
+        // All numeric values are already rounded server-side so the UI
+        // can render them directly without further math.
+        const op = d.openPositions || {}
+        const opPseudo = op.pseudo  || {}
+        const opReal   = op.real    || {}
+        const opLive   = op.live    || {}
+        const opAll    = op.overall || {}
+
         if (!mounted) return
         setStats({
           indicationCycles: d.realtime?.indicationCycles || 0,
@@ -128,6 +181,16 @@ export function StatisticsOverviewV2() {
           mainEvaluated:    mainBreakdownEval,
           mainCoordCreated,
           mainBlockDcaSets,
+          pseudoOpen:           Number(opPseudo.open)        || 0,
+          pseudoVolumeUsd:      Number(opPseudo.volumeUsd)   || 0,
+          pseudoRunningSets:    Number(opPseudo.runningSets) || 0,
+          pseudoTopSets:        Array.isArray(opPseudo.topSets) ? opPseudo.topSets : [],
+          realOpen:             Number(opReal.open)          || 0,
+          realVolumeUsd:        Number(opReal.volumeUsd)     || 0,
+          liveOpen:             Number(opLive.open)          || 0,
+          liveVolumeUsd:        Number(opLive.volumeUsd)     || 0,
+          totalOpenPositions:   Number(opAll.totalOpenPositions) || 0,
+          totalVolumeUsd:       Number(opAll.totalVolumeUsd)     || 0,
           liveFilled:       liveExec.ordersFilled     || 0,
           liveClosed:       liveExec.positionsClosed  || 0,
           liveWinRate:      liveExec.winRate          || liveDetail.winRate  || 0,
@@ -225,7 +288,15 @@ export function StatisticsOverviewV2() {
             <span className="font-bold text-yellow-600 tabular-nums">{fmt(stats.stratMain)}</span>
           </div>
 
-          <div className="flex flex-col gap-0.5">
+          <div
+            className="flex flex-col gap-0.5"
+            title={
+              `Real Sets — ${fmt(stats.stratReal)} total\n` +
+              `• Currently open positions: ${fmt(stats.realOpen)}\n` +
+              `• Accumulated volume: ${fmtUsd(stats.realVolumeUsd)}\n` +
+              `(Real = Main→Real promotions that passed ratio gating)`
+            }
+          >
             <span className="text-muted-foreground">Real</span>
             <span className="font-bold text-emerald-600 tabular-nums">{fmt(stats.stratReal)}</span>
           </div>
@@ -244,6 +315,103 @@ export function StatisticsOverviewV2() {
           </div>
         </div>
 
+        {/* ── OVERALL ACCUMULATED — top-line summary ─────────────────
+            Comprehensive "what's currently running and how much is it
+            worth" strip. Shown whenever ANY open position exists in
+            ANY ledger (pseudo / real / live). Columns, left to right:
+              • Total Open     — distinct positions across all ledgers
+              • Running Sets   — count of valid Sets currently carrying
+                                 open pseudo positions (tooltip lists
+                                 the top-5 Sets by USD exposure)
+              • Pseudo Vol     — sum of position_cost across open
+                                 Base-stage pseudo rows
+              • Real Vol       — sum of (qty * entry) across open Real
+                                 promotions
+              • Live Vol       — cumulative exchange volume to date
+                                 (progHash.live_volume_usd_total)
+              • Total Vol      — sum of the three above
+            This is the coordination view the operator asked for:
+            Exchange-complex-optimal Position Info coord in one line. */}
+        {(stats.totalOpenPositions > 0 ||
+          stats.pseudoOpen > 0 ||
+          stats.realOpen > 0 ||
+          stats.liveOpen > 0 ||
+          stats.totalVolumeUsd > 0) && (
+          <div className="mt-2 pt-2 border-t border-border/40">
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground/80 mb-1">
+              Accumulated — Open Positions &amp; Volume
+            </div>
+            <div className="grid grid-cols-3 gap-2 sm:grid-cols-6 text-[10px]">
+              <div
+                className="flex flex-col gap-0.5"
+                title="Total currently-open positions across all ledgers (pseudo + live exchange)"
+              >
+                <span className="text-muted-foreground">Total Open</span>
+                <span className="font-bold text-green-700 tabular-nums">
+                  {fmt(stats.totalOpenPositions)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title={(() => {
+                  if (!stats.pseudoTopSets || stats.pseudoTopSets.length === 0) {
+                    return `${stats.pseudoRunningSets} Sets currently hold open pseudo positions`
+                  }
+                  const lines = [
+                    `${stats.pseudoRunningSets} Sets with open positions — top 5 by exposure:`,
+                    ...stats.pseudoTopSets.map(
+                      (s) =>
+                        `• ${s.setKey.slice(0, 28)}${s.setKey.length > 28 ? "…" : ""}  (${s.count}×  ${fmtUsd(s.volumeUsd)})`,
+                    ),
+                  ]
+                  return lines.join("\n")
+                })()}
+              >
+                <span className="text-muted-foreground">Running Sets</span>
+                <span className="font-bold text-green-700 tabular-nums">
+                  {fmt(stats.pseudoRunningSets)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title={`Pseudo (Base) open: ${fmt(stats.pseudoOpen)} positions · ${fmtUsd(stats.pseudoVolumeUsd)} accumulated`}
+              >
+                <span className="text-muted-foreground">Pseudo Vol</span>
+                <span className="font-semibold text-green-700 tabular-nums">
+                  {fmtUsd(stats.pseudoVolumeUsd)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title={`Real open: ${fmt(stats.realOpen)} positions · ${fmtUsd(stats.realVolumeUsd)} accumulated`}
+              >
+                <span className="text-muted-foreground">Real Vol</span>
+                <span className="font-semibold text-emerald-700 tabular-nums">
+                  {fmtUsd(stats.realVolumeUsd)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title={`Live exchange open: ${fmt(stats.liveOpen)} positions · ${fmtUsd(stats.liveVolumeUsd)} cumulative`}
+              >
+                <span className="text-muted-foreground">Live Vol</span>
+                <span className="font-semibold text-amber-700 tabular-nums">
+                  {fmtUsd(stats.liveVolumeUsd)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title="Total accumulated USD across all ledgers (pseudo + real + live)"
+              >
+                <span className="text-muted-foreground">Total Vol</span>
+                <span className="font-bold text-primary tabular-nums">
+                  {fmtUsd(stats.totalVolumeUsd)}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Main-stage breakdown strip — shown whenever Main has any
             evaluated Sets so the operator can see the cascade from
             Base → Main broken into: how many Base Sets were evaluated,
@@ -252,7 +420,7 @@ export function StatisticsOverviewV2() {
             those carry a Block or DCA tag. Mirrors the Live strip
             pattern below for visual consistency. */}
         {(stats.mainEvaluated > 0 || stats.mainCoordCreated > 0 || stats.mainBlockDcaSets > 0) && (
-          <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-3 gap-2 text-[10px]">
+          <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-3 gap-2 text-[10px] sm:grid-cols-5">
             <div className="flex flex-col gap-0.5" title="Base Sets that reached Main-stage evaluation">
               <span className="text-muted-foreground">Main Eval (Base)</span>
               <span className="font-semibold text-yellow-700 tabular-nums">{fmt(stats.mainEvaluated)}</span>
@@ -265,12 +433,30 @@ export function StatisticsOverviewV2() {
               <span className="text-muted-foreground">Block + DCA</span>
               <span className="font-semibold text-yellow-700 tabular-nums">{fmt(stats.mainBlockDcaSets)}</span>
             </div>
+            {/* Real-stage accumulation — shows the downstream "what
+                actually reached real trading size" picture right next
+                to the Main breakdown so the operator can eyeball the
+                Base → Main → Real funnel on one strip. */}
+            <div
+              className="flex flex-col gap-0.5"
+              title={`${fmt(stats.realOpen)} currently open Real positions (status ≠ closed)`}
+            >
+              <span className="text-muted-foreground">Real Open</span>
+              <span className="font-semibold text-emerald-700 tabular-nums">{fmt(stats.realOpen)}</span>
+            </div>
+            <div
+              className="flex flex-col gap-0.5"
+              title={`Sum of quantity × entryPrice across open Real positions: ${fmtUsd(stats.realVolumeUsd)}`}
+            >
+              <span className="text-muted-foreground">Real Accum.</span>
+              <span className="font-semibold text-emerald-700 tabular-nums">{fmtUsd(stats.realVolumeUsd)}</span>
+            </div>
           </div>
         )}
 
         {/* Live exchange metrics strip — only shown when there is live activity */}
         {stats.stratLive > 0 && (
-          <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-4 gap-2 text-[10px]">
+          <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-3 gap-2 text-[10px] sm:grid-cols-6">
             <div className="flex flex-col gap-0.5">
               <span className="text-muted-foreground">Filled</span>
               <span className="font-semibold text-amber-700 tabular-nums">{fmt(stats.liveFilled)}</span>
@@ -278,6 +464,17 @@ export function StatisticsOverviewV2() {
             <div className="flex flex-col gap-0.5">
               <span className="text-muted-foreground">Closed</span>
               <span className="font-semibold text-amber-700 tabular-nums">{fmt(stats.liveClosed)}</span>
+            </div>
+            <div className="flex flex-col gap-0.5" title="Live positions currently open on the exchange (created − closed)">
+              <span className="text-muted-foreground">Live Open</span>
+              <span className="font-semibold text-amber-700 tabular-nums">{fmt(stats.liveOpen)}</span>
+            </div>
+            <div
+              className="flex flex-col gap-0.5"
+              title="Cumulative exchange-side trading volume in USD (progHash.live_volume_usd_total)"
+            >
+              <span className="text-muted-foreground">Live Vol</span>
+              <span className="font-semibold text-amber-700 tabular-nums">{fmtUsd(stats.liveVolumeUsd)}</span>
             </div>
             <div className="flex flex-col gap-0.5">
               <span className="text-muted-foreground">Fill %</span>

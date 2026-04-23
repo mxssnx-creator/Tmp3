@@ -214,13 +214,131 @@ export async function GET(
       n(es.total_strategies_evaluated)
     )
 
-    // Open positions: check pseudo_positions:{connId} set
-    let positionsOpen = 0
+    // ── OPEN POSITIONS + ACCUMULATED VOLUME (per-Set rollup) ────────────
+    //
+    // We track *two* independent open-position namespaces because they
+    // answer different questions:
+    //
+    //   1. PseudoPositionManager rows at `pseudo_position:{connId}:{id}`
+    //      — every live Base-stage pseudo position carries its full
+    //      sizing (`position_cost`, `quantity`, `entry_price`) plus the
+    //      `config_set_key` that identifies which strategy Set created
+    //      it. Summing `position_cost` gives the accumulated notional
+    //      USD across every *running* pseudo position, and grouping by
+    //      `config_set_key` gives a per-Set rollup so the operator can
+    //      see "Set X currently has 3 positions worth $1,200".
+    //      Running Sets = SCARD of `pseudo_positions:{connId}:active_config_keys`.
+    //
+    //   2. Real-stage positions at `real:position:real:{connId}:*` —
+    //      these carry `quantity * entryPrice` notional but no
+    //      per-Set key; they represent Main → Real promotions that
+    //      survived ratio gating. We report count + accumulated USD
+    //      volume so the Strategies → Real tile can show the same
+    //      "currently holding" picture as Main/Live.
+    //
+    // Live exchange accumulated volume is already exposed via
+    // progHash.live_volume_usd_total (cumulative) and derived into
+    // `openPositions.live` below.
+    let pseudoOpen = 0
+    let pseudoVolumeUsd = 0
+    let pseudoRunningSets = 0
+    const pseudoSetAgg = new Map<string, { count: number; volumeUsd: number }>()
+
     try {
-      const posIds = await client.smembers(`pseudo_positions:${connectionId}`).catch(() => [] as string[])
-      for (const posId of posIds.slice(0, 200)) {
-        const h = (await client.hgetall(`pseudo_position:${connectionId}:${posId}`).catch(() => null)) || {}
-        if ((h as any)?.status === "active" || !(h as any)?.status) positionsOpen++
+      const posIds = (await client
+        .smembers(`pseudo_positions:${connectionId}`)
+        .catch(() => [] as string[])) || []
+      // Parallel hgetall for every id — matches the fan-out pattern in
+      // stages/real-stage.ts etc. A sequential loop here dominated
+      // /stats latency when pseudo positions accumulated.
+      const hashes = await Promise.all(
+        posIds.slice(0, 500).map((id) =>
+          client.hgetall(`pseudo_position:${connectionId}:${id}`).catch(() => null),
+        ),
+      )
+      for (const h of hashes) {
+        if (!h) continue
+        const hh = h as Record<string, any>
+        const status = hh.status ?? "active"
+        // Only "open" rows count — status="active" (PseudoPositionManager
+        // default) and status="open" (legacy) are both live; everything
+        // else (closed, cancelled, rejected) is excluded.
+        if (status !== "active" && status !== "open") continue
+        pseudoOpen++
+
+        // Prefer the pre-computed position_cost written at creation;
+        // fall back to qty * entry for defensive compatibility with
+        // older rows that may not have it.
+        let cost = Number(hh.position_cost)
+        if (!Number.isFinite(cost) || cost <= 0) {
+          const qty = Number(hh.quantity) || 0
+          const px  = Number(hh.entry_price) || 0
+          cost = qty * px
+        }
+        if (Number.isFinite(cost) && cost > 0) pseudoVolumeUsd += cost
+
+        const setKey = String(hh.config_set_key || "").trim()
+        if (setKey) {
+          const prev = pseudoSetAgg.get(setKey) || { count: 0, volumeUsd: 0 }
+          prev.count++
+          prev.volumeUsd += (Number.isFinite(cost) && cost > 0 ? cost : 0)
+          pseudoSetAgg.set(setKey, prev)
+        }
+      }
+
+      // Running Sets = distinct config_set_keys currently active. This
+      // is the set PseudoPositionManager maintains for O(1) duplicate
+      // detection; it's the ground truth for "valid Running Sets".
+      pseudoRunningSets = Number(
+        await client
+          .scard(`pseudo_positions:${connectionId}:active_config_keys`)
+          .catch(() => 0),
+      ) || 0
+    } catch { /* non-critical */ }
+
+    // Back-compat: the historic `positionsOpen` field always referred
+    // to the pseudo total, so keep that contract.
+    const positionsOpen = pseudoOpen
+
+    // Top-5 per-Set rollup sorted by USD exposure so the UI can show
+    // the heaviest Sets at a glance. We keep the full payload small
+    // (setKey trimmed, numbers rounded) — this is polled every 5s.
+    const pseudoTopSets = Array.from(pseudoSetAgg.entries())
+      .map(([setKey, agg]) => ({
+        setKey,
+        count: agg.count,
+        volumeUsd: Math.round(agg.volumeUsd * 100) / 100,
+      }))
+      .sort((a, b) => b.volumeUsd - a.volumeUsd)
+      .slice(0, 5)
+
+    // ── Real-stage open positions + accumulated volume ──────────────────
+    //
+    // Unlike Base/Main (which are evaluation tiers with no per-position
+    // quantity), Real positions carry `{ quantity, entryPrice, status }`.
+    // We scan the namespace once and sum notional for all non-closed
+    // rows. Bounded by a 500-key safety ceiling — anything beyond that
+    // is a data-hygiene issue the operator needs to fix independently.
+    let realOpen = 0
+    let realVolumeUsd = 0
+    try {
+      const realKeys = await client.keys(`real:position:real:${connectionId}:*`)
+      if (realKeys.length > 0) {
+        const caps = realKeys.slice(0, 500)
+        const raws = await Promise.all(
+          caps.map((k: string) => client.get(k).catch(() => null)),
+        )
+        for (const raw of raws) {
+          if (!raw) continue
+          try {
+            const pos = JSON.parse(raw as string)
+            if (pos.status === "closed") continue
+            realOpen++
+            const qty = Number(pos.quantity)  || 0
+            const px  = Number(pos.entryPrice) || 0
+            if (qty > 0 && px > 0) realVolumeUsd += qty * px
+          } catch { /* skip malformed */ }
+        }
       }
     } catch { /* non-critical */ }
 
@@ -704,6 +822,75 @@ export async function GET(
       // pipeline (see lib/trade-engine/stages/live-stage.ts). Every stage of
       // the pipeline increments one of these so the UI can show a real-time
       // picture of exchange-level activity.
+      // ── OPEN POSITIONS & ACCUMULATED VOLUME ─────────────────────────────
+      // Comprehensive "what's currently holding exposure" snapshot so the
+      // UI can show Overall, per-stage, and per-Set breakdowns in one
+      // place without having to stitch data from multiple endpoints.
+      //
+      //   • pseudo  — PseudoPositionManager rows (the authoritative
+      //                  Base-stage volume-aware namespace with full
+      //                  sizing + `config_set_key`). Includes a top-5
+      //                  per-Set rollup sorted by USD exposure so the
+      //                  operator can see which Sets are carrying the
+      //                  heaviest weight at a glance.
+      //   • real    — Real-stage promotions that survived Main filtering,
+      //                  with accumulated (quantity * entryPrice) notional.
+      //   • live    — Exchange-side positions (derived from progHash
+      //                  counters — already cumulative-volume-tracked
+      //                  by live-stage.ts).
+      //   • overall — Single-number roll-up across ALL namespaces so
+      //                  the dashboard can render a top-line
+      //                  "Accumulated" strip without doing the math
+      //                  client-side.
+      openPositions: (() => {
+        const liveOpen = Math.max(
+          0,
+          n(progHash.live_positions_created_count) -
+            n(progHash.live_positions_closed_count),
+        )
+        const liveVolumeUsd = n(progHash.live_volume_usd_total)
+        const pseudoVolumeUsdR = Math.round(pseudoVolumeUsd * 100) / 100
+        const realVolumeUsdR   = Math.round(realVolumeUsd   * 100) / 100
+        const liveVolumeUsdR   = Math.round(liveVolumeUsd   * 100) / 100
+        // Total accumulated USD across every "currently holding"
+        // bucket. Pseudo + Real are independent ledgers (Pseudo =
+        // Base-stage volume-aware; Real = Main→Real promotions) and
+        // they do NOT overlap, so summing them is semantically
+        // correct. Live is the true exchange position, additive as
+        // well.
+        const totalVolumeUsd = Math.round(
+          (pseudoVolumeUsd + realVolumeUsd + liveVolumeUsd) * 100,
+        ) / 100
+        return {
+          pseudo: {
+            open:         pseudoOpen,
+            volumeUsd:    pseudoVolumeUsdR,
+            runningSets:  pseudoRunningSets,
+            topSets:      pseudoTopSets,
+          },
+          real: {
+            open:         realOpen,
+            volumeUsd:    realVolumeUsdR,
+          },
+          live: {
+            open:         liveOpen,
+            volumeUsd:    liveVolumeUsdR,
+          },
+          overall: {
+            // Distinct "running" positions across ALL ledgers. Pseudo
+            // + Live are the two source-of-truth ledgers; Real sits
+            // inside the pseudo-pipeline but has its own namespace, so
+            // we expose it separately rather than double-counting.
+            totalOpenPositions: pseudoOpen + liveOpen,
+            pseudoVolumeUsd:    pseudoVolumeUsdR,
+            realVolumeUsd:      realVolumeUsdR,
+            liveVolumeUsd:      liveVolumeUsdR,
+            totalVolumeUsd,
+            runningSetsCount:   pseudoRunningSets,
+          },
+        }
+      })(),
+
       liveExecution: {
         // Orders
         ordersPlaced:     n(progHash.live_orders_placed_count),
