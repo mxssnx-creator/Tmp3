@@ -28,35 +28,30 @@ interface CompactStats {
   mainEvaluated: number
   mainCoordCreated: number
   mainBlockDcaSets: number
-  // ── OPEN POSITIONS + ACCUMULATED VOLUME ──────────────────────────
-  // Sourced from `/stats`'s new `openPositions` branch. Two parallel
-  // ledgers: Pseudo (Base-stage volume-aware; has per-Set rollup) and
-  // Real (Main→Real promotions; count + notional). Live comes from
-  // the exchange progression counters. Overall roll-up is server-
-  // computed so the dashboard never has to sum it client-side.
+  // ── OPEN POSITIONS through the MIRRORING pipeline ────────────────
+  // Pseudo (Base-stage strategy evaluation) → Real (Main→Real
+  // promotions) → Live (actual exchange orders). These are the SAME
+  // signal mirrored through stages — not independent pools — so only
+  // the Live stage carries meaningful USD volume (real exchange
+  // exposure). Pseudo / Real surface counts only.
   pseudoOpen: number
-  pseudoVolumeUsd: number
   pseudoRunningSets: number
-  pseudoTopSets: Array<{ setKey: string; count: number; volumeUsd: number }>
   realOpen: number
-  realVolumeUsd: number
   liveOpen: number
   liveVolumeUsd: number
-  totalOpenPositions: number
-  totalVolumeUsd: number
   liveFilled: number
   liveClosed: number
   liveWinRate: number
   liveFillRate: number
-  // ── Live-exchange position → Set relation coordination ───────────
-  // Per-position breakdown emitted by `/stats` (openPositions.live.
-  // positions). The server joins each live exchange position against
-  // the pseudo-position ledger by symbol+direction, so the UI can
-  // surface the exact Set a live order was spawned from (Exchange
-  // Position Info → Set coordination). Each entry carries top-3
-  // candidate setKeys ranked by USD exposure, plus a `resolution`
-  // tag that tells us how the match was made (pseudo | real-fallback
-  // | unresolved).
+  // ── Live-exchange position → mirrored Sets coordination ──────────
+  // Each live exchange position is the consolidation of one or more
+  // equivalent upstream Sets (same base + same ranges). The server
+  // returns the list of Sets mirrored into each live position via a
+  // symbol+direction join against the pseudo ledger. Volume applies
+  // only to the live position itself (exchange exposure) — per-set
+  // entries carry count only (how many eval positions that Set is
+  // holding upstream). `mirroredSetCount` = how many equivalent Sets
+  // were consolidated into this single exchange order.
   livePositions: Array<{
     id: string
     symbol: string
@@ -68,7 +63,8 @@ interface CompactStats {
     status: string
     createdAt: number
     realPositionId?: string
-    setKeys: Array<{ setKey: string; count: number; volumeUsd: number }>
+    mirroredSetCount: number
+    mirroredSets: Array<{ setKey: string; count: number }>
     resolution: "pseudo" | "real-fallback" | "unresolved"
   }>
   liveResolution: { pseudo: number; realFallback: number; unresolved: number }
@@ -91,15 +87,10 @@ const EMPTY: CompactStats = {
   mainCoordCreated: 0,
   mainBlockDcaSets: 0,
   pseudoOpen: 0,
-  pseudoVolumeUsd: 0,
   pseudoRunningSets: 0,
-  pseudoTopSets: [],
   realOpen: 0,
-  realVolumeUsd: 0,
   liveOpen: 0,
   liveVolumeUsd: 0,
-  totalOpenPositions: 0,
-  totalVolumeUsd: 0,
   liveFilled: 0,
   liveClosed: 0,
   liveWinRate: 0,
@@ -176,21 +167,19 @@ export function StatisticsOverviewV2() {
         const dcaSets   = d.strategyVariants?.dca?.createdSets   ?? 0
         const mainBlockDcaSets    = blockSets + dcaSets
 
-        // ── Open positions + accumulated volume ─────────────────────
-        // Full shape lives at d.openPositions:
-        //   { pseudo: { open, volumeUsd, runningSets, topSets[] },
-        //     real:   { open, volumeUsd },
-        //     live:   { open, volumeUsd },
-        //     overall:{ totalOpenPositions, pseudoVolumeUsd,
-        //               realVolumeUsd, liveVolumeUsd,
-        //               totalVolumeUsd, runningSetsCount } }
-        // All numeric values are already rounded server-side so the UI
-        // can render them directly without further math.
+        // ── Open positions through the mirroring pipeline ──────────
+        // Shape: d.openPositions = {
+        //   pseudo: { open, runningSets, topSets[{setKey,count}] },
+        //   real:   { open },
+        //   live:   { open, volumeUsd, positions[], resolution },
+        //   overall:{ pipelineEvalOpen, exchangeOpen,
+        //             exchangeVolumeUsd, runningSetsCount }
+        // }
+        // Only live.volumeUsd carries real exchange exposure.
         const op = d.openPositions || {}
-        const opPseudo = op.pseudo  || {}
-        const opReal   = op.real    || {}
-        const opLive   = op.live    || {}
-        const opAll    = op.overall || {}
+        const opPseudo = op.pseudo || {}
+        const opReal   = op.real   || {}
+        const opLive   = op.live   || {}
 
         if (!mounted) return
         setStats({
@@ -208,23 +197,19 @@ export function StatisticsOverviewV2() {
           mainCoordCreated,
           mainBlockDcaSets,
           pseudoOpen:           Number(opPseudo.open)        || 0,
-          pseudoVolumeUsd:      Number(opPseudo.volumeUsd)   || 0,
           pseudoRunningSets:    Number(opPseudo.runningSets) || 0,
-          pseudoTopSets:        Array.isArray(opPseudo.topSets) ? opPseudo.topSets : [],
           realOpen:             Number(opReal.open)          || 0,
-          realVolumeUsd:        Number(opReal.volumeUsd)     || 0,
           liveOpen:             Number(opLive.open)          || 0,
           liveVolumeUsd:        Number(opLive.volumeUsd)     || 0,
-          totalOpenPositions:   Number(opAll.totalOpenPositions) || 0,
-          totalVolumeUsd:       Number(opAll.totalVolumeUsd)     || 0,
           liveFilled:       liveExec.ordersFilled     || 0,
           liveClosed:       liveExec.positionsClosed  || 0,
           liveWinRate:      liveExec.winRate          || liveDetail.winRate  || 0,
           liveFillRate:     liveExec.fillRate         || liveDetail.passRatio || 0,
-          // Live-exchange → Set coordination payload (scan-derived).
-          // Values come from openPositions.live.positions / .resolution
-          // server-side. Guard against legacy responses that don't
-          // include the branch yet.
+          // Mirroring coordination payload: for each live exchange
+          // position, which equivalent Sets are mirrored into it, plus
+          // resolution provenance (pseudo / real-fallback /
+          // unresolved). `mirroredSetCount` is the deduplication
+          // metric — N Sets consolidated into 1 exchange order.
           livePositions:    Array.isArray(opLive.positions) ? opLive.positions : [],
           liveResolution: {
             pseudo:       Number(opLive.resolution?.pseudo)       || 0,
@@ -329,8 +314,9 @@ export function StatisticsOverviewV2() {
             title={
               `Real Sets — ${fmt(stats.stratReal)} total\n` +
               `• Currently open positions: ${fmt(stats.realOpen)}\n` +
-              `• Accumulated volume: ${fmtUsd(stats.realVolumeUsd)}\n` +
-              `(Real = Main→Real promotions that passed ratio gating)`
+              `(Real = Main→Real promotions that passed ratio gating.\n` +
+              ` Volume is tracked only at the Live exchange stage —\n` +
+              ` see Live strip below for actual USD exposure.)`
             }
           >
             <span className="text-muted-foreground">Real</span>
@@ -362,15 +348,15 @@ export function StatisticsOverviewV2() {
             surfaced here to avoid conflating cross-stage totals with
             evaluation processing. */}
 
-        {/* Main-stage breakdown strip — shown whenever Main has any
-            evaluated Sets so the operator can see the cascade from
-            Base → Main broken into: how many Base Sets were evaluated,
-            how many additional related Sets position coordination
-            contributed on top of the default variant, and how many of
-            those carry a Block or DCA tag. Mirrors the Live strip
-            pattern below for visual consistency. */}
-        {(stats.mainEvaluated > 0 || stats.mainCoordCreated > 0 || stats.mainBlockDcaSets > 0) && (
-          <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-3 gap-2 text-[10px] sm:grid-cols-5">
+        {/* Main-stage breakdown strip — Base → Main → Real funnel
+            showing counts at each mirroring stage. No volume metrics
+            here; volume is a Live-only figure and appears on the Live
+            strip further down. */}
+        {(stats.mainEvaluated > 0 ||
+          stats.mainCoordCreated > 0 ||
+          stats.mainBlockDcaSets > 0 ||
+          stats.realOpen > 0) && (
+          <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-2 gap-2 text-[10px] sm:grid-cols-4">
             <div className="flex flex-col gap-0.5" title="Base Sets that reached Main-stage evaluation">
               <span className="text-muted-foreground">Main Eval (Base)</span>
               <span className="font-semibold text-yellow-700 tabular-nums">{fmt(stats.mainEvaluated)}</span>
@@ -383,23 +369,16 @@ export function StatisticsOverviewV2() {
               <span className="text-muted-foreground">Block + DCA</span>
               <span className="font-semibold text-yellow-700 tabular-nums">{fmt(stats.mainBlockDcaSets)}</span>
             </div>
-            {/* Real-stage accumulation — shows the downstream "what
-                actually reached real trading size" picture right next
-                to the Main breakdown so the operator can eyeball the
-                Base → Main → Real funnel on one strip. */}
             <div
               className="flex flex-col gap-0.5"
-              title={`${fmt(stats.realOpen)} currently open Real positions (status ≠ closed)`}
+              title={
+                `${fmt(stats.realOpen)} currently open Real positions (status ≠ closed).\n` +
+                `These are Main→Real promotions that cleared ratio gating,\n` +
+                `awaiting mirror-out to the live exchange stage.`
+              }
             >
               <span className="text-muted-foreground">Real Open</span>
               <span className="font-semibold text-emerald-700 tabular-nums">{fmt(stats.realOpen)}</span>
-            </div>
-            <div
-              className="flex flex-col gap-0.5"
-              title={`Sum of quantity × entryPrice across open Real positions: ${fmtUsd(stats.realVolumeUsd)}`}
-            >
-              <span className="text-muted-foreground">Real Accum.</span>
-              <span className="font-semibold text-emerald-700 tabular-nums">{fmtUsd(stats.realVolumeUsd)}</span>
             </div>
           </div>
         )}
@@ -437,40 +416,41 @@ export function StatisticsOverviewV2() {
           </div>
         )}
 
-        {/* ── Live Exchange Orders → Set Coordination panel ──────────────
-            For every OPEN exchange position on the live ledger, shows
-            exactly which Set it belongs to (resolved server-side by
-            joining symbol+direction against the pseudo-position
-            ledger). This is the "coord to be identified for
-            statistics — by Exchange Position Info values" view the
-            operator asked for. Columns, per row:
+        {/* ── Exchange Positions ← Mirrored Sets (consolidation view) ─
+            Every live exchange position is the deduplicated mirror of
+            one-or-more equivalent upstream Sets (same base + same
+            ranges). This panel answers, per exchange position, "which
+            Sets is this order consolidating?" Columns:
               • symbol/direction — Exchange Position Info identifier
-              • volume + PnL     — exposure & current unrealized P&L
-              • Set              — top-ranked setKey (truncated) with
-                                    resolution badge: pseudo / real-
-                                    fallback / unresolved
-              • tooltip lists the top-3 candidate setKeys with their
-                per-Set counts and USD share, plus the resolution
-                reason so the operator can trust the relationship. */}
+              • exposure         — USD on the exchange (real money)
+              • unrealized PnL   — live P&L
+              • mirrored Sets    — N equivalent Sets → 1 exchange order
+                                    (hover for the full list with per-
+                                    Set pseudo-position count)
+              • resolution badge — where the Set match came from:
+                                    P (pseudo, exact) /
+                                    R (real-fallback) /
+                                    ? (unresolved). */}
         {stats.livePositions.length > 0 && (
           <div className="mt-2 pt-2 border-t border-border/40">
             <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-muted-foreground/80 mb-1">
-              <span>Live Orders — Set Coordination</span>
+              <span>Exchange Positions &mdash; Mirroring Coordination</span>
               <span
                 className="text-[9px] tabular-nums"
                 title={
-                  `Resolution sources:\n` +
-                  `• pseudo:        ${stats.liveResolution.pseudo} (exact Base-ledger match)\n` +
-                  `• real-fallback: ${stats.liveResolution.realFallback} (Base row closed — resolved via Real)\n` +
-                  `• unresolved:    ${stats.liveResolution.unresolved} (no upstream match — investigate)`
+                  `Set-resolution provenance:\n` +
+                  `• P ${stats.liveResolution.pseudo} pseudo       (exact Base-ledger match — authoritative)\n` +
+                  `• R ${stats.liveResolution.realFallback} real-fallback (Base row closed — resolved via Real-stage)\n` +
+                  `• ? ${stats.liveResolution.unresolved} unresolved  (no upstream match — investigate)`
                 }
               >
-                {stats.liveResolution.pseudo}p / {stats.liveResolution.realFallback}r / {stats.liveResolution.unresolved}u
+                P {stats.liveResolution.pseudo} &middot; R {stats.liveResolution.realFallback} &middot; ? {stats.liveResolution.unresolved}
               </span>
             </div>
             <div className="space-y-1">
               {stats.livePositions.slice(0, 8).map((lp) => {
-                const primarySet = lp.setKeys[0]
+                const nSets = lp.mirroredSetCount || lp.mirroredSets.length
+                const primarySet = lp.mirroredSets[0]
                 const setLabel = primarySet
                   ? primarySet.setKey.length > 32
                     ? `${primarySet.setKey.slice(0, 32)}…`
@@ -483,19 +463,22 @@ export function StatisticsOverviewV2() {
                       ? "text-amber-700"
                       : "text-muted-foreground"
                 const tooltip = [
-                  `${lp.symbol} ${lp.direction.toUpperCase()}  ·  ${fmtUsd(lp.volumeUsd)} exposure`,
+                  `${lp.symbol} ${lp.direction.toUpperCase()}  ·  ${fmtUsd(lp.volumeUsd)} on exchange`,
                   `Unrealized PnL: ${lp.unrealizedPnl >= 0 ? "+" : ""}${fmtUsd(lp.unrealizedPnl)}`,
                   `Entry: ${lp.entryPrice}  ·  Mark: ${lp.markPrice || "—"}`,
                   ``,
                   `Resolution: ${lp.resolution}`,
                   lp.realPositionId ? `RealPositionId: ${lp.realPositionId}` : "",
                   ``,
-                  lp.setKeys.length > 0
-                    ? `Candidate Set${lp.setKeys.length > 1 ? "s" : ""} (by USD exposure):`
-                    : `No upstream Set matched — position is orphaned.`,
-                  ...lp.setKeys.map(
+                  nSets > 0
+                    ? `${nSets} equivalent Set${nSets > 1 ? "s" : ""} mirrored → 1 exchange order` +
+                      (nSets > 1
+                        ? `\n(consolidated — avoids ${nSets - 1} duplicate order${nSets - 1 > 1 ? "s" : ""} on the exchange)`
+                        : "")
+                    : `No upstream Set matched — orphaned exchange position.`,
+                  ...lp.mirroredSets.map(
                     (s, i) =>
-                      `  ${i + 1}. ${s.setKey}  (${s.count}× · ${fmtUsd(s.volumeUsd)})`,
+                      `  ${i + 1}. ${s.setKey}  (${s.count} eval position${s.count === 1 ? "" : "s"})`,
                   ),
                 ].filter(Boolean).join("\n")
                 return (
@@ -531,8 +514,27 @@ export function StatisticsOverviewV2() {
                       {lp.unrealizedPnl > 0 ? "+" : ""}
                       {fmtUsd(lp.unrealizedPnl)}
                     </div>
-                    <div className={`col-span-4 truncate font-mono text-[9px] ${resTone}`}>
-                      {setLabel}
+                    {/* Mirrored-Sets column: count badge + top setKey */}
+                    <div className="col-span-4 flex items-center gap-1 min-w-0">
+                      {nSets > 0 && (
+                        <span
+                          className={`px-1 rounded text-[8px] font-semibold tabular-nums shrink-0 ${
+                            nSets > 1
+                              ? "bg-primary/15 text-primary"
+                              : "bg-muted text-muted-foreground"
+                          }`}
+                          title={
+                            nSets > 1
+                              ? `This single exchange order consolidates ${nSets} equivalent Sets (same base + same ranges)`
+                              : `1 Set mirrored into this exchange order`
+                          }
+                        >
+                          {nSets}&times; Set{nSets === 1 ? "" : "s"}
+                        </span>
+                      )}
+                      <span className={`truncate font-mono text-[9px] ${resTone}`}>
+                        {setLabel}
+                      </span>
                     </div>
                     <div className="col-span-1 text-right">
                       <span
@@ -556,7 +558,7 @@ export function StatisticsOverviewV2() {
               })}
               {stats.livePositions.length > 8 && (
                 <div className="text-[9px] text-muted-foreground text-center pt-0.5">
-                  +{stats.livePositions.length - 8} more live position{stats.livePositions.length - 8 === 1 ? "" : "s"} (truncated)
+                  +{stats.livePositions.length - 8} more exchange position{stats.livePositions.length - 8 === 1 ? "" : "s"} (truncated)
                 </div>
               )}
             </div>

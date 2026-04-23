@@ -177,19 +177,15 @@ interface LiveStats {
   liveOrdersPlaced: number
   liveOrdersFilled: number
   liveWinRate: number
-  // ── Open positions & accumulated volume (mirror of /stats openPositions branch)
-  // Pseudo = Base-stage volume-aware ledger. Real = Main→Real promotions.
-  // Live = cumulative exchange volume. Overall = server-computed rollup
-  // covering every "currently holding" bucket across all ledgers.
+  // ── Open positions through the mirroring pipeline ───────────────
+  // Pseudo / Real / Live are NOT additive pools — they're the same
+  // signal mirrored through evaluation stages into a final exchange
+  // order. Only the Live stage carries real USD exposure; Pseudo and
+  // Real report counts only (pipeline health). No cross-stage total.
   pseudoOpen: number
-  pseudoVolumeUsd: number
   pseudoRunningSets: number
-  pseudoTopSets: Array<{ setKey: string; count: number; volumeUsd: number }>
   realOpen: number
-  realVolumeUsd: number
   liveVolumeUsd: number
-  totalOpenPositions: number
-  totalVolumeUsd: number
   // windows
   indLast5m: number
   indLast60m: number
@@ -235,9 +231,7 @@ const EMPTY_STATS: LiveStats = {
   },
   livePositionsOpen: 0, livePositionsCreated: 0, livePositionsClosed: 0,
   liveOrdersPlaced: 0, liveOrdersFilled: 0, liveWinRate: 0,
-  pseudoOpen: 0, pseudoVolumeUsd: 0, pseudoRunningSets: 0, pseudoTopSets: [],
-  realOpen: 0, realVolumeUsd: 0, liveVolumeUsd: 0,
-  totalOpenPositions: 0, totalVolumeUsd: 0,
+  pseudoOpen: 0, pseudoRunningSets: 0, realOpen: 0, liveVolumeUsd: 0,
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
 }
 
@@ -458,24 +452,14 @@ export function QuickstartSection() {
         liveOrdersPlaced:      s.liveExecution?.ordersPlaced     || 0,
         liveOrdersFilled:      s.liveExecution?.ordersFilled     || 0,
         liveWinRate:           s.liveExecution?.winRate          || 0,
-        // ── Open positions & accumulated volume ───────────────────
-        // Server exposes this as `s.openPositions` with the shape:
-        //   { pseudo: { open, volumeUsd, runningSets, topSets[] },
-        //     real:   { open, volumeUsd },
-        //     live:   { open, volumeUsd },
-        //     overall:{ totalOpenPositions, totalVolumeUsd, ... } }
-        // All values are pre-rounded server-side — we just surface them.
+        // ── Mirroring-pipeline open positions ─────────────────────
+        // Counts-only for pseudo/real; volume exposed only for live
+        // (the real exchange). See /stats openPositions block for the
+        // authoritative semantics.
         pseudoOpen:            Number(s.openPositions?.pseudo?.open)         || 0,
-        pseudoVolumeUsd:       Number(s.openPositions?.pseudo?.volumeUsd)    || 0,
         pseudoRunningSets:     Number(s.openPositions?.pseudo?.runningSets)  || 0,
-        pseudoTopSets:         Array.isArray(s.openPositions?.pseudo?.topSets)
-                                 ? s.openPositions.pseudo.topSets
-                                 : [],
         realOpen:              Number(s.openPositions?.real?.open)           || 0,
-        realVolumeUsd:         Number(s.openPositions?.real?.volumeUsd)      || 0,
         liveVolumeUsd:         Number(s.openPositions?.live?.volumeUsd)      || 0,
-        totalOpenPositions:    Number(s.openPositions?.overall?.totalOpenPositions) || 0,
-        totalVolumeUsd:        Number(s.openPositions?.overall?.totalVolumeUsd)     || 0,
         indLast5m:             s.windows?.indications?.last5m     || 0,
         indLast60m:            s.windows?.indications?.last60m    || 0,
         phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
@@ -1030,14 +1014,66 @@ export function QuickstartSection() {
           )}
         </div>
 
-        {/* NOTE: Open-position accumulation is intentionally NOT
-            rendered as an overall top strip here. The Quick Start
-            stats block mirrors Overall Strategies processing, which
-            remains independent of exposure accumulation per the
-            user's design brief. Real-stage and Live-exchange
-            accumulation is surfaced only where it belongs — on the
-            Strategies → Real tile and the Live Exchange Orders strip
-            in the per-connection statistics view. */}
+        {/* ── Mirroring pipeline — counts only, plus Live USD exposure ─
+            Same signal flows Base → Main → Real → Exchange. Pseudo
+            and Real report pipeline-health counts; volume belongs
+            exclusively to the Live exchange (real money). No cross-
+            stage "total" — it would double-count mirrored signals. */}
+        {(stats.pseudoOpen > 0 ||
+          stats.realOpen > 0 ||
+          stats.livePositionsOpen > 0 ||
+          stats.liveVolumeUsd > 0) && (
+          <div className="rounded-md border bg-muted/20 p-2 space-y-1">
+            <div className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground/80">
+              Mirroring Pipeline &mdash; Open Positions
+            </div>
+            <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4 text-[10px]">
+              <div
+                className="flex flex-col gap-0.5"
+                title={
+                  `${fmt(stats.pseudoOpen)} pseudo positions currently under continuous strategy evaluation.\n` +
+                  `Spread across ${fmt(stats.pseudoRunningSets)} running Set${stats.pseudoRunningSets === 1 ? "" : "s"}.\n` +
+                  `No real USD exposure at this stage.`
+                }
+              >
+                <span className="text-muted-foreground">Pseudo (eval)</span>
+                <span className="font-bold text-green-700 dark:text-green-400 tabular-nums">
+                  {fmt(stats.pseudoOpen)}
+                  <span className="ml-1 text-[9px] font-normal text-muted-foreground">
+                    / {fmt(stats.pseudoRunningSets)} set{stats.pseudoRunningSets === 1 ? "" : "s"}
+                  </span>
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title="Main → Real promotions that cleared ratio gating, awaiting mirror into exchange orders. Count only — no real USD until Live."
+              >
+                <span className="text-muted-foreground">Real (mirror)</span>
+                <span className="font-bold text-emerald-700 dark:text-emerald-400 tabular-nums">
+                  {fmt(stats.realOpen)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title="Live positions currently open on the exchange. Multiple equivalent Sets may consolidate into a single exchange order (mirroring coordination)."
+              >
+                <span className="text-muted-foreground">Exchange</span>
+                <span className="font-bold text-amber-700 dark:text-amber-400 tabular-nums">
+                  {fmt(stats.livePositionsOpen)}
+                </span>
+              </div>
+              <div
+                className="flex flex-col gap-0.5"
+                title="Cumulative live-trade USD volume transacted on the exchange (the only authoritative exposure figure)."
+              >
+                <span className="text-muted-foreground">Live Volume</span>
+                <span className="font-bold text-amber-700 dark:text-amber-400 tabular-nums">
+                  {fmtUsd(stats.liveVolumeUsd)}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* ── expanded panel ─────────────────────────────────────────────── */}
         {expanded && (
@@ -1269,7 +1305,7 @@ export function QuickstartSection() {
             {/* ── Strategy Stages — detailed per-stage metrics ───────────
                 Shows sets validated from prev stage (passed count), avg
                 positions per Set, avg profit factor and avg drawdown time
-                for each stage of the BASE → MAIN → REAL → LIVE flow.
+                for each stage of the BASE → MAIN → REAL �� LIVE flow.
 
                 These values come from `strategy_detail:{connId}:{stage}`
                 Redis hashes, written by StrategyCoordinator after each

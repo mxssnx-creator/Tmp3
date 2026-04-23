@@ -338,16 +338,15 @@ export async function GET(
     // to the pseudo total, so keep that contract.
     const positionsOpen = pseudoOpen
 
-    // Top-5 per-Set rollup sorted by USD exposure so the UI can show
-    // the heaviest Sets at a glance. We keep the full payload small
-    // (setKey trimmed, numbers rounded) — this is polled every 5s.
+    // Top-5 per-Set rollup sorted by POSITION COUNT — pseudo positions
+    // are evaluation-stage exposure, not real money, so sorting by count
+    // (how many eval positions the Set carries) is the meaningful metric.
+    // Volume is intentionally NOT surfaced here; it would conflate
+    // simulated-sizing eval with actual exchange exposure. Real USD
+    // exposure lives on the live branch below.
     const pseudoTopSets = Array.from(pseudoSetAgg.entries())
-      .map(([setKey, agg]) => ({
-        setKey,
-        count: agg.count,
-        volumeUsd: Math.round(agg.volumeUsd * 100) / 100,
-      }))
-      .sort((a, b) => b.volumeUsd - a.volumeUsd)
+      .map(([setKey, agg]) => ({ setKey, count: agg.count }))
+      .sort((a, b) => b.count - a.count)
       .slice(0, 5)
 
     // ── Real-stage open positions + accumulated volume ──────────────────
@@ -1017,25 +1016,34 @@ export async function GET(
       // the pipeline increments one of these so the UI can show a real-time
       // picture of exchange-level activity.
       // ── OPEN POSITIONS & ACCUMULATED VOLUME ─────────────────────────────
-      // Comprehensive "what's currently holding exposure" snapshot so the
-      // UI can show Overall, per-stage, and per-Set breakdowns in one
-      // place without having to stitch data from multiple endpoints.
+      // Snapshot of every "currently holding exposure" layer of the
+      // mirroring pipeline. CRITICAL semantics — pseudo/real/live are
+      // NOT independent pools: they represent the SAME trading signal
+      // being mirrored down through evaluation stages before finally
+      // becoming an exchange order. Therefore:
       //
-      //   • pseudo  — PseudoPositionManager rows (the authoritative
-      //                  Base-stage volume-aware namespace with full
-      //                  sizing + `config_set_key`). Includes a top-5
-      //                  per-Set rollup sorted by USD exposure so the
-      //                  operator can see which Sets are carrying the
-      //                  heaviest weight at a glance.
-      //   • real    — Real-stage promotions that survived Main filtering,
-      //                  with accumulated (quantity * entryPrice) notional.
-      //   • live    — Exchange-side positions (derived from progHash
-      //                  counters — already cumulative-volume-tracked
-      //                  by live-stage.ts).
-      //   • overall — Single-number roll-up across ALL namespaces so
-      //                  the dashboard can render a top-line
-      //                  "Accumulated" strip without doing the math
-      //                  client-side.
+      //   • Volume is a LIVE-ONLY concept. The only USD exposure that
+      //     matters is what actually sits on the exchange. Pseudo and
+      //     Real positions carry evaluation-only notionals that MUST
+      //     NOT be summed with live volume — doing so would grossly
+      //     overstate real exposure. We surface counts for pseudo/
+      //     real (pipeline health), and volume only for live.
+      //
+      //   • Layers:
+      //       pseudo — Strategy-level continuous evaluation (Base).
+      //                Count only. Running-sets index feeds the live
+      //                coordination join.
+      //       real   — Main→Real promotions that cleared gating.
+      //                Count only.
+      //       live   — Actual exchange positions. Count + USD volume
+      //                (progHash.live_volume_usd_total is the single
+      //                authoritative exposure figure).
+      //
+      //   • Coordination principle: multiple equivalent Sets that
+      //     share the same Base + ranges produce ONE consolidated
+      //     exchange position, not N duplicate orders. The
+      //     `live.positions[].mirroredSets` array carries those
+      //     equivalent Sets so the UI can render "N Sets → 1 Order".
       openPositions: (() => {
         const liveOpen = Math.max(
           0,
@@ -1043,49 +1051,51 @@ export async function GET(
             n(progHash.live_positions_closed_count),
         )
         const liveVolumeUsd = n(progHash.live_volume_usd_total)
-        const pseudoVolumeUsdR = Math.round(pseudoVolumeUsd * 100) / 100
-        const realVolumeUsdR   = Math.round(realVolumeUsd   * 100) / 100
-        const liveVolumeUsdR   = Math.round(liveVolumeUsd   * 100) / 100
-        // Total accumulated USD across every "currently holding"
-        // bucket. Pseudo + Real are independent ledgers (Pseudo =
-        // Base-stage volume-aware; Real = Main→Real promotions) and
-        // they do NOT overlap, so summing them is semantically
-        // correct. Live is the true exchange position, additive as
-        // well.
-        const totalVolumeUsd = Math.round(
-          (pseudoVolumeUsd + realVolumeUsd + liveVolumeUsd) * 100,
-        ) / 100
+        const liveVolumeUsdR = Math.round(liveVolumeUsd * 100) / 100
+
+        // Rename setKeys → mirroredSets on each live position and
+        // drop per-set volumeUsd (Set-level eval volume is noise at
+        // this layer; we only care about WHICH Sets are being
+        // mirrored into this one exchange position, i.e. the
+        // deduplication fan-in).
+        const liveMirroring = livePositionSetRelations
+          .slice(0, 50)
+          .map((p) => ({
+            id:            p.id,
+            symbol:        p.symbol,
+            direction:     p.direction,
+            volumeUsd:     p.volumeUsd,      // this live position's exchange exposure
+            unrealizedPnl: p.unrealizedPnl,
+            entryPrice:    p.entryPrice,
+            markPrice:     p.markPrice,
+            status:        p.status,
+            createdAt:     p.createdAt,
+            realPositionId: p.realPositionId,
+            // How many equivalent upstream Sets mirror into THIS one
+            // exchange position. This is the consolidation metric —
+            // higher = more deduplication work saved on the exchange.
+            mirroredSetCount: p.setKeys.length,
+            mirroredSets:     p.setKeys.map((s) => ({
+              setKey: s.setKey,
+              count:  s.count,
+            })),
+            resolution: p.resolution,
+          }))
+
         return {
           pseudo: {
-            open:         pseudoOpen,
-            volumeUsd:    pseudoVolumeUsdR,
+            open:         pseudoOpen,                // count only
             runningSets:  pseudoRunningSets,
-            topSets:      pseudoTopSets,
+            topSets:      pseudoTopSets,             // { setKey, count }
           },
           real: {
-            open:         realOpen,
-            volumeUsd:    realVolumeUsdR,
+            open:         realOpen,                  // count only
           },
           live: {
-            // progHash counters are cumulative and the fastest
-            // source of truth for simple "how many are open" UI.
-            open:         liveOpen,
-            volumeUsd:    liveVolumeUsdR,
-            // Scan-derived count ("right now" from live:position:*
-            // rows). May differ by ±1 from `open` when the progHash
-            // counter lags a fresh create/close — the UI can surface
-            // drift if needed.
+            open:         liveOpen,                  // count
+            volumeUsd:    liveVolumeUsdR,            // exchange USD exposure (only real figure)
             openScanned:  liveOpenScanned,
-            // ── Set-relation coordination ─────────────────────
-            // Per live exchange position, a compact record with:
-            //   • symbol, direction, volume, unrealized PnL
-            //   • best-candidate setKeys (top-3 by exposure)
-            //   • resolution source: "pseudo" | "real-fallback" |
-            //     "unresolved" — tells the operator exactly how the
-            //     Set was identified (via pseudo ledger, via Real
-            //     fallback, or no upstream match).
-            // Bounded to 50 entries — the UI paginates on demand.
-            positions: livePositionSetRelations.slice(0, 50),
+            positions:    liveMirroring,
             resolution: {
               pseudo:       liveResolvedViaPseudo,
               realFallback: liveResolvedViaReal,
@@ -1093,16 +1103,12 @@ export async function GET(
             },
           },
           overall: {
-            // Distinct "running" positions across ALL ledgers. Pseudo
-            // + Live are the two source-of-truth ledgers; Real sits
-            // inside the pseudo-pipeline but has its own namespace, so
-            // we expose it separately rather than double-counting.
-            totalOpenPositions: pseudoOpen + liveOpen,
-            pseudoVolumeUsd:    pseudoVolumeUsdR,
-            realVolumeUsd:      realVolumeUsdR,
-            liveVolumeUsd:      liveVolumeUsdR,
-            totalVolumeUsd,
-            runningSetsCount:   pseudoRunningSets,
+            // Pipeline-health counters. Semantically distinct from
+            // each other — do NOT sum.
+            pipelineEvalOpen: pseudoOpen,   // strategies evaluating
+            exchangeOpen:     liveOpen,     // orders actually on exchange
+            exchangeVolumeUsd: liveVolumeUsdR,
+            runningSetsCount: pseudoRunningSets,
           },
         }
       })(),
