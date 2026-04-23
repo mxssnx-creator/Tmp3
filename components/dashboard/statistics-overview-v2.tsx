@@ -118,6 +118,311 @@ function fmtUsd(n: number): string {
   return `$${n.toFixed(0)}`
 }
 
+// ── Exchange position row (coordination panel) ───────────────────────
+// One row per live exchange position. Collapsed view shows symbol /
+// direction / exposure / PnL / mirrored Sets / resolution badge. Click
+// the chevron to expand and see the FULL Position Details: leverage,
+// margin at risk, liquidation distance, SL/TP levels, ROI, exchange
+// order IDs, sync staleness. Everything comes from the single /stats
+// payload — no additional API calls.
+function ExchangePositionRow({
+  lp,
+}: {
+  lp: CompactStats["livePositions"][number]
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const nSets = lp.mirroredSetCount || lp.mirroredSets.length
+  const primarySet = lp.mirroredSets[0]
+  const setLabel = primarySet
+    ? primarySet.setKey.length > 32
+      ? `${primarySet.setKey.slice(0, 32)}…`
+      : primarySet.setKey
+    : "—"
+  const resTone =
+    lp.resolution === "pseudo"
+      ? "text-emerald-700"
+      : lp.resolution === "real-fallback"
+        ? "text-amber-700"
+        : "text-muted-foreground"
+
+  // Near-liquidation heuristic: mark within 5% of liq price is critical
+  // — surface visually so operator notices at a glance.
+  const nearLiq =
+    lp.liquidationPrice > 0 &&
+    lp.markPrice > 0 &&
+    lp.liquidationDistancePct > 0 &&
+    lp.liquidationDistancePct <= 5
+
+  // Sync staleness: >60s without an exchange reconciliation hints that
+  // the live polling loop is lagging or the connector is rate-limited.
+  const nowMs = Date.now()
+  const syncAgeSec = lp.syncedAt > 0 ? Math.round((nowMs - lp.syncedAt) / 1000) : -1
+  const staleSync = syncAgeSec >= 60
+
+  return (
+    <div
+      className={`rounded transition-colors text-[10px] ${
+        expanded ? "bg-muted/50" : "bg-muted/30 hover:bg-muted/50"
+      }`}
+    >
+      {/* ── Collapsed summary row ──────────────────────────────── */}
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="w-full grid grid-cols-12 items-center gap-2 px-2 py-1 text-left"
+        aria-expanded={expanded}
+      >
+        <div className="col-span-3 flex items-center gap-1 min-w-0">
+          <span className="text-muted-foreground text-[8px] shrink-0" aria-hidden>
+            {expanded ? "▾" : "▸"}
+          </span>
+          <span className="font-semibold text-foreground truncate">{lp.symbol}</span>
+          <span
+            className={`px-1 rounded text-[8px] uppercase font-semibold shrink-0 ${
+              lp.direction === "long"
+                ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                : "bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300"
+            }`}
+          >
+            {lp.direction}
+          </span>
+          {lp.leverage > 1 && (
+            <span
+              className="px-1 rounded text-[8px] font-semibold tabular-nums bg-blue-100 text-blue-800 dark:bg-blue-950/40 dark:text-blue-300 shrink-0"
+              title={`${lp.leverage}x leverage · ${lp.marginType} margin · ${fmtUsd(lp.marginUsd)} at risk`}
+            >
+              {lp.leverage}x
+            </span>
+          )}
+          {nearLiq && (
+            <span
+              className="px-1 rounded text-[8px] font-bold bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300 shrink-0 animate-pulse"
+              title={`Near liquidation — mark price is within ${lp.liquidationDistancePct.toFixed(2)}% of liq @ ${lp.liquidationPrice}`}
+            >
+              LIQ
+            </span>
+          )}
+        </div>
+        <div
+          className="col-span-2 tabular-nums text-right font-semibold text-amber-700"
+          title={`Exchange exposure: ${fmtUsd(lp.volumeUsd)} (qty ${lp.quantity} @ ${lp.entryPrice})`}
+        >
+          {fmtUsd(lp.volumeUsd)}
+        </div>
+        <div
+          className={`col-span-2 tabular-nums text-right font-semibold ${
+            lp.unrealizedPnl > 0
+              ? "text-emerald-600"
+              : lp.unrealizedPnl < 0
+                ? "text-red-600"
+                : "text-muted-foreground"
+          }`}
+          title={`ROI ${lp.roiPct > 0 ? "+" : ""}${lp.roiPct.toFixed(2)}% on ${fmtUsd(lp.marginUsd)} margin`}
+        >
+          {lp.unrealizedPnl > 0 ? "+" : ""}
+          {fmtUsd(lp.unrealizedPnl)}
+          <span className="ml-1 text-[8px] font-normal opacity-75">
+            ({lp.roiPct > 0 ? "+" : ""}{lp.roiPct.toFixed(1)}%)
+          </span>
+        </div>
+        {/* Mirrored-Sets column */}
+        <div className="col-span-4 flex items-center gap-1 min-w-0">
+          {nSets > 0 && (
+            <span
+              className={`px-1 rounded text-[8px] font-semibold tabular-nums shrink-0 ${
+                nSets > 1
+                  ? "bg-primary/15 text-primary"
+                  : "bg-muted text-muted-foreground"
+              }`}
+              title={
+                nSets > 1
+                  ? `${nSets} equivalent Sets consolidated into 1 exchange order (avoids ${nSets - 1} duplicate order${nSets - 1 > 1 ? "s" : ""})`
+                  : `1 Set mirrored into this exchange order`
+              }
+            >
+              {nSets}&times; Set{nSets === 1 ? "" : "s"}
+            </span>
+          )}
+          <span className={`truncate font-mono text-[9px] ${resTone}`}>
+            {setLabel}
+          </span>
+        </div>
+        <div className="col-span-1 text-right flex items-center justify-end gap-1">
+          {staleSync && (
+            <span
+              className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0"
+              title={`Exchange sync is ${syncAgeSec}s stale`}
+            />
+          )}
+          <span
+            className={`px-1 rounded text-[8px] font-semibold ${
+              lp.resolution === "pseudo"
+                ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                : lp.resolution === "real-fallback"
+                  ? "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
+                  : "bg-muted text-muted-foreground"
+            }`}
+            title={
+              lp.resolution === "pseudo"
+                ? "Resolved via pseudo ledger (exact Base-stage match)"
+                : lp.resolution === "real-fallback"
+                  ? "Resolved via Real stage (Base row already closed)"
+                  : "No upstream Set matched — investigate orphaned position"
+            }
+          >
+            {lp.resolution === "pseudo"
+              ? "P"
+              : lp.resolution === "real-fallback"
+                ? "R"
+                : "?"}
+          </span>
+        </div>
+      </button>
+
+      {/* ── Expanded Position Details ──────────────────────────── */}
+      {expanded && (
+        <div className="px-2 pb-2 pt-1 border-t border-border/40 grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] sm:grid-cols-4">
+          {/* Exposure & sizing */}
+          <div className="flex flex-col">
+            <span className="text-muted-foreground text-[9px]">Quantity</span>
+            <span className="font-mono tabular-nums">{lp.quantity}</span>
+          </div>
+          <div className="flex flex-col">
+            <span className="text-muted-foreground text-[9px]">Margin at Risk</span>
+            <span className="font-semibold tabular-nums">
+              {fmtUsd(lp.marginUsd)}{" "}
+              <span className="text-[9px] font-normal text-muted-foreground">
+                ({lp.marginType})
+              </span>
+            </span>
+          </div>
+          <div className="flex flex-col">
+            <span className="text-muted-foreground text-[9px]">Leverage</span>
+            <span className="font-semibold tabular-nums">{lp.leverage}x</span>
+          </div>
+          <div className="flex flex-col">
+            <span className="text-muted-foreground text-[9px]">ROI (ROE)</span>
+            <span
+              className={`font-semibold tabular-nums ${
+                lp.roiPct > 0 ? "text-emerald-600" : lp.roiPct < 0 ? "text-red-600" : ""
+              }`}
+            >
+              {lp.roiPct > 0 ? "+" : ""}
+              {lp.roiPct.toFixed(2)}%
+            </span>
+          </div>
+          {/* Price levels */}
+          <div className="flex flex-col">
+            <span className="text-muted-foreground text-[9px]">Entry</span>
+            <span className="font-mono tabular-nums">{lp.entryPrice || "—"}</span>
+          </div>
+          <div className="flex flex-col">
+            <span className="text-muted-foreground text-[9px]">Mark</span>
+            <span className="font-mono tabular-nums">{lp.markPrice || "—"}</span>
+          </div>
+          <div className="flex flex-col">
+            <span className="text-muted-foreground text-[9px]">Liquidation</span>
+            <span
+              className={`font-mono tabular-nums ${nearLiq ? "text-red-600 font-bold" : ""}`}
+              title={
+                lp.liquidationPrice > 0
+                  ? `${lp.liquidationDistancePct.toFixed(2)}% distance from mark`
+                  : "Liquidation price not yet synced from exchange"
+              }
+            >
+              {lp.liquidationPrice || "—"}
+              {lp.liquidationPrice > 0 && (
+                <span className="ml-1 text-[9px] font-normal opacity-75">
+                  ({lp.liquidationDistancePct > 0 ? "" : ""}{lp.liquidationDistancePct.toFixed(1)}%)
+                </span>
+              )}
+            </span>
+          </div>
+          <div className="flex flex-col">
+            <span className="text-muted-foreground text-[9px]">
+              TP{lp.takeProfitOrderId && " ✓"}
+            </span>
+            <span className="font-mono tabular-nums text-emerald-700">
+              {lp.takeProfitPrice || "—"}
+            </span>
+          </div>
+          {/* SL */}
+          <div className="flex flex-col">
+            <span className="text-muted-foreground text-[9px]">
+              SL{lp.stopLossOrderId && " ✓"}
+            </span>
+            <span className="font-mono tabular-nums text-red-700">
+              {lp.stopLossPrice || "—"}
+            </span>
+          </div>
+          {/* Exchange refs */}
+          <div className="flex flex-col col-span-1 min-w-0">
+            <span className="text-muted-foreground text-[9px]">Order ID</span>
+            <span className="font-mono text-[9px] truncate" title={lp.orderId || ""}>
+              {lp.orderId || "—"}
+            </span>
+          </div>
+          <div className="flex flex-col col-span-1 min-w-0">
+            <span className="text-muted-foreground text-[9px]">Real Position</span>
+            <span
+              className="font-mono text-[9px] truncate"
+              title={lp.realPositionId || ""}
+            >
+              {lp.realPositionId || "—"}
+            </span>
+          </div>
+          <div className="flex flex-col">
+            <span className="text-muted-foreground text-[9px]">Status</span>
+            <span className="font-semibold uppercase text-[9px]">
+              {lp.status}
+              {staleSync && (
+                <span
+                  className="ml-1 px-1 rounded bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
+                  title={`Last exchange sync: ${syncAgeSec}s ago`}
+                >
+                  {syncAgeSec}s stale
+                </span>
+              )}
+            </span>
+          </div>
+          {/* Mirrored Sets full list */}
+          {lp.mirroredSets.length > 0 && (
+            <div className="col-span-2 sm:col-span-4 border-t border-border/40 pt-1 mt-1">
+              <div className="text-muted-foreground text-[9px] mb-0.5">
+                Mirrored Sets ({lp.mirroredSets.length} equivalent
+                {lp.mirroredSets.length > 1
+                  ? `s consolidated into 1 order)`
+                  : ")"}
+              </div>
+              <ul className="space-y-0.5">
+                {lp.mirroredSets.map((s, i) => (
+                  <li
+                    key={`${s.setKey}-${i}`}
+                    className="flex items-center gap-2 font-mono text-[9px]"
+                  >
+                    <span className="text-muted-foreground w-3 text-right tabular-nums">
+                      {i + 1}.
+                    </span>
+                    <span className="truncate flex-1" title={s.setKey}>
+                      {s.setKey}
+                    </span>
+                    <span
+                      className="tabular-nums px-1 rounded bg-muted text-muted-foreground shrink-0"
+                      title={`${s.count} pseudo eval position${s.count === 1 ? "" : "s"} on this Set`}
+                    >
+                      {s.count}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function StatisticsOverviewV2() {
   const { selectedConnectionId } = useExchange()
   const connectionId = selectedConnectionId || "default-bingx-001"
@@ -448,114 +753,9 @@ export function StatisticsOverviewV2() {
               </span>
             </div>
             <div className="space-y-1">
-              {stats.livePositions.slice(0, 8).map((lp) => {
-                const nSets = lp.mirroredSetCount || lp.mirroredSets.length
-                const primarySet = lp.mirroredSets[0]
-                const setLabel = primarySet
-                  ? primarySet.setKey.length > 32
-                    ? `${primarySet.setKey.slice(0, 32)}…`
-                    : primarySet.setKey
-                  : "—"
-                const resTone =
-                  lp.resolution === "pseudo"
-                    ? "text-emerald-700"
-                    : lp.resolution === "real-fallback"
-                      ? "text-amber-700"
-                      : "text-muted-foreground"
-                const tooltip = [
-                  `${lp.symbol} ${lp.direction.toUpperCase()}  ·  ${fmtUsd(lp.volumeUsd)} on exchange`,
-                  `Unrealized PnL: ${lp.unrealizedPnl >= 0 ? "+" : ""}${fmtUsd(lp.unrealizedPnl)}`,
-                  `Entry: ${lp.entryPrice}  ·  Mark: ${lp.markPrice || "—"}`,
-                  ``,
-                  `Resolution: ${lp.resolution}`,
-                  lp.realPositionId ? `RealPositionId: ${lp.realPositionId}` : "",
-                  ``,
-                  nSets > 0
-                    ? `${nSets} equivalent Set${nSets > 1 ? "s" : ""} mirrored → 1 exchange order` +
-                      (nSets > 1
-                        ? `\n(consolidated — avoids ${nSets - 1} duplicate order${nSets - 1 > 1 ? "s" : ""} on the exchange)`
-                        : "")
-                    : `No upstream Set matched — orphaned exchange position.`,
-                  ...lp.mirroredSets.map(
-                    (s, i) =>
-                      `  ${i + 1}. ${s.setKey}  (${s.count} eval position${s.count === 1 ? "" : "s"})`,
-                  ),
-                ].filter(Boolean).join("\n")
-                return (
-                  <div
-                    key={lp.id}
-                    className="grid grid-cols-12 items-center gap-2 rounded px-2 py-1 bg-muted/30 hover:bg-muted/50 transition-colors text-[10px]"
-                    title={tooltip}
-                  >
-                    <div className="col-span-3 flex items-center gap-1">
-                      <span className="font-semibold text-foreground truncate">{lp.symbol}</span>
-                      <span
-                        className={`px-1 rounded text-[8px] uppercase font-semibold ${
-                          lp.direction === "long"
-                            ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
-                            : "bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300"
-                        }`}
-                      >
-                        {lp.direction}
-                      </span>
-                    </div>
-                    <div className="col-span-2 tabular-nums text-right font-semibold text-amber-700">
-                      {fmtUsd(lp.volumeUsd)}
-                    </div>
-                    <div
-                      className={`col-span-2 tabular-nums text-right font-semibold ${
-                        lp.unrealizedPnl > 0
-                          ? "text-emerald-600"
-                          : lp.unrealizedPnl < 0
-                            ? "text-red-600"
-                            : "text-muted-foreground"
-                      }`}
-                    >
-                      {lp.unrealizedPnl > 0 ? "+" : ""}
-                      {fmtUsd(lp.unrealizedPnl)}
-                    </div>
-                    {/* Mirrored-Sets column: count badge + top setKey */}
-                    <div className="col-span-4 flex items-center gap-1 min-w-0">
-                      {nSets > 0 && (
-                        <span
-                          className={`px-1 rounded text-[8px] font-semibold tabular-nums shrink-0 ${
-                            nSets > 1
-                              ? "bg-primary/15 text-primary"
-                              : "bg-muted text-muted-foreground"
-                          }`}
-                          title={
-                            nSets > 1
-                              ? `This single exchange order consolidates ${nSets} equivalent Sets (same base + same ranges)`
-                              : `1 Set mirrored into this exchange order`
-                          }
-                        >
-                          {nSets}&times; Set{nSets === 1 ? "" : "s"}
-                        </span>
-                      )}
-                      <span className={`truncate font-mono text-[9px] ${resTone}`}>
-                        {setLabel}
-                      </span>
-                    </div>
-                    <div className="col-span-1 text-right">
-                      <span
-                        className={`px-1 rounded text-[8px] font-semibold ${
-                          lp.resolution === "pseudo"
-                            ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
-                            : lp.resolution === "real-fallback"
-                              ? "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
-                              : "bg-muted text-muted-foreground"
-                        }`}
-                      >
-                        {lp.resolution === "pseudo"
-                          ? "P"
-                          : lp.resolution === "real-fallback"
-                            ? "R"
-                            : "?"}
-                      </span>
-                    </div>
-                  </div>
-                )
-              })}
+              {stats.livePositions.slice(0, 8).map((lp) => (
+                <ExchangePositionRow key={lp.id} lp={lp} />
+              ))}
               {stats.livePositions.length > 8 && (
                 <div className="text-[9px] text-muted-foreground text-center pt-0.5">
                   +{stats.livePositions.length - 8} more exchange position{stats.livePositions.length - 8 === 1 ? "" : "s"} (truncated)
