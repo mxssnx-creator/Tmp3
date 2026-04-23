@@ -187,6 +187,20 @@ export function ActiveConnectionCard({
     liveVolumeUsdTotal: number
     liveFillRate: number
     liveWinRate: number
+    // ── Open positions & accumulated volume (from /stats openPositions) ──
+    // Comprehensive ledger of exposure currently on the books:
+    // pseudo = Base-stage, real = Main→Real promotions, live = exchange.
+    // `totalOpenPositions` + `totalVolumeUsd` are server-computed rollups.
+    pseudoOpen: number
+    pseudoVolumeUsd: number
+    pseudoRunningSets: number
+    pseudoTopSets: Array<{ setKey: string; count: number; volumeUsd: number }>
+    realOpen: number
+    realVolumeUsd: number
+    liveOpenPositions: number
+    liveVolumeUsd: number
+    totalOpenPositions: number
+    totalVolumeUsd: number
     // Prehistoric metadata
     rangeDays: number
     timeframeSeconds: number
@@ -447,6 +461,21 @@ export function ActiveConnectionCard({
           liveVolumeUsdTotal:    data?.liveExecution?.volumeUsdTotal   || 0,
           liveFillRate:          data?.liveExecution?.fillRate         || 0,
           liveWinRate:           data?.liveExecution?.winRate          || 0,
+          // ── Open positions & accumulated volume ─────────────────
+          // Same source-of-truth shape as statistics-overview-v2 and
+          // quickstart-section — sourced from `data.openPositions`.
+          pseudoOpen:            Number(data?.openPositions?.pseudo?.open)        || 0,
+          pseudoVolumeUsd:       Number(data?.openPositions?.pseudo?.volumeUsd)   || 0,
+          pseudoRunningSets:     Number(data?.openPositions?.pseudo?.runningSets) || 0,
+          pseudoTopSets:         Array.isArray(data?.openPositions?.pseudo?.topSets)
+                                   ? data.openPositions.pseudo.topSets
+                                   : [],
+          realOpen:              Number(data?.openPositions?.real?.open)          || 0,
+          realVolumeUsd:         Number(data?.openPositions?.real?.volumeUsd)     || 0,
+          liveOpenPositions:     Number(data?.openPositions?.live?.open)          || 0,
+          liveVolumeUsd:         Number(data?.openPositions?.live?.volumeUsd)     || 0,
+          totalOpenPositions:    Number(data?.openPositions?.overall?.totalOpenPositions) || 0,
+          totalVolumeUsd:        Number(data?.openPositions?.overall?.totalVolumeUsd)     || 0,
           rangeDays:               pm.rangeDays              || 1,
           timeframeSeconds:        pm.timeframeSeconds        || 1,
           intervalsProcessed:      pm.intervalsProcessed      || 0,
@@ -876,6 +905,82 @@ export function ActiveConnectionCard({
                     ))}
                   </div>
                 )}
+
+                {/* ── Accumulated Positions & Volume strip ─────────────────
+                    Compact per-connection "where is the money" view.
+                    Renders when ANY ledger has open exposure so it can
+                    be trusted as a single-glance health check without
+                    expanding the card or opening the dashboard.
+                    Values come from the /stats openPositions branch
+                    (same source as the global statistics-overview-v2
+                    and quickstart-section), so numbers are guaranteed
+                    to agree across all three views. */}
+                {prehistoricStats && phase !== "prehistoric_data" && (
+                  prehistoricStats.totalOpenPositions > 0 ||
+                  prehistoricStats.pseudoOpen > 0 ||
+                  prehistoricStats.realOpen > 0 ||
+                  prehistoricStats.liveOpenPositions > 0 ||
+                  prehistoricStats.totalVolumeUsd > 0
+                ) && (() => {
+                  // Local K/M-scaled USD formatter. Kept inline to
+                  // avoid polluting the module scope of this large
+                  // component file with a helper; the other stats
+                  // views already have their own named `fmtUsd`.
+                  const usd = (n: number) => {
+                    if (!Number.isFinite(n) || n < 1) return "$0"
+                    if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`
+                    if (n >= 1_000)     return `$${(n / 1_000).toFixed(1)}K`
+                    return `$${n.toFixed(0)}`
+                  }
+                  const k = (n: number) =>
+                    n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n)
+                  const ps = prehistoricStats
+                  const topSetsTooltip = (() => {
+                    if (!ps.pseudoTopSets || ps.pseudoTopSets.length === 0) {
+                      return `${ps.pseudoRunningSets} Sets currently hold open pseudo positions`
+                    }
+                    return [
+                      `${ps.pseudoRunningSets} Sets with open positions — top 5:`,
+                      ...ps.pseudoTopSets.map(
+                        (s) =>
+                          `• ${s.setKey.slice(0, 28)}${s.setKey.length > 28 ? "…" : ""}  (${s.count}×  ${usd(s.volumeUsd)})`,
+                      ),
+                    ].join("\n")
+                  })()
+                  return (
+                    <div className="mt-2 rounded border bg-gradient-to-r from-emerald-50/60 to-amber-50/40 dark:from-emerald-950/20 dark:to-amber-950/10 px-2 py-1.5 space-y-1">
+                      <div className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground/80">
+                        Accumulated — Open Positions &amp; Volume
+                      </div>
+                      <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-6 text-[10px]">
+                        <div className="flex flex-col gap-0.5" title="Total currently-open positions across all ledgers">
+                          <span className="text-muted-foreground">Total Open</span>
+                          <span className="font-bold text-green-700 dark:text-green-400 tabular-nums">{k(ps.totalOpenPositions)}</span>
+                        </div>
+                        <div className="flex flex-col gap-0.5" title={topSetsTooltip}>
+                          <span className="text-muted-foreground">Running Sets</span>
+                          <span className="font-bold text-green-700 dark:text-green-400 tabular-nums">{k(ps.pseudoRunningSets)}</span>
+                        </div>
+                        <div className="flex flex-col gap-0.5" title={`Pseudo (Base) open: ${k(ps.pseudoOpen)} positions · ${usd(ps.pseudoVolumeUsd)} accumulated`}>
+                          <span className="text-muted-foreground">Pseudo Vol</span>
+                          <span className="font-semibold text-green-700 dark:text-green-400 tabular-nums">{usd(ps.pseudoVolumeUsd)}</span>
+                        </div>
+                        <div className="flex flex-col gap-0.5" title={`Real open: ${k(ps.realOpen)} positions · ${usd(ps.realVolumeUsd)} accumulated`}>
+                          <span className="text-muted-foreground">Real Vol</span>
+                          <span className="font-semibold text-emerald-700 dark:text-emerald-400 tabular-nums">{usd(ps.realVolumeUsd)}</span>
+                        </div>
+                        <div className="flex flex-col gap-0.5" title={`Live exchange open: ${k(ps.liveOpenPositions)} positions · ${usd(ps.liveVolumeUsd)} cumulative`}>
+                          <span className="text-muted-foreground">Live Vol</span>
+                          <span className="font-semibold text-amber-700 dark:text-amber-400 tabular-nums">{usd(ps.liveVolumeUsd)}</span>
+                        </div>
+                        <div className="flex flex-col gap-0.5" title="Total accumulated USD across all ledgers (pseudo + real + live)">
+                          <span className="text-muted-foreground">Total Vol</span>
+                          <span className="font-bold text-primary tabular-nums">{usd(ps.totalVolumeUsd)}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })()}
 
                 {/* Rich prehistoric progress display */}
                 {(phase === "prehistoric_data" || (prehistoricStats && (prehistoricStats.indicationsTotal > 0 || prehistoricStats.stratBase > 0))) && (
