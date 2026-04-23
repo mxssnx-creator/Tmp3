@@ -219,7 +219,7 @@ export async function GET(request: NextRequest) {
           pseudoRealPF20h: pfByType.real.pf20h,
           pseudoRealPF25: pfByType.real.pf25,
           pseudoActivePF20h: pfByType.active.pf20h,
-          pseudoActivePF25: pfByType.active.pf25,
+          pseudoActivePF25: pfByType.active.pf25
         },
       }
     }
