@@ -1697,7 +1697,10 @@ export async function storeIndications(connectionId: string, symbol: string, ind
     // Save to main key with 1-hour TTL
     await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
     
-    // Also maintain per-type independent sets for high-frequency lookups
+    // Also maintain per-type independent sets for high-frequency lookups.
+    // Note: iterating once over unique types would be slightly more efficient,
+    // but `indications` is always a small batch (<=10), so the clarity of a
+    // per-indication pass is preferred.
     for (const ind of indications) {
       const typeKey = `indications:${connectionId}:${ind.type}`
       const typeIndications = indications.filter(i => i.type === ind.type)
@@ -1705,36 +1708,6 @@ export async function storeIndications(connectionId: string, symbol: string, ind
         await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
       }
     }
-// Add new indications with metadata for per-config tracking
-     const newIndications = indications.map(ind => ({
-       ...ind,
-       symbol,
-       connectionId,
-       timestamp: new Date().toISOString(),
-       configSet: getConfigurationSet(ind.type, ind.value), // Track which config set this belongs to
-     }))
-     
-     existing.push(...newIndications)
-     
-     // Keep only latest 2500 indications per connection (250 per symbol × 10 symbols typical)
-     if (existing.length > 2500) {
-       existing = existing.slice(-2500)
-     }
-     
-     // Save to main key with 1-hour TTL
-     await client.set(mainKey, JSON.stringify(existing), { EX: 3600 })
-     
-     // Also maintain per-type independent sets for high-frequency lookups
-     await Promise.all(
-       indications.map(async (indication) => {
-         const typeKey = `indications:${connectionId}:${indication.type}`
-         const typeIndications = indications.filter(i => i.type === indication.type)
-         if (typeIndications.length > 0) {
-           await client.set(typeKey, JSON.stringify(typeIndications), { EX: 3600 })
-         }
-       })
-     )
-    
   } catch (error) {
     console.error(`[v0] Error storing indications for ${connectionId}:`, error)
   }
