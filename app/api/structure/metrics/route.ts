@@ -221,7 +221,8 @@ export async function GET(request: NextRequest) {
           pseudoActivePF20h: pfByType.active.pf20h,
           pseudoActivePF25: pfByType.active.pf25
         }
-      },
+      }
+    }),
     }
   })
   } catch (error) {
