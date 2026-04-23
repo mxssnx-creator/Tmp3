@@ -222,8 +222,6 @@ export async function GET(request: NextRequest) {
           pseudoActivePF25: pfByType.active.pf25,
         },
       }
-    }
-    })
   } catch (error) {
     console.error("[v0] Error fetching structure metrics:", error)
     return NextResponse.json(
@@ -235,3 +233,4 @@ export async function GET(request: NextRequest) {
     )
   }
 }
+  })
