@@ -15,6 +15,19 @@ interface CompactStats {
   stratMain: number
   stratReal: number
   stratLive: number
+  // ── Main-stage breakdown ──────────────────────────────────────────
+  // Three sub-counts that let the operator see *why* Main is the size
+  // it is:
+  //   • mainEvaluated       — Base Sets that entered Main evaluation
+  //                           (every promoted Base slot is counted here)
+  //   • mainCoordCreated    — extra related variant Sets created at
+  //                           Main by position coordination (trailing /
+  //                           block / dca) on top of the default set
+  //   • mainBlockDcaSets    — subset of coord-created Sets that carry a
+  //                           Block or DCA variant tag
+  mainEvaluated: number
+  mainCoordCreated: number
+  mainBlockDcaSets: number
   liveFilled: number
   liveClosed: number
   liveWinRate: number
@@ -34,6 +47,9 @@ const EMPTY: CompactStats = {
   stratMain: 0,
   stratReal: 0,
   stratLive: 0,
+  mainEvaluated: 0,
+  mainCoordCreated: 0,
+  mainBlockDcaSets: 0,
   liveFilled: 0,
   liveClosed: 0,
   liveWinRate: 0,
@@ -76,6 +92,27 @@ export function StatisticsOverviewV2() {
         const liveExec = d.liveExecution || {}
         const liveDetail = d.strategyDetail?.live || {}
 
+        // ── Main-stage breakdown sources ────────────────────────────
+        // Three distinct backend namespaces, all exposed by /stats:
+        //   • breakdown.strategies.mainEvaluated   — Base Sets that
+        //       reached Main evaluation (hincrby counter
+        //       `strategies_main_evaluated`).
+        //   • mainCoordination.totalCreated        — cumulative count
+        //       of related variant Sets created by Main-stage position
+        //       coordination on top of the default Set (hincrby
+        //       `strategies_main_related_created`).
+        //   • strategyVariants.block.createdSets +
+        //     strategyVariants.dca.createdSets     — cumulative Sets
+        //       carrying a Block or DCA variant tag (from the
+        //       `strategy_variant:{id}:{block|dca}` hashes).
+        const mainBreakdownEval   = d.breakdown?.strategies?.mainEvaluated
+          ?? d.strategyDetail?.main?.evaluated
+          ?? 0
+        const mainCoordCreated    = d.mainCoordination?.totalCreated ?? 0
+        const blockSets = d.strategyVariants?.block?.createdSets ?? 0
+        const dcaSets   = d.strategyVariants?.dca?.createdSets   ?? 0
+        const mainBlockDcaSets    = blockSets + dcaSets
+
         if (!mounted) return
         setStats({
           indicationCycles: d.realtime?.indicationCycles || 0,
@@ -88,6 +125,9 @@ export function StatisticsOverviewV2() {
           stratMain:        d.breakdown?.strategies?.main || 0,
           stratReal:        d.breakdown?.strategies?.real || 0,
           stratLive:        d.breakdown?.strategies?.live || liveExec.positionsCreated || 0,
+          mainEvaluated:    mainBreakdownEval,
+          mainCoordCreated,
+          mainBlockDcaSets,
           liveFilled:       liveExec.ordersFilled     || 0,
           liveClosed:       liveExec.positionsClosed  || 0,
           liveWinRate:      liveExec.winRate          || liveDetail.winRate  || 0,
@@ -172,7 +212,15 @@ export function StatisticsOverviewV2() {
             <span className="font-bold text-orange-600 tabular-nums">{fmt(stats.stratBase)}</span>
           </div>
 
-          <div className="flex flex-col gap-0.5">
+          <div
+            className="flex flex-col gap-0.5"
+            title={
+              `Main Sets — ${fmt(stats.stratMain)} total\n` +
+              `• Evaluated (from Base): ${fmt(stats.mainEvaluated)}\n` +
+              `• Pos.coord. additionally created: ${fmt(stats.mainCoordCreated)}\n` +
+              `• Block + DCA Sets: ${fmt(stats.mainBlockDcaSets)}`
+            }
+          >
             <span className="text-muted-foreground">Main</span>
             <span className="font-bold text-yellow-600 tabular-nums">{fmt(stats.stratMain)}</span>
           </div>
@@ -195,6 +243,30 @@ export function StatisticsOverviewV2() {
             </span>
           </div>
         </div>
+
+        {/* Main-stage breakdown strip — shown whenever Main has any
+            evaluated Sets so the operator can see the cascade from
+            Base → Main broken into: how many Base Sets were evaluated,
+            how many additional related Sets position coordination
+            contributed on top of the default variant, and how many of
+            those carry a Block or DCA tag. Mirrors the Live strip
+            pattern below for visual consistency. */}
+        {(stats.mainEvaluated > 0 || stats.mainCoordCreated > 0 || stats.mainBlockDcaSets > 0) && (
+          <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-3 gap-2 text-[10px]">
+            <div className="flex flex-col gap-0.5" title="Base Sets that reached Main-stage evaluation">
+              <span className="text-muted-foreground">Main Eval (Base)</span>
+              <span className="font-semibold text-yellow-700 tabular-nums">{fmt(stats.mainEvaluated)}</span>
+            </div>
+            <div className="flex flex-col gap-0.5" title="Additional related variant Sets created by Main-stage position coordination on top of the default Set">
+              <span className="text-muted-foreground">Pos.coord. add&apos;l</span>
+              <span className="font-semibold text-yellow-700 tabular-nums">{fmt(stats.mainCoordCreated)}</span>
+            </div>
+            <div className="flex flex-col gap-0.5" title="Cumulative Sets carrying a Block or DCA variant tag">
+              <span className="text-muted-foreground">Block + DCA</span>
+              <span className="font-semibold text-yellow-700 tabular-nums">{fmt(stats.mainBlockDcaSets)}</span>
+            </div>
+          </div>
+        )}
 
         {/* Live exchange metrics strip — only shown when there is live activity */}
         {stats.stratLive > 0 && (
