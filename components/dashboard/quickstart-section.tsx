@@ -1030,91 +1030,14 @@ export function QuickstartSection() {
           )}
         </div>
 
-        {/* ── Accumulated Positions & Volume strip ──────────────────────────
-            Single-glance view of every "currently holding exposure"
-            ledger: pseudo (Base-stage), Real (Main→Real promotions),
-            and live exchange — with Running Sets and a Total Vol
-            rollup. Shown whenever ANY ledger has activity, even when
-            the quickstart card is collapsed, so the operator can
-            always see where the money is without expanding. */}
-        {(stats.totalOpenPositions > 0 ||
-          stats.pseudoOpen > 0 ||
-          stats.realOpen > 0 ||
-          stats.livePositionsOpen > 0 ||
-          stats.totalVolumeUsd > 0) && (
-          <div className="rounded-md border bg-gradient-to-r from-emerald-50/60 to-amber-50/40 dark:from-emerald-950/20 dark:to-amber-950/10 p-2 space-y-1">
-            <div className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground/80">
-              Accumulated — Open Positions &amp; Volume
-            </div>
-            <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-6 text-[10px]">
-              <div
-                className="flex flex-col gap-0.5"
-                title="Total currently-open positions across all ledgers (pseudo + live exchange)"
-              >
-                <span className="text-muted-foreground">Total Open</span>
-                <span className="font-bold text-green-700 dark:text-green-400 tabular-nums">
-                  {fmt(stats.totalOpenPositions)}
-                </span>
-              </div>
-              <div
-                className="flex flex-col gap-0.5"
-                title={(() => {
-                  if (!stats.pseudoTopSets || stats.pseudoTopSets.length === 0) {
-                    return `${stats.pseudoRunningSets} Sets currently hold open pseudo positions`
-                  }
-                  return [
-                    `${stats.pseudoRunningSets} Sets with open positions — top 5 by exposure:`,
-                    ...stats.pseudoTopSets.map(
-                      (s) =>
-                        `• ${s.setKey.slice(0, 28)}${s.setKey.length > 28 ? "…" : ""}  (${s.count}×  ${fmtUsd(s.volumeUsd)})`,
-                    ),
-                  ].join("\n")
-                })()}
-              >
-                <span className="text-muted-foreground">Running Sets</span>
-                <span className="font-bold text-green-700 dark:text-green-400 tabular-nums">
-                  {fmt(stats.pseudoRunningSets)}
-                </span>
-              </div>
-              <div
-                className="flex flex-col gap-0.5"
-                title={`Pseudo (Base) open: ${fmt(stats.pseudoOpen)} positions · ${fmtUsd(stats.pseudoVolumeUsd)} accumulated`}
-              >
-                <span className="text-muted-foreground">Pseudo Vol</span>
-                <span className="font-semibold text-green-700 dark:text-green-400 tabular-nums">
-                  {fmtUsd(stats.pseudoVolumeUsd)}
-                </span>
-              </div>
-              <div
-                className="flex flex-col gap-0.5"
-                title={`Real open: ${fmt(stats.realOpen)} positions · ${fmtUsd(stats.realVolumeUsd)} accumulated`}
-              >
-                <span className="text-muted-foreground">Real Vol</span>
-                <span className="font-semibold text-emerald-700 dark:text-emerald-400 tabular-nums">
-                  {fmtUsd(stats.realVolumeUsd)}
-                </span>
-              </div>
-              <div
-                className="flex flex-col gap-0.5"
-                title={`Live exchange open: ${fmt(stats.livePositionsOpen)} positions · ${fmtUsd(stats.liveVolumeUsd)} cumulative`}
-              >
-                <span className="text-muted-foreground">Live Vol</span>
-                <span className="font-semibold text-amber-700 dark:text-amber-400 tabular-nums">
-                  {fmtUsd(stats.liveVolumeUsd)}
-                </span>
-              </div>
-              <div
-                className="flex flex-col gap-0.5"
-                title="Total accumulated USD across all ledgers (pseudo + real + live)"
-              >
-                <span className="text-muted-foreground">Total Vol</span>
-                <span className="font-bold text-primary tabular-nums">
-                  {fmtUsd(stats.totalVolumeUsd)}
-                </span>
-              </div>
-            </div>
-          </div>
-        )}
+        {/* NOTE: Open-position accumulation is intentionally NOT
+            rendered as an overall top strip here. The Quick Start
+            stats block mirrors Overall Strategies processing, which
+            remains independent of exposure accumulation per the
+            user's design brief. Real-stage and Live-exchange
+            accumulation is surfaced only where it belongs — on the
+            Strategies → Real tile and the Live Exchange Orders strip
+            in the per-connection statistics view. */}
 
         {/* ── expanded panel ─────────────────────────────────────────────── */}
         {expanded && (

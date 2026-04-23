@@ -243,6 +243,22 @@ export async function GET(
     let pseudoVolumeUsd = 0
     let pseudoRunningSets = 0
     const pseudoSetAgg = new Map<string, { count: number; volumeUsd: number }>()
+    // ── Symbol+direction → setKey lookup index ───────────────────────
+    // Built during the pseudo-position scan so the live-stage
+    // Set-relation join below can identify which Set an exchange
+    // position was spawned from WITHOUT requiring new fields on the
+    // LivePosition schema. Keyed as `SYMBOL:direction` (upper-cased
+    // symbol, lowercase direction). Value is the list of candidate
+    // setKeys currently holding open pseudo exposure for that pair,
+    // with the per-set share so the UI can rank them. In practice a
+    // live position maps to exactly one Set (the one whose Real
+    // promotion triggered the exchange order) — we expose candidates
+    // regardless so the operator sees the relationship even when
+    // multiple Sets overlap on the same symbol/direction.
+    const pseudoSymDirIdx = new Map<
+      string,
+      Array<{ setKey: string; count: number; volumeUsd: number }>
+    >()
 
     try {
       const posIds = (await client
@@ -283,6 +299,28 @@ export async function GET(
           prev.count++
           prev.volumeUsd += (Number.isFinite(cost) && cost > 0 ? cost : 0)
           pseudoSetAgg.set(setKey, prev)
+
+          // Populate symbol+direction → setKey join index for live
+          // position coordination (see openPositions.live.positions
+          // downstream). Same per-hash pass — no extra Redis work.
+          const sym = String(hh.symbol || "").trim().toUpperCase()
+          const dir = String(hh.direction || "").trim().toLowerCase()
+          if (sym && (dir === "long" || dir === "short")) {
+            const joinKey = `${sym}:${dir}`
+            const arr = pseudoSymDirIdx.get(joinKey) || []
+            const existing = arr.find((e) => e.setKey === setKey)
+            if (existing) {
+              existing.count++
+              existing.volumeUsd += (Number.isFinite(cost) && cost > 0 ? cost : 0)
+            } else {
+              arr.push({
+                setKey,
+                count: 1,
+                volumeUsd: Number.isFinite(cost) && cost > 0 ? cost : 0,
+              })
+            }
+            pseudoSymDirIdx.set(joinKey, arr)
+          }
         }
       }
 
@@ -321,6 +359,14 @@ export async function GET(
     // is a data-hygiene issue the operator needs to fix independently.
     let realOpen = 0
     let realVolumeUsd = 0
+    // ── Symbol+direction → candidate Real positions index ─────────
+    // Populated alongside the real scan so live-position resolution
+    // can fall back to Real when the pseudo ledger has no matching
+    // entry (e.g. Set was closed before the exchange position did).
+    const realSymDirIdx = new Map<
+      string,
+      Array<{ realPositionId: string; volumeUsd: number }>
+    >()
     try {
       const realKeys = await client.keys(`real:position:real:${connectionId}:*`)
       if (realKeys.length > 0) {
@@ -336,11 +382,159 @@ export async function GET(
             realOpen++
             const qty = Number(pos.quantity)  || 0
             const px  = Number(pos.entryPrice) || 0
-            if (qty > 0 && px > 0) realVolumeUsd += qty * px
+            const volume = qty > 0 && px > 0 ? qty * px : 0
+            if (volume > 0) realVolumeUsd += volume
+            // Index for live position join
+            const sym = String(pos.symbol || "").trim().toUpperCase()
+            const dir = String(pos.direction || "").trim().toLowerCase()
+            if (sym && (dir === "long" || dir === "short") && pos.id) {
+              const joinKey = `${sym}:${dir}`
+              const arr = realSymDirIdx.get(joinKey) || []
+              arr.push({ realPositionId: String(pos.id), volumeUsd: volume })
+              realSymDirIdx.set(joinKey, arr)
+            }
           } catch { /* skip malformed */ }
         }
       }
     } catch { /* non-critical */ }
+
+    // ── Live-stage OPEN positions + Set-relation join ────────────────
+    //
+    // The operator asked for a coordination view that identifies which
+    // Set each live exchange position came from. The live-stage
+    // persists positions at `live:position:{id}` with
+    // `{ symbol, direction, realPositionId, quantity, entryPrice,
+    //    exchangeData: { unrealizedPnl, markPrice }, status, ... }`.
+    //
+    // The live ledger does NOT natively carry `config_set_key` (the
+    // Set identifier lives on pseudo rows upstream). We resolve the
+    // relationship here, server-side, by joining on
+    // `symbol + direction` against the pseudoSymDirIdx built during
+    // the Base scan above. For any live position whose pseudo join
+    // returns no candidates, we fall back to the Real-stage index —
+    // useful when the Set closed its pseudo row between order
+    // placement and the stats request. Each live position is exposed
+    // with its top-3 candidate setKeys (ordered by per-set USD
+    // exposure), giving the UI everything it needs to render a
+    // "which Set does this live position belong to?" tooltip without
+    // extra API round-trips.
+    const livePositionSetRelations: Array<{
+      id: string
+      symbol: string
+      direction: "long" | "short"
+      volumeUsd: number
+      unrealizedPnl: number
+      entryPrice: number
+      markPrice: number
+      status: string
+      createdAt: number
+      realPositionId?: string
+      setKeys: Array<{ setKey: string; count: number; volumeUsd: number }>
+      // `resolution` lets the UI say exactly HOW the Set was identified:
+      //   • "pseudo"        — exact pseudo row exists for this symbol+dir
+      //   • "real-fallback" — no pseudo match; resolved via Real ledger
+      //   • "unresolved"    — nothing upstream matched (stale or manual)
+      resolution: "pseudo" | "real-fallback" | "unresolved"
+    }> = []
+    try {
+      const liveOpenIds = ((await client
+        .lrange(`live:positions:${connectionId}`, 0, 499)
+        .catch(() => [])) || []) as string[]
+
+      if (liveOpenIds.length > 0) {
+        const rawList = await Promise.all(
+          liveOpenIds.map((id) =>
+            client.get(`live:position:${id}`).catch(() => null),
+          ),
+        )
+        for (const raw of rawList) {
+          if (!raw) continue
+          try {
+            const pos = JSON.parse(raw as string)
+            // Exclude closed/cancelled; accept every in-flight state
+            // where exchange exposure is still on the books.
+            const status = String(pos.status || "").toLowerCase()
+            if (status === "closed" || status === "cancelled" || status === "error") continue
+
+            const sym = String(pos.symbol || "").trim().toUpperCase()
+            const dir = String(pos.direction || "").trim().toLowerCase()
+            if (!sym || (dir !== "long" && dir !== "short")) continue
+
+            const qty = Number(pos.executedQuantity || pos.quantity) || 0
+            const px  = Number(pos.averageExecutionPrice || pos.entryPrice) || 0
+            const volumeUsd = qty > 0 && px > 0 ? Math.round(qty * px * 100) / 100 : 0
+
+            const joinKey = `${sym}:${dir}`
+            let setKeys: Array<{ setKey: string; count: number; volumeUsd: number }> = []
+            let resolution: "pseudo" | "real-fallback" | "unresolved" = "unresolved"
+
+            const pseudoMatches = pseudoSymDirIdx.get(joinKey)
+            if (pseudoMatches && pseudoMatches.length > 0) {
+              setKeys = [...pseudoMatches]
+                .sort((a, b) => b.volumeUsd - a.volumeUsd)
+                .slice(0, 3)
+                .map((s) => ({
+                  setKey: s.setKey,
+                  count: s.count,
+                  volumeUsd: Math.round(s.volumeUsd * 100) / 100,
+                }))
+              resolution = "pseudo"
+            } else {
+              const realMatches = realSymDirIdx.get(joinKey)
+              if (realMatches && realMatches.length > 0) {
+                // Real-stage fallback: we don't have the setKey itself,
+                // only that one exists upstream. Surface a synthetic
+                // marker so the UI can distinguish "no Set found" from
+                // "Set existed but Base row already closed".
+                resolution = "real-fallback"
+                setKeys = [{
+                  setKey: `real:${realMatches[0].realPositionId}`,
+                  count: realMatches.length,
+                  volumeUsd: Math.round(
+                    realMatches.reduce((s, m) => s + m.volumeUsd, 0) * 100,
+                  ) / 100,
+                }]
+              }
+            }
+
+            livePositionSetRelations.push({
+              id: String(pos.id || ""),
+              symbol: sym,
+              direction: dir as "long" | "short",
+              volumeUsd,
+              unrealizedPnl: Math.round(
+                (Number(pos.exchangeData?.unrealizedPnl ?? pos.exchangeData?.unrealizedPnL) || 0) * 100,
+              ) / 100,
+              entryPrice: Math.round(px * 1e8) / 1e8,
+              markPrice:  Math.round(
+                (Number(pos.exchangeData?.markPrice) || 0) * 1e8,
+              ) / 1e8,
+              status,
+              createdAt: Number(pos.createdAt) || 0,
+              realPositionId: pos.realPositionId ? String(pos.realPositionId) : undefined,
+              setKeys,
+              resolution,
+            })
+          } catch { /* skip malformed */ }
+        }
+      }
+    } catch { /* non-critical */ }
+
+    // Derived aggregates for the openPositions.live branch below.
+    // Kept separate from progHash counters because the hash is
+    // write-heavy and occasionally lags the actual live:position:* rows
+    // by a few seconds. These scan-derived values are the authoritative
+    // "right now" view for the coordination UI.
+    const liveOpenScanned = livePositionSetRelations.length
+    const liveResolvedViaPseudo = livePositionSetRelations.filter(
+      (p) => p.resolution === "pseudo",
+    ).length
+    const liveResolvedViaReal = livePositionSetRelations.filter(
+      (p) => p.resolution === "real-fallback",
+    ).length
+    const liveUnresolvedCount = livePositionSetRelations.filter(
+      (p) => p.resolution === "unresolved",
+    ).length
 
     const realtimeIsActive =
       realtimeIndicationCycles > 0 ||
@@ -873,8 +1067,30 @@ export async function GET(
             volumeUsd:    realVolumeUsdR,
           },
           live: {
+            // progHash counters are cumulative and the fastest
+            // source of truth for simple "how many are open" UI.
             open:         liveOpen,
             volumeUsd:    liveVolumeUsdR,
+            // Scan-derived count ("right now" from live:position:*
+            // rows). May differ by ±1 from `open` when the progHash
+            // counter lags a fresh create/close — the UI can surface
+            // drift if needed.
+            openScanned:  liveOpenScanned,
+            // ── Set-relation coordination ─────────────────────
+            // Per live exchange position, a compact record with:
+            //   • symbol, direction, volume, unrealized PnL
+            //   • best-candidate setKeys (top-3 by exposure)
+            //   • resolution source: "pseudo" | "real-fallback" |
+            //     "unresolved" — tells the operator exactly how the
+            //     Set was identified (via pseudo ledger, via Real
+            //     fallback, or no upstream match).
+            // Bounded to 50 entries — the UI paginates on demand.
+            positions: livePositionSetRelations.slice(0, 50),
+            resolution: {
+              pseudo:       liveResolvedViaPseudo,
+              realFallback: liveResolvedViaReal,
+              unresolved:   liveUnresolvedCount,
+            },
           },
           overall: {
             // Distinct "running" positions across ALL ledgers. Pseudo

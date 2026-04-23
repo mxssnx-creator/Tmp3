@@ -48,6 +48,30 @@ interface CompactStats {
   liveClosed: number
   liveWinRate: number
   liveFillRate: number
+  // ── Live-exchange position → Set relation coordination ───────────
+  // Per-position breakdown emitted by `/stats` (openPositions.live.
+  // positions). The server joins each live exchange position against
+  // the pseudo-position ledger by symbol+direction, so the UI can
+  // surface the exact Set a live order was spawned from (Exchange
+  // Position Info → Set coordination). Each entry carries top-3
+  // candidate setKeys ranked by USD exposure, plus a `resolution`
+  // tag that tells us how the match was made (pseudo | real-fallback
+  // | unresolved).
+  livePositions: Array<{
+    id: string
+    symbol: string
+    direction: "long" | "short"
+    volumeUsd: number
+    unrealizedPnl: number
+    entryPrice: number
+    markPrice: number
+    status: string
+    createdAt: number
+    realPositionId?: string
+    setKeys: Array<{ setKey: string; count: number; volumeUsd: number }>
+    resolution: "pseudo" | "real-fallback" | "unresolved"
+  }>
+  liveResolution: { pseudo: number; realFallback: number; unresolved: number }
   phase: string
   isActive: boolean
 }
@@ -80,6 +104,8 @@ const EMPTY: CompactStats = {
   liveClosed: 0,
   liveWinRate: 0,
   liveFillRate: 0,
+  livePositions: [],
+  liveResolution: { pseudo: 0, realFallback: 0, unresolved: 0 },
   phase: "",
   isActive: false,
 }
@@ -195,6 +221,16 @@ export function StatisticsOverviewV2() {
           liveClosed:       liveExec.positionsClosed  || 0,
           liveWinRate:      liveExec.winRate          || liveDetail.winRate  || 0,
           liveFillRate:     liveExec.fillRate         || liveDetail.passRatio || 0,
+          // Live-exchange → Set coordination payload (scan-derived).
+          // Values come from openPositions.live.positions / .resolution
+          // server-side. Guard against legacy responses that don't
+          // include the branch yet.
+          livePositions:    Array.isArray(opLive.positions) ? opLive.positions : [],
+          liveResolution: {
+            pseudo:       Number(opLive.resolution?.pseudo)       || 0,
+            realFallback: Number(opLive.resolution?.realFallback) || 0,
+            unresolved:   Number(opLive.resolution?.unresolved)   || 0,
+          },
           phase:            d.metadata?.phase || "",
           isActive:         d.metadata?.engineRunning || false,
         })
@@ -315,102 +351,16 @@ export function StatisticsOverviewV2() {
           </div>
         </div>
 
-        {/* ── OVERALL ACCUMULATED — top-line summary ─────────────────
-            Comprehensive "what's currently running and how much is it
-            worth" strip. Shown whenever ANY open position exists in
-            ANY ledger (pseudo / real / live). Columns, left to right:
-              • Total Open     — distinct positions across all ledgers
-              • Running Sets   — count of valid Sets currently carrying
-                                 open pseudo positions (tooltip lists
-                                 the top-5 Sets by USD exposure)
-              • Pseudo Vol     — sum of position_cost across open
-                                 Base-stage pseudo rows
-              • Real Vol       — sum of (qty * entry) across open Real
-                                 promotions
-              • Live Vol       — cumulative exchange volume to date
-                                 (progHash.live_volume_usd_total)
-              • Total Vol      — sum of the three above
-            This is the coordination view the operator asked for:
-            Exchange-complex-optimal Position Info coord in one line. */}
-        {(stats.totalOpenPositions > 0 ||
-          stats.pseudoOpen > 0 ||
-          stats.realOpen > 0 ||
-          stats.liveOpen > 0 ||
-          stats.totalVolumeUsd > 0) && (
-          <div className="mt-2 pt-2 border-t border-border/40">
-            <div className="text-[10px] uppercase tracking-wide text-muted-foreground/80 mb-1">
-              Accumulated — Open Positions &amp; Volume
-            </div>
-            <div className="grid grid-cols-3 gap-2 sm:grid-cols-6 text-[10px]">
-              <div
-                className="flex flex-col gap-0.5"
-                title="Total currently-open positions across all ledgers (pseudo + live exchange)"
-              >
-                <span className="text-muted-foreground">Total Open</span>
-                <span className="font-bold text-green-700 tabular-nums">
-                  {fmt(stats.totalOpenPositions)}
-                </span>
-              </div>
-              <div
-                className="flex flex-col gap-0.5"
-                title={(() => {
-                  if (!stats.pseudoTopSets || stats.pseudoTopSets.length === 0) {
-                    return `${stats.pseudoRunningSets} Sets currently hold open pseudo positions`
-                  }
-                  const lines = [
-                    `${stats.pseudoRunningSets} Sets with open positions — top 5 by exposure:`,
-                    ...stats.pseudoTopSets.map(
-                      (s) =>
-                        `• ${s.setKey.slice(0, 28)}${s.setKey.length > 28 ? "…" : ""}  (${s.count}×  ${fmtUsd(s.volumeUsd)})`,
-                    ),
-                  ]
-                  return lines.join("\n")
-                })()}
-              >
-                <span className="text-muted-foreground">Running Sets</span>
-                <span className="font-bold text-green-700 tabular-nums">
-                  {fmt(stats.pseudoRunningSets)}
-                </span>
-              </div>
-              <div
-                className="flex flex-col gap-0.5"
-                title={`Pseudo (Base) open: ${fmt(stats.pseudoOpen)} positions · ${fmtUsd(stats.pseudoVolumeUsd)} accumulated`}
-              >
-                <span className="text-muted-foreground">Pseudo Vol</span>
-                <span className="font-semibold text-green-700 tabular-nums">
-                  {fmtUsd(stats.pseudoVolumeUsd)}
-                </span>
-              </div>
-              <div
-                className="flex flex-col gap-0.5"
-                title={`Real open: ${fmt(stats.realOpen)} positions · ${fmtUsd(stats.realVolumeUsd)} accumulated`}
-              >
-                <span className="text-muted-foreground">Real Vol</span>
-                <span className="font-semibold text-emerald-700 tabular-nums">
-                  {fmtUsd(stats.realVolumeUsd)}
-                </span>
-              </div>
-              <div
-                className="flex flex-col gap-0.5"
-                title={`Live exchange open: ${fmt(stats.liveOpen)} positions · ${fmtUsd(stats.liveVolumeUsd)} cumulative`}
-              >
-                <span className="text-muted-foreground">Live Vol</span>
-                <span className="font-semibold text-amber-700 tabular-nums">
-                  {fmtUsd(stats.liveVolumeUsd)}
-                </span>
-              </div>
-              <div
-                className="flex flex-col gap-0.5"
-                title="Total accumulated USD across all ledgers (pseudo + real + live)"
-              >
-                <span className="text-muted-foreground">Total Vol</span>
-                <span className="font-bold text-primary tabular-nums">
-                  {fmtUsd(stats.totalVolumeUsd)}
-                </span>
-              </div>
-            </div>
-          </div>
-        )}
+        {/* NOTE: The Overall Strategies processing block above is
+            deliberately independent of the accumulation view. Open-
+            position accumulation belongs only to the downstream
+            stages that actually hold exposure — Real (see main-
+            breakdown strip below) and Live Exchange Orders (see Live
+            strip further down). Pseudo-position aggregates are still
+            captured by the /stats API for the per-stage tooltips and
+            the Running-Sets coordination tooltip on Live, but are not
+            surfaced here to avoid conflating cross-stage totals with
+            evaluation processing. */}
 
         {/* Main-stage breakdown strip — shown whenever Main has any
             evaluated Sets so the operator can see the cascade from
@@ -483,6 +433,132 @@ export function StatisticsOverviewV2() {
             <div className="flex flex-col gap-0.5">
               <span className="text-muted-foreground">Win %</span>
               <span className={`font-semibold tabular-nums ${stats.liveWinRate >= 50 ? "text-green-600" : "text-amber-700"}`}>{stats.liveWinRate.toFixed(1)}%</span>
+            </div>
+          </div>
+        )}
+
+        {/* ── Live Exchange Orders → Set Coordination panel ──────────────
+            For every OPEN exchange position on the live ledger, shows
+            exactly which Set it belongs to (resolved server-side by
+            joining symbol+direction against the pseudo-position
+            ledger). This is the "coord to be identified for
+            statistics — by Exchange Position Info values" view the
+            operator asked for. Columns, per row:
+              • symbol/direction — Exchange Position Info identifier
+              • volume + PnL     — exposure & current unrealized P&L
+              • Set              — top-ranked setKey (truncated) with
+                                    resolution badge: pseudo / real-
+                                    fallback / unresolved
+              • tooltip lists the top-3 candidate setKeys with their
+                per-Set counts and USD share, plus the resolution
+                reason so the operator can trust the relationship. */}
+        {stats.livePositions.length > 0 && (
+          <div className="mt-2 pt-2 border-t border-border/40">
+            <div className="flex items-center justify-between text-[10px] uppercase tracking-wide text-muted-foreground/80 mb-1">
+              <span>Live Orders — Set Coordination</span>
+              <span
+                className="text-[9px] tabular-nums"
+                title={
+                  `Resolution sources:\n` +
+                  `• pseudo:        ${stats.liveResolution.pseudo} (exact Base-ledger match)\n` +
+                  `• real-fallback: ${stats.liveResolution.realFallback} (Base row closed — resolved via Real)\n` +
+                  `• unresolved:    ${stats.liveResolution.unresolved} (no upstream match — investigate)`
+                }
+              >
+                {stats.liveResolution.pseudo}p / {stats.liveResolution.realFallback}r / {stats.liveResolution.unresolved}u
+              </span>
+            </div>
+            <div className="space-y-1">
+              {stats.livePositions.slice(0, 8).map((lp) => {
+                const primarySet = lp.setKeys[0]
+                const setLabel = primarySet
+                  ? primarySet.setKey.length > 32
+                    ? `${primarySet.setKey.slice(0, 32)}…`
+                    : primarySet.setKey
+                  : "—"
+                const resTone =
+                  lp.resolution === "pseudo"
+                    ? "text-emerald-700"
+                    : lp.resolution === "real-fallback"
+                      ? "text-amber-700"
+                      : "text-muted-foreground"
+                const tooltip = [
+                  `${lp.symbol} ${lp.direction.toUpperCase()}  ·  ${fmtUsd(lp.volumeUsd)} exposure`,
+                  `Unrealized PnL: ${lp.unrealizedPnl >= 0 ? "+" : ""}${fmtUsd(lp.unrealizedPnl)}`,
+                  `Entry: ${lp.entryPrice}  ·  Mark: ${lp.markPrice || "—"}`,
+                  ``,
+                  `Resolution: ${lp.resolution}`,
+                  lp.realPositionId ? `RealPositionId: ${lp.realPositionId}` : "",
+                  ``,
+                  lp.setKeys.length > 0
+                    ? `Candidate Set${lp.setKeys.length > 1 ? "s" : ""} (by USD exposure):`
+                    : `No upstream Set matched — position is orphaned.`,
+                  ...lp.setKeys.map(
+                    (s, i) =>
+                      `  ${i + 1}. ${s.setKey}  (${s.count}× · ${fmtUsd(s.volumeUsd)})`,
+                  ),
+                ].filter(Boolean).join("\n")
+                return (
+                  <div
+                    key={lp.id}
+                    className="grid grid-cols-12 items-center gap-2 rounded px-2 py-1 bg-muted/30 hover:bg-muted/50 transition-colors text-[10px]"
+                    title={tooltip}
+                  >
+                    <div className="col-span-3 flex items-center gap-1">
+                      <span className="font-semibold text-foreground truncate">{lp.symbol}</span>
+                      <span
+                        className={`px-1 rounded text-[8px] uppercase font-semibold ${
+                          lp.direction === "long"
+                            ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                            : "bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300"
+                        }`}
+                      >
+                        {lp.direction}
+                      </span>
+                    </div>
+                    <div className="col-span-2 tabular-nums text-right font-semibold text-amber-700">
+                      {fmtUsd(lp.volumeUsd)}
+                    </div>
+                    <div
+                      className={`col-span-2 tabular-nums text-right font-semibold ${
+                        lp.unrealizedPnl > 0
+                          ? "text-emerald-600"
+                          : lp.unrealizedPnl < 0
+                            ? "text-red-600"
+                            : "text-muted-foreground"
+                      }`}
+                    >
+                      {lp.unrealizedPnl > 0 ? "+" : ""}
+                      {fmtUsd(lp.unrealizedPnl)}
+                    </div>
+                    <div className={`col-span-4 truncate font-mono text-[9px] ${resTone}`}>
+                      {setLabel}
+                    </div>
+                    <div className="col-span-1 text-right">
+                      <span
+                        className={`px-1 rounded text-[8px] font-semibold ${
+                          lp.resolution === "pseudo"
+                            ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300"
+                            : lp.resolution === "real-fallback"
+                              ? "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
+                              : "bg-muted text-muted-foreground"
+                        }`}
+                      >
+                        {lp.resolution === "pseudo"
+                          ? "P"
+                          : lp.resolution === "real-fallback"
+                            ? "R"
+                            : "?"}
+                      </span>
+                    </div>
+                  </div>
+                )
+              })}
+              {stats.livePositions.length > 8 && (
+                <div className="text-[9px] text-muted-foreground text-center pt-0.5">
+                  +{stats.livePositions.length - 8} more live position{stats.livePositions.length - 8 === 1 ? "" : "s"} (truncated)
+                </div>
+              )}
             </div>
           </div>
         )}
