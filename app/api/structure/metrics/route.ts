@@ -42,7 +42,7 @@ export async function GET(request: NextRequest) {
               0,
             ),
             trades_per_hour: 0,
-          }
+          },
         })()
       : null
 
