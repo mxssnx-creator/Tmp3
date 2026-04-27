@@ -313,6 +313,52 @@ async function pollOrderFill(
 }
 
 /**
+ * Cancel an SL/TP order on the exchange. Tolerates "order not found" and
+ * other recoverable errors silently — the typical reason this is called
+ * is that the position is being closed or the protection order is being
+ * replaced, both of which mean we don't care if it's already gone.
+ *
+ * Returns `true` only when we actively confirmed cancellation (or that
+ * the connector accepted the request); returns `false` for any error so
+ * callers can decide whether to retry or fall through to a market exit.
+ */
+async function cancelProtectionOrder(
+  connector: any,
+  symbol: string,
+  orderId: string | undefined,
+  label: string,
+): Promise<boolean> {
+  if (!orderId) return false
+  try {
+    if (typeof connector?.cancelOrder !== "function") return false
+    const res = await connector.cancelOrder(symbol, orderId)
+    if (res?.success) {
+      console.log(`${LOG_PREFIX} ${label} cancelled: ${orderId}`)
+      return true
+    }
+    // Treat "not found" / "already filled" / "already cancelled" as success
+    // for our purposes — the exchange-side state is already what we wanted.
+    const errStr = String(res?.error || "").toLowerCase()
+    if (
+      errStr.includes("not found") ||
+      errStr.includes("not exist") ||
+      errStr.includes("already") ||
+      errStr.includes("filled") ||
+      errStr.includes("cancelled") ||
+      errStr.includes("canceled")
+    ) {
+      console.log(`${LOG_PREFIX} ${label} already gone: ${orderId} (${res?.error})`)
+      return true
+    }
+    console.warn(`${LOG_PREFIX} ${label} cancel failed: ${orderId} — ${res?.error}`)
+    return false
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} ${label} cancel error:`, err instanceof Error ? err.message : err)
+    return false
+  }
+}
+
+/**
  * Place a protection order (SL or TP) as a reduce-only limit order at
  * `triggerPrice` that *closes* (never opens) a position.
  *
@@ -354,6 +400,156 @@ async function placeProtectionOrder(
     console.warn(`${LOG_PREFIX} ${orderLabel} error:`, err)
     return null
   }
+}
+
+/**
+ * Derive the desired SL/TP trigger prices from a live position's current
+ * percentage settings and average execution price. Returns `0` for either
+ * leg when the corresponding percentage is non-positive (i.e. SL/TP is
+ * disabled for that side). Pure function — does NOT touch the exchange.
+ */
+function computeDesiredProtectionPrices(pos: LivePosition): {
+  desiredSl: number
+  desiredTp: number
+} {
+  const fillPrice = pos.averageExecutionPrice || pos.entryPrice
+  if (!fillPrice || fillPrice <= 0) return { desiredSl: 0, desiredTp: 0 }
+
+  const slPct = Math.max(0, pos.stopLoss || 0) / 100
+  const tpPct = Math.max(0, pos.takeProfit || 0) / 100
+
+  const desiredSl =
+    slPct > 0
+      ? pos.direction === "long"
+        ? fillPrice * (1 - slPct)
+        : fillPrice * (1 + slPct)
+      : 0
+  const desiredTp =
+    tpPct > 0
+      ? pos.direction === "long"
+        ? fillPrice * (1 + tpPct)
+        : fillPrice * (1 - tpPct)
+      : 0
+
+  return { desiredSl, desiredTp }
+}
+
+/**
+ * Has the desired protection price drifted enough from the currently
+ * placed one to warrant cancelling and re-placing? We use 0.25% as the
+ * tolerance — tighter than that and we'd thrash the exchange API on
+ * every tiny rounding diff. Looser and we'd leave stale levels in place
+ * after a real strategy adjustment.
+ */
+function priceDrifted(current: number | undefined, desired: number): boolean {
+  if (!desired || desired <= 0) return false
+  if (!current || current <= 0) return true // never placed or lost
+  return Math.abs(current - desired) / desired > 0.0025
+}
+
+/**
+ * Reconcile the SL/TP exchange orders against the live position's current
+ * desired levels. Three cases per leg (SL and TP independently):
+ *
+ *   1. Desired = 0 (disabled) and an order is still on the exchange:
+ *      cancel it. Common after an operator turns off SL or TP mid-trade.
+ *   2. No order recorded (or order id stale) and desired > 0:
+ *      place a fresh protection order.
+ *   3. Order id present BUT price drifted (>0.25%) from desired:
+ *      cancel old → place new at correct level. Cancel-first guarantees
+ *      we never accidentally double-protect (which would produce two
+ *      reduce-only fills against the same exchange position).
+ *
+ * Updates `pos.stopLossOrderId`, `pos.takeProfitOrderId`, `pos.stopLossPrice`,
+ * `pos.takeProfitPrice` to reflect what's now actually live on the exchange.
+ *
+ * Returns a boolean indicating whether anything changed (so callers can
+ * decide whether to persist the position).
+ */
+async function updateProtectionOrders(
+  connector: any,
+  pos: LivePosition,
+  reason: string,
+): Promise<{ changed: boolean; slPlaced: boolean; tpPlaced: boolean }> {
+  const result = { changed: false, slPlaced: false, tpPlaced: false }
+  if (!connector || pos.executedQuantity <= 0) return result
+
+  const { desiredSl, desiredTp } = computeDesiredProtectionPrices(pos)
+  const closeSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
+
+  // ── Stop-Loss leg ────────────────────────────────────────────────────
+  if (desiredSl <= 0 && pos.stopLossOrderId) {
+    // SL was turned off — yank the existing order.
+    await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+    pos.stopLossOrderId = undefined
+    pos.stopLossPrice = 0
+    result.changed = true
+  } else if (desiredSl > 0 && (!pos.stopLossOrderId || priceDrifted(pos.stopLossPrice, desiredSl))) {
+    if (pos.stopLossOrderId) {
+      await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+    }
+    const id = await placeProtectionOrder(
+      connector,
+      pos.symbol,
+      closeSide,
+      pos.executedQuantity,
+      desiredSl,
+      "StopLoss",
+      pos.direction,
+    )
+    pos.stopLossOrderId = id || undefined
+    pos.stopLossPrice = desiredSl
+    result.changed = true
+    result.slPlaced = !!id
+  }
+
+  // ── Take-Profit leg ──────────────────────────────────────────────────
+  if (desiredTp <= 0 && pos.takeProfitOrderId) {
+    await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+    pos.takeProfitOrderId = undefined
+    pos.takeProfitPrice = 0
+    result.changed = true
+  } else if (desiredTp > 0 && (!pos.takeProfitOrderId || priceDrifted(pos.takeProfitPrice, desiredTp))) {
+    if (pos.takeProfitOrderId) {
+      await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+    }
+    const id = await placeProtectionOrder(
+      connector,
+      pos.symbol,
+      closeSide,
+      pos.executedQuantity,
+      desiredTp,
+      "TakeProfit",
+      pos.direction,
+    )
+    pos.takeProfitOrderId = id || undefined
+    pos.takeProfitPrice = desiredTp
+    result.changed = true
+    result.tpPlaced = !!id
+  }
+
+  if (result.changed) {
+    pushStep(
+      pos,
+      "update_sl_tp",
+      true,
+      `[${reason}] SL=${pos.stopLossPrice ? pos.stopLossPrice.toFixed(6) : "—"} (${pos.stopLossOrderId || "—"}) TP=${pos.takeProfitPrice ? pos.takeProfitPrice.toFixed(6) : "—"} (${pos.takeProfitOrderId || "—"})`,
+    )
+    await logProgressionEvent(
+      pos.connectionId,
+      "live_trading",
+      "info",
+      `SL/TP updated for ${pos.symbol} (${reason})`,
+      {
+        slOrderId: pos.stopLossOrderId,
+        slPrice: pos.stopLossPrice,
+        tpOrderId: pos.takeProfitOrderId,
+        tpPrice: pos.takeProfitPrice,
+      },
+    )
+  }
+
+  return result
 }
 
 // ── Main Pipeline ────────────────────────────────────────────────────────────
@@ -859,12 +1055,28 @@ export async function updateLivePositionFill(
 
 /**
  * Close a live position (market exit) and release its dedup lock.
+ *
+ * Order of operations is critical to avoid orphan orders & leaked indices:
+ *   1. Cancel any open SL/TP orders FIRST so the exchange-side close
+ *      doesn't race against a still-active reduce-only sitting in the
+ *      book (which would either double-fire or leave a stale order
+ *      glued to the user's account).
+ *   2. Issue the actual close on the exchange (best-effort; if it fails
+ *      we still mark the Redis record closed so reconcile picks it up
+ *      next pass — better than leaking the lock).
+ *   3. Compute realized PnL + margin-based ROI (matches exchange ROE).
+ *   4. Persist via savePosition() — that helper already handles the
+ *      open-index → closed-archive move idempotently. We do NOT touch
+ *      Redis directly any more (which previously left the position in
+ *      the open index forever on manual close).
+ *   5. Release the dedup lock so a subsequent signal can re-enter.
  */
 export async function closeLivePosition(
   connectionId: string,
   livePositionId: string,
   closePrice: number,
-  exchangeConnector?: any
+  exchangeConnector?: any,
+  closeReason: string = "manual",
 ): Promise<LivePosition | null> {
   await initRedis()
   const client = getRedisClient()
@@ -876,38 +1088,92 @@ export async function closeLivePosition(
 
     const position: LivePosition = JSON.parse(data as string)
 
+    // ── 1. Cancel orphan SL/TP orders BEFORE the close ────────────────
+    if (exchangeConnector) {
+      const cancellations: Promise<boolean>[] = []
+      if (position.stopLossOrderId) {
+        cancellations.push(
+          cancelProtectionOrder(exchangeConnector, position.symbol, position.stopLossOrderId, "StopLoss"),
+        )
+      }
+      if (position.takeProfitOrderId) {
+        cancellations.push(
+          cancelProtectionOrder(exchangeConnector, position.symbol, position.takeProfitOrderId, "TakeProfit"),
+        )
+      }
+      if (cancellations.length > 0) {
+        const results = await Promise.all(cancellations)
+        pushStep(
+          position,
+          "cancel_protection",
+          results.every(Boolean),
+          `cancelled SL=${!!position.stopLossOrderId} TP=${!!position.takeProfitOrderId}`,
+        )
+        // Clear local record regardless — orders that didn't cancel
+        // cleanly will be reconciled away on next reconcile pass.
+        position.stopLossOrderId = undefined
+        position.takeProfitOrderId = undefined
+      }
+    }
+
+    // ── 2. Issue the close on the exchange ────────────────────────────
+    let exchangeCloseSuccess = false
     if (exchangeConnector && typeof exchangeConnector.closePosition === "function") {
       try {
-        await exchangeConnector.closePosition(position.symbol, position.direction)
+        const r = await exchangeConnector.closePosition(position.symbol, position.direction)
+        exchangeCloseSuccess = r?.success !== false
       } catch (err) {
         console.warn(`${LOG_PREFIX} Error closing on exchange:`, err)
       }
     }
 
-    position.status = "closed"
-    position.updatedAt = Date.now()
-    pushStep(position, "close", true, `close @ ${closePrice}`)
-    await client.setex(key, 604800, JSON.stringify(position))
-
-    await releaseLock(connectionId, position.symbol, position.direction)
-
+    // ── 3. Compute realized PnL & ROI (margin-based to match exchange ROE) ──
+    const qty = position.executedQuantity || 0
+    const avgEntry = position.averageExecutionPrice || position.entryPrice || 0
     const pnl =
-      position.executedQuantity *
-      (position.direction === "long"
-        ? closePrice - position.averageExecutionPrice
-        : position.averageExecutionPrice - closePrice)
-    const notional = position.averageExecutionPrice * position.executedQuantity
-    const roi = notional > 0 ? (pnl / notional) * 100 : 0
+      qty > 0 && avgEntry > 0 && closePrice > 0
+        ? qty *
+          (position.direction === "long"
+            ? closePrice - avgEntry
+            : avgEntry - closePrice)
+        : 0
+    const lev = Math.max(1, position.leverage || 1)
+    const notional = avgEntry * qty
+    const margin = notional > 0 ? notional / lev : 0
+    const roi = margin > 0 ? (pnl / margin) * 100 : 0
 
+    // ── 4. Persist with terminal state ────────────────────────────────
+    position.status = "closed"
+    position.closedAt = Date.now()
+    position.updatedAt = Date.now()
+    position.realizedPnL = Math.round(pnl * 100) / 100
+    position.closeReason = closeReason
+    pushStep(
+      position,
+      "close",
+      true,
+      `close @ ${closePrice} pnl=${pnl.toFixed(2)} roi=${roi.toFixed(2)}% reason=${closeReason}${exchangeConnector && !exchangeCloseSuccess ? " [exchange-close-uncertain]" : ""}`,
+    )
+    // savePosition() handles index move + idempotent archival.
+    await savePosition(position)
+
+    // ── 5. Release dedup lock + counters + audit log ──────────────────
+    await releaseLock(connectionId, position.symbol, position.direction)
     await incrementMetric(connectionId, "live_positions_closed_count")
     if (pnl > 0) await incrementMetric(connectionId, "live_wins_count")
+
     await logProgressionEvent(connectionId, "live_trading", "info", `Closed live position ${position.symbol}`, {
       pnl,
       roi,
       closePrice,
+      closeReason,
+      executedQuantity: qty,
+      averageEntry: avgEntry,
+      leverage: lev,
+      marginAtRisk: margin,
     })
 
-    console.log(`${LOG_PREFIX} Closed ${position.symbol} P&L=${pnl.toFixed(2)} ROI=${roi.toFixed(2)}%`)
+    console.log(`${LOG_PREFIX} Closed ${position.symbol} P&L=${pnl.toFixed(2)} ROI=${roi.toFixed(2)}% reason=${closeReason}`)
 
     return position
   } catch (err) {
@@ -1157,6 +1423,27 @@ export async function reconcileLivePositions(
             syncedAt: Date.now(),
           }
           pos.updatedAt = Date.now()
+
+          // ── SL/TP self-healing ──────────────────────────────────────
+          // Every reconcile cycle (driven by the cron) we verify the
+          // protection orders match the desired levels derived from the
+          // position's current stopLoss / takeProfit percentages and
+          // average execution price. This auto-heals three scenarios:
+          //   • Operator manually cancelled SL or TP on the exchange.
+          //   • Strategy update mutated the percentages mid-trade.
+          //   • Partial fill changed executedQuantity without re-arming.
+          // updateProtectionOrders() is no-op when nothing drifted, so
+          // this is cheap on the steady state — only fires real REST
+          // calls when something actually needs to change.
+          try {
+            await updateProtectionOrders(exchangeConnector, pos, "reconcile")
+          } catch (slTpErr) {
+            console.warn(
+              `${LOG_PREFIX} reconcile SL/TP heal error for ${pos.id}:`,
+              slTpErr instanceof Error ? slTpErr.message : String(slTpErr),
+            )
+          }
+
           await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
           summary.updated++
         } else {
@@ -1171,9 +1458,32 @@ export async function reconcileLivePositions(
               (pos.direction === "long" ? exitPrice - avgEntry : avgEntry - exitPrice)
           }
 
+          // Best-effort orphan cleanup: if the position vanished from
+          // the exchange because (e.g.) the TP fired, the SL is now an
+          // orphan reduce-only order with no position to reduce. The
+          // exchange will usually auto-reject any future fill, but the
+          // order can still sit in the book and confuse the operator.
+          // Cancelling here is silent on "already gone".
+          if (pos.stopLossOrderId || pos.takeProfitOrderId) {
+            const cancellations: Promise<boolean>[] = []
+            if (pos.stopLossOrderId) {
+              cancellations.push(
+                cancelProtectionOrder(exchangeConnector, pos.symbol, pos.stopLossOrderId, "StopLoss"),
+              )
+            }
+            if (pos.takeProfitOrderId) {
+              cancellations.push(
+                cancelProtectionOrder(exchangeConnector, pos.symbol, pos.takeProfitOrderId, "TakeProfit"),
+              )
+            }
+            await Promise.all(cancellations).catch(() => {})
+            pos.stopLossOrderId = undefined
+            pos.takeProfitOrderId = undefined
+          }
+
           pos.status = "closed"
           pos.closedAt = Date.now()
-          pos.realizedPnL = realizedPnl
+          pos.realizedPnL = Math.round(realizedPnl * 100) / 100
           pos.closeReason = pos.closeReason || "exchange_reconciliation"
           pos.progression.push({
             step: "close",
@@ -1315,6 +1625,57 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
   }
 }
 
+/**
+ * Recalculate the desired SL/TP for a single live position and apply
+ * the change to the exchange. Used by the strategy coordinator when an
+ * operator edits SL/TP percentages on an active connection — without
+ * this, the exchange-side levels stay glued to the original fill and
+ * the change only affects newly-opened positions.
+ *
+ * Pass updated `stopLossPct` / `takeProfitPct` to override the values
+ * stored on the live position; omit them to recompute from whatever
+ * is currently on the LivePosition record (useful as a "force-heal"
+ * after a missed reconcile).
+ *
+ * Returns `null` if the position doesn't exist or is already closed.
+ */
+export async function recalculateAndApplySLTP(
+  connectionId: string,
+  livePositionId: string,
+  exchangeConnector: any,
+  overrides?: { stopLossPct?: number; takeProfitPct?: number },
+): Promise<LivePosition | null> {
+  await initRedis()
+  const client = getRedisClient()
+
+  try {
+    const key = `live:position:${livePositionId}`
+    const data = await client.get(key)
+    if (!data) return null
+
+    const position: LivePosition = JSON.parse(data as string)
+    if (
+      position.status === "closed" ||
+      position.status === "rejected" ||
+      position.status === "error" ||
+      position.executedQuantity <= 0
+    ) {
+      return position
+    }
+
+    if (overrides?.stopLossPct !== undefined) position.stopLoss = overrides.stopLossPct
+    if (overrides?.takeProfitPct !== undefined) position.takeProfit = overrides.takeProfitPct
+
+    await updateProtectionOrders(exchangeConnector, position, "manual_recalc")
+    position.updatedAt = Date.now()
+    await savePosition(position)
+    return position
+  } catch (err) {
+    console.error(`${LOG_PREFIX} recalculateAndApplySLTP error:`, err)
+    return null
+  }
+}
+
 export default {
   executeLivePosition,
   updateLivePositionFill,
@@ -1323,4 +1684,7 @@ export default {
   getLivePositionsByStatus,
   calculateLivePositionStats,
   syncWithExchange,
+  reconcileLivePositions,
+  recalculateAndApplySLTP,
+  getClosedLivePositions,
 }
