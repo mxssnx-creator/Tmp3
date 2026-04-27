@@ -88,6 +88,17 @@ export interface LivePosition {
   closedAt?: number
   realizedPnL?: number
   closeReason?: string       // "sl_hit" | "tp_hit" | "manual" | "exchange_reconciliation" | ...
+  // ── Accumulation tracking ──────────────────────────────────────────
+  // When multiple upstream Sets (or the same Set firing repeatedly via
+  // DCA / pyramiding) want to enter on the same symbol+direction, we
+  // ADD their computed volumes into a single exchange position instead
+  // of rejecting duplicates. These fields document the consolidation
+  // history so the UI can show "this 1 exchange order absorbed N Set
+  // signals" and so reconcile knows the SL/TP levels need to track the
+  // weighted-average entry, not just the very first fill.
+  accumulationCount?: number               // number of Set signals merged in (1 = single entry)
+  lastAccumulatedAt?: number               // timestamp of the most recent merge
+  accumulatedRealPositionIds?: string[]    // upstream Real position ids that contributed
   progression: {
     step: string
     timestamp: number
@@ -244,6 +255,249 @@ async function releaseLock(
     await client.del(lockKey)
   } catch {
     /* non-critical */
+  }
+}
+
+/**
+ * Find the existing open live position (if any) for a given symbol +
+ * direction on a connection. Returns the most recently created one if
+ * multiple are somehow in the open index (defensive — should not happen
+ * given the dedup lock, but indices can drift after restarts/migrations).
+ *
+ * Used by `executeLivePosition` to merge incoming Set signals into the
+ * already-running exchange order rather than rejecting them.
+ */
+async function findOpenLivePositionByDir(
+  connectionId: string,
+  symbol: string,
+  direction: "long" | "short",
+): Promise<LivePosition | null> {
+  try {
+    const all = await getLivePositions(connectionId)
+    const candidates = all.filter(
+      (p) =>
+        p.symbol === symbol &&
+        p.direction === direction &&
+        // "open" is the steady state; "placed" / "partially_filled" / "filled"
+        // also count as live for accumulation purposes (entry order in flight
+        // or partially executed — we still want to add to it). We do NOT
+        // accumulate into "pending" because that means the entry order itself
+        // hasn't been placed yet — better to let the original call finish.
+        ["open", "placed", "partially_filled", "filled"].includes(p.status),
+    )
+    if (candidates.length === 0) return null
+    // Most recent first — defensive against stale duplicates.
+    candidates.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    return candidates[0]
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} findOpenLivePositionByDir error:`, err)
+    return null
+  }
+}
+
+/**
+ * Merge a new Set signal (RealPosition) into an existing live exchange
+ * position. Places an additional market entry on the exchange so the
+ * position size grows by the newly computed volume, then re-arms SL/TP
+ * at the new weighted-average entry price.
+ *
+ * Result invariants after this returns successfully:
+ *   • `existing.executedQuantity` = sum of all fills (old + new).
+ *   • `existing.averageExecutionPrice` = qty-weighted mean of all fills.
+ *   • `existing.volumeUsd`            = sum of (fillQty × fillPrice) per fill.
+ *   • `existing.fills[]`              = old fills + new fill appended.
+ *   • `existing.stopLossPrice` / `takeProfitPrice` recomputed from the
+ *     new average via `updateProtectionOrders` (cancel-old → place-new
+ *     at the correct level AND the new total quantity).
+ *   • `existing.accumulationCount`     incremented.
+ *   • `existing.accumulatedRealPositionIds` includes `realPosition.id`.
+ *
+ * Returns the updated LivePosition. Never throws — failures are recorded
+ * as a failed `accumulate` progression step and the position is left
+ * untouched (the new Set's volume simply isn't added).
+ */
+async function accumulateIntoLivePosition(
+  connectionId: string,
+  existing: LivePosition,
+  realPosition: RealPosition,
+  currentPrice: number,
+  exchangeConnector: any,
+): Promise<LivePosition> {
+  const symbol = realPosition.symbol
+  const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
+
+  try {
+    // ── 1. Compute additional volume (always honors min) ───────────────
+    const volumeResult = await VolumeCalculator.calculateVolumeForConnection(
+      connectionId,
+      symbol,
+      currentPrice,
+    ).catch((err) => {
+      console.error(`${LOG_PREFIX} accumulate volume calc error:`, err)
+      return null
+    })
+
+    let addQty = volumeResult?.finalVolume || volumeResult?.volume || 0
+    if (addQty <= 0 || !Number.isFinite(addQty)) {
+      const FALLBACK_NOTIONAL_USD = 5
+      addQty = currentPrice > 0 ? FALLBACK_NOTIONAL_USD / currentPrice : 0
+    }
+    if (addQty <= 0) {
+      pushStep(existing, "accumulate", false, "additional volume could not be computed")
+      await savePosition(existing)
+      return existing
+    }
+
+    // ── 2. Place additional entry on the exchange ─────────────────────
+    const orderResult: any = await retry(
+      () =>
+        exchangeConnector.placeOrder(
+          symbol,
+          exchangeSide,
+          addQty,
+          undefined,
+          "market",
+          { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+        ),
+      (r) => !!r?.success && !!(r.orderId || r.id),
+      "accumulatePlaceOrder",
+    )
+
+    if (!orderResult?.success || !(orderResult.orderId || orderResult.id)) {
+      pushStep(
+        existing,
+        "accumulate",
+        false,
+        `additional order failed: ${orderResult?.error || "unknown"}`,
+      )
+      await savePosition(existing)
+      await incrementMetric(connectionId, "live_orders_failed_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        `Accumulation entry failed for ${symbol} — kept existing position untouched`,
+        {
+          existingId: existing.id,
+          additionalQty: addQty,
+          error: orderResult?.error,
+        },
+      )
+      return existing
+    }
+
+    const addOrderId: string = orderResult.orderId || orderResult.id
+    pushStep(existing, "accumulate_place", true, `addQty=${addQty.toFixed(6)} orderId=${addOrderId}`)
+
+    // ── 3. Poll the new fill ──────────────────────────────────────────
+    const fill = await pollOrderFill(exchangeConnector, symbol, addOrderId)
+    if (!fill.filled || fill.filledQty <= 0) {
+      pushStep(existing, "accumulate_fill", false, `fill not confirmed (status=${fill.status})`)
+      await savePosition(existing)
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        `Accumulation fill not confirmed for ${symbol}`,
+        { addOrderId, status: fill.status },
+      )
+      return existing
+    }
+
+    const newFillQty = fill.filledQty
+    const newFillPrice = fill.filledPrice || currentPrice
+
+    // ── 4. Recompute weighted-average entry + cumulative volume ──────
+    // Compute against the running totals so this is correct whether the
+    // existing position has had 1 fill or already accumulated N times.
+    const oldQty = existing.executedQuantity || 0
+    const oldAvg = existing.averageExecutionPrice || existing.entryPrice || 0
+    const oldNotional = oldQty * oldAvg
+    const newNotional = newFillQty * newFillPrice
+    const totalQty = oldQty + newFillQty
+    const newAvg = totalQty > 0 ? (oldNotional + newNotional) / totalQty : newFillPrice
+
+    existing.executedQuantity = totalQty
+    existing.remainingQuantity = 0
+    existing.averageExecutionPrice = newAvg
+    // volumeUsd is the cumulative notional summed across all fills —
+    // the authoritative real-money exposure on the exchange. We add the
+    // *new* fill's notional to whatever was already accumulated.
+    existing.volumeUsd = (existing.volumeUsd || 0) + newNotional
+    existing.fills.push({
+      timestamp: Date.now(),
+      quantity: newFillQty,
+      price: newFillPrice,
+      fee: 0,
+      feeAsset: "USDT",
+    })
+    existing.accumulationCount = (existing.accumulationCount || 1) + 1
+    existing.lastAccumulatedAt = Date.now()
+    existing.accumulatedRealPositionIds = [
+      ...(existing.accumulatedRealPositionIds || []),
+      realPosition.id,
+    ].slice(-50) // cap to last 50 to bound payload size
+    existing.updatedAt = Date.now()
+    if (existing.status === "filled" || existing.status === "partially_filled") {
+      existing.status = "open"
+    }
+
+    pushStep(
+      existing,
+      "accumulate_fill",
+      true,
+      `+${newFillQty.toFixed(6)} @ ${newFillPrice.toFixed(8)} → totalQty=${totalQty.toFixed(6)} avgEntry=${newAvg.toFixed(8)} accCount=${existing.accumulationCount}`,
+    )
+    await incrementMetric(connectionId, "live_orders_filled_count")
+    await incrementMetric(connectionId, "live_orders_accumulated_count")
+    await incrementMetric(connectionId, "live_volume_usd_total", Math.round(newNotional))
+
+    // ── 5. Re-arm SL/TP at NEW weighted-avg entry + NEW total qty ────
+    // updateProtectionOrders will:
+    //   - detect the SL/TP price drift caused by the new avg entry
+    //   - cancel the old reduce-only orders
+    //   - place new ones at the correct level AND the new total qty
+    // Drift tolerance is 0.25%; for typical accumulation merges the
+    // average moves more than that, so this almost always fires.
+    try {
+      await updateProtectionOrders(exchangeConnector, existing, "accumulation")
+    } catch (slTpErr) {
+      console.warn(
+        `${LOG_PREFIX} accumulation SL/TP rearm error:`,
+        slTpErr instanceof Error ? slTpErr.message : String(slTpErr),
+      )
+    }
+
+    await savePosition(existing)
+    await logProgressionEvent(
+      connectionId,
+      "live_trading",
+      "info",
+      `Accumulated into existing ${symbol} ${realPosition.direction} position`,
+      {
+        existingId: existing.id,
+        addedQty: newFillQty,
+        addedNotionalUsd: Math.round(newNotional * 100) / 100,
+        newTotalQty: totalQty,
+        newAvgEntry: newAvg,
+        newSlPrice: existing.stopLossPrice,
+        newTpPrice: existing.takeProfitPrice,
+        accumulationCount: existing.accumulationCount,
+        realPositionId: realPosition.id,
+      },
+    )
+
+    console.log(
+      `${LOG_PREFIX} ACCUMULATED ${symbol} ${realPosition.direction}: +${newFillQty} @ ${newFillPrice} → total=${totalQty} avg=${newAvg.toFixed(8)} count=${existing.accumulationCount}`,
+    )
+
+    return existing
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
+    console.error(`${LOG_PREFIX} accumulateIntoLivePosition error:`, errMsg)
+    pushStep(existing, "accumulate", false, errMsg)
+    await savePosition(existing).catch(() => {})
+    return existing
   }
 }
 
@@ -626,21 +880,82 @@ export async function executeLivePosition(
       { liveTrade: isLiveTradeEnabled, realPositionId: realPosition.id }
     )
 
-    // Deduplication: skip if same symbol+direction already in-flight.
-    if (await hasOpenLivePosition(connectionId, realPosition.symbol, realPosition.direction)) {
-      livePosition.status = "rejected"
-      livePosition.statusReason = "A live position is already open for this symbol+direction"
-      pushStep(livePosition, "dedup", false, livePosition.statusReason)
-      await savePosition(livePosition)
-      await incrementMetric(connectionId, "live_orders_rejected_count")
-      await logProgressionEvent(
+    // ── Coordination: accumulate instead of reject ──────────────────
+    // When a Set tries to enter on a symbol+direction that already has
+    // an open exchange position, we no longer drop the signal — we
+    // ROUTE the new volume into the existing position so the exchange
+    // exposure equals the SUM of every contributing Set's coordination-
+    // derived volume. The accumulator places an additional market
+    // order, recomputes the weighted-average entry, and re-arms SL/TP
+    // at the new effective levels. Live-trade gating still applies:
+    // if `live_trade=false` we fall through to the simulation branch
+    // below (no exchange call, just records the intent).
+    if (
+      isLiveTradeEnabled &&
+      (await hasOpenLivePosition(connectionId, realPosition.symbol, realPosition.direction))
+    ) {
+      // Resolve the actual existing position so we have its avg entry,
+      // cumulative qty, and current SL/TP order ids to merge into.
+      const existing = await findOpenLivePositionByDir(
         connectionId,
-        "live_trading",
-        "info",
-        `Skipped duplicate live order for ${realPosition.symbol} ${realPosition.direction}`,
-        {}
+        realPosition.symbol,
+        realPosition.direction,
       )
-      return livePosition
+
+      if (!existing) {
+        // Lock says one is open but the index can't find it — likely a
+        // stale lock from a previous crash. Release it and let this
+        // call fall through to the normal new-position path below.
+        console.warn(
+          `${LOG_PREFIX} stale dedup lock for ${realPosition.symbol} ${realPosition.direction} — releasing and proceeding with fresh entry`,
+        )
+        await releaseLock(connectionId, realPosition.symbol, realPosition.direction)
+      } else {
+        // Need a price to compute additional volume + retain it for the
+        // accumulator. Reuse fetchCurrentPrice with the realPosition
+        // entry-price hint so we don't pay two fetches for the same tick.
+        let accPrice = realPosition.entryPrice
+        if (!accPrice || accPrice <= 0) accPrice = await fetchCurrentPrice(realPosition.symbol)
+
+        // Skip-paths: when we can't accumulate right now (no market price
+        // or no connector), we record the deferral on the EXISTING
+        // position's progression rather than persisting the throw-away
+        // `livePosition` placeholder into the open index. Reconcile will
+        // pick up market data and a fresh signal on the next cycle.
+        if (!accPrice || accPrice <= 0) {
+          pushStep(
+            existing,
+            "accumulate_skip",
+            false,
+            `no market price for ${realPosition.symbol} — accumulation deferred`,
+          )
+          await savePosition(existing)
+          return existing
+        }
+
+        if (!exchangeConnector || typeof exchangeConnector.placeOrder !== "function") {
+          pushStep(
+            existing,
+            "accumulate_skip",
+            false,
+            "exchange connector unavailable — accumulation deferred",
+          )
+          await savePosition(existing)
+          return existing
+        }
+
+        const merged = await accumulateIntoLivePosition(
+          connectionId,
+          existing,
+          realPosition,
+          accPrice,
+          exchangeConnector,
+        )
+        // Return the (now updated) existing position. We do NOT save the
+        // throw-away `livePosition` placeholder into the open index —
+        // accumulateIntoLivePosition owns the persistence of `existing`.
+        return merged
+      }
     }
 
     // Short-circuit on simulation mode — still record the intent.
@@ -1428,10 +1743,11 @@ export async function reconcileLivePositions(
           // Every reconcile cycle (driven by the cron) we verify the
           // protection orders match the desired levels derived from the
           // position's current stopLoss / takeProfit percentages and
-          // average execution price. This auto-heals three scenarios:
+          // average execution price. This auto-heals four scenarios:
           //   • Operator manually cancelled SL or TP on the exchange.
           //   • Strategy update mutated the percentages mid-trade.
           //   • Partial fill changed executedQuantity without re-arming.
+          //   • Accumulation merged new volume in (avg entry shifted).
           // updateProtectionOrders() is no-op when nothing drifted, so
           // this is cheap on the steady state — only fires real REST
           // calls when something actually needs to change.
@@ -1442,6 +1758,84 @@ export async function reconcileLivePositions(
               `${LOG_PREFIX} reconcile SL/TP heal error for ${pos.id}:`,
               slTpErr instanceof Error ? slTpErr.message : String(slTpErr),
             )
+          }
+
+          // ── Proactive close-in-time safety check ───────────────────
+          // The SL/TP orders we place are reduce-only LIMIT orders. On
+          // a price gap (illiquid pairs, news events) the exchange may
+          // skip past the limit price without filling, leaving the
+          // position open and unprotected. We compare the just-fetched
+          // mark price against the desired SL/TP levels and force-close
+          // if breached. This is the safety net that guarantees timely
+          // exits regardless of how the venue handled the limit fill.
+          //
+          // Only triggers when ALL of:
+          //   • markPrice is fresh (just synced this cycle)
+          //   • desired SL/TP price is non-zero (i.e. armed)
+          //   • mark has actually crossed the level for the position's
+          //     direction (long: price ≤ SL or ≥ TP; short: ≥ SL or ≤ TP)
+          //
+          // Closes via closeLivePosition() which cancels the orphan
+          // protection order on the OTHER side and archives properly.
+          if (markPrice > 0 && pos.executedQuantity > 0) {
+            const fillPrice = pos.averageExecutionPrice || pos.entryPrice
+            const slPct = Math.max(0, pos.stopLoss || 0) / 100
+            const tpPct = Math.max(0, pos.takeProfit || 0) / 100
+            const desiredSl =
+              slPct > 0 && fillPrice > 0
+                ? pos.direction === "long"
+                  ? fillPrice * (1 - slPct)
+                  : fillPrice * (1 + slPct)
+                : 0
+            const desiredTp =
+              tpPct > 0 && fillPrice > 0
+                ? pos.direction === "long"
+                  ? fillPrice * (1 + tpPct)
+                  : fillPrice * (1 - tpPct)
+                : 0
+
+            let crossReason: string | null = null
+            if (pos.direction === "long") {
+              if (desiredSl > 0 && markPrice <= desiredSl) crossReason = "sl_hit"
+              else if (desiredTp > 0 && markPrice >= desiredTp) crossReason = "tp_hit"
+            } else {
+              // short
+              if (desiredSl > 0 && markPrice >= desiredSl) crossReason = "sl_hit"
+              else if (desiredTp > 0 && markPrice <= desiredTp) crossReason = "tp_hit"
+            }
+
+            if (crossReason) {
+              console.log(
+                `${LOG_PREFIX} ${crossReason.toUpperCase()} detected for ${pos.symbol} ${pos.direction} @ mark=${markPrice} (sl=${desiredSl} tp=${desiredTp}) — force-closing`,
+              )
+              await logProgressionEvent(
+                connectionId,
+                "live_trading",
+                "warning",
+                `${crossReason === "sl_hit" ? "Stop-loss" : "Take-profit"} cross detected for ${pos.symbol} — force-closing`,
+                {
+                  positionId: pos.id,
+                  markPrice,
+                  desiredSl,
+                  desiredTp,
+                  direction: pos.direction,
+                  averageEntry: pos.averageExecutionPrice,
+                },
+              )
+              try {
+                await closeLivePosition(connectionId, pos.id, markPrice, exchangeConnector, crossReason)
+                summary.closed++
+                continue // skip the per-cycle setex below — close already persisted
+              } catch (closeErr) {
+                console.warn(
+                  `${LOG_PREFIX} force-close on ${crossReason} failed for ${pos.id}:`,
+                  closeErr instanceof Error ? closeErr.message : String(closeErr),
+                )
+                summary.errors++
+                // Fall through to the regular setex so the mark refresh
+                // is still persisted; next cycle will retry the close.
+              }
+            }
           }
 
           await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
