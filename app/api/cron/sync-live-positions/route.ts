@@ -25,6 +25,16 @@ export async function GET() {
   await initRedis()
   const client = getRedisClient()
 
+  // Overlap guard: if a previous invocation is still running (e.g. slow
+  // exchange API on a large connection pool), skip this tick rather than
+  // stacking two reconcile passes on top of each other. TTL = 55s so a
+  // crashed run never permanently blocks the cron.
+  const LOCK_KEY = "cron:sync-live-positions:lock"
+  const acquired = await client.set(LOCK_KEY, "1", "EX", 55, "NX")
+  if (!acquired) {
+    return NextResponse.json({ ok: true, skipped: true, reason: "previous run still active" })
+  }
+
   const summary = {
     connectionsChecked: 0,
     connectionsSkipped: 0,
@@ -79,6 +89,7 @@ export async function GET() {
       }
     }
 
+    await client.del(LOCK_KEY).catch(() => {})
     return NextResponse.json({
       ok: true,
       ms: Date.now() - started,
@@ -86,6 +97,7 @@ export async function GET() {
     })
   } catch (err) {
     console.error("[SyncLivePositions] Fatal:", err)
+    await client.del(LOCK_KEY).catch(() => {})
     return NextResponse.json(
       {
         ok: false,

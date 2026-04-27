@@ -20,5 +20,15 @@
       "memory": 3008,
       "maxDuration": 300
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/sync-live-positions",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/generate-indications",
+      "schedule": "*/5 * * * *"
+    }
+  ]
 }
