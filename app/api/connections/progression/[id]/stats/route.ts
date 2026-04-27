@@ -51,12 +51,20 @@ function pick(...values: unknown[]): number {
  * Response shape:
  * {
  *   historic: { symbolsProcessed, symbolsTotal, candlesLoaded, indicatorsCalculated,
- *               cyclesCompleted, isComplete, progressPercent }
+ *               cyclesCompleted, isComplete, progressPercent,
+ *               processing: { indicationChurnCycles, strategyChurnCycles } }
  *   realtime: { indicationCycles, strategyCycles, realtimeCycles, indicationsTotal,
- *               strategiesTotal, positionsOpen, isActive, successRate, avgCycleTimeMs }
+ *               strategiesTotal, positionsOpen, isActive, successRate, avgCycleTimeMs,
+ *               cycleCounters: {                            // per-processor cumulative
+ *                 indication, indicationLive,               // (every tick / live only)
+ *                 strategy, strategyLive,
+ *                 realtime, realtimeLive
+ *               },
+ *               framesProcessed                              // cross-processor tick total
+ *                                                            // — independent of 250 cap }
  *               ↑ strategiesTotal = Real-stage output (NOT sum of stages)
  *   breakdown: {
- *     indications: { direction, move, active, optimal, auto, total }
+ *     indications: { direction, move, active, activeAdvanced, optimal, auto, total }
  *     strategies:  { base, main, real, live, total,
  *                    baseEvaluated, mainEvaluated, realEvaluated }
  *                    ↑ `total` = Real-stage count only, per pipeline rule above
@@ -184,14 +192,25 @@ export async function GET(
     )
     const liveIndicationCycles = n(progHash.indication_live_cycle_count)
     const liveStrategyCycles   = n(progHash.strategy_live_cycle_count)
+    const liveRealtimeCycles   = n(progHash.realtime_live_cycle_count)
 
     const realtimeIndicationCycles = liveIndicationCycles || churnIndicationCycles
     const realtimeStrategyCycles   = liveStrategyCycles   || churnStrategyCycles
+    // realtimeCycles = total realtime ticks (churn). This is now actually
+    // populated because EngineManager.startRealtimeProcessor writes
+    // `realtime_cycle_count` on every tick via hincrby (previously this key
+    // was never written, so this counter was permanently 0).
     const realtimeCycles = pick(
       n(progHash.realtime_cycle_count),
       n(realtimeHash.cycle_count),
       n(es.realtime_cycle_count)
     )
+
+    // Cross-processor cumulative tick counter — sum of every tick across
+    // indication + strategy + realtime processors since the engine started.
+    // INDEPENDENT of the per-Set 250-entry DB cap. This is the "Frames /
+    // Total Ticks" metric on the dashboard.
+    const framesProcessed = n(progHash.frames_processed)
 
     // Cycle time average from realtime hash
     const realtimeCycleTimeSum = n(realtimeHash.cycle_time_sum_ms)
@@ -649,7 +668,13 @@ export async function GET(
     //   2. standalone key:   indications:{connId}:{type}:count  (also by statistics-tracker incr)
     // We read both and take the higher.
 
-    const indTypes = ["direction", "move", "active", "optimal", "auto"] as const
+    // Indication types tracked. MUST stay in sync with `DEFAULT_LIMITS`
+    // in `lib/indication-sets-processor.ts`. Each type has:
+    //   - its own per-Set 250-entry pool (per config)
+    //   - its own cumulative counter `indications_{type}_count` on progression:{id}
+    //   - its own per-cycle increment via hincrby in EngineManager.startIndicationProcessor
+    // `auto` is a synthetic legacy alias retained for back-compat with old runs.
+    const indTypes = ["direction", "move", "active", "active_advanced", "optimal", "auto"] as const
     const indCounts: Record<string, number> = {}
     await Promise.all(
       indTypes.map(async (type) => {
@@ -997,6 +1022,24 @@ export async function GET(
         indicationCycles: realtimeIndicationCycles,
         strategyCycles:   realtimeStrategyCycles,
         realtimeCycles,
+        // ── Per-processor cycle counters (cumulative, hincrby-backed) ──
+        // Each processor maintains TWO independent counters:
+        //   *_cycle_count       — every tick (incl. idle/empty/gated)
+        //   *_live_cycle_count  — only ticks that produced actual work
+        // The dashboard surfaces both so the operator can spot imbalances
+        // (e.g. realtime ticking but never doing live work = no positions).
+        cycleCounters: {
+          indication:       churnIndicationCycles,
+          indicationLive:   liveIndicationCycles,
+          strategy:         churnStrategyCycles,
+          strategyLive:     liveStrategyCycles,
+          realtime:         realtimeCycles,
+          realtimeLive:     liveRealtimeCycles,
+        },
+        // Cross-processor cumulative tick total — independent of the
+        // per-Set 250-entry DB cap. Counts every loop tick across all
+        // three processors since the engine started.
+        framesProcessed,
         indicationsTotal,
         strategiesTotal,
         positionsOpen,
@@ -1029,13 +1072,18 @@ export async function GET(
       },
 
       breakdown: {
+        // EVERY indication type tracked by `IndicationSetsProcessor` is
+        // surfaced here — `active_advanced` was previously silently
+        // dropped from this response despite the engine generating it.
+        // Each value is the cumulative count since run start.
         indications: {
-          direction: indCounts.direction || 0,
-          move:      indCounts.move      || 0,
-          active:    indCounts.active    || 0,
-          optimal:   indCounts.optimal   || 0,
-          auto:      indCounts.auto      || 0,
-          total:     indTotal,
+          direction:      indCounts.direction      || 0,
+          move:           indCounts.move           || 0,
+          active:         indCounts.active         || 0,
+          activeAdvanced: indCounts.active_advanced || 0,
+          optimal:        indCounts.optimal        || 0,
+          auto:           indCounts.auto           || 0,
+          total:          indTotal,
         },
         strategies: {
           base: stratCounts.base || 0,

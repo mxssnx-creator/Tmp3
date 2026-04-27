@@ -35,14 +35,36 @@ interface StatsResponse {
   historic: {
     symbolsProcessed: number; symbolsTotal: number; candlesLoaded: number
     indicatorsCalculated: number; cyclesCompleted: number; isComplete: boolean; progressPercent: number
+    processing?: { indicationChurnCycles: number; strategyChurnCycles: number }
   }
   realtime: {
     indicationCycles: number; strategyCycles: number; realtimeCycles: number
     indicationsTotal: number; strategiesTotal: number; positionsOpen: number
     isActive: boolean; successRate: number; avgCycleTimeMs: number
+    // Per-processor cycle counters. Each processor maintains TWO counters:
+    //   - <name>      : every tick (incl. idle / empty / gated)
+    //   - <name>Live  : only ticks that produced real work
+    cycleCounters?: {
+      indication: number; indicationLive: number
+      strategy: number;   strategyLive: number
+      realtime: number;   realtimeLive: number
+    }
+    // Cumulative tick total across ALL processors. Independent of the
+    // per-Set 250-entry DB cap. Equivalent to "Frames / Total Ticks".
+    framesProcessed?: number
   }
   breakdown: {
-    indications: { direction: number; move: number; active: number; optimal: number; auto: number; total: number }
+    // Each indication TYPE counted independently. `activeAdvanced` was
+    // previously missing from this shape despite the engine generating it.
+    indications: {
+      direction:      number
+      move:           number
+      active:         number
+      activeAdvanced: number
+      optimal:        number
+      auto:           number
+      total:          number
+    }
     strategies: { base: number; main: number; real: number; live: number; total: number
                   baseEvaluated: number; mainEvaluated: number; realEvaluated: number }
   }
@@ -196,12 +218,17 @@ export function QuickstartComprehensiveLogDialog() {
   const win = stats?.windows
   const meta = stats?.metadata
 
+  // Indication types — MUST stay in sync with `DEFAULT_LIMITS` in
+  // `lib/indication-sets-processor.ts`. Each type has its own independent
+  // counter on `progression:{connId}`. Each is its own column in the
+  // breakdown so the operator can see contributions per type at a glance.
   const indTypes = [
-    { label: "Direction", key: "direction" as const },
-    { label: "Move",      key: "move"      as const },
-    { label: "Active",    key: "active"    as const },
-    { label: "Optimal",   key: "optimal"   as const },
-    { label: "Auto",      key: "auto"      as const },
+    { label: "Direction",  key: "direction"      as const },
+    { label: "Move",       key: "move"           as const },
+    { label: "Active",     key: "active"         as const },
+    { label: "Active Adv", key: "activeAdvanced" as const },
+    { label: "Optimal",    key: "optimal"        as const },
+    { label: "Auto",       key: "auto"           as const },
   ]
   const totalIndByType = indTypes.reduce((s, { key }) => s + (bd?.indications[key] ?? 0), 0) || 1
   const totalIndAll = rt?.indicationsTotal || bd?.indications.total || 0
@@ -420,8 +447,27 @@ export function QuickstartComprehensiveLogDialog() {
                     Cycle Metrics
                   </div>
                   <div className="grid grid-cols-2 gap-1">
+                    {/*
+                     * "Cycles" rows show TOTAL ticks per processor (incl. idle).
+                     * "Live" rows (when present) show only ticks that produced
+                     * real work — a meaningful "engine doing useful things"
+                     * signal that's not skewed by warmup churn.
+                     * Each processor type has its OWN counter — they are NOT
+                     * the same number unless every tick was productive.
+                     */}
                     <Row label="Indication Cycles" value={fmt(rt?.indicationCycles || 0)} />
+                    <Row label="Strategy Cycles"   value={fmt(rt?.strategyCycles   || 0)} />
                     <Row label="Realtime Cycles"   value={fmt(rt?.realtimeCycles   || 0)} />
+                    {rt?.cycleCounters && (
+                      <>
+                        <Row label="Indication Live" value={fmt(rt.cycleCounters.indicationLive || 0)} />
+                        <Row label="Strategy Live"   value={fmt(rt.cycleCounters.strategyLive   || 0)} />
+                        <Row label="Realtime Live"   value={fmt(rt.cycleCounters.realtimeLive   || 0)} />
+                      </>
+                    )}
+                    {(rt?.framesProcessed || 0) > 0 && (
+                      <Row label="Frames Processed" value={fmt(rt!.framesProcessed!)} />
+                    )}
                     <Row label="Open Positions"    value={fmt(rt?.positionsOpen     || 0)} />
                     <Row label="Success Rate"      value={`${(rt?.successRate || 0).toFixed(1)}%`} />
                     {(rt?.avgCycleTimeMs || 0) > 0 && (

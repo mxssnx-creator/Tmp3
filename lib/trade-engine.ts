@@ -1,10 +1,14 @@
 /**
  * Global Trade Engine Coordinator V4.0
  * @version 4.0.0 - Force engine restart on version change to fix stale closures
+ *
+ * NOTE: The legacy `indication-processor-patch` side-effect import was
+ * removed — it monkey-patched cache initialisation that the underlying
+ * class now handles natively (instance fields backed by module-level
+ * shared singletons in `indication-processor-fixed` v5.0.1+). The patch
+ * file itself is preserved as a no-op stub for backward compatibility
+ * with any external imports of its named exports.
  */
-
-// CRITICAL: Import patch FIRST to fix cache initialization issues in stale webpack bundles
-import "./trade-engine/indication-processor-patch"
 
 const COORDINATOR_VERSION = "4.1.0"
 

@@ -27,10 +27,16 @@ export interface ProgressionState {
   prehistoricCandlesProcessed?: number
   prehistoricSymbolsProcessedCount?: number
   
-  // Indications by type (direction, move, active, optimal, auto)
+  // Indications by type. EVERY type used by IndicationSetsProcessor has its
+  // own independent cumulative counter on `progression:{connId}` written
+  // atomically via hincrby in EngineManager.startIndicationProcessor.
+  // Adding a new type to DEFAULT_LIMITS in indication-sets-processor.ts
+  // requires adding the matching counter here AND in `getProgressionState`
+  // / `getDefaultState` so the dashboard surfaces it.
   indicationsDirectionCount?: number
   indicationsMoveCount?: number
   indicationsActiveCount?: number
+  indicationsActiveAdvancedCount?: number
   indicationsOptimalCount?: number
   indicationsAutoCount?: number
   
@@ -47,6 +53,23 @@ export interface ProgressionState {
   intervalsProcessed?: number
   indicationsCount?: number
   strategiesCount?: number
+
+  // ── Per-processor cycle counters (cumulative, hincrby) ─────────────
+  // Each processor (indication / strategy / realtime) writes these
+  // atomically on every tick. They survive engine restarts and are the
+  // canonical source of truth used by `/api/connections/progression/[id]/stats`.
+  // The "_live_" variants only increment on productive ticks (work was done).
+  indicationCycleCount?: number
+  indicationLiveCycleCount?: number
+  strategyCycleCount?: number
+  strategyLiveCycleCount?: number
+  realtimeCycleCount?: number
+  realtimeLiveCycleCount?: number
+  // Cross-processor cumulative tick counter — sum of all per-processor
+  // cycle increments since the engine started. Independent of per-Set
+  // DB-entry caps. This is the "Frames / Total Ticks" number on the
+  // dashboard.
+  framesProcessed?: number
 }
 
 export class ProgressionStateManager {
@@ -96,6 +119,7 @@ export class ProgressionStateManager {
          indicationsDirectionCount: parseInt(data.indications_direction_count || "0", 10),
          indicationsMoveCount: parseInt(data.indications_move_count || "0", 10),
          indicationsActiveCount: parseInt(data.indications_active_count || "0", 10),
+         indicationsActiveAdvancedCount: parseInt(data.indications_active_advanced_count || "0", 10),
          indicationsOptimalCount: parseInt(data.indications_optimal_count || "0", 10),
          indicationsAutoCount: parseInt(data.indications_auto_count || "0", 10),
          strategiesBaseTotal: parseInt(data.strategies_base_total || "0", 10),
@@ -108,6 +132,14 @@ export class ProgressionStateManager {
          intervalsProcessed: parseInt(data.intervals_processed || "0", 10),
          indicationsCount: parseInt(data.indications_count || "0", 10),
          strategiesCount: parseInt(data.strategies_count || "0", 10),
+         // Per-processor cycle counters (cumulative, atomic)
+         indicationCycleCount: parseInt(data.indication_cycle_count || "0", 10),
+         indicationLiveCycleCount: parseInt(data.indication_live_cycle_count || "0", 10),
+         strategyCycleCount: parseInt(data.strategy_cycle_count || "0", 10),
+         strategyLiveCycleCount: parseInt(data.strategy_live_cycle_count || "0", 10),
+         realtimeCycleCount: parseInt(data.realtime_cycle_count || "0", 10),
+         realtimeLiveCycleCount: parseInt(data.realtime_live_cycle_count || "0", 10),
+         framesProcessed: parseInt(data.frames_processed || "0", 10),
        }
     } catch (error) {
       console.error(`[v0] Failed to get progression state for ${connectionId}:`, error)
@@ -140,6 +172,7 @@ export class ProgressionStateManager {
       indicationsDirectionCount: 0,
       indicationsMoveCount: 0,
       indicationsActiveCount: 0,
+      indicationsActiveAdvancedCount: 0,
       indicationsOptimalCount: 0,
       indicationsAutoCount: 0,
       strategiesBaseTotal: 0,
@@ -152,6 +185,13 @@ export class ProgressionStateManager {
       intervalsProcessed: 0,
       indicationsCount: 0,
       strategiesCount: 0,
+      indicationCycleCount: 0,
+      indicationLiveCycleCount: 0,
+      strategyCycleCount: 0,
+      strategyLiveCycleCount: 0,
+      realtimeCycleCount: 0,
+      realtimeLiveCycleCount: 0,
+      framesProcessed: 0,
     }
   }
 

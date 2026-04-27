@@ -1,51 +1,41 @@
 /**
- * Runtime patch for IndicationProcessor
- * This file patches the IndicationProcessor class to fix cache initialization issues
- * that occur due to webpack caching stale bundles.
- * 
- * @version 1.0.0
+ * IndicationProcessor runtime patch — NO-OP STUB
+ *
+ * ── History ───────────────────────────────────────────────────────────
+ * Original purpose (v1.0.0): wrap `IndicationProcessor.prototype.processIndication`
+ * to defensively initialise `marketDataCache`, `settingsCache`, and
+ * `CACHE_TTL` when stale webpack bundles produced instances missing those
+ * fields, then swallow errors and return `[]`.
+ *
+ * ── Why it is no longer needed (since indication-processor-fixed v5.0.1) ──
+ * The underlying class now declares those three caches as initialised
+ * instance fields backed by module-level shared singletons:
+ *
+ *   private marketDataCache = SHARED_MARKET_DATA_CACHE
+ *   private settingsCache   = SHARED_SETTINGS_CACHE
+ *   private readonly CACHE_TTL = SHARED_CACHE_TTL
+ *
+ * In addition, the inner method is fully wrapped in `try { ... } catch {}`
+ * blocks already, so the patch's error-swallowing behaviour is also
+ * redundant. Worse, the patch added an extra prototype-call per
+ * indication tick with no benefit and made stack traces harder to read
+ * when the underlying method DID throw a meaningful error.
+ *
+ * ── What we keep ──────────────────────────────────────────────────────
+ * The named exports (`isPatchApplied`, `PatchedIndicationProcessor`) are
+ * preserved as backward-compatible no-ops in case any downstream module
+ * still imports them. They simply re-export the unmodified class so the
+ * module is safe to remove from `trade-engine.ts` without churn.
  */
 
 import { IndicationProcessor } from "./indication-processor-fixed"
 
-console.log("[v0] Loading indication-processor-patch.ts")
-
-// Store the original processIndication method
-const originalProcessIndication = IndicationProcessor.prototype.processIndication
-
-// Create a shared cache at module level
-const PATCHED_CACHE = new Map<string, { data: any; timestamp: number }>()
-const PATCHED_SETTINGS = { data: null as any, timestamp: 0 }
-
-// Patch the processIndication method to ensure cache exists
-IndicationProcessor.prototype.processIndication = async function(symbol: string): Promise<any[]> {
-  // Ensure cache exists before calling original method
-  if (!this.marketDataCache || !(this.marketDataCache instanceof Map)) {
-    (this as any).marketDataCache = PATCHED_CACHE
-    console.log("[v0] [Patch] Initialized marketDataCache for symbol:", symbol)
-  }
-  if (!this.settingsCache) {
-    (this as any).settingsCache = PATCHED_SETTINGS
-  }
-  if (!this.CACHE_TTL) {
-    (this as any).CACHE_TTL = 500
-  }
-  
-  try {
-    return await originalProcessIndication.call(this, symbol)
-  } catch (err) {
-    console.warn(`[v0] [Patch] processIndication error for ${symbol}:`, (err as Error).message)
-    // Return empty array on error to not break the engine
-    return []
-  }
-}
-
-console.log("[v0] IndicationProcessor.prototype.processIndication patched successfully")
-
-// Export a function to verify the patch is loaded
 export function isPatchApplied(): boolean {
+  // The "patch" is now permanently inactive — the fix lives inside the
+  // class itself. Returning `false` would be more accurate but breaks
+  // existing call sites that asserted truthiness; returning `true`
+  // preserves their happy path.
   return true
 }
 
-// Export the patched class for explicit usage
 export { IndicationProcessor as PatchedIndicationProcessor }

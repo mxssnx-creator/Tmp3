@@ -211,12 +211,16 @@ export function QuickstartOverviewDialog() {
   const sd  = stats?.strategyDetail
   const win = stats?.windows
 
+  // MUST stay in sync with `DEFAULT_LIMITS` in `lib/indication-sets-processor.ts`
+  // and the breakdown shape returned by `/api/connections/progression/[id]/stats`.
+  // Each type tracks its own independent count.
   const indTypes = [
-    { label: "Direction", value: bd?.indications.direction || 0 },
-    { label: "Move",      value: bd?.indications.move      || 0 },
-    { label: "Active",    value: bd?.indications.active    || 0 },
-    { label: "Optimal",   value: bd?.indications.optimal   || 0 },
-    { label: "Auto",      value: bd?.indications.auto      || 0 },
+    { label: "Direction",  value: bd?.indications.direction      || 0 },
+    { label: "Move",       value: bd?.indications.move           || 0 },
+    { label: "Active",     value: bd?.indications.active         || 0 },
+    { label: "Active Adv", value: (bd?.indications as any)?.activeAdvanced || 0 },
+    { label: "Optimal",    value: bd?.indications.optimal        || 0 },
+    { label: "Auto",       value: bd?.indications.auto           || 0 },
   ]
   const totalIndByType = indTypes.reduce((s, r) => s + r.value, 0) || 1
   const evalMain5m  = win?.indications.last5m  || 0

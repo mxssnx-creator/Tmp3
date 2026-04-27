@@ -947,9 +947,13 @@ export class TradeEngineManager {
         //   * indication_cycle_count          — EVERY tick (incl. warmup/empty cycles). Treat as
         //                                       "prehistoric processing" churn — hidden from the
         //                                       primary live-progression display.
-        //   * indication_live_cycle_count     �� only ticks that produced at least one indication.
+        //   * indication_live_cycle_count     — only ticks that produced at least one indication.
         //                                       This is the meaningful "live progression" counter.
         //   * indications_count / per-type    — cumulative indications generated (hincrby).
+        //   * frames_processed                — cumulative tick count across ALL processors
+        //                                       (indication + strategy + realtime). Independent
+        //                                       of per-Set DB-entry caps — counts every loop tick
+        //                                       since the engine started.
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
@@ -958,6 +962,7 @@ export class TradeEngineManager {
           // awaited round-trips per cycle compared to sequential awaits.
           const writes: Promise<any>[] = [
             client.hincrby(redisKey, "indication_cycle_count", 1),
+            client.hincrby(redisKey, "frames_processed", 1),
             client.hset(redisKey, "symbols_processed", String(symbols.length)),
             client.expire(redisKey, 7 * 24 * 60 * 60),
           ]
@@ -990,7 +995,22 @@ export class TradeEngineManager {
           }
         }
 
-        // Persist cycle count every 100 cycles to reduce Redis writes
+        // Persist non-counter snapshot data every 100 cycles to reduce Redis writes.
+        //
+        // INTENTIONALLY OMITTED FROM THIS SNAPSHOT (use progression:{id} instead):
+        //   - indication_cycle_count        — authoritative source is hincrby on
+        //                                     progression:{id}, which survives engine
+        //                                     restarts. This local snapshot would
+        //                                     reset to 0 on every restart and
+        //                                     overwrite the live counter through the
+        //                                     /stats fallback chain.
+        //   - total_indications_generated   — was previously written as
+        //                                     `totalIndications * cycleCount` which
+        //                                     is mathematically nonsensical
+        //                                     (current-tick count × loop counter).
+        //                                     The cumulative is already maintained
+        //                                     atomically as `indications_count` on
+        //                                     progression:{id}.
         if (cycleCount % 100 === 0) {
           try {
             await setSettings(`trade_engine_state:${this.connectionId}`, {
@@ -998,10 +1018,7 @@ export class TradeEngineManager {
               status: "running",
               started_at: this.startTime?.toISOString() || new Date().toISOString(),
               last_indication_run: new Date().toISOString(),
-              indication_cycle_count: cycleCount,
               indication_avg_duration_ms: totalDuration > 0 ? Math.round(totalDuration / cycleCount) : 0,
-              engine_cycles_total: cycleCount,
-              total_indications_generated: totalIndications * cycleCount,
               symbols_in_scope: symbols.length,
             })
           } catch { /* silently fail */ }
@@ -1177,7 +1194,9 @@ export class TradeEngineManager {
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
+          // Cycle counters (per-processor + cross-processor frame total).
           await client.hincrby(redisKey, "strategy_cycle_count", 1)
+          await client.hincrby(redisKey, "frames_processed", 1)
           if (evaluatedThisCycle > 0) {
             await client.hincrby(redisKey, "strategy_live_cycle_count", 1)
             await client.hincrby(redisKey, "strategies_count", evaluatedThisCycle)
@@ -1196,19 +1215,28 @@ export class TradeEngineManager {
           }
         }
 
-        // Persist cycle count every 50 cycles (faster update rate for strategies)
+        // Persist non-counter snapshot data every 50 cycles to reduce Redis writes.
+        //
+        // INTENTIONALLY OMITTED FROM THIS SNAPSHOT (authoritative source is the
+        // progression:{id} hash):
+        //   - strategy_cycle_count           — atomic hincrby, survives restarts
+        //   - total_strategies_evaluated     — local in-process counter; the
+        //                                      authoritative cumulative is the
+        //                                      `strategies_count` field on
+        //                                      progression:{id}.
+        //   - engine_cycles_total            — meaningless when written from a
+        //                                      single processor's cycleCount; the
+        //                                      cross-processor total now lives in
+        //                                      progression:{id}.frames_processed.
         if (cycleCount % 50 === 0) {
           try {
             await setSettings(`trade_engine_state:${this.connectionId}`, {
               status: "running",
               last_strategy_run: new Date().toISOString(),
-              strategy_cycle_count: cycleCount,
               strategy_avg_duration_ms: totalDuration > 0 ? Math.round(totalDuration / cycleCount) : 0,
-              total_strategies_evaluated: typeof totalStrategiesEvaluated !== "undefined" ? totalStrategiesEvaluated : 0,
               strategies_live_ready: liveReadyThisCycle,
               last_cycle_duration: duration,
               last_cycle_type: "strategies",
-              engine_cycles_total: cycleCount,
             })
           } catch { /* silently fail */ }
         }
@@ -1395,6 +1423,25 @@ export class TradeEngineManager {
           console.error(`[v0] [Engine] Realtime cycle increment failed:`, incError instanceof Error ? incError.message : String(incError))
         }
 
+        // Write cycle counters into progression hash so the dashboard reads
+        // real values (analogous to the indication & strategy processors).
+        //
+        // COUNTER TAXONOMY:
+        //   * realtime_cycle_count       — every realtime tick (incl. idle/gated).
+        //   * realtime_live_cycle_count  — only ticks that actually updated open
+        //                                  positions (rtResult.updates > 0).
+        //   * frames_processed           — cross-processor cumulative tick total.
+        try {
+          const client = getRedisClient()
+          const redisKey = `progression:${this.connectionId}`
+          await client.hincrby(redisKey, "realtime_cycle_count", 1)
+          await client.hincrby(redisKey, "frames_processed", 1)
+          if (outcome === "productive") {
+            await client.hincrby(redisKey, "realtime_live_cycle_count", 1)
+          }
+          await client.expire(redisKey, 7 * 24 * 60 * 60)
+        } catch { /* non-critical */ }
+
         // Track detailed performance metrics (every 100 cycles)
         if (cycleCount % 100 === 0) {
           await engineMonitor.trackCycle(this.connectionId, "realtime", {
@@ -1406,16 +1453,17 @@ export class TradeEngineManager {
           })
         }
 
-        // Update Redis every 100 cycles
+        // Persist non-counter snapshot data every 100 cycles. The cycle
+        // counters themselves (realtime_cycle_count, frames_processed) live
+        // exclusively in progression:{id} as atomic hincrbys — see comment
+        // on the indication processor above for the rationale.
         if (cycleCount % 100 === 0) {
           try {
             await setSettings(`trade_engine_state:${this.connectionId}`, {
               last_realtime_run: new Date().toISOString(),
-              realtime_cycle_count: cycleCount,
               realtime_avg_duration_ms: totalDuration > 0 ? Math.round(totalDuration / cycleCount) : 0,
               last_cycle_duration: duration,
               last_cycle_type: "realtime",
-              engine_cycles_total: cycleCount,
             })
           } catch { /* silently fail */ }
         }

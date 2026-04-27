@@ -1,13 +1,26 @@
 /**
  * Independent Indication Sets Processor
- * Maintains separate 250-entry pools for each indication type AND each configuration
- * Each type+config combination calculates independently with own set
- * 
- * Key Design Principles:
- * 1. Each indication type (direction, move, active, optimal) has independent sets
- * 2. Each configuration/parameter combination within a type has its own set
- * 3. Max positions per direction (long/short) is enforced per config
- * 4. Indication timeout is applied after valid evaluation
+ *
+ * ── Design Principles ─────────────────────────────────────────────────
+ *  1. Each indication TYPE (direction, move, active, optimal,
+ *     active_advanced) has independent sets.
+ *  2. Each CONFIG/parameter combination within a type has its OWN set.
+ *  3. Each set is keyed `indication_set:{connId}:{symbol}:{type}:{configHash}`.
+ *  4. Max positions per direction (long/short) is enforced per config.
+ *  5. Indication timeout is applied after valid evaluation.
+ *
+ * ── 250-entry cap is PER-SET, not per-type total ─────────────────────
+ * The constant `DEFAULT_LIMITS[type]` (250 by default) caps the number
+ * of historical entries stored INSIDE a single Set (i.e. inside one
+ * Redis key). It is NOT a cap on:
+ *   - the total number of Sets per type (that's bounded by the number
+ *     of valid config combinations)
+ *   - the total entries across all Sets of a type (sum across keys)
+ *   - cycle / frame / tick counters (those are unbounded counters
+ *     stored on `progression:{connId}` independently of this cap)
+ *
+ * The cap is applied inside `batchSaveIndications` / `saveIndicationToSet`
+ * via `entries.slice(0, limit)` after every push.
  */
 
 import { getRedisClient, initRedis, getSettings, getAppSettings, setSettings } from "@/lib/redis-db"
@@ -460,7 +473,23 @@ export class IndicationSetsProcessor {
   }
 
   /**
-   * Batch save multiple indications - much more efficient than individual saves
+   * Batch save multiple indications - much more efficient than individual saves.
+   *
+   * Each entry persists the full set of fields downstream consumers need:
+   *   - `type`        : indication type (direction|move|active|optimal|active_advanced)
+   *   - `direction`   : long|short — required for per-direction position-cap
+   *                     enforcement when the entry is replayed by the strategy
+   *                     pipeline. Pulled from `indication.direction` (set
+   *                     upstream in `processDirectionSet`/`processMoveSet`)
+   *                     with sane fallbacks: explicit metadata.firstDir,
+   *                     then "long" as last resort.
+   *   - `setKey`      : not stored on the entry (it lives on the Redis key
+   *                     itself) — but `getSetEntries` re-attaches it for
+   *                     consumers that need provenance.
+   *
+   * The 250-cap (configurable via `getLimit`) is applied PER setKey — i.e.
+   * per independent Set. This is the documented per-DB-entry cap; cycle
+   * counters / frame counters are completely independent of it.
    */
   private async batchSaveIndications(
     writes: Array<{ setKey: string; indication: any; config: any }>,
@@ -480,9 +509,23 @@ export class IndicationSetsProcessor {
         const chunk = writes.slice(i, i + concurrency)
         await Promise.all(
           chunk.map(async ({ setKey, indication, config }, idx) => {
+            // Resolve direction with progressive fallbacks. The strategy
+            // coordinator + live-stage both use this field, so it MUST
+            // be on the persisted entry to avoid silent "long" fallback.
+            const direction: "long" | "short" =
+              indication.direction === "short"
+                ? "short"
+                : indication.direction === "long"
+                ? "long"
+                : indication?.metadata?.firstDir < 0
+                ? "short"
+                : "long"
+
             const entry = {
               id: `${type}_${now}_${i + idx}_${Math.random().toString(36).slice(2, 6)}`,
               timestamp,
+              type,
+              direction,
               profitFactor: indication.profitFactor,
               confidence: indication.confidence,
               config,
@@ -503,8 +546,17 @@ export class IndicationSetsProcessor {
   }
 
   /**
-   * Save indication to its independent set pool (default 250 entries)
-   * OPTIMIZED: Removed redundant stats updates
+   * Save indication to its independent set pool (per-Set cap, default 250
+   * entries — see `DEFAULT_LIMITS` for per-type values).
+   *
+   * Persists the same shape as `batchSaveIndications` so consumers can
+   * read either path interchangeably.
+   *
+   * NOTE: The legacy `Math.random() > 0.5` direction fallback used in the
+   * realtime broadcast was non-deterministic — it produced UP/DOWN flicker
+   * on the dashboard for every cell every cycle. The fix derives the
+   * direction from the actual indication payload and falls back to NEUTRAL
+   * for non-directional types (active/optimal/active_advanced).
    */
   private async saveIndicationToSet(
     setKey: string,
@@ -518,10 +570,22 @@ export class IndicationSetsProcessor {
       const existing = await client.get(setKey)
       let entries = existing ? JSON.parse(existing) : []
 
+      // Same direction-resolution logic as batchSaveIndications — see comment there.
+      const direction: "long" | "short" =
+        indication.direction === "short"
+          ? "short"
+          : indication.direction === "long"
+          ? "long"
+          : indication?.metadata?.firstDir < 0
+          ? "short"
+          : "long"
+
       const id = `${type}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
       entries.unshift({
         id,
         timestamp: new Date().toISOString(),
+        type,
+        direction,
         profitFactor: indication.profitFactor,
         confidence: indication.confidence,
         config,
@@ -533,12 +597,21 @@ export class IndicationSetsProcessor {
 
       await client.set(setKey, JSON.stringify(entries))
       
-      // Broadcast indication update to connected clients
-      const symbol = setKey.split(':')[2] // Extract symbol from setKey
+      // Broadcast indication update to connected clients. Direction is
+      // derived from the actual indication signal — directional types
+      // (direction/move) report UP/DOWN, all other types (active /
+      // optimal / active_advanced) report NEUTRAL.
+      const symbol = setKey.split(':')[2]
+      const broadcastDirection: "UP" | "DOWN" | "NEUTRAL" =
+        type === "direction" || type === "move"
+          ? direction === "long"
+            ? "UP"
+            : "DOWN"
+          : "NEUTRAL"
       emitIndicationUpdate(this.connectionId, {
         id,
         symbol,
-        direction: type === 'direction' || type === 'move' ? (Math.random() > 0.5 ? 'UP' : 'DOWN') : 'NEUTRAL',
+        direction: broadcastDirection,
         confidence: indication.confidence || 0,
         strength: indication.profitFactor || 0,
       })
