@@ -497,6 +497,12 @@ export async function executeLivePosition(
     pushStep(livePosition, "price_fetch", true, `price=${currentPrice}`)
 
     // ── Step 3: Volume calculation ─────────────────────────────────────────
+    // POLICY: minimum volume is ALWAYS enforced — we never reject a live
+    // order for "qty too small". If the calculator returns null or a
+    // non-positive quantity (e.g. balance fetch failed, NaN math) we
+    // synthesize a fallback at the universal $5-notional floor and
+    // continue. This keeps the operator's signal flow uninterrupted
+    // and matches the documented behavior of `VolumeCalculator`.
     const volumeResult = await VolumeCalculator.calculateVolumeForConnection(
       connectionId,
       realPosition.symbol,
@@ -506,49 +512,54 @@ export async function executeLivePosition(
       return null
     })
 
-    const computedVolume = volumeResult?.finalVolume || volumeResult?.volume || 0
-    if (!volumeResult || computedVolume <= 0) {
-      livePosition.status = "rejected"
-      livePosition.statusReason =
-        volumeResult?.adjustmentReason ||
-        `Computed volume is zero or below exchange minimum for ${realPosition.symbol}`
-      pushStep(livePosition, "volume_calc", false, livePosition.statusReason)
-      await savePosition(livePosition)
-      await incrementMetric(connectionId, "live_orders_rejected_count")
+    let computedVolume = volumeResult?.finalVolume || volumeResult?.volume || 0
+    let volumeNote = ""
+    if (computedVolume <= 0 || !Number.isFinite(computedVolume)) {
+      // Synthesize at $5 notional / currentPrice so the order still has a
+      // valid size. Any subsequent exchange-side rejection (e.g. a venue
+      // requiring a higher minimum) will then come back from the connector
+      // with a real error, not from us pre-emptively dropping the signal.
+      const FALLBACK_NOTIONAL_USD = 5
+      computedVolume = currentPrice > 0
+        ? FALLBACK_NOTIONAL_USD / currentPrice
+        : 0
+      volumeNote = ` [synthesized-min: $${FALLBACK_NOTIONAL_USD} notional fallback — calculator returned ${volumeResult?.finalVolume ?? "null"}]`
       await logProgressionEvent(
         connectionId,
         "live_trading",
-        "warning",
-        `Live order rejected — volume too small for ${realPosition.symbol}`,
+        "info",
+        `Live order volume synthesized to enforced minimum for ${realPosition.symbol}`,
         {
-          reason: livePosition.statusReason,
-          calculatedVolume: volumeResult?.calculatedVolume,
+          reason: volumeResult?.adjustmentReason || "calculator returned no usable quantity",
+          fallbackNotionalUsd: FALLBACK_NOTIONAL_USD,
+          synthesizedQty: computedVolume,
         }
       )
-      return livePosition
     }
 
     livePosition.quantity = computedVolume
     livePosition.remainingQuantity = computedVolume
     livePosition.volumeUsd = computedVolume * currentPrice
-    livePosition.leverage = volumeResult.leverage || livePosition.leverage
+    livePosition.leverage = volumeResult?.leverage || livePosition.leverage
 
     // If the volume calculator clamped the quantity UP to the exchange
-    // minimum (new behavior — see VolumeCalculator.calculatePositionVolume),
-    // surface that in the progression step so the UI / logs show *why* the
-    // executed qty differs from the coordination-derived qty rather than
-    // just a bare number. We still mark the step as successful because the
-    // order itself is valid.
-    const clampNote = volumeResult.volumeAdjusted && volumeResult.adjustmentReason
+    // minimum (or we synthesized a fallback above), surface that in the
+    // progression step so the UI / logs show *why* the executed qty
+    // differs from the coordination-derived qty rather than just a bare
+    // number. The step is always recorded as successful because the
+    // order itself is valid — minimum enforcement never fails the trade.
+    const clampNote = volumeResult?.volumeAdjusted && volumeResult.adjustmentReason
       ? ` [clamped-to-min: ${volumeResult.adjustmentReason}]`
       : ""
     pushStep(
       livePosition,
       "volume_calc",
       true,
-      `qty=${computedVolume.toFixed(6)} usd=${livePosition.volumeUsd.toFixed(2)} lev=${livePosition.leverage}x${clampNote}`
+      `qty=${computedVolume.toFixed(6)} usd=${livePosition.volumeUsd.toFixed(2)} lev=${livePosition.leverage}x${clampNote}${volumeNote}`
     )
-    await VolumeCalculator.logVolumeCalculation(connectionId, realPosition.symbol, volumeResult).catch(() => {})
+    if (volumeResult) {
+      await VolumeCalculator.logVolumeCalculation(connectionId, realPosition.symbol, volumeResult).catch(() => {})
+    }
 
     // ── Step 4: Configure leverage + margin type on exchange ───────────────
     if (typeof exchangeConnector.setLeverage === "function") {
