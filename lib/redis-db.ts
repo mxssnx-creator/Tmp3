@@ -110,7 +110,14 @@ export class InlineLocalRedis {
   private async resolveSnapshotPath(): Promise<{ dir: string; file: string } | null> {
     if (typeof process === "undefined" || !process.versions?.node) return null
     try {
-      const path = await import("node:path")
+      // Bare specifier (no `node:` URI scheme) — Webpack 5's bundler can
+      // analyse this and Node's resolver maps it to the built-in. The
+      // `node:path` form triggers `UnhandledSchemeError` on the Edge
+      // build because Webpack's scheme handler doesn't recognise it.
+      // Bare imports are aliased to `false` for the Edge runtime in
+      // `next.config.mjs`, which short-circuits the load (the runtime
+      // guard above already returns `null` before this line ever runs).
+      const path = await import("path")
       const explicit = process.env.V0_REDIS_SNAPSHOT_PATH
       if (explicit) {
         return { dir: path.dirname(explicit), file: explicit }
@@ -127,7 +134,8 @@ export class InlineLocalRedis {
   private async tmpFallbackPath(): Promise<{ dir: string; file: string } | null> {
     if (typeof process === "undefined" || !process.versions?.node) return null
     try {
-      const path = await import("node:path")
+      // Bare specifier — see comment in `resolveSnapshotPath`.
+      const path = await import("path")
       return { dir: "/tmp", file: path.join("/tmp", "v0-redis-snapshot.json") }
     } catch {
       return null
@@ -188,9 +196,11 @@ export class InlineLocalRedis {
   async loadFromDisk(): Promise<boolean> {
     const target = await this.resolveSnapshotPath()
     if (!target) return false
-    let fs: typeof import("node:fs/promises")
+    // Bare specifier — see comment in `resolveSnapshotPath`. Type alias
+    // also drops the `node:` prefix so the bundler doesn't analyse it.
+    let fs: typeof import("fs/promises")
     try {
-      fs = await import("node:fs/promises")
+      fs = await import("fs/promises")
     } catch {
       return false
     }
@@ -226,9 +236,10 @@ export class InlineLocalRedis {
   async saveToDisk(): Promise<boolean> {
     const primary = await this.resolveSnapshotPath()
     if (!primary) return false
-    let fs: typeof import("node:fs/promises")
+    // Bare specifier — see comment in `resolveSnapshotPath`.
+    let fs: typeof import("fs/promises")
     try {
-      fs = await import("node:fs/promises")
+      fs = await import("fs/promises")
     } catch {
       return false
     }
@@ -257,13 +268,20 @@ export class InlineLocalRedis {
   /** Synchronous variant for SIGTERM / SIGINT / beforeExit handlers. */
   saveToDiskSync(): boolean {
     if (typeof process === "undefined" || !process.versions?.node) return false
-    let fsSync: typeof import("node:fs"), pathMod: typeof import("node:path")
+    // Type aliases use bare specifiers so TypeScript's emitted .d.ts
+    // (and any incremental compile cache) don't carry `node:` URIs that
+    // could re-enter the bundler graph.
+    let fsSync: typeof import("fs"), pathMod: typeof import("path")
     try {
       // require() is fine here because this method only ever runs in Node.
       // We use dynamic require via Function to bypass static-bundler analysis.
       const dynamicRequire = Function("m", "return require(m)") as (m: string) => any
-      fsSync = dynamicRequire("node:fs")
-      pathMod = dynamicRequire("node:path")
+      // Bare specifiers — Node maps these to the built-ins identically
+      // to the `node:` URI form. Avoiding the URI form here keeps the
+      // request strings out of any chunk the bundler might still scan
+      // (defence in depth — `Function(...)` already hides them).
+      fsSync = dynamicRequire("fs")
+      pathMod = dynamicRequire("path")
     } catch {
       return false
     }

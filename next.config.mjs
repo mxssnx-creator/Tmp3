@@ -1,4 +1,6 @@
-// Force rebuild: 2026-04-10T13:07:30
+// Force rebuild: 2026-04-28T10:11:00
+
+/** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
   typescript: {
@@ -15,8 +17,45 @@ const nextConfig = {
       allowedOrigins: ["*"],
     },
   },
-  webpack: (config, { isServer, nextRuntime }) => {
+  // Next.js passes its own bundled `webpack` instance as the second
+  // argument here. We DON'T `import "webpack"` at the top of this file
+  // because `webpack` isn't a direct dependency of the project and
+  // Node's ESM loader will throw `ERR_MODULE_NOT_FOUND` (observed in
+  // dev logs at 2026-04-28T10:08:20).
+  webpack: (config, { isServer, nextRuntime, webpack }) => {
     config.resolve = config.resolve || {}
+    config.plugins = config.plugins || []
+
+    // ── Strip the `node:` URI scheme from every dynamic/static import ──
+    //
+    // Webpack 5's default scheme handler does NOT recognise `node:`, so a
+    // call like `await import("node:fs/promises")` raises
+    // `UnhandledSchemeError` during the BUILD pass — even when the call
+    // is gated by a runtime guard like
+    // `if (typeof process === "undefined" || !process.versions?.node)`.
+    // The error originates BEFORE alias resolution, so simply aliasing
+    // `node:fs/promises → false` is not sufficient (we tried — see the
+    // `nodeBuiltinsToStub` block below).
+    //
+    // `NormalModuleReplacementPlugin` runs in the resolve pipeline
+    // BEFORE the scheme handler. Rewriting `node:fs/promises → fs/promises`
+    // here means:
+    //   • Server (nodejs runtime): bare specifier resolves natively.
+    //   • Edge runtime: bare specifier resolves to `false` via the alias
+    //     map below.
+    //   • Browser: bare specifier resolves to `false` via the fallback
+    //     map below.
+    // This single plugin invocation is the safe, runtime-agnostic fix.
+    //
+    // Persistent dependency graphs from Webpack's filesystem cache
+    // (`.next/cache`) are also healed because the replacement runs on
+    // every build, not just on cold compiles — stale cache entries
+    // referencing `node:` URIs get rewritten on the next module touch.
+    config.plugins.push(
+      new webpack.NormalModuleReplacementPlugin(/^node:/, (resource) => {
+        resource.request = resource.request.replace(/^node:/, "")
+      }),
+    )
 
     // Browser bundle: Node built-ins are unavailable. Alias them to empty
     // stubs so any transitively-imported server lib still type-checks and
