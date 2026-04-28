@@ -3,7 +3,9 @@
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Switch } from "@/components/ui/switch"
+// `Switch` no longer imported — the obsolete `Base Trailing Enabled`
+// toggle has been replaced with an engine-decided statistical-trailing
+// note (see comment block below).
 
 export default function BaseStrategySettings({
   settings,
@@ -90,22 +92,32 @@ export default function BaseStrategySettings({
             </div>
           </div>
 
+          {/*
+           * Trailing is no longer an operator toggle.
+           *
+           * Spec: "Trailing, No Trailing handled System Internally and
+           * Statistically". The strategy coordinator decides trailing
+           * on/off PER POSITION at creation time based on the best entry's
+           * statistical confidence — see
+           * `lib/strategy-coordinator.ts` (`trailing = bestEntry.confidence >= 0.85`).
+           *
+           * The previous `strategyBaseTrailing` Switch had ZERO engine
+           * consumers — toggling it had no effect on any live path. It
+           * has been removed to prevent operator confusion and to keep
+           * the settings UI honest about what the engine actually reads.
+           */}
           <div className="border-t pt-6 space-y-4">
             <h3 className="text-lg font-semibold border-b pb-2">Base Strategy Features</h3>
 
-            <div className="grid gap-4">
-              <div className="flex items-center justify-between p-3 border rounded-lg bg-card">
-                <div>
-                  <Label className="text-base">Base Trailing Enabled</Label>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Enable trailing stop loss for base strategy positions
-                  </p>
-                </div>
-                <Switch
-                  checked={settings.strategyBaseTrailing !== false}
-                  onCheckedChange={(checked) => handleSettingChange("strategyBaseTrailing", checked)}
-                />
-              </div>
+            <div className="rounded-lg border bg-muted/40 p-4">
+              <p className="text-sm font-medium">Trailing Stop Loss</p>
+              <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                Trailing is decided automatically per position based on
+                statistical confidence of the originating Set (threshold
+                <span className="font-mono"> conf ≥ 0.85</span>). High-confidence
+                Sets enable trailing; lower-confidence Sets use fixed TP/SL.
+                No operator toggle is consulted on the live path.
+              </p>
             </div>
           </div>
 
@@ -182,8 +194,9 @@ export default function BaseStrategySettings({
                 distribution across different positions.
               </p>
               <p>
-                Base trailing enables automatic profit protection at the foundational level, moving stop losses as
-                positions become profitable.
+                Profit protection (trailing stop) is engine-managed
+                per position based on statistical confidence — see the
+                Trailing Stop Loss note above.
               </p>
             </div>
           </div>
