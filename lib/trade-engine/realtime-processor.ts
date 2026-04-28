@@ -493,31 +493,151 @@ export class RealtimeProcessor {
   }
 
   /**
-   * Update trailing stop (Redis-based)
+   * Trailing-stop tick — supports BOTH the legacy single-step path AND
+   * the multi-step state machine driven by the Settings → Strategy →
+   * Trailing matrix.
+   *
+   *   • Legacy path (no `trailing_start_ratio` on the hash, or 0): trail
+   *     distance = `stoploss_ratio` %; ratchet on every favourable move.
+   *     Identical to the previous behaviour — kept for back-compat with
+   *     positions opened before multi-step trailing existed.
+   *
+   *   • Multi-step path (3 ratio fields populated): a 2-phase state
+   *     machine.
+   *
+   *       1. INACTIVE — `gain_ratio < trailing_start_ratio` → no-op.
+   *       2. ACTIVATION — `gain_ratio >= trailing_start_ratio` →
+   *          flip `trailing_active = 1`, set `trailing_anchor` to
+   *          `currentPrice` (high-water for long, low-water for short),
+   *          set `trailing_stop_price` to
+   *          `anchor × (1 ∓ trailing_stop_ratio)`.
+   *       3. ACTIVE — re-anchor only when price has moved at least
+   *          `trailing_step_ratio × anchor` in the favourable direction
+   *          (so jitter inside the step doesn't re-write Redis on every
+   *          tick). Stop ratchets one direction.
+   *
+   *   When stop is hit, `shouldCloseStopLoss` (unchanged) closes the
+   *   position with reason `stop_loss`. The check there reads
+   *   `trailing_stop_price`, which we set in BOTH paths, so the close
+   *   gate is shared.
    */
   private async updateTrailingStop(position: any, currentPrice: number): Promise<void> {
     try {
       const entryPrice = parseFloat(position.entry_price || "0")
-      const stoplossRatio = parseFloat(position.stoploss_ratio || "0")
-      const side = position.side || "long"
-      const currentTrailingStop = parseFloat(position.trailing_stop_price || "0")
+      const side: "long" | "short" = position.side === "short" ? "short" : "long"
+      if (entryPrice <= 0 || currentPrice <= 0) return
 
+      const startRatio = parseFloat(position.trailing_start_ratio || "0")
+      const stopRatio = parseFloat(position.trailing_stop_ratio || "0")
+      const stepRatio = parseFloat(position.trailing_step_ratio || "0")
+      const useMultiStep = startRatio > 0 && stopRatio > 0
+
+      const client = getRedisClient()
+      const hashKey = `pseudo_position:${this.connectionId}:${position.id}`
+
+      // ── Multi-step path ────────────────────────────────────────────
+      if (useMultiStep) {
+        // Profit ratio in the trade's favourable direction.
+        const gainRatio =
+          side === "long"
+            ? (currentPrice - entryPrice) / entryPrice
+            : (entryPrice - currentPrice) / entryPrice
+
+        const wasActive = position.trailing_active === "1" || position.trailing_active === true
+        const anchorStored = parseFloat(position.trailing_anchor || "0")
+        const currentTrailingStop = parseFloat(position.trailing_stop_price || "0")
+
+        // Phase 1 — INACTIVE: not yet at the activation threshold.
+        if (!wasActive) {
+          if (gainRatio < startRatio) return  // dormant; pure TP/SL governs
+
+          // Phase 2 — ACTIVATION: cross the start threshold for the first time.
+          const anchor = currentPrice
+          const newStop =
+            side === "long"
+              ? anchor * (1 - stopRatio)
+              : anchor * (1 + stopRatio)
+
+          await client.hset(hashKey, {
+            trailing_active: "1",
+            trailing_anchor: String(anchor),
+            trailing_stop_price: String(newStop),
+            updated_at: new Date().toISOString(),
+          })
+          // Mutate in-place so the very next gate (shouldCloseStopLoss)
+          // sees the freshly-armed stop without re-fetching the hash.
+          position.trailing_active = "1"
+          position.trailing_anchor = String(anchor)
+          position.trailing_stop_price = String(newStop)
+          return
+        }
+
+        // Phase 3 — ACTIVE: re-anchor only when price has moved by ≥ step
+        // in the favourable direction. Step is computed against the
+        // STORED anchor (not currentPrice) so a single big tick doesn't
+        // skip over and immediately re-anchor on the next.
+        const stepDistance = anchorStored * stepRatio
+        if (side === "long") {
+          if (currentPrice <= anchorStored + stepDistance) return
+          const newAnchor = currentPrice
+          const newStop = newAnchor * (1 - stopRatio)
+          // Ratchet — never relax the stop downward for longs
+          if (currentTrailingStop > 0 && newStop <= currentTrailingStop) {
+            // Anchor moved but stop didn't tighten meaningfully — write
+            // the anchor only so subsequent steps measure from the new
+            // high. Cheap one-field write.
+            await client.hset(hashKey, {
+              trailing_anchor: String(newAnchor),
+              updated_at: new Date().toISOString(),
+            })
+            position.trailing_anchor = String(newAnchor)
+            return
+          }
+          await client.hset(hashKey, {
+            trailing_anchor: String(newAnchor),
+            trailing_stop_price: String(newStop),
+            updated_at: new Date().toISOString(),
+          })
+          position.trailing_anchor = String(newAnchor)
+          position.trailing_stop_price = String(newStop)
+        } else {
+          if (currentPrice >= anchorStored - stepDistance) return
+          const newAnchor = currentPrice
+          const newStop = newAnchor * (1 + stopRatio)
+          if (currentTrailingStop > 0 && newStop >= currentTrailingStop) {
+            await client.hset(hashKey, {
+              trailing_anchor: String(newAnchor),
+              updated_at: new Date().toISOString(),
+            })
+            position.trailing_anchor = String(newAnchor)
+            return
+          }
+          await client.hset(hashKey, {
+            trailing_anchor: String(newAnchor),
+            trailing_stop_price: String(newStop),
+            updated_at: new Date().toISOString(),
+          })
+          position.trailing_anchor = String(newAnchor)
+          position.trailing_stop_price = String(newStop)
+        }
+        return
+      }
+
+      // ── Legacy single-step path (back-compat) ─────────────────────
+      const stoplossRatio = parseFloat(position.stoploss_ratio || "0")
+      const currentTrailingStop = parseFloat(position.trailing_stop_price || "0")
       const trailingDistance = currentPrice * (stoplossRatio / 100)
 
       let newTrailingStop: number
       if (side === "long") {
         newTrailingStop = currentPrice - trailingDistance
-        // Only move trailing stop UP for longs
         if (newTrailingStop <= currentTrailingStop && currentTrailingStop > 0) return
       } else {
         newTrailingStop = currentPrice + trailingDistance
-        // Only move trailing stop DOWN for shorts
         if (newTrailingStop >= currentTrailingStop && currentTrailingStop > 0) return
       }
 
-      // Update via the position manager's update
-      const client = getRedisClient()
-      await client.hset(`pseudo_position:${this.connectionId}:${position.id}`, {
+      await client.hset(hashKey, {
         trailing_stop_price: String(newTrailingStop),
         updated_at: new Date().toISOString(),
       })

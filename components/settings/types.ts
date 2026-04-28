@@ -34,6 +34,27 @@ export interface Settings {
   baseRatioMax: number
   trailingOption: boolean
 
+  /**
+   * Multi-step trailing for Base Strategies.
+   *
+   * Spec: each enabled (start, stop) combo spawns one INDEPENDENT Base Set
+   * per (indication_type × direction), so the engine evaluates the full
+   * configuration matrix in parallel. Operator can prune the matrix in
+   * Settings → Strategy → Trailing.
+   *
+   * Units: ratios where 0.1 ≡ 10% (decimal of price change).
+   *   trailingStart  ∈ {0.3, 0.6, 0.9, 1.2, 1.5}    (activation gain)
+   *   trailingStop   ∈ {0.1, 0.2, 0.3, 0.4, 0.5}    (trail distance)
+   *   trailingStep   = trailingStop / 2              (derived; ratchet
+   *                                                   minimum increment)
+   *
+   * `strategyBaseTrailingVariants` is a list of "start:stop" tokens
+   * (e.g. "0.3:0.1") — one entry per ENABLED combo. Empty array means
+   * multi-trailing is effectively off even with the master toggle on.
+   */
+  strategyBaseTrailingEnabled: boolean
+  strategyBaseTrailingVariants: string[]
+
   // Main Strategy
   previousPositionsCount: number
   lastStateCount: number
