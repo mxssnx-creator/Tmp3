@@ -421,23 +421,38 @@ export class ConfigSetProcessor {
               const entries = (await client.lrange(setKey, 0, StrategyConfigManager.MAX_POSITIONS - 1)) || []
               for (const entry of entries) {
                 if (!entry) continue
-                // Entries are produced via StrategyConfigManager.serializeSetEntry,
-                // which is "|"-delimited. The result % is the field after `status=...`.
-                // We tolerate both pipe-delimited and JSON-delimited rows so legacy
-                // formats don't poison the aggregate.
-                let resultPct: number = NaN
-                if (entry.startsWith("{")) {
-                  try {
-                    const obj = JSON.parse(entry)
-                    resultPct = Number(obj?.result)
-                  } catch { /* fall through to pipe parse */ }
-                }
-                if (!Number.isFinite(resultPct) && entry.includes("|")) {
-                  // Pipe schema: every field is `key=value` separated by `|`.
-                  // Extract `result=…` directly so we don't depend on positional order.
-                  const m = /(?:^|\|)result=(-?\d+(?:\.\d+)?)/.exec(entry)
-                  if (m) resultPct = Number(m[1])
-                }
+                // ── Closed-only gate (spec: "Main Sets / Pos Coord ones must
+                //    evaluate previous CLOSED pseudo positions, not opened ones") ──
+                //
+                // Entries are produced via `StrategyConfigManager.serializeSetEntry`,
+                // which writes a POSITIONAL "|"-delimited tuple:
+                //   entry_time|symbol|entry_price|take_profit|stop_loss|
+                //   status|result|exit_time|exit_price
+                //
+                // The previous parser tried two branches that never matched
+                // real production rows:
+                //   (1) `JSON.parse` — only legacy payloads use that
+                //   (2) regex `\bresult=…` — assumed key=value pairs that
+                //       this serializer does NOT produce
+                // The result was `resultCount` permanently 0 — and worse,
+                // had parsing succeeded the aggregate would have summed
+                // OPEN positions because the prehistoric fill path appends
+                // `status:"open"` rows alongside `status:"closed"` ones.
+                //
+                // Now: parse with the canonical `StrategyConfigManager.parseEntry`
+                // helper (already used by `getLatestPosition` / `getStats`),
+                // then hard-gate on `status === "closed"`. Floating
+                // mark-to-market PnL on still-open prehistoric trades is
+                // excluded from the aggregate that mirrors into
+                //   strategy_detail:{base|main|real}.avg_profit_factor
+                //   progression:{id}.strategy_{base|main|real}_avg_profit_factor
+                //   prehistoric:{id}.historic_avg_profit_factor
+                // — all of which feed the Main-stage position-factor
+                // coordination layer.
+                const parsed = StrategyConfigManager.parseEntry(String(entry))
+                if (!parsed) continue
+                if (parsed.status !== "closed") continue
+                const resultPct = Number(parsed.result)
                 if (!Number.isFinite(resultPct)) continue
                 if (resultPct > 0) posSum += resultPct
                 else if (resultPct < 0) negAbsSum += Math.abs(resultPct)
