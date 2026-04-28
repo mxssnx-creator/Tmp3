@@ -9,7 +9,11 @@
 // Force module rebuild timestamp: 1712341200000
 const _STRATEGY_BUILD_VERSION = "2.1.0"
 
-import { initRedis, getSettings, getAppSettings, getIndications, createPosition } from "@/lib/redis-db"
+// `getSettings`, `getAppSettings`, `createPosition` no longer imported —
+// they were only consumed by the now-removed per-variant evaluators
+// and direct pseudo-position creator. Live flow imports come exclusively
+// from `StrategyCoordinator` + `PseudoPositionManager`.
+import { initRedis, getIndications } from "@/lib/redis-db"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { StrategyCoordinator } from "@/lib/strategy-coordinator"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
@@ -216,117 +220,32 @@ export class StrategyProcessor {
     }
   }
 
-  /**
-   * Evaluate strategy based on indication
-   */
-  private async evaluateStrategy(symbol: string, indication: any, settings: any): Promise<any> {
-    const strategies: any[] = []
-
-    if (settings.trailingEnabled && indication.profit_factor >= 0.8) {
-      const trailingSignal = this.evaluateTrailingStrategy(indication, settings)
-      if (trailingSignal) strategies.push(trailingSignal)
-    }
-
-    if (settings.blockEnabled && indication.confidence >= 60) {
-      const blockSignal = this.evaluateBlockStrategy(indication, settings)
-      if (blockSignal) strategies.push(blockSignal)
-    }
-
-    if (settings.dcaEnabled && indication.profit_factor >= 0.5) {
-      const dcaSignal = this.evaluateDCAStrategy(indication, settings)
-      if (dcaSignal) strategies.push(dcaSignal)
-    }
-
-    if (strategies.length === 0) return null
-
-    return strategies.sort((a, b) => b.profit_factor - a.profit_factor)[0]
-  }
-
-  private evaluateTrailingStrategy(indication: any, settings: any): any {
-    const direction = indication.metadata?.direction || "long"
-    const baseTP = 1.5 + indication.profit_factor
-    const baseSL = 0.5 + (1 - indication.profit_factor) * 0.5
-
-    return {
-      strategy: "trailing",
-      category: "additional",
-      side: direction,
-      entry_price: indication.value,
-      takeprofit_factor: baseTP,
-      stoploss_ratio: baseSL,
-      profit_factor: indication.profit_factor * 1.2,
-      trailing_enabled: true,
-      trail_start: 1.0,
-      trail_stop: 0.5,
-    }
-  }
-
-  private evaluateBlockStrategy(indication: any, settings: any): any {
-    const direction = indication.metadata?.direction || "long"
-    const confidenceFactor = indication.confidence / 100
-
-    return {
-      strategy: "block",
-      category: "adjust",
-      side: direction,
-      entry_price: indication.value,
-      takeprofit_factor: 1.2 + confidenceFactor,
-      stoploss_ratio: 0.8 - confidenceFactor * 0.3,
-      profit_factor: indication.profit_factor * (0.8 + confidenceFactor * 0.4),
-      trailing_enabled: false,
-      block_size: Math.ceil(confidenceFactor * 5),
-    }
-  }
-
-  private evaluateDCAStrategy(indication: any, settings: any): any {
-    const direction = indication.metadata?.direction || "long"
-
-    return {
-      strategy: "dca",
-      category: "adjust",
-      side: direction,
-      entry_price: indication.value,
-      takeprofit_factor: 2.0,
-      stoploss_ratio: 1.5,
-      profit_factor: indication.profit_factor * 0.9,
-      trailing_enabled: false,
-      dca_levels: 3,
-      dca_spacing: 2.0,
-    }
-  }
-
-  /**
-   * Create pseudo position in Redis
-   */
-  private async createPseudoPosition(
-    symbol: string,
-    indication: any,
-    strategySignal: any,
-    timestamp?: string,
-  ): Promise<void> {
-    try {
-      await createPosition({
-        connection_id: this.connectionId,
-        type: "pseudo",
-        symbol,
-        indication_type: indication.indication_type,
-        side: strategySignal.side,
-        entry_price: strategySignal.entry_price,
-        current_price: strategySignal.entry_price,
-        quantity: 1.0,
-        position_cost: 0.1,
-        takeprofit_factor: strategySignal.takeprofit_factor,
-        stoploss_ratio: strategySignal.stoploss_ratio,
-        profit_factor: strategySignal.profit_factor,
-        trailing_enabled: strategySignal.trailing_enabled,
-        opened_at: timestamp || new Date().toISOString(),
-      })
-
-      console.log(`[v0] Created pseudo position for ${symbol}`)
-    } catch (error) {
-      console.error(`[v0] Failed to create pseudo position for ${symbol}:`, error)
-    }
-  }
+  // ── Removed: per-variant strategy evaluators + direct pseudo-position creator ──
+  //
+  // The legacy methods `evaluateStrategy` / `evaluateTrailingStrategy` /
+  // `evaluateBlockStrategy` / `evaluateDCAStrategy` / `createPseudoPosition`
+  // (and their helper `getStrategySettings`) used to read the operator
+  // toggles `settings.trailingEnabled` / `blockEnabled` / `dcaEnabled` to
+  // decide which variant to instantiate, then create positions directly
+  // via the low-level `createPosition` redis-db helper.
+  //
+  // They have been unreachable since `processStrategy` was rewritten to
+  // delegate the full BASE → MAIN → REAL → LIVE flow to `StrategyCoordinator`,
+  // which:
+  //   1. Decides trailing on/off STATISTICALLY per Set based on the best
+  //      entry's confidence (`bestEntry.confidence >= 0.85` — see
+  //      `lib/strategy-coordinator.ts`), not from any operator toggle.
+  //      This matches the spec: "Trailing, No Trailing handled System
+  //      Internally and Statistically".
+  //   2. Creates positions exclusively through `PseudoPositionManager.createPosition`,
+  //      which gates on (a) the per-Set uniqueness key and (b) the
+  //      `maxActiveBasePseudoPositionsPerDirection` cap (default 1). The
+  //      legacy direct `createPosition` path bypassed BOTH gates and could
+  //      have multiplied positions per direction in a way that violated
+  //      the cap.
+  //
+  // Removing the dead code prevents any future refactor from accidentally
+  // re-wiring the operator-toggle path and re-introducing the bypass.
 
   /**
    * Get active indications from Redis
@@ -389,25 +308,8 @@ export class StrategyProcessor {
     }
   }
 
-  /**
-   * Get strategy settings from Redis
-   */
-  private async getStrategySettings(): Promise<any> {
-    try {
-      // Mirror-aware read: picks up the operator's values whether the UI
-      // wrote them to the canonical (`app_settings`) or legacy
-      // (`all_settings`) hash.
-      const settings = (await getAppSettings()) || {}
-
-      return {
-        minProfitFactor: settings.strategyMinProfitFactor || 0.5,
-        trailingEnabled: settings.trailingEnabled !== false,
-        dcaEnabled: settings.dcaEnabled !== false,
-        blockEnabled: settings.blockEnabled !== false,
-      }
-    } catch (error) {
-      console.error("[v0] Failed to get strategy settings:", error)
-      return { minProfitFactor: 0.5, trailingEnabled: true, dcaEnabled: true, blockEnabled: true }
-    }
-  }
+  // `getStrategySettings` removed alongside the per-variant evaluators —
+  // see the block comment above. Operator toggles for trailing / DCA /
+  // block are NOT consulted on the live path; trailing is now decided
+  // statistically per Set inside `StrategyCoordinator`.
 }
