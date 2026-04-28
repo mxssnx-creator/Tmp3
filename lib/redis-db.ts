@@ -70,10 +70,247 @@ export class InlineLocalRedis {
     this.startPersistence();
   }
 
-  async loadFromDisk(): Promise<boolean> { return false }
-  async startPersistence(): Promise<boolean> { return false }
-  async saveToDisk(): Promise<boolean> { return false }
-  saveToDiskSync(): boolean { return false }
+  // ──────────────────────────────────────────────────────────────────────
+  // Disk persistence (snapshot-based, single instance)
+  // ──────────────────────────────────────────────────────────────────────
+  //
+  // The "local Redis" is in-memory only, so without a snapshot every
+  // deploy / container restart / serverless cold-start wipes EVERYTHING:
+  // connections, settings, progression counters, prehistoric flags.
+  //
+  // This implementation does the simplest thing that survives a restart on
+  // a single warm instance:
+  //   • saveToDisk():       JSON-serialise data, write atomically (tmp + rename)
+  //   • saveToDiskSync():   same, blocking — used in SIGTERM/SIGINT/beforeExit
+  //   • loadFromDisk():     read + restore Maps/Sets; rename corrupt file aside
+  //   • startPersistence(): once-per-process 5-min interval + signal handlers
+  //
+  // Notes:
+  //   • Defaults to `<cwd>/.v0-data/redis-snapshot.json`, falls back to
+  //     `/tmp/v0-redis-snapshot.json` if the cwd path is not writable
+  //     (Vercel serverless restricts writes outside `/tmp`).
+  //   • This is NOT cross-instance durable. Vercel `/tmp` is per warm
+  //     instance; a fresh cold instance starts empty and rebuilds via
+  //     migrations. Swap the body of save/load for Vercel Blob to gain
+  //     cross-instance durability without changing this surface.
+  //   • Browser builds: every entry point exits early via the `process`
+  //     guard so client bundles never pull in `node:fs`. We use dynamic
+  //     `await import("node:fs/promises")` to keep the file's "no static
+  //     fs/path imports" contract (see header comment).
+  //
+  // Failure-mode philosophy: the in-memory store keeps working regardless
+  // of disk failures — the only observable effect of a broken disk is a
+  // single rate-limited warning per minute and no cross-restart recovery.
+
+  private static persistenceTickStarted = false
+  private static signalsAttached = false
+  private static lastSaveErrorWarn = 0
+
+  /** Resolve snapshot path; honours `V0_REDIS_SNAPSHOT_PATH` env override. */
+  private async resolveSnapshotPath(): Promise<{ dir: string; file: string } | null> {
+    if (typeof process === "undefined" || !process.versions?.node) return null
+    try {
+      const path = await import("node:path")
+      const explicit = process.env.V0_REDIS_SNAPSHOT_PATH
+      if (explicit) {
+        return { dir: path.dirname(explicit), file: explicit }
+      }
+      // Prefer cwd/.v0-data; fall back to /tmp in restricted environments.
+      const primary = path.join(process.cwd(), ".v0-data", "redis-snapshot.json")
+      return { dir: path.dirname(primary), file: primary }
+    } catch {
+      return null
+    }
+  }
+
+  /** Fallback: write to `/tmp` when the primary path is read-only. */
+  private async tmpFallbackPath(): Promise<{ dir: string; file: string } | null> {
+    if (typeof process === "undefined" || !process.versions?.node) return null
+    try {
+      const path = await import("node:path")
+      return { dir: "/tmp", file: path.join("/tmp", "v0-redis-snapshot.json") }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Build a JSON-safe snapshot of the in-memory data. We can't JSON-stringify
+   * Maps and Sets directly, so we materialise them as arrays of entries.
+   * Format is versioned (`v: 1`) so future shape changes can migrate cleanly.
+   */
+  private buildSnapshot(): string {
+    const d = this.data
+    return JSON.stringify({
+      v: 1,
+      savedAt: Date.now(),
+      strings: Array.from(d.strings.entries()),
+      hashes: Array.from(d.hashes.entries()),
+      sets: Array.from(d.sets.entries()).map(([k, s]) => [k, Array.from(s)]),
+      lists: Array.from(d.lists.entries()),
+      sorted_sets: Array.from(d.sorted_sets.entries()),
+      ttl: Array.from(d.ttl.entries()),
+    })
+  }
+
+  /** Restore Maps/Sets from a parsed snapshot. Tolerant of partial files. */
+  private applySnapshot(parsed: any): boolean {
+    if (!parsed || typeof parsed !== "object") return false
+    const d = this.data
+    try {
+      if (Array.isArray(parsed.strings))
+        d.strings = new Map(parsed.strings)
+      if (Array.isArray(parsed.hashes))
+        d.hashes = new Map(parsed.hashes)
+      if (Array.isArray(parsed.sets))
+        d.sets = new Map(parsed.sets.map(([k, s]: [string, string[]]) => [k, new Set(s)]))
+      if (Array.isArray(parsed.lists))
+        d.lists = new Map(parsed.lists)
+      if (Array.isArray(parsed.sorted_sets))
+        d.sorted_sets = new Map(parsed.sorted_sets)
+      if (Array.isArray(parsed.ttl))
+        d.ttl = new Map(parsed.ttl)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** Single rate-limited warning per minute so a broken disk doesn't spam logs. */
+  private warnRateLimited(msg: string, err: unknown): void {
+    const now = Date.now()
+    if (now - InlineLocalRedis.lastSaveErrorWarn < 60_000) return
+    InlineLocalRedis.lastSaveErrorWarn = now
+    const detail = err instanceof Error ? err.message : String(err)
+    console.warn(`[v0] [Redis Persistence] ${msg}: ${detail}`)
+  }
+
+  async loadFromDisk(): Promise<boolean> {
+    const target = await this.resolveSnapshotPath()
+    if (!target) return false
+    let fs: typeof import("node:fs/promises")
+    try {
+      fs = await import("node:fs/promises")
+    } catch {
+      return false
+    }
+    // Try primary path, then `/tmp` fallback.
+    const candidates = [target, await this.tmpFallbackPath()].filter(Boolean) as Array<{ file: string }>
+    for (const c of candidates) {
+      try {
+        const raw = await fs.readFile(c.file, "utf8")
+        const parsed = JSON.parse(raw)
+        if (this.applySnapshot(parsed)) {
+          const keys =
+            this.data.strings.size + this.data.hashes.size + this.data.sets.size +
+            this.data.lists.size + this.data.sorted_sets.size
+          console.log(`[v0] [Redis Persistence] Restored ${keys} keys from ${c.file}`)
+          return true
+        }
+        // Parsed but didn't fit — quarantine and continue.
+        try { await fs.rename(c.file, `${c.file}.corrupt-${Date.now()}`) } catch {}
+      } catch (err: any) {
+        if (err?.code === "ENOENT") continue // no snapshot yet
+        if (err instanceof SyntaxError) {
+          // Corrupt JSON — move it aside so we don't keep failing.
+          try { await fs.rename(c.file, `${c.file}.corrupt-${Date.now()}`) } catch {}
+          continue
+        }
+        // Other I/O error — try fallback.
+        continue
+      }
+    }
+    return false
+  }
+
+  async saveToDisk(): Promise<boolean> {
+    const primary = await this.resolveSnapshotPath()
+    if (!primary) return false
+    let fs: typeof import("node:fs/promises")
+    try {
+      fs = await import("node:fs/promises")
+    } catch {
+      return false
+    }
+    const json = this.buildSnapshot()
+    // Try primary then `/tmp` fallback so a read-only cwd doesn't lose data.
+    const candidates = [primary, await this.tmpFallbackPath()].filter(Boolean) as Array<{ dir: string; file: string }>
+    for (const c of candidates) {
+      try {
+        await fs.mkdir(c.dir, { recursive: true })
+        const tmpPath = `${c.file}.tmp`
+        await fs.writeFile(tmpPath, json, "utf8")
+        // Atomic on POSIX — readers either see old or new, never partial.
+        await fs.rename(tmpPath, c.file)
+        return true
+      } catch (err) {
+        // Try next fallback. Only warn after we've exhausted everything.
+        if (c === candidates[candidates.length - 1]) {
+          this.warnRateLimited(`save failed (${c.file})`, err)
+        }
+        continue
+      }
+    }
+    return false
+  }
+
+  /** Synchronous variant for SIGTERM / SIGINT / beforeExit handlers. */
+  saveToDiskSync(): boolean {
+    if (typeof process === "undefined" || !process.versions?.node) return false
+    let fsSync: typeof import("node:fs"), pathMod: typeof import("node:path")
+    try {
+      // require() is fine here because this method only ever runs in Node.
+      // We use dynamic require via Function to bypass static-bundler analysis.
+      const dynamicRequire = Function("m", "return require(m)") as (m: string) => any
+      fsSync = dynamicRequire("node:fs")
+      pathMod = dynamicRequire("node:path")
+    } catch {
+      return false
+    }
+    const explicit = process.env.V0_REDIS_SNAPSHOT_PATH
+    const primaryFile = explicit || pathMod.join(process.cwd(), ".v0-data", "redis-snapshot.json")
+    const tmpFile = pathMod.join("/tmp", "v0-redis-snapshot.json")
+    const json = this.buildSnapshot()
+    for (const file of [primaryFile, tmpFile]) {
+      try {
+        const dir = pathMod.dirname(file)
+        fsSync.mkdirSync(dir, { recursive: true })
+        const tmp = `${file}.tmp`
+        fsSync.writeFileSync(tmp, json, "utf8")
+        fsSync.renameSync(tmp, file)
+        return true
+      } catch {
+        continue
+      }
+    }
+    return false
+  }
+
+  async startPersistence(): Promise<boolean> {
+    if (typeof process === "undefined" || !process.versions?.node) return false
+    if (InlineLocalRedis.persistenceTickStarted) return true
+    InlineLocalRedis.persistenceTickStarted = true
+
+    // 5-minute snapshot tick. unref() so this timer never holds the
+    // process open during a graceful exit.
+    const FIVE_MIN_MS = 5 * 60 * 1000
+    const t = setInterval(() => {
+      this.saveToDisk().catch(() => { /* warned inside saveToDisk */ })
+    }, FIVE_MIN_MS)
+    if (typeof t.unref === "function") t.unref()
+
+    // Flush-on-exit handlers (idempotent).
+    if (!InlineLocalRedis.signalsAttached) {
+      InlineLocalRedis.signalsAttached = true
+      const flush = () => { try { this.saveToDiskSync() } catch {} }
+      // setMaxListeners is a NodeEventEmitter API; guard for ts safety.
+      try { (process as any).setMaxListeners?.(50) } catch {}
+      process.on("SIGTERM", flush)
+      process.on("SIGINT", flush)
+      process.on("beforeExit", flush)
+    }
+    return true
+  }
   
   private startTTLCleanup(): void {
     // DISABLED: Automatic TTL cleanup causing all data to be deleted every 60 seconds
@@ -671,7 +908,10 @@ export async function initRedis(): Promise<void> {
 
   if (!redisInstance) {
     redisInstance = new InlineLocalRedis()
-    await redisInstance.load()
+    // Restore from disk snapshot before any caller reads keys. The
+    // constructor also kicks off a background load, but awaiting here
+    // guarantees migrations + readers see hydrated state on first tick.
+    await redisInstance.loadFromDisk().catch(() => { /* fresh start ok */ })
   }
 
   isConnected = true

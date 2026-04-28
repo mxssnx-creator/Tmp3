@@ -4,15 +4,13 @@
 declare global { var totalStrategiesEvaluated: number }
 ;(globalThis as any).totalStrategiesEvaluated = 0
 
-// Also clear any stale engine timers from previous versions
-const engineGlobal = globalThis as any
-if (engineGlobal.__engine_timers?.size > 0) {
-  console.log(`[v0] [Instrumentation] Clearing ${engineGlobal.__engine_timers.size} stale engine timers`)
-  for (const timer of engineGlobal.__engine_timers) {
-    try { clearInterval(timer) } catch {}
-  }
-  engineGlobal.__engine_timers.clear()
-}
+// NOTE: Previously this module pre-emptively cleared `globalThis.__engine_timers`
+// on every import. That nuked the timer loops of any *live* engine that had
+// already armed itself in the same process — a frequent cause of the
+// "engines silently stop running" symptom on dev hot-reload and on serverless
+// cold-warm transitions. The clear was always destructive and never useful:
+// real timer cleanup belongs to `EngineManager.stop()`. The clear is now
+// removed; in-flight engines keep running across module reload.
 
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") {
@@ -35,8 +33,38 @@ export async function register() {
     console.error("[ERROR_INTEGRATION] Failed to initialize error handling integration:", error)
   }
 
-  // NOTE: Migrations moved to first-request handler to avoid runtime errors
-  // on platforms that don't support instrumentation well (like Vercel)
-  
+  // ──────────────────────────────────────────────────────────────────────
+  // Boot-time core init.
+  //
+  // 1. completeStartup(): initialises Redis (which runs migrations AND
+  //    restores the on-disk snapshot via loadFromDisk) and prepares the
+  //    trade-engine coordinator singleton — without auto-starting any
+  //    engine. Without this hook the coordinator and snapshot only come
+  //    online when someone hits a route, which can be many minutes after
+  //    a redeploy.
+  //
+  // 2. initializeTradeEngineAutoStart(): starts the auto-start MONITOR
+  //    only — it does NOT start engines on its own. The monitor scans for
+  //    connections with `is_enabled_dashboard=1` and (re-)starts ONLY
+  //    those, so disabled connections stay disabled across restarts.
+  //
+  // Failures here are logged but never thrown — boot must not crash the
+  // runtime even if Redis hydration or the coordinator fail. Subsequent
+  // route hits will retry.
+  // ──────────────────────────────────────────────────────────────────────
+  try {
+    const { completeStartup } = await import("@/lib/startup-coordinator")
+    await completeStartup()
+  } catch (error) {
+    console.error("[Instrumentation] completeStartup failed:", error)
+  }
+
+  try {
+    const { initializeTradeEngineAutoStart } = await import("@/lib/trade-engine-auto-start")
+    await initializeTradeEngineAutoStart()
+  } catch (error) {
+    console.error("[Instrumentation] auto-start init failed:", error)
+  }
+
   return
 }
