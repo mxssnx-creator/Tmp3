@@ -56,7 +56,7 @@ export interface StrategySet {
   createdAt: string
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
-  variant?: "default" | "trailing" | "block" | "dca"
+  variant?: "default" | "trailing" | "block" | "dca" | "pause"
 }
 
 export interface StrategySetEntry {
@@ -503,6 +503,7 @@ export class StrategyCoordinator {
       trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+      pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
     }
     for (const set of mainSets) {
       const setVariant = set.variant ?? (set.entries[0] ? classifyVariant(set.entries[0]) : "default")
@@ -617,7 +618,7 @@ export class StrategyCoordinator {
       // Using hincrby for the counters keeps them append-only and crash-safe.
       // The derived averages are rewritten as hset after each accumulation so
       // the stats API can read them directly without recomputing on the fly.
-      for (const variant of ["default", "trailing", "block", "dca"] as const) {
+      for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
         const agg = variantAgg[variant]
         if (agg.entries === 0) continue
 
@@ -642,7 +643,7 @@ export class StrategyCoordinator {
       // full lifetime of the run rather than just the current cycle.
       try {
         const recompute: Promise<any>[] = []
-        for (const variant of ["default", "trailing", "block", "dca"] as const) {
+        for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
           const agg = variantAgg[variant]
           if (agg.entries === 0) continue
           const vKey = `strategy_variant:${this.connectionId}:${variant}`
@@ -680,7 +681,7 @@ export class StrategyCoordinator {
 
     if (baseSets.length > 0) {
       const sample = baseSets[0]
-      const variantBreakdown = ["default", "trailing", "block", "dca"]
+      const variantBreakdown = ["default", "trailing", "block", "dca", "pause"]
         .map((v) => `${v[0]}=${mainSets.filter((s) => s.variant === v).length}`)
         .join(",")
       console.log(
@@ -801,6 +802,7 @@ export class StrategyCoordinator {
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
+        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0, passedSets: 0 },
       }
       for (const set of realSets) {
         const setVariant = (set.variant as keyof typeof realVariantAgg) ?? "default"
@@ -812,7 +814,7 @@ export class StrategyCoordinator {
           realVariantAgg[setVariant].sumDDT  += Number(entry.drawdownTime || 0)
         }
       }
-      for (const variant of ["default", "trailing", "block", "dca"] as const) {
+      for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
         const agg = realVariantAgg[variant]
         if (agg.entries === 0) continue
         const vKey = `strategy_variant_real:${this.connectionId}:${variant}`
@@ -832,7 +834,7 @@ export class StrategyCoordinator {
       // so the stats API can read them without recomputing.
       try {
         const recompute: Promise<any>[] = []
-        for (const variant of ["default", "trailing", "block", "dca"] as const) {
+        for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
           if (realVariantAgg[variant].entries === 0) continue
           const vKey = `strategy_variant_real:${this.connectionId}:${variant}`
           recompute.push(
@@ -954,6 +956,7 @@ export class StrategyCoordinator {
         trailing: { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         block:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
         dca:      { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
+        pause:    { sumPF: 0, sumDDT: 0, entries: 0, setsContaining: 0 },
       }
       for (const set of qualifying) {
         const variant = (set.variant as keyof typeof liveVariantAgg) ?? "default"
@@ -966,7 +969,7 @@ export class StrategyCoordinator {
       }
 
       const liveVariantWrites: Promise<any>[] = []
-      for (const variant of ["default", "trailing", "block", "dca"] as const) {
+      for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
         const agg = liveVariantAgg[variant]
         if (agg.entries === 0) continue
         const vKey = `strategy_variant_live:${this.connectionId}:${variant}`
@@ -1358,9 +1361,14 @@ export class StrategyCoordinator {
           if (pnl < 0) prevLosses++
           lastN.push({ closedAt, pnl })
         }
-        // Keep the 5 most recently closed for the "last-N" breakdown
+        // Keep the 8 most recently closed for the "last-N" breakdown.
+        // Spec: Pause variant validates against the last 1-8 positions
+        // (step 1) — each lookback window N feeds one Pause sub-config.
+        // The remaining gates (`trailing.lastWins >= 2`, etc.) only ever
+        // need the top of this list, so the wider window is essentially
+        // free for them.
         lastN.sort((a, b) => b.closedAt - a.closedAt)
-        lastN.length = Math.min(lastN.length, 5)
+        lastN.length = Math.min(lastN.length, 8)
       } catch { /* best-effort; fall through with zeros */ }
 
       const ctx: PositionContext = {
@@ -1434,7 +1442,7 @@ export class StrategyCoordinator {
    *   dca      — recent losses to recover with averaged entries
    */
   private variantProfiles(): Array<{
-    name: "default" | "trailing" | "block" | "dca"
+    name: "default" | "trailing" | "block" | "dca" | "pause"
     gate: (ctx: PositionContext) => boolean
     configs: Array<{ size: number; leverage: number; state: string; pfBias: number; ddtBias: number }>
   }> {
@@ -1472,6 +1480,32 @@ export class StrategyCoordinator {
           { size: 0.5, leverage: 1, state: "close",  pfBias: 0.95, ddtBias: 30 },
         ],
       },
+      {
+        // ── Pause variant — 1..8 last-position validation windows (step 1) ──
+        // Spec: *"add Pause 1-8 Pos step 1 to Main additional Sets creation
+        // after Pos prev,Last,cont .. add the 1-8 Last for counting Pause of
+        // validating."* Each sub-config encodes one validation lookback N
+        // (the last N closed positions) — when at least one of them was a
+        // loser the Pause Set throttles back the next entry. The 8 sub-
+        // configs ramp size DOWN and DDT-bias UP as the pause window
+        // widens, so a deeper-history pause produces a more conservative
+        // entry config than a shallow-history one. Gate fires whenever
+        // there is ≥1 closed position to validate against; the closed-only
+        // lookback enforced by `getPositionContext` (P2-1) means floating
+        // mark-to-market PnL never leaks into this trigger.
+        name: "pause",
+        gate: (c) => c.lastPosCount >= 1,
+        configs: [
+          { size: 0.90, leverage: 1, state: "new", pfBias: 1.00, ddtBias: 5  }, // last 1
+          { size: 0.85, leverage: 1, state: "new", pfBias: 1.00, ddtBias: 10 }, // last 2
+          { size: 0.80, leverage: 1, state: "new", pfBias: 1.01, ddtBias: 15 }, // last 3
+          { size: 0.75, leverage: 1, state: "new", pfBias: 1.02, ddtBias: 20 }, // last 4
+          { size: 0.70, leverage: 1, state: "new", pfBias: 1.03, ddtBias: 25 }, // last 5
+          { size: 0.65, leverage: 1, state: "new", pfBias: 1.04, ddtBias: 30 }, // last 6
+          { size: 0.60, leverage: 1, state: "new", pfBias: 1.05, ddtBias: 35 }, // last 7
+          { size: 0.55, leverage: 1, state: "new", pfBias: 1.06, ddtBias: 40 }, // last 8
+        ],
+      },
     ]
   }
 
@@ -1506,20 +1540,24 @@ export class StrategyCoordinator {
    */
   private variantFingerprint(
     baseSet: StrategySet,
-    variant: "default" | "trailing" | "block" | "dca",
+    variant: "default" | "trailing" | "block" | "dca" | "pause",
     ctx: PositionContext,
   ): string {
     const bPF = Math.round(baseSet.avgProfitFactor * 10) / 10
     const bEC = baseSet.entryCount
     // Clamp each context dimension to its spec maximum.
     // cont is live-open by spec; the other four are closed-only via
-    // the P2-1 gate in getPositionContext.
+    // the P2-1 gate in getPositionContext. lastPosCount is the Pause
+    // variant's primary discriminator (1..8 windows) — adding it to the
+    // fingerprint guarantees a 3-loss / 5-loss / 8-loss pause produce
+    // distinct cached Sets instead of collapsing into the same bucket.
     const cont = Math.min(10, Math.max(0, ctx.continuousCount))
     const lW   = Math.min(4,  Math.max(0, ctx.lastWins))
     const lL   = Math.min(4,  Math.max(0, ctx.lastLosses))
+    const lP   = Math.min(8,  Math.max(0, ctx.lastPosCount))
     const pP   = Math.min(12, Math.max(0, ctx.prevPosCount))
     const pL   = Math.min(12, Math.max(0, ctx.prevLosses))
-    const bCtx = `c${cont}/lw${lW}/ll${lL}/pp${pP}/pl${pL}`
+    const bCtx = `c${cont}/lw${lW}/ll${lL}/lp${lP}/pp${pP}/pl${pL}`
     return `${baseSet.setKey}#${variant}#pf=${bPF}#ec=${bEC}#ctx=${bCtx}`
   }
 
