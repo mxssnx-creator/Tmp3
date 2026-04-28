@@ -379,6 +379,143 @@ export class ConfigSetProcessor {
       durationMs: result.duration,
     })
 
+    // ── Aggregate per-stage avg profit factor from prehistoric positions ──
+    //
+    // The realtime strategy-coordinator writes
+    // `strategy_detail:{connId}:{base|main|real}.avg_profit_factor` once it
+    // starts running. During pure prehistoric processing those keys stay
+    // empty, so the dashboard's Base/Main/Real PF tiles read 0/— even
+    // though we just generated thousands of historic positions with full
+    // PnL data. Spec ask: "Show / Add also Average Profitfactors for
+    // Strategies Base, Main, Real (for Historic Processing Info / Stats)."
+    //
+    // We compute one aggregate PF over all prehistoric position results
+    // and mirror it into the three stage hashes. Per-stage tiering does
+    // not exist in the prehistoric data model (StrategyConfig has no
+    // tier field), so the same aggregate is written across all three;
+    // once the realtime strategy-coordinator runs, its tier-specific
+    // writes naturally overwrite these prehistoric placeholders. We use
+    // SETNX-style logic via plain HSET because callers downstream
+    // already accept the field whenever it is present.
+    //
+    // PF = sum(positive results %) / |sum(negative results %)|.
+    // Capped at 9.999 so a no-loss prehistoric run renders cleanly.
+    try {
+      let posSum = 0
+      let negAbsSum = 0
+      let resultCount = 0
+      const tStart = Date.now()
+      // Cap concurrency on the hot prehistoric path — for very large
+      // strategy config counts we don't want to fan out an unbounded
+      // number of LRANGE commands at once.
+      const PF_SCAN_CONCURRENCY = 16
+      const queue = strategyConfigs.slice()
+      const workers: Promise<void>[] = []
+      for (let w = 0; w < Math.min(PF_SCAN_CONCURRENCY, queue.length); w++) {
+        workers.push((async () => {
+          while (true) {
+            const cfg = queue.shift()
+            if (!cfg) return
+            try {
+              const setKey = `strategy:${this.connectionId}:config:${cfg.id}:positions`
+              const entries = (await client.lrange(setKey, 0, StrategyConfigManager.MAX_POSITIONS - 1)) || []
+              for (const entry of entries) {
+                if (!entry) continue
+                // Entries are produced via StrategyConfigManager.serializeSetEntry,
+                // which is "|"-delimited. The result % is the field after `status=...`.
+                // We tolerate both pipe-delimited and JSON-delimited rows so legacy
+                // formats don't poison the aggregate.
+                let resultPct: number = NaN
+                if (entry.startsWith("{")) {
+                  try {
+                    const obj = JSON.parse(entry)
+                    resultPct = Number(obj?.result)
+                  } catch { /* fall through to pipe parse */ }
+                }
+                if (!Number.isFinite(resultPct) && entry.includes("|")) {
+                  // Pipe schema: every field is `key=value` separated by `|`.
+                  // Extract `result=…` directly so we don't depend on positional order.
+                  const m = /(?:^|\|)result=(-?\d+(?:\.\d+)?)/.exec(entry)
+                  if (m) resultPct = Number(m[1])
+                }
+                if (!Number.isFinite(resultPct)) continue
+                if (resultPct > 0) posSum += resultPct
+                else if (resultPct < 0) negAbsSum += Math.abs(resultPct)
+                resultCount++
+              }
+            } catch (err) {
+              console.warn(
+                `[v0] [ConfigSetProcessor] PF scan failed for ${cfg.id}:`,
+                err instanceof Error ? err.message : String(err),
+              )
+            }
+          }
+        })())
+      }
+      await Promise.all(workers)
+
+      // Compute PF only when we actually saw closed positions on both
+      // sides, otherwise the value is meaningless and we leave the field
+      // alone (downstream realtime writers will populate it later).
+      if (resultCount > 0 && (posSum > 0 || negAbsSum > 0)) {
+        const rawPF = negAbsSum > 0 ? posSum / negAbsSum : 9.999 // all-wins ceiling
+        const aggregatePF = Math.min(9.999, Math.max(0, rawPF))
+        const pfStr = aggregatePF.toFixed(4)
+        const stageWrites: Promise<any>[] = []
+        for (const stage of ["base", "main", "real"] as const) {
+          const stageKey = `strategy_detail:${this.connectionId}:${stage}`
+          stageWrites.push(
+            client.hset(stageKey, {
+              avg_profit_factor: pfStr,
+              // Mark provenance so anyone debugging the dashboard can tell
+              // this PF was synthesised from prehistoric positions and not
+              // from realtime strategy-coordinator. Cleared on the first
+              // realtime write because that flow doesn't set this field.
+              avg_profit_factor_source: "prehistoric_aggregate",
+              avg_profit_factor_count: String(resultCount),
+              avg_profit_factor_calc_at: new Date().toISOString(),
+            }),
+          )
+          stageWrites.push(client.expire(stageKey, 86400))
+          // Also mirror into the canonical progression hash so the
+          // legacy fallback chain in the /stats route can find it
+          // even if the per-stage detail hash is unreadable for any
+          // reason. Stage-specific keys avoid clobbering the
+          // realtime writer's own writes.
+          stageWrites.push(
+            client.hset(`progression:${this.connectionId}`, {
+              [`strategy_${stage}_avg_profit_factor`]: pfStr,
+            }),
+          )
+        }
+        // Single overall key for the dashboard's "Historic PF" surface.
+        stageWrites.push(
+          client.hset(`prehistoric:${this.connectionId}`, {
+            historic_avg_profit_factor: pfStr,
+            historic_avg_profit_factor_count: String(resultCount),
+            historic_avg_profit_factor_at: new Date().toISOString(),
+          }),
+        )
+        await Promise.all(stageWrites)
+        console.log(
+          `[v0] [ConfigSetProcessor] Historic PF aggregated: ${pfStr} ` +
+          `(across ${resultCount} positions, +${posSum.toFixed(2)}% / ` +
+          `-${negAbsSum.toFixed(2)}%, ${Date.now() - tStart}ms)`,
+        )
+      } else {
+        console.log(
+          `[v0] [ConfigSetProcessor] Historic PF skipped — no closed positions ` +
+          `(scan ${Date.now() - tStart}ms)`,
+        )
+      }
+    } catch (err) {
+      // Aggregate PF is a UX nicety — never fail the prehistoric run.
+      console.warn(
+        `[v0] [ConfigSetProcessor] Historic PF aggregation failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
+
     // Flip `prehistoric_phase_active` to "false" and refresh last_update.
     // Downstream readers (verify-engine API, progression stats API, the
     // dashboard prehistoric card) use this as the authoritative "historical

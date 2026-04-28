@@ -389,9 +389,29 @@ export function ActiveConnectionCard({
         )
         if (!res.ok) return
         const data = await res.json()
+        // Cycles label in the header should report the real interval-
+        // frame count — every loop tick the indication processor fired
+        // since the engine started — NOT the "live cycle" subset that
+        // only counts ticks which actually generated indications. The
+        // user reported "showing very Low number or Just '1'" which is
+        // exactly what `indicationCycles` (= live || churn) does on a
+        // freshly started engine that has not yet produced any indication
+        // (e.g. during prehistoric warmup). We now read the explicit
+        // churn counter from `cycleCounters.indication`, falling through
+        // to the older shapes for backwards compat with the previous
+        // payload.
+        const cc = data.realtime?.cycleCounters || {}
         setLiveStats({
-          indicationCycles: data.realtime?.indicationCycles  || data.indicationCycleCount  || 0,
-          strategyCycles:   data.realtime?.strategyCycles    || data.strategyCycleCount    || 0,
+          indicationCycles:
+            Number(cc.indication) ||
+            data.realtime?.indicationCycles ||
+            data.indicationCycleCount ||
+            0,
+          strategyCycles:
+            Number(cc.strategy) ||
+            data.realtime?.strategyCycles ||
+            data.strategyCycleCount ||
+            0,
           indications:      data.realtime?.indicationsTotal  || data.totalIndicationsCount || 0,
           strategies:       data.realtime?.strategiesTotal   || data.totalStrategyCount    || 0,
           positions:        data.realtime?.positionsOpen     || data.positionsCount        || 0,
@@ -539,7 +559,23 @@ export function ActiveConnectionCard({
   }
 
   const phase = progression?.phase || "idle"
-  const progress = progression?.progress || 0
+  // Override the engine's coarse phase progress with the live prehistoric
+  // symbols-processed percent while we're in `prehistoric_data`. The
+  // engine sets the phase to 15% the moment it enters that phase and
+  // doesn't touch it again until the realtime processor takes over —
+  // resulting in a progress bar that looks frozen for minutes during
+  // a long historic load. Spec ask: "Show Correct Progress Bar (with
+  // Percentage) for PreHistoric Calculations within UIs".
+  //
+  // Falls back to the engine's value when:
+  //   • the prehistoric percent is 0 (nothing to render yet), or
+  //   • we're in any other phase (engine progress is correct elsewhere).
+  const enginePhaseProgress = progression?.progress || 0
+  const prehistoricPercent = progression?.prehistoricProgress?.percentComplete ?? 0
+  const progress =
+    phase === "prehistoric_data" && prehistoricPercent > 0
+      ? prehistoricPercent
+      : enginePhaseProgress
   const isRunning = phase === "live_trading"
   const isStarting = phase !== "idle" && phase !== "stopped" && phase !== "live_trading" && phase !== "error" && progress < 100
   const hasError = phase === "error"
@@ -1095,7 +1131,21 @@ export function ActiveConnectionCard({
                     )}
 
                     {/* Strategy stages breakdown */}
-                    {prehistoricStats && (prehistoricStats.stratBase > 0 || prehistoricStats.stratMain > 0 || prehistoricStats.stratReal > 0 || prehistoricStats.livePositionsCreated > 0) && (
+                    {prehistoricStats && (
+                      prehistoricStats.stratBase > 0 ||
+                      prehistoricStats.stratMain > 0 ||
+                      prehistoricStats.stratReal > 0 ||
+                      prehistoricStats.livePositionsCreated > 0 ||
+                      // Also surface the section during pure prehistoric
+                      // processing — the historic PF aggregate is written
+                      // even before any Set is "created" in the realtime
+                      // sense, so we open the section when any stage's PF
+                      // is non-zero. See historic PF block in
+                      // lib/trade-engine/config-set-processor.ts.
+                      prehistoricStats.avgProfitFactorBase > 0 ||
+                      prehistoricStats.avgProfitFactorMain > 0 ||
+                      prehistoricStats.avgProfitFactorReal > 0
+                    ) && (
                       <div className="space-y-1">
                         <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Strategy Sets</div>
                         {/* Stage rows: Base → Main → Real → Live (exchange-side outcomes) */}
@@ -1155,7 +1205,16 @@ export function ActiveConnectionCard({
                             isLive: true,
                           },
                         ].map(({ label, count, evaluated, passed, passRatio, avgPF, avgDDT, avgPosEval, countPosEval, color, isLive }) => (
-                          count > 0 && (
+                          // Render the row whenever ANY metric for the stage
+                          // has data — count, evaluated/passed, OR an avg
+                          // profit factor. Previously this was gated on
+                          // `count > 0`, which hid Base/Main/Real PF entirely
+                          // during pure prehistoric processing (set count is
+                          // populated by realtime strategy-coordinator only,
+                          // but the PF aggregate is now also written by the
+                          // prehistoric path — see config-set-processor's
+                          // historic PF aggregation block).
+                          (count > 0 || evaluated > 0 || avgPF > 0) && (
                             <div key={label} className="space-y-0.5">
                               {/* Main row: label, sets/positions count, pass/fill ratio, PF */}
                               <div className="flex items-center gap-2 text-[10px]">

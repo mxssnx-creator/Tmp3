@@ -1036,6 +1036,18 @@ export async function GET(
           realtime:         realtimeCycles,
           realtimeLive:     liveRealtimeCycles,
         },
+        // ── Pseudo-position mark-to-market visibility ────────────────
+        // Cumulative counters written by RealtimeProcessor.processRealtimeUpdates
+        // on every tick that touched ≥1 open pseudo-position. Lets the
+        // dashboard prove the "open positions are recalculated INDEPENDENT
+        // of indication/strategy" invariant — independent of indication/
+        // strategy cycle counters above.
+        pseudoPositionUpdates: {
+          totalUpdates:     n(progHash.pseudo_positions_updated_count),
+          updateCycles:     n(progHash.pseudo_positions_update_cycles),
+          lastUpdateAt:     progHash.pseudo_positions_last_update_at || null,
+          lastBatchSize:    n(progHash.pseudo_positions_last_count),
+        },
         // Cross-processor cumulative tick total — independent of the
         // per-Set 250-entry DB cap. Counts every loop tick across all
         // three processors since the engine started.

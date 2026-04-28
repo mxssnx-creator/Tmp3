@@ -268,6 +268,40 @@ export class RealtimeProcessor {
           this.processPosition(position, prehistoricReady),
         ),
       )
+
+      // ── Cross-tick visibility for the "open positions are being
+      //    handled independent of indication/strategy" guarantee ─────
+      // Spec: open pseudo positions inside the multiple Sets must get
+      // mark-to-market refreshed on EVERY realtime cycle, before/
+      // independent of indication+strategy ticks. We already do that
+      // above (this is the only writer of `updatePosition` inside
+      // trade-engine — verified by grep), but the dashboard needed a
+      // way to *see* that it was firing without sampling individual
+      // position hashes. We surface two atomic counters:
+      //
+      //   pseudo_positions_updated_count : cumulative position-tick events
+      //                                    (= sum of `updates` across ticks)
+      //   pseudo_positions_update_cycles : cumulative realtime cycles that
+      //                                    actually touched ≥1 position
+      //
+      // These are independent of the existing realtime_*_cycle_count
+      // family (which tracks tick existence regardless of work).
+      try {
+        const client = getRedisClient()
+        const progKey = `progression:${this.connectionId}`
+        await Promise.all([
+          client.hincrby(progKey, "pseudo_positions_updated_count", count),
+          client.hincrby(progKey, "pseudo_positions_update_cycles", 1),
+          client.hset(progKey, {
+            pseudo_positions_last_update_at: new Date().toISOString(),
+            pseudo_positions_last_count: String(count),
+          }),
+          client.expire(progKey, 7 * 24 * 60 * 60),
+        ])
+      } catch {
+        // Non-critical visibility metric — never break the realtime loop.
+      }
+
       return { updates: count }
     } catch (error) {
       console.error("[v0] Failed to process realtime updates:", error)
