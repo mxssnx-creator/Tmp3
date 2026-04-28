@@ -693,6 +693,57 @@ export async function GET(
     )
     const indTotal = Object.values(indCounts).reduce((s, v) => s + v, 0) || indicationsTotal
 
+    // ── ACTIVE-NOW aggregation: indications + strategies ───────────────
+    // The cumulative `indCounts` / `stratCounts` above answer "how many
+    // were ever created since the run started". The dashboard Overview
+    // also needs "how many are alive RIGHT NOW" — i.e. passing their
+    // thresholds on the latest cycle. The engine writes per-cycle
+    // overwrites into:
+    //
+    //   indications_active:{connId} hash (fields: "{symbol}:{type}")
+    //   strategies_active:{connId}  hash (fields: "{symbol}:{stage}")
+    //
+    // We hgetall both, then aggregate by type / stage. If the engine
+    // never wrote (e.g. fresh run, no symbols yet) the hashes are empty
+    // and all activeCounts come back zero — exactly the right "nothing
+    // alive" semantic for the UI.
+    const activeIndByType: Record<string, number> = {
+      direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
+    }
+    const activeStratByStage: Record<string, number> = {
+      base: 0, main: 0, real: 0,
+    }
+    try {
+      const [indActiveHash, stratActiveHash] = await Promise.all([
+        client.hgetall(`indications_active:${connectionId}`).catch(() => null),
+        client.hgetall(`strategies_active:${connectionId}`).catch(() => null),
+      ])
+      if (indActiveHash && typeof indActiveHash === "object") {
+        for (const [field, val] of Object.entries(indActiveHash)) {
+          // field shape: "{symbol}:{type}" — split on the LAST colon so
+          // symbols containing colons (none today, but future-proof) survive.
+          const idx = field.lastIndexOf(":")
+          if (idx <= 0) continue
+          const type = field.slice(idx + 1)
+          if (type in activeIndByType) {
+            activeIndByType[type] += n(val)
+          }
+        }
+      }
+      if (stratActiveHash && typeof stratActiveHash === "object") {
+        for (const [field, val] of Object.entries(stratActiveHash)) {
+          const idx = field.lastIndexOf(":")
+          if (idx <= 0) continue
+          const stage = field.slice(idx + 1)
+          if (stage in activeStratByStage) {
+            activeStratByStage[stage] += n(val)
+          }
+        }
+      }
+    } catch { /* non-critical: dashboard falls back to cumulative */ }
+    const activeIndTotal = Object.values(activeIndByType).reduce((s, v) => s + v, 0)
+    const activeStratTotal = activeStratByStage.base + activeStratByStage.main + activeStratByStage.real
+
     // Strategy per-stage counts
     const stratTypes = ["base", "main", "real", "live"] as const
     const stratCounts: Record<string, number> = {}
@@ -731,7 +782,13 @@ export async function GET(
     //
     // We surface these alongside the stage-level detail so the dashboard can
     // show "Avg PF / Avg DDT per variant" over the lifetime of the run.
-    const variantKeys = ["default", "trailing", "block", "dca"] as const
+    // ── PAUSE VARIANT ────────────────────────────────────────────────
+    // The Real stage and StrategyCoordinator both write a 5th variant
+    // bucket — `pause` — for entries placed under the global pause-axis
+    // ratio config. The previous `variantKeys` list dropped this row so
+    // the dashboard quietly missed the count. Adding it here surfaces
+    // those entries in `strategyVariants.pause` of the response.
+    const variantKeys = ["default", "trailing", "block", "dca", "pause"] as const
     const variantDetail: Record<string, Record<string, number>> = {}
     await Promise.all(
       variantKeys.map(async (variant) => {
@@ -1113,6 +1170,32 @@ export async function GET(
           baseEvaluated: stratEvaluated.base || 0,
           mainEvaluated: stratEvaluated.main || 0,
           realEvaluated: stratEvaluated.real || 0,
+        },
+      },
+
+      // ── CURRENTLY-ACTIVE counts (per cycle, not cumulative) ───────────
+      // The Overview surfaces these as the headline numbers because the
+      // operator wants to see what's alive RIGHT NOW — not "how many
+      // were ever created since boot". Engine writers overwrite the
+      // backing hashes once per cycle so these values track live state.
+      // See engine writers in:
+      //   - lib/indication-sets-processor.ts → indications_active:{id}
+      //   - lib/strategy-coordinator.ts      → strategies_active:{id}
+      activeCounts: {
+        indications: {
+          direction:      activeIndByType.direction        || 0,
+          move:           activeIndByType.move             || 0,
+          active:         activeIndByType.active           || 0,
+          activeAdvanced: activeIndByType.active_advanced  || 0,
+          optimal:        activeIndByType.optimal          || 0,
+          auto:           activeIndByType.auto             || 0,
+          total:          activeIndTotal,
+        },
+        strategies: {
+          base:  activeStratByStage.base  || 0,
+          main:  activeStratByStage.main  || 0,
+          real:  activeStratByStage.real  || 0,
+          total: activeStratTotal,
         },
       },
 

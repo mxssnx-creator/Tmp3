@@ -505,6 +505,20 @@ export class StrategyCoordinator {
         writes.push(client.hincrby(redisKey, "strategies_base_total", baseSets.length))
         writes.push(client.hincrby(redisKey, "strategies_base_evaluated", baseSets.length))
       }
+
+      // ── ACTIVE-NOW snapshot per (symbol, stage) ───────────────────────
+      // The cumulative `strategies_base_total` hincrby above answers
+      // "how many Base Sets have been created EVER", but the dashboard
+      // Overview asks "how many are alive RIGHT NOW for this symbol".
+      // We overwrite a single field per (symbol, stage) every cycle so
+      // the latest value is always the most recent count. The stats API
+      // hgetalls this hash and aggregates by stage.
+      writes.push(
+        client.hset(`strategies_active:${this.connectionId}`, {
+          [`${symbol}:base`]: String(baseSets.length),
+        }),
+        client.expire(`strategies_active:${this.connectionId}`, 600),
+      )
       await Promise.all(writes)
     } catch { /* non-critical */ }
 
@@ -898,6 +912,19 @@ export class StrategyCoordinator {
       } catch { /* non-critical */ }
     } catch { /* non-critical */ }
 
+    // ── ACTIVE-NOW snapshot for Main stage ────────────────────────────
+    // Same pattern as createBaseSets — single field per (symbol, stage)
+    // overwritten per cycle. Done here BEFORE the early-return path
+    // below so a Main run that produces 0 Sets correctly clears the
+    // previous cycle's value.
+    try {
+      const _client = getRedisClient()
+      await _client.hset(`strategies_active:${this.connectionId}`, {
+        [`${symbol}:main`]: String(mainSets.length),
+      })
+      await _client.expire(`strategies_active:${this.connectionId}`, 600)
+    } catch { /* non-critical */ }
+
     // `failedEvaluation` counts Base Sets that were rejected by the validation
     // filter. When a single Base Set produces multiple related variant Sets
     // (default + trailing + block …) we still want the pass/fail accounting
@@ -955,11 +982,24 @@ export class StrategyCoordinator {
 
     // P0-2: Real filter axes are PF-min + DDT-max ONLY. Confidence is
     // advisory metadata and is not part of the filter predicate.
-    const realSets = mainSets.filter(
+    const realQualifying = mainSets.filter(
       (s) =>
         s.avgProfitFactor >= metrics.minProfitFactor &&
         s.avgDrawdownTime <= metrics.maxDrawdownTime,
     )
+
+    // ── PRIORITY SORT: better Sets first ──────────────────────────────
+    // Per user spec: "arrange so that better Sets have priority". We sort
+    // descending by `avgProfitFactor` — the same metric Live uses for its
+    // top-N selection at line 1140 — so when the downstream Live stage
+    // (and any per-direction Pos limit) takes the head of the list it
+    // gets the highest-quality Sets first. The `maxRealSets` config cap
+    // is applied AFTER sorting so the trim keeps the best ones.
+    const realSorted = [...realQualifying].sort(
+      (a, b) => b.avgProfitFactor - a.avgProfitFactor,
+    )
+    const maxRealSets = (this.config as any).maxRealSets || 1000
+    const realSets = realSorted.slice(0, maxRealSets)
 
     // Debug: show why sets failed REAL filter
     if (mainSets.length > 0 && realSets.length === 0) {
@@ -1015,6 +1055,18 @@ export class StrategyCoordinator {
       ]
       if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", mainSets.length))
       if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realSets.length))
+
+      // ── ACTIVE-NOW snapshot for Real stage ──────────────────────────
+      // Mirrors the Base/Main pattern. The dashboard reads this hash and
+      // aggregates to a "Strategies (Real, alive now)" tile. Note this
+      // is the COUNT-AFTER-SORT-AND-CAP, i.e. exactly what propagates
+      // forward to Live evaluation — not the raw post-filter count.
+      writes.push(
+        client.hset(`strategies_active:${this.connectionId}`, {
+          [`${symbol}:real`]: String(realSets.length),
+        }),
+        client.expire(`strategies_active:${this.connectionId}`, 600),
+      )
 
       // ── P1-1: Real-stage per-variant aggregation ────────────────────
       // Same shape as Main's `variantAgg` but computed over the Real

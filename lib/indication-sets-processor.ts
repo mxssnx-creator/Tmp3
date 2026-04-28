@@ -322,6 +322,34 @@ export class IndicationSetsProcessor {
         (activeResults?.qualified || 0) +
         (optimalResults?.qualified || 0)
 
+      // ── ACTIVE-VALID indication snapshot (per cycle, per (symbol, type)) ──
+      // The legacy `:count` keys are CUMULATIVE (hincrby every commit). The
+      // dashboard "Overview" needs a *current* count: how many indications of
+      // each type are passing their thresholds RIGHT NOW. We overwrite a
+      // single hash field per (symbol, type) on every cycle so the most
+      // recent qualified count for that pair is always the one read.
+      //
+      //   indications_active:{connectionId} → hash
+      //     fields: "{symbol}:direction", "{symbol}:move", "{symbol}:active",
+      //             "{symbol}:active_advanced", "{symbol}:optimal"
+      //
+      // The stats API hgetalls this hash and aggregates by type — fields are
+      // O(symbols × types) total which is small (≤ 5 × 5 = 25 fields). TTL
+      // is short so a stopped engine doesn't leave stale "active" rows
+      // forever; the next cycle naturally refreshes them.
+      try {
+        const { getRedisClient: _getRedis } = await import("@/lib/redis-db")
+        const client = _getRedis()
+        const activeKey = `indications_active:${this.connectionId}`
+        await client.hset(activeKey, {
+          [`${symbol}:direction`]: String(directionResults?.qualified ?? 0),
+          [`${symbol}:move`]:      String(moveResults?.qualified      ?? 0),
+          [`${symbol}:active`]:    String(activeResults?.qualified    ?? 0),
+          [`${symbol}:optimal`]:   String(optimalResults?.qualified   ?? 0),
+        })
+        await client.expire(activeKey, 600) // 10 min — engine refreshes each cycle
+      } catch { /* non-critical: dashboard falls back to cumulative */ }
+
       if (totalQualified > 0) {
         console.log(
           `[v0] [IndicationSets] ${symbol}: COMPLETE in ${duration}ms | Direction=${directionResults?.qualified}/${directionResults?.total} Move=${moveResults?.qualified}/${moveResults?.total} Active=${activeResults?.qualified}/${activeResults?.total} Optimal=${optimalResults?.qualified}/${optimalResults?.total}`

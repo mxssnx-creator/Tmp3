@@ -15,6 +15,24 @@ interface CompactStats {
   stratMain: number
   stratReal: number
   stratLive: number
+  // ── ACTIVE-NOW counters (per cycle, not cumulative) ─────────────────
+  // Headline tiles show these as the primary number — "what's alive
+  // RIGHT NOW" is what the operator wants to see at a glance. The
+  // cumulative `*Total` numbers above remain as the smaller subtext.
+  // Source: stats response → `activeCounts.{indications,strategies}`.
+  // Indications are split per-type so the operator can see WHICH type
+  // is currently producing signal (Direction vs Move vs Active vs
+  // Optimal). Strategies are split per-stage (Base/Main/Real) — the
+  // same ones the engine pipeline tracks.
+  activeIndDirection: number
+  activeIndMove: number
+  activeIndActive: number
+  activeIndOptimal: number
+  activeIndTotal: number
+  activeStratBase: number
+  activeStratMain: number
+  activeStratReal: number
+  activeStratTotal: number
   // ── Main-stage breakdown ──────────────────────────────────────────
   // Three sub-counts that let the operator see *why* Main is the size
   // it is:
@@ -127,6 +145,15 @@ const EMPTY: CompactStats = {
   stratMain: 0,
   stratReal: 0,
   stratLive: 0,
+  activeIndDirection: 0,
+  activeIndMove: 0,
+  activeIndActive: 0,
+  activeIndOptimal: 0,
+  activeIndTotal: 0,
+  activeStratBase: 0,
+  activeStratMain: 0,
+  activeStratReal: 0,
+  activeStratTotal: 0,
   mainEvaluated: 0,
   mainCoordCreated: 0,
   mainBlockDcaSets: 0,
@@ -592,6 +619,19 @@ export function StatisticsOverviewV2() {
           stratMain:        d.breakdown?.strategies?.main || 0,
           stratReal:        d.breakdown?.strategies?.real || 0,
           stratLive:        d.breakdown?.strategies?.live || liveExec.positionsCreated || 0,
+          // Active-now snapshot — written per cycle by engine writers
+          // (indication-sets-processor + strategy-coordinator). The UI
+          // shows these as the headline numbers and the cumulative
+          // counts above as smaller subtext.
+          activeIndDirection: Number(d.activeCounts?.indications?.direction)      || 0,
+          activeIndMove:      Number(d.activeCounts?.indications?.move)           || 0,
+          activeIndActive:    Number(d.activeCounts?.indications?.active)         || 0,
+          activeIndOptimal:   Number(d.activeCounts?.indications?.optimal)        || 0,
+          activeIndTotal:     Number(d.activeCounts?.indications?.total)          || 0,
+          activeStratBase:    Number(d.activeCounts?.strategies?.base)            || 0,
+          activeStratMain:    Number(d.activeCounts?.strategies?.main)            || 0,
+          activeStratReal:    Number(d.activeCounts?.strategies?.real)            || 0,
+          activeStratTotal:   Number(d.activeCounts?.strategies?.total)           || 0,
           mainEvaluated:    mainBreakdownEval,
           mainCoordCreated,
           mainBlockDcaSets,
@@ -724,14 +764,37 @@ export function StatisticsOverviewV2() {
             <span className="font-bold text-blue-600 tabular-nums">{fmt(stats.indicationCycles)}</span>
           </div>
 
-          <div className="flex flex-col gap-0.5">
-            <span className="text-muted-foreground">Indications</span>
-            <span className="font-bold text-violet-600 tabular-nums">{fmt(stats.indicationsTotal)}</span>
+          <div
+            className="flex flex-col gap-0.5"
+            title={
+              `Indications currently passing thresholds (alive now).\n` +
+              `Cumulative since run start: ${fmt(stats.indicationsTotal)}\n` +
+              `Per-type live counts: D=${fmt(stats.activeIndDirection)} ` +
+              `M=${fmt(stats.activeIndMove)} A=${fmt(stats.activeIndActive)} ` +
+              `O=${fmt(stats.activeIndOptimal)}`
+            }
+          >
+            <span className="text-muted-foreground">Indications (alive)</span>
+            <span className="font-bold text-violet-600 tabular-nums flex items-baseline gap-1">
+              {fmt(stats.activeIndTotal)}
+              <span className="text-[10px] font-normal text-muted-foreground">/ {fmt(stats.indicationsTotal)}</span>
+            </span>
           </div>
 
-          <div className="flex flex-col gap-0.5">
-            <span className="text-muted-foreground">Strategies</span>
-            <span className="font-bold text-amber-600 tabular-nums">{fmt(stats.strategiesTotal)}</span>
+          <div
+            className="flex flex-col gap-0.5"
+            title={
+              `Strategy Sets currently alive across stages (Base + Main + Real).\n` +
+              `Cumulative Sets created since run start: ${fmt(stats.strategiesTotal)}\n` +
+              `Per-stage live: B=${fmt(stats.activeStratBase)} ` +
+              `M=${fmt(stats.activeStratMain)} R=${fmt(stats.activeStratReal)}`
+            }
+          >
+            <span className="text-muted-foreground">Strategies (alive)</span>
+            <span className="font-bold text-amber-600 tabular-nums flex items-baseline gap-1">
+              {fmt(stats.activeStratTotal)}
+              <span className="text-[10px] font-normal text-muted-foreground">/ {fmt(stats.strategiesTotal)}</span>
+            </span>
           </div>
 
           <div className="flex flex-col gap-0.5">
@@ -753,36 +816,53 @@ export function StatisticsOverviewV2() {
             </span>
           </div>
 
-          <div className="flex flex-col gap-0.5">
-            <span className="text-muted-foreground">Base</span>
-            <span className="font-bold text-orange-600 tabular-nums">{fmt(stats.stratBase)}</span>
+          <div
+            className="flex flex-col gap-0.5"
+            title={
+              `Base Sets currently alive: ${fmt(stats.activeStratBase)}\n` +
+              `Cumulative Base Sets created since run start: ${fmt(stats.stratBase)}`
+            }
+          >
+            <span className="text-muted-foreground">Base (alive)</span>
+            <span className="font-bold text-orange-600 tabular-nums flex items-baseline gap-1">
+              {fmt(stats.activeStratBase)}
+              <span className="text-[10px] font-normal text-muted-foreground">/ {fmt(stats.stratBase)}</span>
+            </span>
           </div>
 
           <div
             className="flex flex-col gap-0.5"
             title={
-              `Main Sets — ${fmt(stats.stratMain)} total\n` +
+              `Main Sets currently alive: ${fmt(stats.activeStratMain)}\n` +
+              `Cumulative Main Sets created: ${fmt(stats.stratMain)}\n` +
               `• Evaluated (from Base): ${fmt(stats.mainEvaluated)}\n` +
               `• Pos.coord. additionally created: ${fmt(stats.mainCoordCreated)}\n` +
               `• Block + DCA Sets: ${fmt(stats.mainBlockDcaSets)}`
             }
           >
-            <span className="text-muted-foreground">Main</span>
-            <span className="font-bold text-yellow-600 tabular-nums">{fmt(stats.stratMain)}</span>
+            <span className="text-muted-foreground">Main (alive)</span>
+            <span className="font-bold text-yellow-600 tabular-nums flex items-baseline gap-1">
+              {fmt(stats.activeStratMain)}
+              <span className="text-[10px] font-normal text-muted-foreground">/ {fmt(stats.stratMain)}</span>
+            </span>
           </div>
 
           <div
             className="flex flex-col gap-0.5"
             title={
-              `Real Sets — ${fmt(stats.stratReal)} total\n` +
+              `Real Sets currently alive: ${fmt(stats.activeStratReal)}\n` +
+              `Cumulative Real Sets created: ${fmt(stats.stratReal)}\n` +
               `• Currently open positions: ${fmt(stats.realOpen)}\n` +
-              `(Real = Main→Real promotions that passed ratio gating.\n` +
+              `(Real = Main→Real promotions that passed ratio gating + PF priority.\n` +
               ` Volume is tracked only at the Live exchange stage —\n` +
               ` see Live strip below for actual USD exposure.)`
             }
           >
-            <span className="text-muted-foreground">Real</span>
-            <span className="font-bold text-emerald-600 tabular-nums">{fmt(stats.stratReal)}</span>
+            <span className="text-muted-foreground">Real (alive)</span>
+            <span className="font-bold text-emerald-600 tabular-nums flex items-baseline gap-1">
+              {fmt(stats.activeStratReal)}
+              <span className="text-[10px] font-normal text-muted-foreground">/ {fmt(stats.stratReal)}</span>
+            </span>
           </div>
 
           <div className="flex flex-col gap-0.5" title={`Live positions created on exchange — Fill ${stats.liveFillRate.toFixed(1)}% · WR ${stats.liveWinRate.toFixed(1)}%`}>
@@ -798,6 +878,54 @@ export function StatisticsOverviewV2() {
             </span>
           </div>
         </div>
+
+        {/* ── Per-type indication breakdown (alive now) ─────────────────
+            The four indication-set types each track separately. This
+            strip surfaces them so the operator can see WHICH type is
+            currently producing signal — answering questions like "is
+            Move quiet because the market's flat, or because something's
+            wrong with the Move processor?" Hidden when nothing is alive
+            to keep the overview compact. */}
+        {stats.activeIndTotal > 0 && (
+          <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-2 gap-2 text-[10px] sm:grid-cols-4">
+            <div
+              className="flex flex-col gap-0.5"
+              title="Direction-set indications currently passing thresholds"
+            >
+              <span className="text-muted-foreground">Ind · Direction</span>
+              <span className="font-semibold text-violet-700 tabular-nums">
+                {fmt(stats.activeIndDirection)}
+              </span>
+            </div>
+            <div
+              className="flex flex-col gap-0.5"
+              title="Move-set indications currently passing thresholds"
+            >
+              <span className="text-muted-foreground">Ind · Move</span>
+              <span className="font-semibold text-violet-700 tabular-nums">
+                {fmt(stats.activeIndMove)}
+              </span>
+            </div>
+            <div
+              className="flex flex-col gap-0.5"
+              title="Active-set indications currently passing thresholds"
+            >
+              <span className="text-muted-foreground">Ind · Active</span>
+              <span className="font-semibold text-violet-700 tabular-nums">
+                {fmt(stats.activeIndActive)}
+              </span>
+            </div>
+            <div
+              className="flex flex-col gap-0.5"
+              title="Optimal-set indications currently passing thresholds"
+            >
+              <span className="text-muted-foreground">Ind · Optimal</span>
+              <span className="font-semibold text-violet-700 tabular-nums">
+                {fmt(stats.activeIndOptimal)}
+              </span>
+            </div>
+          </div>
+        )}
 
         {/* NOTE: The Overall Strategies processing block above is
             deliberately independent of the accumulation view. Open-

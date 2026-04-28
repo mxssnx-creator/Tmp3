@@ -95,6 +95,46 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                   <p className="text-xs text-muted-foreground">Max 1 recommended for independent config processing</p>
                 </div>
               </div>
+
+              {/* ── Canonical Per-Direction Cap (cross-section mirror) ──
+                  This is the SAME value as Settings → Strategy → Base →
+                  "Per Direction Pos Limit". The Base-stage pseudo-position
+                  manager (`PseudoPositionManager.getMaxActivePerDirection`)
+                  reads only this key, regardless of which UI surface
+                  edited it. We mirror it on the System tab so an operator
+                  exploring "global system limits" finds it without having
+                  to drill into the Strategy tab. Both surfaces write to
+                  `maxActiveBasePseudoPositionsPerDirection` — there is no
+                  duplicate state. */}
+              <div className="space-y-2 pt-2 border-t border-dashed border-border/40">
+                <div className="flex items-center justify-between">
+                  <Label>Per-Direction Pos Limit (canonical)</Label>
+                  <span className="text-sm font-semibold">
+                    {settings.maxActiveBasePseudoPositionsPerDirection ?? 1}
+                  </span>
+                </div>
+                <Slider
+                  value={[settings.maxActiveBasePseudoPositionsPerDirection ?? 1]}
+                  onValueChange={(v) =>
+                    handleSettingChange("maxActiveBasePseudoPositionsPerDirection", v[0])
+                  }
+                  min={1}
+                  max={10}
+                  step={1}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Caps the number of <strong>active Base-stage pseudo-positions per
+                  direction (long / short)</strong> across all symbols. This is the
+                  master gate the engine consults before creating a new pseudo
+                  position; the per-config sliders above are downstream guards.
+                  Default <strong>1</strong> matches the spec; raise to allow concurrent
+                  Base evaluations in the same direction.
+                </p>
+                <p className="text-[11px] text-muted-foreground italic">
+                  Mirror of <code>Settings → Strategy → Base → Per Direction Pos Limit</code>.
+                  Both surfaces write to <code>maxActiveBasePseudoPositionsPerDirection</code>.
+                </p>
+              </div>
             </div>
 
               <div className="space-y-4 border-t pt-4">
