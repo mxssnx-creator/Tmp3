@@ -275,8 +275,12 @@ export class TradeEngineManager {
       try {
         const client = getRedisClient()
         const existingProgression = await client.hgetall(`progression:${this.connectionId}`)
+        const nowMs = Date.now()
         if (!existingProgression || Object.keys(existingProgression).length === 0) {
-          // First time initialization - set all counters to 0
+          // First time initialization - set all counters to 0 and stamp the
+          // canonical `started_at` epoch-ms. The stats route uses this for
+          // rolling-window rate calculations; absent it falls back to
+          // "now - 1h", which under-reports the very first hour after start.
           await client.hset(`progression:${this.connectionId}`, {
             cycles_completed: "0",
             successful_cycles: "0",
@@ -284,13 +288,23 @@ export class TradeEngineManager {
             connection_id: this.connectionId,
             last_update: new Date().toISOString(),
             engine_started: "true",
+            started_at: String(nowMs),
           })
         } else {
-          // Engine restarted - preserve existing counters, only update metadata
-          await client.hset(`progression:${this.connectionId}`, {
+          // Engine restarted - preserve existing counters, only update metadata.
+          // BACKFILL the `started_at` field if missing (older deployments did
+          // not write it). We use HSETNX semantics manually so a present
+          // value (the original first-ever start) is never overwritten — the
+          // dashboard's "since first start" rates depend on this timestamp
+          // being monotonic across restarts.
+          const restartUpdate: Record<string, string> = {
             last_update: new Date().toISOString(),
             engine_started: "true",
-          })
+          }
+          if (!existingProgression.started_at || !Number.isFinite(Number(existingProgression.started_at))) {
+            restartUpdate.started_at = String(nowMs)
+          }
+          await client.hset(`progression:${this.connectionId}`, restartUpdate)
         }
       } catch (e) {
         console.warn("[v0] [Engine] Failed to init progression state:", e)
