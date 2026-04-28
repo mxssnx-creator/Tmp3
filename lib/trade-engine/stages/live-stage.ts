@@ -48,8 +48,28 @@ export interface LivePosition {
   leverage: number
   marginType: "cross" | "isolated"
   // Risk management
+  //
+  // `stopLoss` / `takeProfit` are the *current* assigned percentages
+  // honored by the exchange protection orders. They can be mutated by
+  // `recalculateAndApplySLTP()` when an operator edits SL/TP mid-trade.
+  //
+  // `assignedStopLoss` / `assignedTakeProfit` are an IMMUTABLE snapshot
+  // of the values originally assigned by the upstream Set/strategy at
+  // position creation. They never change for the lifetime of the
+  // position — even after overrides — so post-trade analysis and the
+  // progression panel can always answer "what did the strategy
+  // originally specify?". Optional for back-compat with positions
+  // opened before this field existed.
   stopLoss: number
   takeProfit: number
+  assignedStopLoss?: number
+  assignedTakeProfit?: number
+  // `stopLossPrice` / `takeProfitPrice` are the latest absolute
+  // trigger prices placed on the exchange — they are recomputed by
+  // `updateProtectionOrders()` whenever the average execution price
+  // shifts (accumulation merges) or the current `stopLoss` /
+  // `takeProfit` percentages change. They mirror the prices the
+  // exchange's reduce-only orders are armed at.
   stopLossPrice?: number
   takeProfitPrice?: number
   // Exchange references
@@ -927,7 +947,8 @@ async function updateProtectionOrders(
       pos,
       "update_sl_tp",
       true,
-      `[${reason}] SL=${pos.stopLossPrice ? pos.stopLossPrice.toFixed(6) : "—"} (${pos.stopLossOrderId || "—"}) TP=${pos.takeProfitPrice ? pos.takeProfitPrice.toFixed(6) : "—"} (${pos.takeProfitOrderId || "—"})`,
+      `[${reason}] SL ${pos.stopLoss}% → ${pos.stopLossPrice ? pos.stopLossPrice.toFixed(6) : "—"} (${pos.stopLossOrderId || "—"}) | ` +
+      `TP ${pos.takeProfit}% → ${pos.takeProfitPrice ? pos.takeProfitPrice.toFixed(6) : "—"} (${pos.takeProfitOrderId || "—"})`,
     )
     await logProgressionEvent(
       pos.connectionId,
@@ -935,10 +956,20 @@ async function updateProtectionOrders(
       "info",
       `SL/TP updated for ${pos.symbol} (${reason})`,
       {
+        // Both the originally-assigned percentages (immutable contract)
+        // and the currently-active percentages (mutable, override-aware).
+        // On the steady state these are equal; after an operator override
+        // they diverge — the assigned pair makes the override audit-trail
+        // self-documenting in the dashboard's progression panel.
+        assignedStopLossPct: pos.assignedStopLoss,
+        assignedTakeProfitPct: pos.assignedTakeProfit,
+        stopLossPct: pos.stopLoss,
+        takeProfitPct: pos.takeProfit,
         slOrderId: pos.stopLossOrderId,
         slPrice: pos.stopLossPrice,
         tpOrderId: pos.takeProfitOrderId,
         tpPrice: pos.takeProfitPrice,
+        fillPrice: pos.averageExecutionPrice,
       },
     )
   }
@@ -989,6 +1020,10 @@ export async function executeLivePosition(
       marginType: "cross",
       stopLoss: realPosition.stopLoss,
       takeProfit: realPosition.takeProfit,
+      // Immutable snapshot of the originally-assigned values — survives
+      // any later override via `recalculateAndApplySLTP`. See type def.
+      assignedStopLoss: realPosition.stopLoss,
+      assignedTakeProfit: realPosition.takeProfit,
       status: "rejected",
       statusReason:
         "Skipped — connection in margin-error cooldown (top up exchange balance to resume live trading)",
@@ -1027,6 +1062,12 @@ export async function executeLivePosition(
     marginType: "cross",
     stopLoss: realPosition.stopLoss,
     takeProfit: realPosition.takeProfit,
+    // Immutable assignment snapshot — preserved across overrides so the
+    // progression panel and post-trade stats can always recover what the
+    // upstream Set originally specified. Mirrors `stopLoss`/`takeProfit`
+    // at creation; never mutated thereafter.
+    assignedStopLoss: realPosition.stopLoss,
+    assignedTakeProfit: realPosition.takeProfit,
     status: "pending",
     fills: [],
     progression: [],
@@ -1420,51 +1461,83 @@ export async function executeLivePosition(
     }
 
     // ── Step 7: Place Stop Loss and Take Profit orders ─────────────────────
+    //
+    // Single source of truth for SL/TP price derivation:
+    // `computeDesiredProtectionPrices()` is also what the accumulation
+    // and reconcile paths use. By routing the initial placement through
+    // the same helper we guarantee that an exchange-side order will
+    // ALWAYS be armed at the same price the strategy assigned (rounded
+    // identically), with no duplicate inline computation that could
+    // drift out of sync with the rest of the file.
     if (livePosition.executedQuantity > 0) {
-      const fillPrice = livePosition.averageExecutionPrice
       const sideClose: "buy" | "sell" = realPosition.direction === "long" ? "sell" : "buy"
-      const slPct = Math.max(0, livePosition.stopLoss) / 100
-      const tpPct = Math.max(0, livePosition.takeProfit) / 100
-      const slPrice =
-        realPosition.direction === "long" ? fillPrice * (1 - slPct) : fillPrice * (1 + slPct)
-      const tpPrice =
-        realPosition.direction === "long" ? fillPrice * (1 + tpPct) : fillPrice * (1 - tpPct)
+      const { desiredSl: slPrice, desiredTp: tpPrice } =
+        computeDesiredProtectionPrices(livePosition)
 
       livePosition.stopLossPrice = slPrice
       livePosition.takeProfitPrice = tpPrice
 
-      const slOrderId = await placeProtectionOrder(
-        exchangeConnector,
-        realPosition.symbol,
-        sideClose,
-        livePosition.executedQuantity,
-        slPrice,
-        "StopLoss",
-        realPosition.direction,
-      )
-      const tpOrderId = await placeProtectionOrder(
-        exchangeConnector,
-        realPosition.symbol,
-        sideClose,
-        livePosition.executedQuantity,
-        tpPrice,
-        "TakeProfit",
-        realPosition.direction,
-      )
+      const [slOrderId, tpOrderId] = await Promise.all([
+        slPrice > 0
+          ? placeProtectionOrder(
+              exchangeConnector,
+              realPosition.symbol,
+              sideClose,
+              livePosition.executedQuantity,
+              slPrice,
+              "StopLoss",
+              realPosition.direction,
+            )
+          : Promise.resolve(null),
+        tpPrice > 0
+          ? placeProtectionOrder(
+              exchangeConnector,
+              realPosition.symbol,
+              sideClose,
+              livePosition.executedQuantity,
+              tpPrice,
+              "TakeProfit",
+              realPosition.direction,
+            )
+          : Promise.resolve(null),
+      ])
+
       if (slOrderId) livePosition.stopLossOrderId = slOrderId
       if (tpOrderId) livePosition.takeProfitOrderId = tpOrderId
+
+      // Step record + progression log carry BOTH the assigned percent
+      // and the resulting absolute trigger price, so an operator
+      // reading the timeline never has to mentally reconstruct one
+      // from the other. `assignedStopLoss`/`assignedTakeProfit` and
+      // `stopLoss`/`takeProfit` are equal at this point (initial
+      // placement); on later overrides the message will show both.
       pushStep(
         livePosition,
         "place_sl_tp",
         !!(slOrderId || tpOrderId),
-        `SL=${slOrderId || "—"} (${slPrice.toFixed(4)}) TP=${tpOrderId || "—"} (${tpPrice.toFixed(4)})`
+        `SL ${livePosition.stopLoss}% → ${slPrice ? slPrice.toFixed(6) : "—"} (${slOrderId || "—"}) | ` +
+        `TP ${livePosition.takeProfit}% → ${tpPrice ? tpPrice.toFixed(6) : "—"} (${tpOrderId || "—"})`
       )
-      await logProgressionEvent(connectionId, "live_trading", "info", `SL/TP placed for ${realPosition.symbol}`, {
-        slOrderId,
-        slPrice,
-        tpOrderId,
-        tpPrice,
-      })
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "info",
+        `SL/TP placed for ${realPosition.symbol} at assigned values`,
+        {
+          // Assigned (immutable strategy contract) and current
+          // (mutable, override-aware) percent pairs — equal on first
+          // placement, can diverge after `recalculateAndApplySLTP`.
+          assignedStopLossPct: livePosition.assignedStopLoss,
+          assignedTakeProfitPct: livePosition.assignedTakeProfit,
+          stopLossPct: livePosition.stopLoss,
+          takeProfitPct: livePosition.takeProfit,
+          slOrderId,
+          slPrice,
+          tpOrderId,
+          tpPrice,
+          fillPrice: livePosition.averageExecutionPrice,
+        },
+      )
     } else {
       pushStep(livePosition, "place_sl_tp", false, "skipped — no fill yet")
     }
@@ -2279,8 +2352,41 @@ export async function recalculateAndApplySLTP(
       return position
     }
 
+    // Capture pre-override values so we can audit the diff in progression.
+    // Note: we deliberately do NOT touch `assignedStopLoss` /
+    // `assignedTakeProfit` — those are the immutable strategy-contract
+    // snapshot. After this call they remain equal to their creation-time
+    // values while `stopLoss` / `takeProfit` carry the operator override.
+    const prevStopLossPct = position.stopLoss
+    const prevTakeProfitPct = position.takeProfit
     if (overrides?.stopLossPct !== undefined) position.stopLoss = overrides.stopLossPct
     if (overrides?.takeProfitPct !== undefined) position.takeProfit = overrides.takeProfitPct
+
+    const slChanged = position.stopLoss !== prevStopLossPct
+    const tpChanged = position.takeProfit !== prevTakeProfitPct
+    if (slChanged || tpChanged) {
+      // Single audit-trail event per override. The progression panel
+      // shows it as a `live_trading info` row alongside the subsequent
+      // `update_sl_tp` step pushed by `updateProtectionOrders`. Together
+      // they tell the full story: "operator changed SL from X% to Y%,
+      // exchange order re-armed at price Z".
+      await logProgressionEvent(
+        position.connectionId,
+        "live_trading",
+        "info",
+        `SL/TP override applied to ${position.symbol}`,
+        {
+          assignedStopLossPct: position.assignedStopLoss,
+          assignedTakeProfitPct: position.assignedTakeProfit,
+          previousStopLossPct: prevStopLossPct,
+          previousTakeProfitPct: prevTakeProfitPct,
+          newStopLossPct: position.stopLoss,
+          newTakeProfitPct: position.takeProfit,
+          slChanged,
+          tpChanged,
+        },
+      )
+    }
 
     await updateProtectionOrders(exchangeConnector, position, "manual_recalc")
     position.updatedAt = Date.now()

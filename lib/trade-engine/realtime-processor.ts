@@ -451,45 +451,77 @@ export class RealtimeProcessor {
   }
 
   /**
-   * Check if take profit should be triggered
+   * Check if take profit should be triggered.
+   *
+   * **Source of truth**: prefer the *assigned* `takeprofit_price` stored
+   * on the position hash at creation time. That value is the SAME one
+   * placed on the exchange for the corresponding live position, so this
+   * pseudo-evaluator and the exchange's own TP order will fire on the
+   * exact same threshold — no drift between the two.
+   *
+   * Recomputing from `(entry_price × takeprofit_factor%)` on every tick
+   * (the legacy behaviour) was numerically equivalent for unaltered
+   * positions, but if the assigned percent was ever overridden after
+   * creation the two paths would silently diverge. The assigned price
+   * is the definitive contract.
+   *
+   * Falls back to the percent-based recompute only when the stored
+   * `takeprofit_price` is absent — preserves back-compat with legacy
+   * position hashes opened before this field was persisted.
    */
   private shouldCloseTakeProfit(position: any, currentPrice: number): boolean {
-    const entryPrice = parseFloat(position.entry_price || "0")
-    const takeprofitFactor = parseFloat(position.takeprofit_factor || "0")
     const side = position.side || "long"
 
-    if (side === "long") {
-      const takeProfitPrice = entryPrice * (1 + takeprofitFactor / 100)
-      return currentPrice >= takeProfitPrice
-    } else {
-      const takeProfitPrice = entryPrice * (1 - takeprofitFactor / 100)
-      return currentPrice <= takeProfitPrice
+    const assignedTpPrice = parseFloat(position.takeprofit_price || "0")
+    if (assignedTpPrice > 0) {
+      return side === "long" ? currentPrice >= assignedTpPrice : currentPrice <= assignedTpPrice
     }
+
+    // Fallback: legacy hashes without `takeprofit_price`.
+    const entryPrice = parseFloat(position.entry_price || "0")
+    const takeprofitFactor = parseFloat(position.takeprofit_factor || "0")
+    if (entryPrice <= 0 || takeprofitFactor <= 0) return false
+    const recomputed =
+      side === "long"
+        ? entryPrice * (1 + takeprofitFactor / 100)
+        : entryPrice * (1 - takeprofitFactor / 100)
+    return side === "long" ? currentPrice >= recomputed : currentPrice <= recomputed
   }
 
   /**
-   * Check if stop loss should be triggered
+   * Check if stop loss should be triggered.
+   *
+   * Same source-of-truth rationale as `shouldCloseTakeProfit` — prefer
+   * the assigned `stoploss_price` snapshot on the position hash, which
+   * is the SAME price placed on the exchange. Trailing-stop checks
+   * still come first (a tighter ratchet trigger should always win over
+   * the static SL gate).
    */
   private shouldCloseStopLoss(position: any, currentPrice: number): boolean {
-    const entryPrice = parseFloat(position.entry_price || "0")
-    const stoplossRatio = parseFloat(position.stoploss_ratio || "0")
     const side = position.side || "long"
 
-    // Check trailing stop first if it exists
+    // Trailing stop wins when armed — it's by definition tighter than the
+    // static SL (otherwise the ratchet wouldn't have moved it).
     const trailingStopPrice = parseFloat(position.trailing_stop_price || "0")
     if (trailingStopPrice > 0) {
       if (side === "long" && currentPrice <= trailingStopPrice) return true
       if (side === "short" && currentPrice >= trailingStopPrice) return true
     }
 
-    // Check regular stop loss
-    if (side === "long") {
-      const stopLossPrice = entryPrice * (1 - stoplossRatio / 100)
-      return currentPrice <= stopLossPrice
-    } else {
-      const stopLossPrice = entryPrice * (1 + stoplossRatio / 100)
-      return currentPrice >= stopLossPrice
+    const assignedSlPrice = parseFloat(position.stoploss_price || "0")
+    if (assignedSlPrice > 0) {
+      return side === "long" ? currentPrice <= assignedSlPrice : currentPrice >= assignedSlPrice
     }
+
+    // Fallback: legacy hashes without `stoploss_price`.
+    const entryPrice = parseFloat(position.entry_price || "0")
+    const stoplossRatio = parseFloat(position.stoploss_ratio || "0")
+    if (entryPrice <= 0 || stoplossRatio <= 0) return false
+    const recomputed =
+      side === "long"
+        ? entryPrice * (1 - stoplossRatio / 100)
+        : entryPrice * (1 + stoplossRatio / 100)
+    return side === "long" ? currentPrice <= recomputed : currentPrice >= recomputed
   }
 
   /**

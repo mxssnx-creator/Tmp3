@@ -1,4 +1,4 @@
-// Force rebuild: 2026-04-28T14:05:00 — maxRealSets cap raised to 12k (operator-tunable in System tab)
+// Force rebuild: 2026-04-28T14:35:00 — assigned TP/SL contract: pseudo evaluator + live exchange share single source of truth, override audit trail
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
