@@ -1086,10 +1086,31 @@ export class TradeEngineManager {
         const duration = Date.now() - startTime
         totalDuration += duration
 
-        // Log detailed breakdown
-        console.log(`[v0] [IndicationProcessor CYCLE ${cycleCount}] Symbols: ${symbols.length} | Total Indications: ${totalIndications}`)
-        console.log(`[v0] [IndicationProcessor] Per-symbol: ${JSON.stringify(symbolIndicationCounts)}`)
-        console.log(`[v0] [IndicationProcessor] Per-type: ${JSON.stringify(indicationTypeCounts)}`)
+        // ── Log detailed breakdown (throttled) ─────────────────────────
+        //
+        // The original implementation logged THREE stdout lines on EVERY
+        // tick. At the live cadence (~50 ms cycle pause + ~30-50 ms work)
+        // the engine produces ~15-20 cycles/sec, which translates to
+        // 45-60 stdout writes/sec from this single block alone. Stdout
+        // writes block the Node event loop, so HTTP requests to the
+        // dashboard time out and the UI looks "crashed".
+        //
+        // Two-tier throttling preserves observability without flooding:
+        //   1. Always log the FIRST tick after a fresh start (boot signal).
+        //   2. Otherwise, log every Nth cycle (50 → ~2.5 s at typical
+        //      cadence, ~5 s at 100 ms). N is set high enough that the
+        //      diagnostic is human-readable and low enough that long-tail
+        //      issues still surface in production trace dumps.
+        //
+        // The Redis hincrby counters below are UNTHROTTLED — those don't
+        // touch stdout and feed the live dashboard, which the operator
+        // expects to update continuously.
+        const CYCLE_LOG_EVERY = 50
+        if (cycleCount === 1 || cycleCount % CYCLE_LOG_EVERY === 0) {
+          console.log(`[v0] [IndicationProcessor CYCLE ${cycleCount}] Symbols: ${symbols.length} | Total Indications: ${totalIndications}`)
+          console.log(`[v0] [IndicationProcessor] Per-symbol: ${JSON.stringify(symbolIndicationCounts)}`)
+          console.log(`[v0] [IndicationProcessor] Per-type: ${JSON.stringify(indicationTypeCounts)}`)
+        }
 
         // Write per-type counters into progression hash so dashboard reads real values.
         //
@@ -1326,8 +1347,14 @@ export class TradeEngineManager {
           symbolStrategyBreakdown[symbols[i]] = strategyResults[i]?.strategiesEvaluated || 0
         }
 
-        console.log(`[v0] [StrategyProcessor CYCLE ${cycleCount}] Total Evaluated: ${evaluatedThisCycle} | Live Ready: ${liveReadyThisCycle} | Total Cumulative: ${totalStrategiesEvaluated}`)
-        console.log(`[v0] [StrategyProcessor] Per-symbol breakdown: ${JSON.stringify(symbolStrategyBreakdown)}`)
+        // Same 1/50 throttle as the IndicationProcessor block above —
+        // see that comment for rationale (Node event-loop hygiene at the
+        // 50 ms cycle cadence).
+        const STRATEGY_LOG_EVERY = 50
+        if (cycleCount === 1 || cycleCount % STRATEGY_LOG_EVERY === 0) {
+          console.log(`[v0] [StrategyProcessor CYCLE ${cycleCount}] Total Evaluated: ${evaluatedThisCycle} | Live Ready: ${liveReadyThisCycle} | Total Cumulative: ${totalStrategiesEvaluated}`)
+          console.log(`[v0] [StrategyProcessor] Per-symbol breakdown: ${JSON.stringify(symbolStrategyBreakdown)}`)
+        }
 
         this.componentHealth.strategies.lastCycleDuration = duration
         this.componentHealth.strategies.cycleCount = cycleCount
