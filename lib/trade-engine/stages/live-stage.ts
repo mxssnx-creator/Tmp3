@@ -451,6 +451,20 @@ async function accumulateIntoLivePosition(
     await incrementMetric(connectionId, "live_orders_filled_count")
     await incrementMetric(connectionId, "live_orders_accumulated_count")
     await incrementMetric(connectionId, "live_volume_usd_total", Math.round(newNotional))
+    // ── Used-balance (margin) counter ──────────────────────────────
+    // Spec: every "USDT" surface in the UI must show the *used balance*
+    // (margin actually committed) and NOT the leveraged notional. The
+    // leveraged figure is `newNotional` (qty × price); the matching
+    // margin figure is `newNotional / leverage`. We persist it as a
+    // sibling of `live_volume_usd_total` so the dashboard can switch
+    // surfaces over without losing the historical notional series.
+    {
+      const lev = Math.max(1, Number(existing.leverage) || 1)
+      const newMargin = newNotional / lev
+      if (Number.isFinite(newMargin) && newMargin > 0) {
+        await incrementMetric(connectionId, "live_margin_usd_total", Math.round(newMargin))
+      }
+    }
 
     // ── 5. Re-arm SL/TP at NEW weighted-avg entry + NEW total qty ────
     // updateProtectionOrders will:
@@ -1288,6 +1302,16 @@ export async function executeLivePosition(
     await savePosition(livePosition)
     await incrementMetric(connectionId, "live_positions_created_count")
     await incrementMetric(connectionId, "live_volume_usd_total", Math.round(livePosition.volumeUsd))
+    // Used-balance (margin) cumulative counter — see accumulation
+    // path above for the rationale. Always increment in lock-step
+    // with `live_volume_usd_total` so the two series stay aligned.
+    {
+      const lev = Math.max(1, Number(livePosition.leverage) || 1)
+      const newMargin = (livePosition.volumeUsd || 0) / lev
+      if (Number.isFinite(newMargin) && newMargin > 0) {
+        await incrementMetric(connectionId, "live_margin_usd_total", Math.round(newMargin))
+      }
+    }
     await logProgressionEvent(connectionId, "live_trading", "info", `Live position created ${realPosition.symbol}`, {
       status: livePosition.status,
       orderId: livePosition.orderId,

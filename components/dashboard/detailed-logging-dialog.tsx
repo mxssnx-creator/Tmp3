@@ -104,7 +104,10 @@ interface ProgressSummary {
     positionsClosed: number
     positionsOpen: number
     wins: number
+    /** Cumulative leveraged notional (qty × price). Legacy field. */
     volumeUsdTotal: number
+    /** Cumulative used balance (margin). Preferred USDT figure. */
+    marginUsdTotal?: number
     fillRate: number
     winRate: number
   }
@@ -387,11 +390,23 @@ export function DetailedLoggingDialog() {
                         <div className="bg-amber-100 rounded p-1 text-center">
                           Wins <span className="font-semibold">{summary.liveExecution.wins}</span>
                         </div>
-                        <div className="bg-amber-100 rounded p-1 text-center">
-                          Vol <span className="font-semibold">
-                            ${summary.liveExecution.volumeUsdTotal >= 1000
-                              ? `${(summary.liveExecution.volumeUsdTotal / 1000).toFixed(1)}K`
-                              : summary.liveExecution.volumeUsdTotal.toFixed(2)}
+                        {/* USDT used-balance tile — shows the margin
+                            committed (notional/leverage), NOT the
+                            leveraged notional. Tooltip carries the
+                            leveraged figure for operators who need it. */}
+                        <div
+                          className="bg-amber-100 rounded p-1 text-center"
+                          title={
+                            (summary.liveExecution.marginUsdTotal || 0) > 0
+                              ? `USDT used balance (margin): $${(summary.liveExecution.marginUsdTotal || 0).toFixed(2)}\nLeveraged notional: $${summary.liveExecution.volumeUsdTotal.toFixed(2)}`
+                              : `Leveraged notional: $${summary.liveExecution.volumeUsdTotal.toFixed(2)} (margin counter not yet populated)`
+                          }
+                        >
+                          USDT <span className="font-semibold">
+                            {(() => {
+                              const v = summary.liveExecution.marginUsdTotal || summary.liveExecution.volumeUsdTotal
+                              return `$${v >= 1000 ? `${(v / 1000).toFixed(1)}K` : v.toFixed(2)}`
+                            })()}
                           </span>
                         </div>
                       </div>

@@ -1214,6 +1214,17 @@ export async function GET(
         )
         const liveVolumeUsd = n(progHash.live_volume_usd_total)
         const liveVolumeUsdR = Math.round(liveVolumeUsd * 100) / 100
+        // Used-balance (margin) cumulative counter — incremented in
+        // lock-step with `live_volume_usd_total` by live-stage.ts at both
+        // creation and accumulation points. This is the canonical "USDT
+        // used balance" surface the UI should prefer over the leveraged
+        // notional figure (per the operator's spec). Falls back to the
+        // current portfolio aggregate when the cumulative counter is
+        // empty (legacy connection that started before margin tracking).
+        const liveMarginUsdCumulative = n(progHash.live_margin_usd_total)
+        const liveMarginUsdR = liveMarginUsdCumulative > 0
+          ? Math.round(liveMarginUsdCumulative * 100) / 100
+          : Math.round(liveAggTotalMarginUsd * 100) / 100
 
         // Full Exchange Position Details per live position. Contains
         // everything the operator needs to evaluate trade health
@@ -1276,7 +1287,15 @@ export async function GET(
           },
           live: {
             open:         liveOpen,                  // count
-            volumeUsd:    liveVolumeUsdR,            // exchange USD exposure (only real figure)
+            volumeUsd:    liveVolumeUsdR,            // exchange USD notional (qty × price, leveraged exposure)
+            // Used-balance / margin USDT — the value of the *capital
+            // committed* to live exchange positions, NOT the leveraged
+            // notional. This is what the dashboard should display under
+            // "USDT" labels per operator spec. Equals the cumulative
+            // sum of (notional / leverage) across every live fill +
+            // accumulation, with a fallback to the live portfolio
+            // aggregate when no historical counter exists.
+            marginUsd:    liveMarginUsdR,
             openScanned:  liveOpenScanned,
             positions:    liveMirroring,
             resolution: {
@@ -1335,8 +1354,17 @@ export async function GET(
           n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)
         ),
         wins:             n(progHash.live_wins_count),
-        // Volume
+        // Volume — leveraged notional (cumulative qty × price across all fills)
         volumeUsdTotal:   n(progHash.live_volume_usd_total),
+        // Used-balance margin (cumulative notional/leverage). This is
+        // the canonical "USDT" figure the dashboard should display:
+        // the actual capital committed, not the leveraged exposure.
+        // Falls back to current portfolio margin aggregate so legacy
+        // connections (which started before this counter existed)
+        // still report a sensible value instead of zero.
+        marginUsdTotal:   n(progHash.live_margin_usd_total) > 0
+                            ? n(progHash.live_margin_usd_total)
+                            : Math.round(liveAggTotalMarginUsd * 100) / 100,
         // Derived
         fillRate: (() => {
           const placed = n(progHash.live_orders_placed_count)

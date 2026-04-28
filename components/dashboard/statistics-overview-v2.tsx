@@ -243,9 +243,12 @@ function ExchangePositionRow({
         </div>
         <div
           className="col-span-2 tabular-nums text-right font-semibold text-amber-700"
-          title={`Exchange exposure: ${fmtUsd(lp.volumeUsd)} (qty ${lp.quantity} @ ${lp.entryPrice})`}
+          title={
+            `USDT used balance (margin at risk): ${fmtUsd(lp.marginUsd)} ` +
+            `— qty ${lp.quantity} @ ${lp.entryPrice}, leveraged exposure ${fmtUsd(lp.volumeUsd)} at ${lp.leverage}x`
+          }
         >
-          {fmtUsd(lp.volumeUsd)}
+          {fmtUsd(lp.marginUsd)}
         </div>
         <div
           className={`col-span-2 tabular-nums text-right font-semibold ${
@@ -803,10 +806,16 @@ export function StatisticsOverviewV2() {
             </div>
             <div
               className="flex flex-col gap-0.5"
-              title="Cumulative exchange-side trading volume in USD (progHash.live_volume_usd_total). The single authoritative notional figure."
+              title={
+                `USDT used balance (margin) across all live exchange positions: ${fmtUsd(stats.liveMarginUsd)}. ` +
+                `Leveraged notional exposure (qty × price across all fills): ${fmtUsd(stats.liveVolumeUsd)}. ` +
+                "USDT here always shows the *capital committed*, never the leveraged figure."
+              }
             >
-              <span className="text-muted-foreground">Live Vol</span>
-              <span className="font-semibold text-amber-700 tabular-nums">{fmtUsd(stats.liveVolumeUsd)}</span>
+              <span className="text-muted-foreground">USDT</span>
+              <span className="font-semibold text-amber-700 tabular-nums">
+                {fmtUsd(stats.liveMarginUsd || stats.liveVolumeUsd)}
+              </span>
             </div>
             <div
               className="flex flex-col gap-0.5"

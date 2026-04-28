@@ -482,18 +482,30 @@ export function ActiveConnectionCard({
           livePositionsClosed:   data?.liveExecution?.positionsClosed  || 0,
           livePositionsOpen:     data?.liveExecution?.positionsOpen    || 0,
           liveWins:              data?.liveExecution?.wins             || 0,
-          liveVolumeUsdTotal:    data?.liveExecution?.volumeUsdTotal   || 0,
+          // USDT figures shown on the card represent the **used balance
+          // (margin)** committed to live exchange positions, NOT the
+          // leveraged notional (qty × price). The /stats route exposes
+          // both: `marginUsdTotal` (preferred, capital at risk) and
+          // `volumeUsdTotal` (legacy, leveraged notional). We prefer
+          // margin and fall back to notional only when the connection
+          // started before margin tracking existed (counter is 0).
+          liveVolumeUsdTotal:    Number(data?.liveExecution?.marginUsdTotal)
+                                   || Number(data?.liveExecution?.volumeUsdTotal)
+                                   || 0,
           liveFillRate:          data?.liveExecution?.fillRate         || 0,
           liveWinRate:           data?.liveExecution?.winRate          || 0,
           // ── Mirroring pipeline open-position counts ─────────────
-          // Counts only for pseudo/real; volume only at the live
-          // exchange layer (real USD). See /stats openPositions
-          // block for the authoritative semantics.
+          // Counts only for pseudo/real; USD only at the live exchange
+          // layer. We prefer the per-position margin aggregate
+          // (`marginUsd`, capital committed) and fall back to the
+          // leveraged `volumeUsd` for legacy clients.
           pseudoOpen:            Number(data?.openPositions?.pseudo?.open)        || 0,
           pseudoRunningSets:     Number(data?.openPositions?.pseudo?.runningSets) || 0,
           realOpen:              Number(data?.openPositions?.real?.open)          || 0,
           liveOpenPositions:     Number(data?.openPositions?.live?.open)          || 0,
-          liveVolumeUsd:         Number(data?.openPositions?.live?.volumeUsd)     || 0,
+          liveVolumeUsd:         Number(data?.openPositions?.live?.marginUsd)
+                                   || Number(data?.openPositions?.live?.volumeUsd)
+                                   || 0,
           rangeDays:               pm.rangeDays              || 1,
           timeframeSeconds:        pm.timeframeSeconds        || 1,
           intervalsProcessed:      pm.intervalsProcessed      || 0,
@@ -985,9 +997,12 @@ export function ActiveConnectionCard({
                     </div>
                     <div
                       className="flex items-center gap-1"
-                      title="Cumulative live-trade USD volume on the exchange (the only authoritative exposure figure)."
+                      title={
+                        "USDT used balance committed to live exchange positions — the actual capital at risk (sum of notional/leverage), " +
+                        "NOT the leveraged exposure."
+                      }
                     >
-                      <span className="text-muted-foreground">Live Vol</span>
+                      <span className="text-muted-foreground">USDT</span>
                       <span className="font-semibold text-amber-700 dark:text-amber-400 tabular-nums">
                         {prehistoricStats.liveVolumeUsd >= 1_000_000
                           ? `$${(prehistoricStats.liveVolumeUsd / 1_000_000).toFixed(2)}M`
@@ -1431,8 +1446,14 @@ export function ActiveConnectionCard({
                             </span>
                           )}
                           {prehistoricStats.liveVolumeUsdTotal > 0 && (
-                            <span className="ml-auto text-muted-foreground">
-                              vol <span className="text-foreground font-semibold tabular-nums">
+                            <span
+                              className="ml-auto text-muted-foreground"
+                              title={
+                                "USDT used balance committed (cumulative margin = sum of notional/leverage across every fill + accumulation). " +
+                                "Reflects actual capital deployed, NOT leveraged exposure."
+                              }
+                            >
+                              USDT <span className="text-foreground font-semibold tabular-nums">
                                 ${prehistoricStats.liveVolumeUsdTotal >= 1000
                                   ? `${(prehistoricStats.liveVolumeUsdTotal / 1000).toFixed(1)}K`
                                   : prehistoricStats.liveVolumeUsdTotal.toFixed(2)}

@@ -27,7 +27,12 @@ interface LiveExecution {
   ordersPlaced: number; ordersFilled: number; ordersFailed: number
   ordersRejected: number; ordersSimulated: number
   positionsCreated: number; positionsClosed: number; positionsOpen: number
-  wins: number; volumeUsdTotal: number
+  wins: number
+  /** Cumulative leveraged notional (qty × price). Legacy; the UI now
+   *  prefers `marginUsdTotal` for any "USDT" display. */
+  volumeUsdTotal: number
+  /** Cumulative used balance (margin = notional / leverage). */
+  marginUsdTotal?: number
   fillRate: number; winRate: number
 }
 
@@ -550,11 +555,15 @@ export function QuickstartComprehensiveLogDialog() {
                       <Row label="Fill Rate" value={`${stats.liveExecution.fillRate.toFixed(1)}%`} />
                       <Row label="Win Rate"  value={`${stats.liveExecution.winRate.toFixed(1)}%`} />
                       <Row label="Wins"      value={fmt(stats.liveExecution.wins)} />
+                      {/* USDT row shows used-balance (margin), not the
+                          leveraged notional. We fall back to the legacy
+                          notional only when no margin counter exists. */}
                       <Row
-                        label="Volume"
-                        value={stats.liveExecution.volumeUsdTotal >= 1000
-                          ? `$${(stats.liveExecution.volumeUsdTotal / 1000).toFixed(1)}K`
-                          : `$${stats.liveExecution.volumeUsdTotal.toFixed(2)}`}
+                        label="USDT (used)"
+                        value={(() => {
+                          const v = stats.liveExecution.marginUsdTotal || stats.liveExecution.volumeUsdTotal
+                          return v >= 1000 ? `$${(v / 1000).toFixed(1)}K` : `$${v.toFixed(2)}`
+                        })()}
                       />
                     </div>
                     {(stats.liveExecution.ordersRejected > 0 || stats.liveExecution.ordersFailed > 0 || stats.liveExecution.ordersSimulated > 0) && (

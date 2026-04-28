@@ -119,9 +119,16 @@ export async function GET() {
         let longPositions  = 0
         let shortPositions = 0
         let unrealizedPnl  = 0
+        let marginUsdSum   = 0      // used balance committed across this connection
+        let volumeUsdSum   = 0      // leveraged notional across this connection
         const positions: Array<{
           symbol: string; side: string; qty: number
           entry: number;  mark: number; pnl: number
+          /** Used balance (margin = notional / leverage). Canonical USDT figure. */
+          marginUsd: number
+          /** Leveraged notional (qty × mark). Kept for back-compat. */
+          volumeUsd: number
+          leverage: number
         }> = []
 
         for (const p of positionObjs) {
@@ -140,13 +147,35 @@ export async function GET() {
           const pnl = toNum(p.unrealized_pnl ?? p.pnl)
           unrealizedPnl += pnl
 
+          // ── USDT semantics: derive the *used balance* (margin) so the
+          //    UI never shows leveraged notional under any "USDT" label.
+          //    margin = notional / leverage. Falls back to a stored
+          //    `margin_usd` field when the exchange-position-manager has
+          //    already computed it. `volumeUsd` is preserved for the
+          //    leveraged exposure tooltip.
+          const qty       = toNum(p.quantity)
+          const markPrice = toNum(p.current_price ?? p.mark_price ?? p.entry_price)
+          const leverage  = Math.max(1, toNum(p.leverage) || 1)
+          const storedVolumeUsd = toNum(p.volume_usd)
+          const volumeUsd = storedVolumeUsd > 0 ? storedVolumeUsd : qty * markPrice
+          const storedMarginUsd = toNum(p.margin_usd)
+          const marginUsd = storedMarginUsd > 0
+            ? storedMarginUsd
+            : leverage > 0 ? volumeUsd / leverage : volumeUsd
+
+          marginUsdSum += marginUsd
+          volumeUsdSum += volumeUsd
+
           positions.push({
             symbol: String(p.symbol || ""),
             side,
-            qty:    toNum(p.quantity),
+            qty,
             entry:  toNum(p.entry_price),
-            mark:   toNum(p.current_price ?? p.mark_price ?? p.entry_price),
+            mark:   markPrice,
             pnl,
+            marginUsd: Math.round(marginUsd * 100) / 100,
+            volumeUsd: Math.round(volumeUsd * 100) / 100,
+            leverage,
           })
         }
 
@@ -166,6 +195,12 @@ export async function GET() {
           longPositions,
           shortPositions,
           unrealizedPnl,
+          // Connection-level USDT roll-ups. `marginUsd` is the canonical
+          // "USDT" figure (used balance = notional / leverage); we
+          // expose `volumeUsd` alongside it for the leveraged-notional
+          // tooltip surface.
+          marginUsd: Math.round(marginUsdSum * 100) / 100,
+          volumeUsd: Math.round(volumeUsdSum * 100) / 100,
           balance: {
             total:     totalBal,
             available: totalBal,        // connectors don't split available/locked
@@ -188,13 +223,20 @@ export async function GET() {
         acc.totalBalance     += c.balance.total
         acc.availableBalance += c.balance.available
         acc.equity           += c.balance.equity
+        // Used-balance (margin) and leveraged notional roll-ups.
+        // Consumers should display `marginUsd` under any "USDT" label;
+        // `volumeUsd` is for explicit "exposure / notional" surfaces.
+        acc.marginUsd        += c.marginUsd || 0
+        acc.volumeUsd        += c.volumeUsd || 0
         if (!acc.currency && c.balance.currency) acc.currency = c.balance.currency
         return acc
       },
       {
         openPositions: 0, longPositions: 0, shortPositions: 0,
         unrealizedPnl: 0, totalBalance: 0, availableBalance: 0,
-        equity: 0, currency: "" as string,
+        equity: 0,
+        marginUsd: 0, volumeUsd: 0,
+        currency: "" as string,
       },
     )
     if (!totals.currency) totals.currency = "USDT"
@@ -222,7 +264,11 @@ function emptyResponse() {
     totals: {
       openPositions: 0, longPositions: 0, shortPositions: 0,
       unrealizedPnl: 0, totalBalance: 0, availableBalance: 0,
-      equity: 0, currency: "USDT",
+      equity: 0,
+      // USDT roll-ups: margin = capital committed, volume = leveraged
+      // notional. Both 0 when no live connections are eligible.
+      marginUsd: 0, volumeUsd: 0,
+      currency: "USDT",
     },
     updatedAt: Date.now(),
   }

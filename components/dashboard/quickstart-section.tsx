@@ -74,30 +74,43 @@ interface IndicationConfigCounts {
 
 // Live exchange footer — aggregates REAL-exchange positions & account balance
 // across every enabled connection. Not the same as pseudo-position counts.
-interface ExchangeLiveSummary {
-  connections: Array<{
-    connectionId: string
-    name: string
-    exchange: string
-    openPositions: number
-    longPositions: number
-    shortPositions: number
-    unrealizedPnl: number
-    balance: { total: number; available: number; equity: number; currency: string }
-    positions: Array<{ symbol: string; side: string; qty: number; entry: number; mark: number; pnl: number }>
-  }>
-  totals: {
-    openPositions: number
-    longPositions: number
-    shortPositions: number
-    unrealizedPnl: number
-    totalBalance:  number
-    availableBalance: number
-    equity:        number
-    currency:      string
+  interface ExchangeLiveSummary {
+    connections: Array<{
+      connectionId: string
+      name: string
+      exchange: string
+      openPositions: number
+      longPositions: number
+      shortPositions: number
+      unrealizedPnl: number
+      /** Used balance committed to live positions on this connection
+       *  (margin = sum of notional/leverage). Canonical USDT figure. */
+      marginUsd?: number
+      /** Leveraged notional exposure on this connection. */
+      volumeUsd?: number
+      balance: { total: number; available: number; equity: number; currency: string }
+      positions: Array<{
+        symbol: string; side: string; qty: number
+        entry: number; mark: number; pnl: number
+        marginUsd?: number; volumeUsd?: number; leverage?: number
+      }>
+    }>
+    totals: {
+      openPositions: number
+      longPositions: number
+      shortPositions: number
+      unrealizedPnl: number
+      totalBalance:  number
+      availableBalance: number
+      equity:        number
+      /** USDT used balance across every connection. */
+      marginUsd?: number
+      /** USDT leveraged notional across every connection. */
+      volumeUsd?: number
+      currency:      string
+    }
+    updatedAt: number
   }
-  updatedAt: number
-}
 
 // Main-stage coordination snapshot — surfaces the per-cycle position context
 // (pseudo-positions gating variant selection), how many related variant Sets
@@ -459,7 +472,14 @@ export function QuickstartSection() {
         pseudoOpen:            Number(s.openPositions?.pseudo?.open)         || 0,
         pseudoRunningSets:     Number(s.openPositions?.pseudo?.runningSets)  || 0,
         realOpen:              Number(s.openPositions?.real?.open)           || 0,
-        liveVolumeUsd:         Number(s.openPositions?.live?.volumeUsd)      || 0,
+        // USDT figure on the QuickStart strip is the **used balance**
+        // (margin actually committed to live exchange positions), NOT
+        // the leveraged notional. We prefer the new `marginUsd` field
+        // and fall back to legacy `volumeUsd` when the server hasn't
+        // emitted it yet (cumulative counter empty + no live positions).
+        liveVolumeUsd:         Number(s.openPositions?.live?.marginUsd)
+                                 || Number(s.openPositions?.live?.volumeUsd)
+                                 || 0,
         indLast5m:             s.windows?.indications?.last5m     || 0,
         indLast60m:            s.windows?.indications?.last60m    || 0,
         phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
@@ -662,7 +682,7 @@ export function QuickstartSection() {
     await refreshLiveTradeStatus()
   }
 
-  // ── live-trade toggle ─────────────────────────────────────────────────────
+  // ── live-trade toggle ─────────────────────────────────────���───────────────
   // Enables or disables real exchange trading for the active connection via
   // /api/settings/connections/[id]/live-trade. The server validates that
   // credentials exist and starts the independent live-trade engine.
@@ -1064,9 +1084,12 @@ export function QuickstartSection() {
               </div>
               <div
                 className="flex flex-col gap-0.5"
-                title="Cumulative live-trade USD volume transacted on the exchange (the only authoritative exposure figure)."
+                title={
+                  "USDT used balance — the actual capital committed to live exchange positions " +
+                  "(margin = sum of notional/leverage). NOT the leveraged notional exposure."
+                }
               >
-                <span className="text-muted-foreground">Live Volume</span>
+                <span className="text-muted-foreground">USDT</span>
                 <span className="font-bold text-amber-700 dark:text-amber-400 tabular-nums">
                   {fmtUsd(stats.liveVolumeUsd)}
                 </span>
