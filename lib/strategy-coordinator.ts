@@ -93,6 +93,27 @@ export interface StrategySet {
     cont:  number
     pause: number
   }
+
+  /**
+   * Multi-step trailing profile (spec — Settings → Strategy → Trailing).
+   *
+   * Set at BASE stage when `strategyBaseTrailingEnabled` is on. Threads
+   * through Main → Real → Live unchanged; consumed at Live by
+   * `PseudoPositionManager.createPosition` to persist the per-position
+   * trailing-state machine fields.
+   *
+   * All three are RATIOS (0.1 ≡ 10 % of price). `stepRatio` is always
+   * `stopRatio / 2` per spec.
+   *
+   * Absent for Sets created when multi-trailing is disabled — those
+   * fall back to the legacy single-step path with confidence-based
+   * trailing on/off (`bestEntry.confidence ≥ 0.85`).
+   */
+  trailingProfile?: {
+    startRatio: number   // activation gain ratio (e.g. 0.3 ≡ 30 %)
+    stopRatio:  number   // trail distance ratio (e.g. 0.1 ≡ 10 %)
+    stepRatio:  number   // ratchet increment ratio (= stopRatio / 2)
+  }
 }
 
 export interface StrategySetEntry {
@@ -216,6 +237,12 @@ export class StrategyCoordinator {
           ? this.neutralPositionContext()
           : await this.getPositionContext())
 
+      // Refresh per-cycle trailing-matrix cache when this entry-point is
+      // called standalone (the batch entry-point invalidates already).
+      // `sharedContext` presence is the cheapest tell that we're inside
+      // a batch — skip the reset there to keep one read per batch.
+      if (!sharedContext) (this as any)._trailingVariantsCache = undefined
+
       // Sets flow BASE → MAIN → REAL → LIVE. Each stage used to re-read its
       // predecessor's output from Redis via getSettings(); we now pipe the
       // computed arrays directly between stages in memory to eliminate 3
@@ -261,6 +288,9 @@ export class StrategyCoordinator {
     isPrehistoric: boolean = false,
   ): Promise<Record<string, StrategyEvaluation[]>> {
     const ctx = isPrehistoric ? this.neutralPositionContext() : await this.getPositionContext()
+    // Refresh per-cycle caches so a Settings save in the dashboard takes
+    // effect on the very next cycle (no engine restart required).
+    ;(this as any)._trailingVariantsCache = undefined
     const out: Record<string, StrategyEvaluation[]> = {}
     // Run per-symbol flows in parallel — they only share the ctx snapshot and
     // each touches distinct symbol-scoped Redis keys.
@@ -275,8 +305,71 @@ export class StrategyCoordinator {
   // ─── STAGE 1: BASE ───────────────────────────────────────────────────────────
 
   /**
-   * Create one StrategySet per (indication_type × direction) combination.
-   * Each Set holds multiple config entries (max 250), but counts as 1 Set.
+   * Read the multi-step trailing matrix from Redis settings (mirror-aware).
+   * Returns one TrailingProfile per ENABLED `(start, stop)` combo.
+   *
+   * When the master toggle (`strategyBaseTrailingEnabled`) is off OR no
+   * variants are enabled, returns `[]` and the caller falls back to the
+   * legacy single-Set path with confidence-based trailing on/off.
+   *
+   * Cached per-cycle on `this._trailingVariantsCache` so the per-symbol
+   * createBaseSets calls in `executeStrategyFlowBatch` share one read.
+   */
+  private async getEnabledTrailingVariants(): Promise<
+    Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string }>
+  > {
+    if ((this as any)._trailingVariantsCache) return (this as any)._trailingVariantsCache
+    try {
+      // Lazy import to avoid circular deps in legacy callers
+      const { getAppSettings } = await import("@/lib/redis-db")
+      const settings = (await getAppSettings()) || {}
+      const enabledMaster = settings.strategyBaseTrailingEnabled !== false
+      if (!enabledMaster) {
+        ;(this as any)._trailingVariantsCache = []
+        return []
+      }
+
+      const raw = settings.strategyBaseTrailingVariants
+      // Support both shapes: stringified JSON (Upstash KV) and array
+      let tokens: string[] = []
+      if (Array.isArray(raw)) tokens = raw
+      else if (typeof raw === "string" && raw.trim().startsWith("[")) {
+        try {
+          const parsed = JSON.parse(raw)
+          if (Array.isArray(parsed)) tokens = parsed
+        } catch { /* tolerate malformed */ }
+      } else if (typeof raw === "string") {
+        // Comma-or-whitespace-separated fallback
+        tokens = raw.split(/[\s,]+/).filter(Boolean)
+      }
+
+      const profiles: Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string }> = []
+      for (const token of tokens) {
+        if (typeof token !== "string") continue
+        const [sStr, kStr] = token.split(":")
+        const start = parseFloat(sStr)
+        const stop = parseFloat(kStr)
+        if (!Number.isFinite(start) || !Number.isFinite(stop)) continue
+        if (start <= 0 || stop <= 0) continue
+        // tag is the canonical compact identifier used in setKey suffix
+        const tag = `t${Math.round(start * 100)}-${Math.round(stop * 100)}`
+        profiles.push({ startRatio: start, stopRatio: stop, stepRatio: stop / 2, tag })
+      }
+      ;(this as any)._trailingVariantsCache = profiles
+      return profiles
+    } catch (err) {
+      console.warn("[v0] [StrategyCoordinator] failed to read trailing variants:", err)
+      ;(this as any)._trailingVariantsCache = []
+      return []
+    }
+  }
+
+  /**
+   * Create one StrategySet per (indication_type × direction × trailing_variant)
+   * combination. Each Set holds multiple config entries (max 250).
+   *
+   * When multi-step trailing is disabled (or no variants are enabled), the
+   * fan-out collapses to one Set per (type × direction) — original behaviour.
    */
   private async createBaseSets(
     symbol: string,
@@ -297,51 +390,72 @@ export class StrategyCoordinator {
     const baseSets: StrategySet[] = []
     const maxEntries = this.config.maxEntriesPerSet || 250
 
-    for (const [setKey, group] of setMap.entries()) {
-      // Build up to maxEntries config entries for this Set
-      const entries: StrategySetEntry[] = []
-      let entryIdx = 0
+    // Multi-step trailing matrix — `[]` (= no fan-out) collapses to legacy
+    // single-Set-per-(type,direction) behaviour. We use `[null]` as a
+    // sentinel "untrailed" pass so the body of the loop is shared between
+    // both paths.
+    const trailingVariants = await this.getEnabledTrailingVariants()
+    const variantPasses: Array<{ startRatio: number; stopRatio: number; stepRatio: number; tag: string } | null> =
+      trailingVariants.length > 0 ? trailingVariants : [null]
 
-      for (const ind of group.indications) {
-        if (entryIdx >= maxEntries) break
-        // Always parse as numbers — indication fields may arrive as strings from Redis hgetall
-        const rawConf = parseFloat(String(ind.confidence ?? 0.5))
-        const conf = Number.isFinite(rawConf) ? rawConf : 0.5
-        const rawPF = parseFloat(String(ind.profitFactor ?? ind.profit_factor ?? 0))
-        const pfFromPF = Number.isFinite(rawPF) && rawPF > 0 ? rawPF : conf * 2
-        const pf = pfFromPF
-        if (pf < this.PF_BASE_MIN) continue
+    for (const variant of variantPasses) {
+      for (const [baseSetKey, group] of setMap.entries()) {
+        // Per-variant Set key — keeps each trailing combo as an INDEPENDENT
+        // Set throughout the BASE → MAIN → REAL → LIVE flow.
+        const setKey = variant ? `${baseSetKey}:${variant.tag}` : baseSetKey
 
-        entries.push({
-          id: `${setKey}-${entryIdx}`,
-          sizeMultiplier: 1.0,
-          leverage: 1,
-          positionState: "new",
-          profitFactor: pf,
-          drawdownTime: 0,
-          confidence: conf,
-        })
-        entryIdx++
+        // Build up to maxEntries config entries for this Set
+        const entries: StrategySetEntry[] = []
+        let entryIdx = 0
+
+        for (const ind of group.indications) {
+          if (entryIdx >= maxEntries) break
+          // Always parse as numbers — indication fields may arrive as strings from Redis hgetall
+          const rawConf = parseFloat(String(ind.confidence ?? 0.5))
+          const conf = Number.isFinite(rawConf) ? rawConf : 0.5
+          const rawPF = parseFloat(String(ind.profitFactor ?? ind.profit_factor ?? 0))
+          const pfFromPF = Number.isFinite(rawPF) && rawPF > 0 ? rawPF : conf * 2
+          const pf = pfFromPF
+          if (pf < this.PF_BASE_MIN) continue
+
+          entries.push({
+            id: `${setKey}-${entryIdx}`,
+            sizeMultiplier: 1.0,
+            leverage: 1,
+            positionState: "new",
+            profitFactor: pf,
+            drawdownTime: 0,
+            confidence: conf,
+          })
+          entryIdx++
+        }
+
+        if (entries.length === 0) continue
+
+        const avgPF = entries.reduce((s, e) => s + e.profitFactor, 0) / entries.length
+        const avgConf = entries.reduce((s, e) => s + e.confidence, 0) / entries.length
+
+        const set: StrategySet = {
+          setKey,
+          indicationType: group.indicationType,
+          direction: group.direction,
+          avgProfitFactor: avgPF,
+          avgConfidence: avgConf,
+          avgDrawdownTime: 0,
+          entryCount: entries.length,
+          entries,
+          createdAt: new Date().toISOString(),
+          ...(variant && {
+            trailingProfile: {
+              startRatio: variant.startRatio,
+              stopRatio: variant.stopRatio,
+              stepRatio: variant.stepRatio,
+            },
+          }),
+        }
+
+        baseSets.push(set)
       }
-
-      if (entries.length === 0) continue
-
-      const avgPF = entries.reduce((s, e) => s + e.profitFactor, 0) / entries.length
-      const avgConf = entries.reduce((s, e) => s + e.confidence, 0) / entries.length
-
-      const set: StrategySet = {
-        setKey,
-        indicationType: group.indicationType,
-        direction: group.direction,
-        avgProfitFactor: avgPF,
-        avgConfidence: avgConf,
-        avgDrawdownTime: 0,
-        entryCount: entries.length,
-        entries,
-        createdAt: new Date().toISOString(),
-      }
-
-      baseSets.push(set)
     }
 
     // Persist BASE sets
@@ -485,7 +599,20 @@ export class StrategyCoordinator {
       if (baseSet.avgProfitFactor < metrics.minProfitFactor) continue
       if (baseSet.avgDrawdownTime > metrics.maxDrawdownTime) continue
 
-      for (const profile of activeVariants) {
+      // ── Multi-step trailing: collapse Main expansion to `default` ──
+      // When the Base Set already carries an explicit `trailingProfile`
+      // (multi-step path), the Set's trailing semantics are already
+      // determined and re-expanding to the legacy "trailing"/"block"/"dca"
+      // variants here would (a) double-count the trailing axis and
+      // (b) blow up the Set count multiplicatively. We keep the
+      // `default` variant only — block/dca are still produced by the
+      // legacy non-trailing Base Sets that exist when the operator has
+      // pruned the trailing matrix.
+      const variantsForThisBase = baseSet.trailingProfile
+        ? activeVariants.filter((p) => p.name === "default")
+        : activeVariants
+
+      for (const profile of variantsForThisBase) {
         const fingerprint = this.variantFingerprint(baseSet, profile.name, ctx)
 
         // Cache hit — reuse the cached Set verbatim. This is the "IF NOT
@@ -495,6 +622,12 @@ export class StrategyCoordinator {
             const cached = JSON.parse(fpCache[fingerprint]) as StrategySet
             // Sanity-check the cached record before reusing it
             if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
+              // Re-attach the parent's trailing profile in case the cached
+              // payload was written before the profile field existed
+              // (operators upgrading mid-cycle keep working).
+              if (baseSet.trailingProfile && !cached.trailingProfile) {
+                cached.trailingProfile = baseSet.trailingProfile
+              }
               mainSets.push(cached)
               nextFpCache[fingerprint] = fpCache[fingerprint]
               reused++
@@ -512,6 +645,10 @@ export class StrategyCoordinator {
         // *that* ctx, and we don't want to retroactively re-bucket).
         const built = await this.buildVariantSet(baseSet, profile, metrics, maxEntries, ctx)
         if (!built) continue
+
+        // Propagate Base's trailingProfile to the freshly-built Main Set
+        // so Real/Live can read it without traversing back to Base.
+        if (baseSet.trailingProfile) built.trailingProfile = baseSet.trailingProfile
 
         mainSets.push(built)
         // Store a compact serialisation in the fingerprint cache. Capped at
@@ -1282,8 +1419,24 @@ export class StrategyCoordinator {
 
                 const tp = Math.max(0.5, (bestEntry.profitFactor - 1) * 100)
                 const sl = Math.min(5, 100 / Math.max(1, bestEntry.profitFactor) * 0.5)
-                const trailing = bestEntry.confidence >= 0.85
-                const configSetKey = `${set.indicationType}:${set.direction}:${symbol}`
+
+                // Multi-step trailing — Set carries its own profile from
+                // BASE, so trailing-on/off and the three ratios are
+                // operator-determined per the matrix in Settings →
+                // Strategy → Trailing. Sets WITHOUT a profile keep the
+                // legacy single-step behaviour with statistical on/off
+                // (`bestEntry.confidence >= 0.85`).
+                const profile = set.trailingProfile
+                const trailing = profile ? true : bestEntry.confidence >= 0.85
+
+                // Include the trailing tuple in the per-Set uniqueness
+                // key so each variant occupies its own slot. The
+                // per-direction cap in `canCreatePosition` still gates
+                // the total — only one Long + one Short open at a time.
+                const tagSuffix = profile
+                  ? `:t${Math.round(profile.startRatio * 100)}-${Math.round(profile.stopRatio * 100)}`
+                  : ""
+                const configSetKey = `${set.indicationType}:${set.direction}:${symbol}${tagSuffix}`
 
                 const posId = await posManager.createPosition({
                   symbol,
@@ -1295,6 +1448,11 @@ export class StrategyCoordinator {
                   profitFactor: bestEntry.profitFactor,
                   trailingEnabled: trailing,
                   configSetKey,
+                  ...(profile && {
+                    trailingStartRatio: profile.startRatio,
+                    trailingStopRatio: profile.stopRatio,
+                    trailingStepRatio: profile.stepRatio,
+                  }),
                 })
                 return Boolean(posId)
               } catch {

@@ -38,6 +38,21 @@ export const initialSettings: Settings = {
   baseRatioMax: 1,
   trailingOption: false,
 
+  // Multi-step trailing — Base Strategies
+  // Default: master enabled, full 5×5 matrix on. Operator prunes in
+  // Settings → Strategy → Trailing. Spec values:
+  //   start ∈ {0.3, 0.6, 0.9, 1.2, 1.5}   step 0.3   (activation)
+  //   stop  ∈ {0.1, 0.2, 0.3, 0.4, 0.5}   step 0.1   (trail distance)
+  //   step  = stop / 2                                (ratchet increment)
+  strategyBaseTrailingEnabled: true,
+  strategyBaseTrailingVariants: [
+    "0.3:0.1", "0.3:0.2", "0.3:0.3", "0.3:0.4", "0.3:0.5",
+    "0.6:0.1", "0.6:0.2", "0.6:0.3", "0.6:0.4", "0.6:0.5",
+    "0.9:0.1", "0.9:0.2", "0.9:0.3", "0.9:0.4", "0.9:0.5",
+    "1.2:0.1", "1.2:0.2", "1.2:0.3", "1.2:0.4", "1.2:0.5",
+    "1.5:0.1", "1.5:0.2", "1.5:0.3", "1.5:0.4", "1.5:0.5",
+  ],
+
   // Main Strategy
   previousPositionsCount: 5,
   lastStateCount: 3,

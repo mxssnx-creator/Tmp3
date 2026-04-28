@@ -7,6 +7,7 @@ import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import AutoIndicationSettings from "@/components/settings/auto-indication-settings"
+import MultiTrailingSettings from "@/components/settings/strategy/multi-trailing-settings"
 import { useState } from "react"
 
 interface StrategyTabProps {
@@ -31,6 +32,7 @@ export function StrategyTab({ settings, handleSettingChange }: StrategyTabProps)
           <Tabs value={strategyMainSubTab} onValueChange={setStrategyMainSubTab}>
             <TabsList>
               <TabsTrigger value="base">Base</TabsTrigger>
+              <TabsTrigger value="trailing">Trailing</TabsTrigger>
               <TabsTrigger value="adjustment">Adjustment</TabsTrigger>
             </TabsList>
 
@@ -128,6 +130,21 @@ export function StrategyTab({ settings, handleSettingChange }: StrategyTabProps)
                   </div>
                 </CardContent>
               </Card>
+            </TabsContent>
+
+            <TabsContent value="trailing" className="space-y-4">
+              {/*
+               * Multi-step trailing matrix per spec — Settings →
+               * Strategy → Main → Trailing. Each enabled (start, stop)
+               * combo spawns one independent Base Set per
+               * (indication_type × direction); engine consumes them
+               * via `getEnabledTrailingVariants()` in
+               * `lib/strategy-coordinator.ts`.
+               */}
+              <MultiTrailingSettings
+                settings={settings}
+                handleSettingChange={handleSettingChange}
+              />
             </TabsContent>
 
             <TabsContent value="adjustment" className="space-y-4">
