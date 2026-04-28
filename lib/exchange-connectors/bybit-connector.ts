@@ -294,6 +294,127 @@ export class BybitConnector extends BaseExchangeConnector {
     }
   }
 
+  /**
+   * Bybit-native conditional order via `/v5/order/create`.
+   *
+   * Bybit folds stop-orders into the regular create endpoint by adding
+   * `triggerPrice` and `triggerDirection` (1 = trigger when last price
+   * RISES through the level, 2 = when it FALLS). Combined with
+   * `orderType: "Market"` and `reduceOnly: true` this yields a real
+   * stop-loss / take-profit on the linear perp. Spot accounts have no
+   * v5 conditional family — fall back to the base limit-as-trigger
+   * implementation.
+   *
+   * Trigger direction matrix (the four cases that cover SL+TP × long+short):
+   *
+   *   long  TP  → close=sell, trigger when price RISES   (triggerDirection=1)
+   *   long  SL  → close=sell, trigger when price FALLS   (triggerDirection=2)
+   *   short TP  → close=buy,  trigger when price FALLS   (triggerDirection=2)
+   *   short SL  → close=buy,  trigger when price RISES   (triggerDirection=1)
+   *
+   * Note we treat the *position* side (derived from `closeSide`) plus
+   * `kind` as the source of truth — easier to reason about than trying
+   * to derive it from `closeSide` alone.
+   */
+  override async placeStopOrder(
+    symbol: string,
+    closeSide: "buy" | "sell",
+    quantity: number,
+    triggerPrice: number,
+    kind: "stop_loss" | "take_profit",
+    options: PlaceOrderOptions = {},
+  ): Promise<{ success: boolean; orderId?: string; error?: string }> {
+    try {
+      const category = this.getTradingCategory()
+      if (category !== "linear" && category !== "inverse") {
+        // Spot etc. — no native trigger family, fall back to legacy.
+        return super.placeStopOrder(symbol, closeSide, quantity, triggerPrice, kind, options)
+      }
+
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        return { success: false, error: `Invalid quantity: ${quantity}` }
+      }
+      if (!Number.isFinite(triggerPrice) || triggerPrice <= 0) {
+        return { success: false, error: `Invalid trigger price: ${triggerPrice}` }
+      }
+
+      const roundedQty = Math.round(quantity * 1e8) / 1e8
+      const qtyStr = roundedQty.toFixed(8).replace(/\.?0+$/, "")
+      const trigRounded = Math.round(triggerPrice * 1e8) / 1e8
+      const trigStr = trigRounded.toFixed(8).replace(/\.?0+$/, "")
+
+      const hedgeMode = options.hedgeMode === true
+      const positionSide: "LONG" | "SHORT" = options.positionSide
+        ?? (closeSide === "sell" ? "LONG" : "SHORT")
+
+      // See JSDoc for the full direction matrix.
+      const isLong = positionSide === "LONG"
+      let triggerDirection: 1 | 2
+      if (kind === "take_profit") {
+        triggerDirection = isLong ? 1 : 2
+      } else {
+        triggerDirection = isLong ? 2 : 1
+      }
+
+      const body: Record<string, any> = {
+        category,
+        symbol,
+        side: closeSide === "buy" ? "Buy" : "Sell",
+        orderType: "Market",
+        qty: qtyStr,
+        timeInForce: "IOC",
+        triggerPrice: trigStr,
+        triggerDirection,
+        // LastPrice trigger matches Bybit's UI default and avoids
+        // mark-vs-last drift confusion. Could be exposed if needed.
+        triggerBy: "LastPrice",
+        reduceOnly: options.reduceOnly !== false,
+      }
+      if (options.clientOrderId) body.orderLinkId = options.clientOrderId
+      // positionIdx: 0 = one-way, 1 = hedge LONG, 2 = hedge SHORT.
+      body.positionIdx = hedgeMode ? (isLong ? 1 : 2) : 0
+
+      this.log(
+        `Placing ${kind === "take_profit" ? "TP" : "SL"}-Market ${closeSide} ${qtyStr} ${symbol} ` +
+          `@ trig=${trigStr} dir=${triggerDirection} idx=${body.positionIdx}`,
+      )
+
+      const { data } = await this.signedRequestV5<any>({
+        method: "POST",
+        path: "/v5/order/create",
+        body,
+      })
+
+      if (data?.retCode !== 0) {
+        // Same idx-mismatch retry as `placeOrder`.
+        if (String(data?.retCode) === "10001") {
+          this.log("Retrying stop order with flipped position mode (idx mismatch)")
+          body.positionIdx = body.positionIdx === 0 ? (isLong ? 1 : 2) : 0
+          const retry = await this.signedRequestV5<any>({
+            method: "POST",
+            path: "/v5/order/create",
+            body,
+          })
+          if (retry.data?.retCode === 0) {
+            const retryId = retry.data.result?.orderId
+            this.log(`✓ Stop order placed on retry: ${retryId}`)
+            return { success: true, orderId: retryId }
+          }
+          throw new Error(`Bybit stop order error: ${retry.data?.retMsg || "Unknown"}`)
+        }
+        throw new Error(`Bybit stop order error: ${data?.retMsg || "Unknown"}`)
+      }
+
+      const orderId = data.result?.orderId
+      this.log(`✓ Stop order placed: ${orderId} @ ${trigStr}`)
+      return { success: true, orderId }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to place stop order: ${errorMsg}`)
+      return { success: false, error: errorMsg }
+    }
+  }
+
   async cancelOrder(symbol: string, orderId: string): Promise<{ success: boolean; error?: string }> {
     try {
       this.log(`Cancelling order ${orderId} for ${symbol}`)

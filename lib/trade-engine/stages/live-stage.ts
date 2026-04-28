@@ -788,17 +788,33 @@ async function placeProtectionOrder(
   closeSide: "buy" | "sell",
   quantity: number,
   triggerPrice: number,
-  orderLabel: string,
+  orderLabel: "StopLoss" | "TakeProfit",
   positionDirection: "long" | "short",
 ): Promise<string | null> {
   try {
-    if (typeof connector.placeOrder !== "function") return null
-    const result = await connector.placeOrder(
+    // Prefer the connector's CONDITIONAL-order path
+    // (`placeStopOrder`) over a regular `placeOrder`. The legacy code
+    // here used `placeOrder(..., "limit")` at the trigger price — which
+    // for SL on a long is a sell-limit BELOW market and gets rejected
+    // by most exchanges as an aggressive reduce-only, leaving the
+    // position unprotected. `placeStopOrder` lands a real STOP_MARKET /
+    // TAKE_PROFIT_MARKET (BingX) or `triggerPrice`-based market reduce
+    // (Bybit), and falls back to the limit-as-trigger behaviour on
+    // connectors that haven't been upgraded yet (see `BaseExchangeConnector`).
+    if (typeof connector?.placeStopOrder !== "function") {
+      console.warn(`${LOG_PREFIX} connector has no placeStopOrder — protection unavailable`)
+      return null
+    }
+
+    const kind: "stop_loss" | "take_profit" =
+      orderLabel === "StopLoss" ? "stop_loss" : "take_profit"
+
+    const result = await connector.placeStopOrder(
       symbol,
       closeSide,
       quantity,
       triggerPrice,
-      "limit",
+      kind,
       {
         reduceOnly: true,
         positionSide: positionDirection === "long" ? "LONG" : "SHORT",

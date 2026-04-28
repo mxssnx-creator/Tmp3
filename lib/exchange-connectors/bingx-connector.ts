@@ -479,6 +479,126 @@ export class BingXConnector extends BaseExchangeConnector {
     }
   }
 
+  /**
+   * BingX-native conditional order: places `STOP_MARKET` / `TAKE_PROFIT_MARKET`
+   * on the perpetual swap endpoint. Differs from a regular order in three ways:
+   *
+   *   • `type` is `STOP_MARKET` or `TAKE_PROFIT_MARKET` (not `LIMIT`/`MARKET`)
+   *   • the trigger level travels in `stopPrice`, NOT `price`
+   *   • on fire, the exchange emits a market reduce-only fill — so we don't
+   *     need to set an explicit `price`. Tighter slippage profile too.
+   *
+   * BingX requires hyphenated symbols on the swap endpoint and accepts
+   * `positionSide` only when the account is in hedge mode — both already
+   * handled the same way as `placeOrder`. Spot accounts don't have a
+   * conditional order family, so we fall back to the base implementation.
+   */
+  override async placeStopOrder(
+    symbol: string,
+    closeSide: "buy" | "sell",
+    quantity: number,
+    triggerPrice: number,
+    kind: "stop_loss" | "take_profit",
+    options: PlaceOrderOptions = {},
+  ): Promise<{ success: boolean; orderId?: string; error?: string }> {
+    try {
+      const isSpot = this.credentials.apiType === "spot"
+      if (isSpot) {
+        // Spot has no native stop-market — let the base fallback handle it.
+        return super.placeStopOrder(symbol, closeSide, quantity, triggerPrice, kind, options)
+      }
+
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        return { success: false, error: `Invalid quantity: ${quantity}` }
+      }
+      if (!Number.isFinite(triggerPrice) || triggerPrice <= 0) {
+        return { success: false, error: `Invalid trigger price: ${triggerPrice}` }
+      }
+
+      const roundedQty = Math.round(quantity * 1e6) / 1e6
+      const qtyStr = roundedQty.toFixed(6).replace(/\.?0+$/, "")
+      const stopRounded = Math.round(triggerPrice * 1e8) / 1e8
+      const stopStr = stopRounded.toFixed(8).replace(/\.?0+$/, "")
+
+      const bingxSymbol = this.toBingXSymbol(symbol)
+      const hedgeMode = options.hedgeMode !== false
+      // Closing a LONG ⇒ sell-side reduce-only against LONG position;
+      // closing a SHORT ⇒ buy-side reduce-only against SHORT position.
+      const positionSide: "LONG" | "SHORT" = options.positionSide
+        ?? (closeSide === "sell" ? "LONG" : "SHORT")
+
+      const orderType = kind === "stop_loss" ? "STOP_MARKET" : "TAKE_PROFIT_MARKET"
+
+      const params: Record<string, any> = {
+        symbol: bingxSymbol,
+        side: closeSide.toUpperCase(),
+        type: orderType,
+        quantity: qtyStr,
+        stopPrice: stopStr,
+        // workingType=MARK_PRICE prevents wick-driven false triggers
+        // on thin tickers; matches BingX's own UI default for SL/TP.
+        workingType: "MARK_PRICE",
+        timestamp: Date.now(),
+      }
+      if (hedgeMode) params.positionSide = positionSide
+      if (options.reduceOnly !== false) params.reduceOnly = "true"
+      if (options.clientOrderId) params.clientOrderId = options.clientOrderId
+
+      this.log(
+        `Placing ${orderType} ${closeSide} ${qtyStr} ${bingxSymbol} @ stop=${stopStr}` +
+          `${hedgeMode ? ` posSide=${positionSide}` : " [one-way]"} [reduceOnly]`,
+      )
+
+      const endpoint = "/openApi/swap/v2/trade/order"
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+      }
+      const data = await response.json()
+
+      // Same one-way retry logic as `placeOrder`: BingX returns 80014 when
+      // a hedge-mode positionSide is sent to a one-way account.
+      if (!this.isBingXSuccess(data.code)) {
+        const sideMismatch = String(data.code) === "80014"
+          || /position.*side/i.test(String(data.msg || ""))
+        if (sideMismatch && hedgeMode) {
+          this.log("Retrying stop order without positionSide (one-way account)")
+          delete params.positionSide
+          params.timestamp = Date.now()
+          const { signature: retrySig, queryString: retryQs } = this.signParams(params)
+          const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}&signature=${retrySig}`
+          const retryResp = await this.rateLimitedFetch(retryUrl, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const retryData = await retryResp.json()
+          if (this.isBingXSuccess(retryData.code)) {
+            const info = retryData.data?.order || retryData.data || {}
+            const id = info.orderId || info.id || retryData.data?.orderId
+            this.log(`✓ ${orderType} placed on retry: ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined }
+          }
+          throw new Error(`BingX stop order error (code=${retryData.code}): ${retryData.msg || "Unknown"}`)
+        }
+        throw new Error(`BingX stop order error (code=${data.code}): ${data.msg || "Unknown"}`)
+      }
+
+      const info = data.data?.order || data.data || {}
+      const orderId = info.orderId || info.id || data.data?.orderId
+      this.log(`✓ ${orderType} placed: ${orderId} @ ${stopStr}`)
+      return { success: true, orderId: orderId ? String(orderId) : undefined }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to place stop order: ${errorMsg}`)
+      return { success: false, error: errorMsg }
+    }
+  }
+
   async cancelOrder(symbol: string, orderId: string): Promise<{ success: boolean; error?: string }> {
     try {
       this.log(`Cancelling order ${orderId} for ${symbol}`)

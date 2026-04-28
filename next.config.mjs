@@ -1,4 +1,4 @@
-// Force rebuild: 2026-04-28T14:35:00 — assigned TP/SL contract: pseudo evaluator + live exchange share single source of truth, override audit trail
+// Force rebuild: 2026-04-28T15:10:00 — native conditional SL/TP orders (BingX STOP_MARKET, Bybit triggerPrice); legacy fallback preserved
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
