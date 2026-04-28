@@ -94,6 +94,7 @@ export async function GET(
       engineState,
       engineProgression,
       prehistoricSymbolCount,
+      axisWindowsHashRaw,
     ] = await Promise.all([
       client.hgetall(`progression:${connectionId}`).catch(() => null),
       client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
@@ -101,11 +102,17 @@ export async function GET(
       getSettings(`trade_engine_state:${connectionId}`).catch(() => ({})),
       getSettings(`engine_progression:${connectionId}`).catch(() => ({})),
       client.scard(`prehistoric:${connectionId}:symbols`).catch(() => 0),
+      // Per-axis-window cumulative counters written by createMainSets in
+      // strategy-coordinator.ts. Hash fields are `${axis}_${N}_sets` /
+      // `${axis}_${N}_pos` for axis ∈ {prev, last, cont, pause} and the
+      // step-1 windows documented in StrategySet.axisWindows.
+      client.hgetall(`axis_windows:${connectionId}`).catch(() => null),
     ])
 
     const progHash: Record<string, string>       = progHashRaw       || {}
     const prehistoricHash: Record<string, string> = prehistoricHashRaw || {}
     const realtimeHash: Record<string, string>   = realtimeHashRaw   || {}
+    const axisWindowsHash: Record<string, string> = axisWindowsHashRaw || {}
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
@@ -1152,6 +1159,33 @@ export async function GET(
         const totalReused  = n(progHash.strategies_main_related_reused)
         const totalCycles  = n(progHash.strategies_main_cycles)
         const reuseDenom   = totalCreated + totalReused
+
+        // ── Build per-axis-window arrays from `axis_windows:{id}` ─────────
+        //
+        // Spec mapping:
+        //   prev  : N ∈ 0..12 (closed lookback window)
+        //   last  : N ∈ 0..4  (last-N wins/losses magnitude)
+        //   cont  : N ∈ 0..8  (open continuous positions)
+        //   pause : N ∈ 0..8  (last-N validation window)
+        //
+        // For each axis we emit an array of `{ window, sets, pos }` so the
+        // dashboard can render a compact 0..N strip without re-deriving
+        // positional offsets. `sets` = cumulative Sets that landed under
+        // window N; `pos` = total entries (≈ "position configurations")
+        // those Sets carried. 0-bucket is included so consumers can show
+        // "axis was inactive N times" without special-casing the absence.
+        const buildAxis = (axis: "prev" | "last" | "cont" | "pause", maxN: number) => {
+          const out: Array<{ window: number; sets: number; pos: number }> = []
+          for (let i = 0; i <= maxN; i++) {
+            out.push({
+              window: i,
+              sets: n(axisWindowsHash[`${axis}_${i}_sets`]),
+              pos:  n(axisWindowsHash[`${axis}_${i}_pos`]),
+            })
+          }
+          return out
+        }
+
         return {
           activeVariants:       activeVariantsStr.split(",").filter(Boolean),
           activeVariantCount:   n(progHash.strategies_main_active_variant_count),
@@ -1168,6 +1202,17 @@ export async function GET(
             prevLosses:  n(progHash.strategies_main_ctx_prev_losses),
             prevTotal:   n(progHash.strategies_main_ctx_prev_total),
             updatedAt:   n(progHash.strategies_main_ctx_updated_at),
+          },
+          // ── Per-axis Position-Count windows (cumulative across run) ─────
+          // Spec: *"step 1 previous 1-12; Last (of previous) 1-4;
+          // continuous 1-8 and Pause 1-8"*. Each axis emits its full 0..N
+          // bucket strip, suitable for a compact "axis summary" UI row.
+          axisWindows: {
+            prev:   buildAxis("prev",  12),
+            last:   buildAxis("last",  4),
+            cont:   buildAxis("cont",  8),
+            pause:  buildAxis("pause", 8),
+            updatedAt: n(axisWindowsHash.updated_at),
           },
         }
       })(),
