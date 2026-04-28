@@ -180,6 +180,14 @@ export function ActiveConnectionCard({
     liveOrdersFailed: number
     liveOrdersRejected: number
     liveOrdersSimulated: number
+    /**
+     * Number of upstream Real-stage Set signals that were merged into
+     * an already-open exchange position instead of creating a new one
+     * (so we never spam the venue with duplicate orders for the same
+     * symbol+direction). This is the canonical "Pos Accumulated"
+     * counter the user wants surfaced at the Real → Live boundary.
+     */
+    liveOrdersAccumulated: number
     livePositionsCreated: number
     livePositionsClosed: number
     livePositionsOpen: number
@@ -469,6 +477,7 @@ export function ActiveConnectionCard({
           liveOrdersFailed:      data?.liveExecution?.ordersFailed     || 0,
           liveOrdersRejected:    data?.liveExecution?.ordersRejected   || 0,
           liveOrdersSimulated:   data?.liveExecution?.ordersSimulated  || 0,
+          liveOrdersAccumulated: data?.liveExecution?.ordersAccumulated || 0,
           livePositionsCreated:  data?.liveExecution?.positionsCreated || 0,
           livePositionsClosed:   data?.liveExecution?.positionsClosed  || 0,
           livePositionsOpen:     data?.liveExecution?.positionsOpen    || 0,
@@ -1253,7 +1262,7 @@ export function ActiveConnectionCard({
                                   </span>
                                 </span>
                               </div>
-                              {/* Real-stage extra row: PosEval avg + count */}
+                              {/* Real-stage extra row: PosEval avg + count + Pos Accumulated */}
                               {avgPosEval !== null && !isLive && (
                                 <div className="flex items-center gap-2 text-[10px] pl-7">
                                   <span className="text-muted-foreground">PosEval avg</span>
@@ -1263,6 +1272,21 @@ export function ActiveConnectionCard({
                                   {countPosEval !== null && countPosEval > 0 && (
                                     <span className="text-muted-foreground">
                                       count <span className="text-foreground font-medium tabular-nums">{countPosEval}</span>
+                                    </span>
+                                  )}
+                                  {/* Pos Accumulated — the Real → Live consolidation counter.
+                                     Counts how many Real-stage Set signals for this connection
+                                     were merged into an already-open exchange position rather
+                                     than spawning a new one. Spec: *"ON Real Show count Sets
+                                     and Pos Accumulated"*. */}
+                                  {label === "Real" && prehistoricStats.liveOrdersAccumulated > 0 && (
+                                    <span
+                                      className="text-muted-foreground ml-auto"
+                                      title="Real-stage signals merged into existing exchange positions to avoid duplicate orders on the same symbol+direction."
+                                    >
+                                      Pos Accum <span className="text-cyan-600 dark:text-cyan-400 font-semibold tabular-nums">
+                                        {prehistoricStats.liveOrdersAccumulated}
+                                      </span>
                                     </span>
                                   )}
                                 </div>
@@ -1353,6 +1377,19 @@ export function ActiveConnectionCard({
                             <span className="text-muted-foreground">
                               sim <span className="text-blue-600 dark:text-blue-400 font-semibold tabular-nums">
                                 {prehistoricStats.liveOrdersSimulated}
+                              </span>
+                            </span>
+                          )}
+                          {/* Accumulated entries — Real-stage Set signals merged
+                              into existing exchange positions (avoids duplicate
+                              orders for the same symbol/direction). */}
+                          {prehistoricStats.liveOrdersAccumulated > 0 && (
+                            <span
+                              className="text-muted-foreground"
+                              title="Real-stage Set signals merged into an existing exchange position instead of opening a new one — keeps live exposure consolidated."
+                            >
+                              accum <span className="text-cyan-600 dark:text-cyan-400 font-semibold tabular-nums">
+                                {prehistoricStats.liveOrdersAccumulated}
                               </span>
                             </span>
                           )}

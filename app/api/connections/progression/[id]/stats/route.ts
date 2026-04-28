@@ -1319,6 +1319,14 @@ export async function GET(
         ordersFailed:     n(progHash.live_orders_failed_count),
         ordersRejected:   n(progHash.live_orders_rejected_count),
         ordersSimulated:  n(progHash.live_orders_simulated_count),
+        // Accumulated entries (extra fills merged into an existing
+        // exchange position because multiple Real-stage Set signals
+        // for the same symbol+direction landed on a still-open live
+        // position). This is the canonical "Pos Accumulated" metric
+        // the user wants surfaced at Real → Live: it's how many
+        // upstream Set signals were absorbed without spawning new
+        // exchange orders, keeping the live exposure consolidated.
+        ordersAccumulated: n(progHash.live_orders_accumulated_count),
         // Positions
         positionsCreated: n(progHash.live_positions_created_count),
         positionsClosed:  n(progHash.live_positions_closed_count),
