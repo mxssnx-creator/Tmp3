@@ -101,6 +101,13 @@ export const initialSettings: Settings = {
   // across ALL Sets). Operator-tunable in Settings → Strategy → Base.
   maxActiveBasePseudoPositionsPerDirection: 1,
 
+  // Hard ceiling on REAL-stage Sets that pass through to Live each cycle.
+  // 12000 is the operational default — high enough that the cap rarely
+  // binds during normal scans yet bounds runaway growth when the funnel
+  // widens (many symbols × many strategy variants). Operator-tunable via
+  // Settings → System; consumed by `StrategyCoordinator.evaluateRealSets`.
+  maxRealSets: 12000,
+
   // System Configuration
   autoRestartOnErrors: true,
   logLevel: "info",

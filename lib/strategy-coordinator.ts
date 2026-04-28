@@ -152,6 +152,14 @@ export interface PositionContext {
 export interface StrategyCoordinatorConfig {
   maxEntriesPerSet?: number   // Default 250 (entries inside one Set)
   maxLiveSets?: number        // Default 500 (Sets eligible for live trading)
+  /**
+   * Hard ceiling on the number of post-filter, post-PF-sort REAL Sets
+   * that propagate to Live evaluation each cycle. Higher values let more
+   * qualifying Sets through; lower values keep evaluation tight when the
+   * funnel widens (many symbols + many strategy variants).
+   * Default 12000. Operator-tunable via Settings → System.
+   */
+  maxRealSets?: number
   pruneStrategy?: "fifo" | "performance" | "hybrid"
 }
 
@@ -160,6 +168,7 @@ export class StrategyCoordinator {
   private config: StrategyCoordinatorConfig = {
     maxEntriesPerSet: 250,
     maxLiveSets: 500,
+    maxRealSets: 12000,
     pruneStrategy: "hybrid",
   }
 
@@ -672,7 +681,7 @@ export class StrategyCoordinator {
       }
     }
 
-    // ─── VARIANT accounting ───────────────────────────────────────────────
+    // ─── VARIANT accounting ───────────────────────���───────────────────────
     // Each related Main Set now carries an authoritative `variant` tag set
     // at build time, so we no longer have to heuristically classify
     // individual entries. Entries within a Set share the variant label.
@@ -991,14 +1000,32 @@ export class StrategyCoordinator {
     // ── PRIORITY SORT: better Sets first ──────────────────────────────
     // Per user spec: "arrange so that better Sets have priority". We sort
     // descending by `avgProfitFactor` — the same metric Live uses for its
-    // top-N selection at line 1140 — so when the downstream Live stage
+    // top-N selection at line 1182 — so when the downstream Live stage
     // (and any per-direction Pos limit) takes the head of the list it
-    // gets the highest-quality Sets first. The `maxRealSets` config cap
-    // is applied AFTER sorting so the trim keeps the best ones.
+    // gets the highest-quality Sets first. The `maxRealSets` cap is
+    // applied AFTER sorting so the trim keeps the best ones.
     const realSorted = [...realQualifying].sort(
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )
-    const maxRealSets = (this.config as any).maxRealSets || 1000
+
+    // Resolve the cap with this precedence:
+    //   1. Operator-set `maxRealSets` in Settings → System (Redis app_settings)
+    //   2. Per-instance config override (if any caller passed one)
+    //   3. Default 12000
+    // The coordinator is instantiated by `StrategyProcessor` without a
+    // config arg, so the runtime path is: app_settings → default. We
+    // read inline rather than caching on `this` because Real evaluation
+    // is the only consumer, runs once per (symbol, cycle), and a
+    // per-cycle Redis `hgetall` is already in the hot path elsewhere.
+    let maxRealSets = this.config.maxRealSets ?? 12000
+    try {
+      const { getAppSettings } = await import("@/lib/redis-db")
+      const settings = (await getAppSettings()) || {}
+      const fromSettings = Number(settings.maxRealSets)
+      if (Number.isFinite(fromSettings) && fromSettings > 0) {
+        maxRealSets = fromSettings
+      }
+    } catch { /* fall back to default */ }
     const realSets = realSorted.slice(0, maxRealSets)
 
     // Debug: show why sets failed REAL filter

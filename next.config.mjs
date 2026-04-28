@@ -1,4 +1,4 @@
-// Force rebuild: 2026-04-28T13:30:00 — active-counts UI + Real PF priority + System tab pos limit mirror
+// Force rebuild: 2026-04-28T14:05:00 — maxRealSets cap raised to 12k (operator-tunable in System tab)
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {

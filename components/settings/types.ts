@@ -106,6 +106,15 @@ export interface Settings {
    */
   maxActiveBasePseudoPositionsPerDirection: number
 
+  /**
+   * Hard ceiling on the number of post-filter, post-PF-sort REAL Sets
+   * that propagate to Live evaluation each cycle. Default 12000 — set
+   * high enough that the cap rarely binds in normal operation, yet
+   * still bounds growth when the funnel widens. Operator-tunable via
+   * Settings → System.
+   */
+  maxRealSets: number
+
   // System Configuration
   autoRestartOnErrors: boolean
   logLevel: string

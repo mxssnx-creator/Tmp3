@@ -67,8 +67,13 @@ function getDefaultSettings(): Record<string, any> {
     // (Long / Short). Kept in the defaults so fresh installs boot with the
     // spec-mandated value instead of an undefined sentinel.
     maxActiveBasePseudoPositionsPerDirection: 1,
+    // Hard ceiling on REAL-stage Sets passed through to Live each cycle.
+    // 12000 is the operational default — see Settings → System for the
+    // user-facing slider. Seeded so fresh installs match what the Strategy
+    // Coordinator's `evaluateRealSets` falls back to internally.
+    maxRealSets: 12000,
   }
-}
+  }
 
 export async function GET() {
   try {

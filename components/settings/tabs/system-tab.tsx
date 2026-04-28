@@ -135,6 +135,39 @@ export function SystemTab({ settings, handleSettingChange }: SystemTabProps) {
                   Both surfaces write to <code>maxActiveBasePseudoPositionsPerDirection</code>.
                 </p>
               </div>
+
+              {/* ── REAL-stage propagation cap ──────────────────────────
+                  This is the hard ceiling consumed by
+                  `StrategyCoordinator.evaluateRealSets`: after PF/DDT
+                  filtering and PF-descending sort, only the top N Sets
+                  propagate to Live evaluation. 12000 is the operational
+                  default — high enough that it rarely binds, yet bounds
+                  unbounded growth when the funnel widens. Range is
+                  1k–25k; step 500 keeps the slider usable while letting
+                  the operator dial in mid-range values. */}
+              <div className="space-y-2 pt-2 border-t border-dashed border-border/40">
+                <div className="flex items-center justify-between">
+                  <Label>Max Real Sets per Cycle</Label>
+                  <span className="text-sm font-semibold tabular-nums">
+                    {(settings.maxRealSets ?? 12000).toLocaleString()}
+                  </span>
+                </div>
+                <Slider
+                  value={[settings.maxRealSets ?? 12000]}
+                  onValueChange={(v) => handleSettingChange("maxRealSets", v[0])}
+                  min={1000}
+                  max={25000}
+                  step={500}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Hard ceiling on REAL-stage Sets that propagate to Live
+                  each cycle. After PF / DDT filtering and PF-descending
+                  priority sort, only the top N Sets survive. Default
+                  <strong> 12,000</strong>; raise if the funnel is wide and
+                  you observe the cap binding in logs, lower to keep
+                  evaluation tight on resource-constrained runs.
+                </p>
+              </div>
             </div>
 
               <div className="space-y-4 border-t pt-4">
