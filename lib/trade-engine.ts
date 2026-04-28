@@ -146,6 +146,10 @@ export class GlobalTradeEngineCoordinator {
    * PHASE 1 FIX: Added startup lock to prevent duplicate engines
    */
   async startEngine(connectionId: string, config: EngineConfig): Promise<void> {
+    // Self-heal background timers on every public entry-point — see
+    // `ensureBackgroundTimers` doc-block. No-op if already armed.
+    this.ensureBackgroundTimers()
+
     // Step 1: Check if already starting
     if (this.startingEngines.has(connectionId)) {
       console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
@@ -358,13 +362,92 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
+   * Idempotent background-timer self-heal.
+   *
+   * STABILITY: HMR / module-reload events historically fired in
+   * production (e.g. when a settings save bounced a route handler) and
+   * were observed to leave the coordinator singleton alive but with
+   * `healthCheckTimer` / `coordinationMetricsTimer` cleared. The
+   * watchdog re-arm and refresh-request handling are *exactly* the
+   * mechanisms that keep engines processing; losing them silently is
+   * the worst-case stability failure.
+   *
+   * This method is called from every public coordinator entry-point
+   * (`startMissingEngines`, `refreshEngines`, `startEngine`,
+   * `getAllEnginesStatus`, `pause`, `resume`, …) so the very next
+   * caller after such an event re-arms both timers. The constructor
+   * already calls them once; the underlying `startGlobal*` helpers are
+   * themselves idempotent (they early-return when the timer field is
+   * already set), so calling this on every entry-point is essentially
+   * free in steady state.
+   */
+  ensureBackgroundTimers(): void {
+    try {
+      this.startGlobalHealthMonitoring()
+    } catch (e) {
+      console.warn("[v0] [Coordinator] ensureBackgroundTimers: health monitor restart failed:", e)
+    }
+    try {
+      this.startCoordinationMetricsTracking()
+    } catch (e) {
+      console.warn("[v0] [Coordinator] ensureBackgroundTimers: metrics tracker restart failed:", e)
+    }
+  }
+
+  /**
+   * Drop "zombie" engine-manager entries — Map slots whose manager is
+   * not actually running and whose creation predates `staleAgeMs`. We
+   * see these accumulate when an engine fails to fully initialise
+   * (e.g. credentials were revoked) and the failure path leaves a
+   * not-running manager in the Map. They prevent `startMissingEngines`
+   * from ever retrying that connection because the connectionId
+   * appears "owned".
+   *
+   * Safe to call any time — a manager that *is* running is never
+   * pruned.
+   */
+  private pruneZombieManagers(staleAgeMs = 30_000): number {
+    let pruned = 0
+    const now = Date.now()
+    for (const [connectionId, mgr] of this.engineManagers.entries()) {
+      if (mgr.isEngineRunning) continue
+      // `createdAt` is set on TradeEngineManager construction; if it's
+      // missing (older instances) we treat the entry as immediately
+      // prunable, which is the conservative behaviour — a not-running
+      // manager has no semantics worth preserving.
+      const createdAt = (mgr as any).createdAt as number | undefined
+      const ageMs = createdAt ? now - createdAt : Number.POSITIVE_INFINITY
+      if (ageMs >= staleAgeMs) {
+        this.engineManagers.delete(connectionId)
+        pruned++
+        console.log(
+          `[v0] [Coordinator] Pruned zombie manager for ${connectionId} (age=${
+            Number.isFinite(ageMs) ? `${ageMs}ms` : "unknown"
+          }, isEngineRunning=false)`,
+        )
+      }
+    }
+    return pruned
+  }
+
+  /**
    * Start engines for connections that should be running but don't have engines
    * Does NOT stop engines - leaves that to explicit user actions via dashboard toggles
    */
   async startMissingEngines(connections: any[]): Promise<number> {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
-      
+
+      // Self-heal: make sure the watchdog and metrics tracker are armed
+      // before we start any new engines (otherwise any stalls on
+      // freshly-started engines wouldn't be recovered).
+      this.ensureBackgroundTimers()
+
+      // Prune dead Map entries before computing `runningIds` so a
+      // failed-init manager doesn't shadow a connection that should
+      // legitimately be (re-)started.
+      this.pruneZombieManagers()
+
       const { initRedis, getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
       
@@ -446,7 +529,13 @@ export class GlobalTradeEngineCoordinator {
   async refreshEngines(): Promise<void> {
     try {
       console.log("[v0] [Coordinator] === REFRESH ENGINES START (START ONLY) ===")
-      
+
+      // Self-heal background timers + drop dead Map slots before we
+      // reconcile so a zombie manager doesn't shadow a connection that
+      // legitimately needs (re-)starting.
+      this.ensureBackgroundTimers()
+      this.pruneZombieManagers()
+
       const { initRedis, getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
       
@@ -669,9 +758,15 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
-   * Get status of all engines
+   * Get status of all engines.
+   *
+   * Status reads are by far the most frequent coordinator entry-point
+   * (the dashboard polls every few seconds). We piggyback the background
+   * timer self-heal here so even a system that's never explicitly
+   * "started" but is being observed will keep its watchdog armed.
    */
   async getAllEnginesStatus(): Promise<Record<string, any>> {
+    this.ensureBackgroundTimers()
     const status: Record<string, any> = {}
 
     for (const [connectionId, manager] of this.engineManagers.entries()) {

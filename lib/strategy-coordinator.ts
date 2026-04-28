@@ -20,6 +20,11 @@ import { initRedis, getSettings, setSettings, getRedisClient } from "@/lib/redis
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { PositionThresholdManager } from "@/lib/position-threshold-manager"
 import { PseudoPositionManager } from "@/lib/trade-engine/pseudo-position-manager"
+import {
+  compact,
+  loadCompactionConfig,
+  type CompactionConfig,
+} from "@/lib/sets-compaction"
 
 export interface EvaluationMetrics {
   maxDrawdownTime: number
@@ -505,7 +510,7 @@ export class StrategyCoordinator {
         // window from the cycle they were materialised in (this is the
         // correct semantics — the gate that admitted them was based on
         // *that* ctx, and we don't want to retroactively re-bucket).
-        const built = this.buildVariantSet(baseSet, profile, metrics, maxEntries, ctx)
+        const built = await this.buildVariantSet(baseSet, profile, metrics, maxEntries, ctx)
         if (!built) continue
 
         mainSets.push(built)
@@ -1651,13 +1656,20 @@ export class StrategyCoordinator {
    * Returns `null` if all candidate entries are rejected by the DDT cap or
    * the Set ends up empty (shouldn't normally happen at Main thresholds).
    */
-  private buildVariantSet(
+  /**
+   * Build a Main variant Set from a Base Set + variant profile.
+   *
+   * Now `async` because the prune step delegates to the shared
+   * compaction policy (cached settings hash, async resolution). The
+   * cache TTL keeps this effectively synchronous in steady state.
+   */
+  private async buildVariantSet(
     baseSet: StrategySet,
     profile: ReturnType<StrategyCoordinator["variantProfiles"]>[number],
     metrics: EvaluationMetrics,
     maxEntries: number,
     ctx?: PositionContext,
-  ): StrategySet | null {
+  ): Promise<StrategySet | null> {
     const entries: StrategySetEntry[] = []
     let idx = 0
 
@@ -1685,7 +1697,7 @@ export class StrategyCoordinator {
     }
 
     if (entries.length === 0) return null
-    const capped = this.pruneEntries(entries, maxEntries)
+    const capped = await this.pruneEntries(entries, maxEntries)
     const avgPF  = capped.reduce((s, e) => s + Number(e.profitFactor  || 0), 0) / capped.length
     const avgCnf = capped.reduce((s, e) => s + Number(e.confidence    || 0), 0) / capped.length
     const avgDDT = capped.reduce((s, e) => s + Number(e.drawdownTime  || 0), 0) / capped.length
@@ -1727,14 +1739,51 @@ export class StrategyCoordinator {
   }
 
   /**
-   * Enforce max entries per Set using hybrid pruning (keep highest PF first, recent bonus).
+   * Enforce max entries per Set using the shared threshold-compaction
+   * policy (`lib/sets-compaction.ts`) in `mode: "best"`.
+   *
+   *   • Floor       = caller-provided `max` (so existing call sites that
+   *                   compute their own per-Set max keep working).
+   *   • thresholdPct= operator-controlled (Settings → System → Set
+   *                   Compaction). Defaults to 20% per spec, so a
+   *                   `max=250` floor admits up to 300 entries before
+   *                   the compactor fires.
+   *   • Mode "best" = stable-sort by PF desc, keep top floor, then
+   *                   re-sort by timestamp asc so chronological order
+   *                   is preserved downstream.
+   *
+   * The result is the same shape the legacy pruner returned (best-PF
+   * first within the kept set) — but it only does the sort + slice
+   * once every (ceiling - floor) calls instead of every call. Hot
+   * paths that build a Set from many indications now see a meaningful
+   * CPU drop on the prune step.
+   *
+   * `compactionThresholdPct` is read once and cached on the coordinator
+   * instance — see `getCompactionThresholdPct`.
    */
-  private pruneEntries(entries: StrategySetEntry[], max: number): StrategySetEntry[] {
+  private async pruneEntries(entries: StrategySetEntry[], max: number): Promise<StrategySetEntry[]> {
     if (entries.length <= max) return entries
-    // Performance-based: keep top PF entries
-    return entries
-      .sort((a, b) => b.profitFactor - a.profitFactor)
-      .slice(0, max)
+    const thresholdPct = await this.getCompactionThresholdPct()
+    const cfg: CompactionConfig = { floor: max, thresholdPct }
+    return compact(entries, cfg, "best", (e) => Number(e.profitFactor) || 0)
+  }
+
+  /** Cached threshold-pct lookup. 5s effective TTL via the underlying helper. */
+  private _compactionThresholdPctCache: { v: number; t: number } | null = null
+  private async getCompactionThresholdPct(): Promise<number> {
+    const cache = this._compactionThresholdPctCache
+    if (cache && Date.now() - cache.t < 5_000) return cache.v
+    try {
+      // Use the coordinator-entries pool key — it carries the operator's
+      // intent for "how aggressively to keep entries within a single
+      // Set". Falls back to the global threshold (20%) when nothing
+      // is configured.
+      const cfg = await loadCompactionConfig("coordinator.entries")
+      this._compactionThresholdPctCache = { v: cfg.thresholdPct, t: Date.now() }
+      return cfg.thresholdPct
+    } catch {
+      return 20
+    }
   }
 
   /**

@@ -1,7 +1,63 @@
 /**
- * Progression State Manager
- * Tracks trade engine progression metrics (cycles completed, success rates, etc.)
- * State is persisted to Redis for durability across restarts
+ * ╔═════════════════════════════════════════════════════════════════════════╗
+ * ║                    PROGRESSION STATE — REDIS SCHEMA                    ║
+ * ║                                                                         ║
+ * ║  Canonical hash key:  progression:{connectionId}                       ║
+ * ║                                                                         ║
+ * ║  Update discipline:                                                     ║
+ * ║   • Counters use HINCRBY (atomic, restart-safe). NEVER set them via     ║
+ * ║     HSET / setSettings — that races with concurrent processors.        ║
+ * ║   • Snapshots / timestamps / strings use HSET (the field is replaced).  ║
+ * ║   • Float fields persisted as strings via the standard Redis float      ║
+ * ║     contract (JS `Number(string)` round-trips losslessly within IEEE   ║
+ * ║     754 — tests guard the precision boundary).                          ║
+ * ║                                                                         ║
+ * ║  Field families (full list in `ProgressionState` interface below):     ║
+ * ║                                                                         ║
+ * ║   ┌─ Cycle counters (HINCRBY) ─────────────────────────────────────┐  ║
+ * ║   │  cycles_completed, successful_cycles, failed_cycles,            │  ║
+ * ║   │  prehistoric_cycles_completed,                                  │  ║
+ * ║   │  indication_cycles_total, strategy_cycles_total,                │  ║
+ * ║   │  realtime_cycles_total                                          │  ║
+ * ║   └────────────────────────────────────────────────────────────────┘  ║
+ * ║                                                                         ║
+ * ║   ┌─ Indication-set counters (HINCRBY, one per type) ──────────────┐  ║
+ * ║   │  indications_direction_count, indications_move_count,           │  ║
+ * ║   │  indications_active_count, indications_active_advanced_count,   │  ║
+ * ║   │  indications_optimal_count, indications_auto_count              │  ║
+ * ║   │  ▸ Adding a new type to                                         │  ║
+ * ║   │    `lib/indication-sets-processor.ts → DEFAULT_LIMITS`          │  ║
+ * ║   │    REQUIRES adding the counter here + in `getDefaultState`.    │  ║
+ * ║   └────────────────────────────────────────────────────────────────┘  ║
+ * ║                                                                         ║
+ * ║   ┌─ Strategy-set counters (HINCRBY, one per type) ────────────────┐  ║
+ * ║   │  strategies_base_total, strategies_main_total,                  │  ║
+ * ║   │  strategies_real_total,                                         │  ║
+ * ║   │  strategy_evaluated_base, strategy_evaluated_main,              │  ║
+ * ║   │  strategy_evaluated_real                                        │  ║
+ * ║   └────────────────────────────────────────────────────────────────┘  ║
+ * ║                                                                         ║
+ * ║   ┌─ Trade outcomes (HINCRBY) + profit (HSET float-as-string) ────┐  ║
+ * ║   │  total_trades, successful_trades, total_profit                  │  ║
+ * ║   └────────────────────────────────────────────────────────────────┘  ║
+ * ║                                                                         ║
+ * ║   ┌─ Snapshots / single-value fields (HSET) ───────────────────────┐  ║
+ * ║   │  cycle_success_rate (float), trade_success_rate (float),        │  ║
+ * ║   │  cycle_time_ms (float), last_cycle_time (ISO),                  │  ║
+ * ║   │  last_update (ISO), prehistoric_phase_active ("true"/"false"),  │  ║
+ * ║   │  prehistoric_symbols_processed (JSON array)                     │  ║
+ * ║   └────────────────────────────────────────────────────────────────┘  ║
+ * ║                                                                         ║
+ * ║  Read path:                                                             ║
+ * ║   • `getProgressionState(connectionId)` HGETALLs the hash and parses    ║
+ * ║     numeric fields. Missing fields are filled from `getDefaultState`    ║
+ * ║     so consumers always see a complete, well-typed object.              ║
+ * ║                                                                         ║
+ * ║  Reset path:                                                            ║
+ * ║   • Operator-driven only — see `resetProgressionState`. Never          ║
+ * ║     auto-reset on engine restart; the counters MUST survive crashes    ║
+ * ║     so the dashboard's "since first start" semantics hold.              ║
+ * ╚═════════════════════════════════════════════════════════════════════════╝
  */
 
 import { getRedisClient } from "@/lib/redis-db"

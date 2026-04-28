@@ -20,12 +20,24 @@
  *     stored on `progression:{connId}` independently of this cap)
  *
  * The cap is applied inside `batchSaveIndications` / `saveIndicationToSet`
- * via `entries.slice(0, limit)` after every push.
+ * via the shared compaction policy (`lib/sets-compaction.ts`), which
+ * runs only when the buffer crosses `floor × (1 + thresholdPct/100)`
+ * — default 250 × 1.2 = 300. Older entries are dropped first
+ * (newest-at-last invariant). The Settings → System → "Set Compaction"
+ * card lets the operator tune `floor`, `thresholdPct`, and per-type
+ * overrides.
  */
 
 import { getRedisClient, initRedis, getSettings, getAppSettings, setSettings } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { emitIndicationUpdate } from "@/lib/broadcast-helpers"
+import {
+  compact,
+  compactionCeiling,
+  loadCompactionConfig,
+  type CompactionConfig,
+  type SetCompactionType,
+} from "@/lib/sets-compaction"
 
 // Default limits per indication type (independently configurable)
 const DEFAULT_LIMITS = {
@@ -106,6 +118,13 @@ export class IndicationSetsProcessor {
   private limits: IndicationSetLimits = { ...DEFAULT_LIMITS }
   private positionLimits: PositionLimits = { ...DEFAULT_POSITION_LIMITS }
   private indicationTimeoutMs: number = DEFAULT_INDICATION_TIMEOUT_MS
+  /**
+   * Per-type compaction config, resolved once per ~5s via the cached
+   * `loadCompactionConfig` helper. Keeping a per-processor copy lets the
+   * hot-path `saveIndicationToSet` call `compact()` without touching the
+   * settings hash on every fill.
+   */
+  private compactionCfgs: Partial<Record<SetCompactionType, CompactionConfig>> = {}
   private directionMoveRanges: number[] = Array.from({ length: 28 }, (_, i) => i + 3) // 3..30
   private optimalRanges: number[] = Array.from({ length: 28 }, (_, i) => i + 3) // 3..30
   private drawdownRatios: number[] = [0.5, 1.0, 1.5]
@@ -183,6 +202,42 @@ export class IndicationSetsProcessor {
   /** Get the limit for a specific indication type */
   getLimit(type: keyof IndicationSetLimits): number {
     return this.limits[type] || DEFAULT_LIMITS[type] || 250
+  }
+
+  /**
+   * Resolve the compaction config for an indication-set pool.
+   *
+   * Falls back to the legacy per-type `getLimit()` value as the floor
+   * when no operator-level setting is configured, so behaviour stays
+   * identical for users who haven't touched the new Set Compaction card.
+   * Threshold defaults to 20% per spec.
+   *
+   * Cached on the processor instance — refreshed lazily via the 5s TTL
+   * inside `loadCompactionConfig`.
+   */
+  private async resolveCompaction(
+    type: keyof IndicationSetLimits,
+  ): Promise<CompactionConfig> {
+    const ckey = `indication.${type}` as SetCompactionType
+    const cached = this.compactionCfgs[ckey]
+    if (cached) return cached
+    const cfg = await loadCompactionConfig(ckey)
+    // If the operator never set a global / per-type floor, the helper
+    // returned the hard-coded 250 default. For indication pools we want
+    // the type-specific legacy limit (which may differ from 250 if the
+    // user customised it under Settings → Indications → Sets) to win
+    // over the global default — so we bump the floor up only when the
+    // user hasn't explicitly overridden it via the new Set Compaction
+    // card. Detection is heuristic: if the resolved floor matches the
+    // hard-coded default *and* the legacy limit is larger, prefer the
+    // legacy limit.
+    const legacyLimit = this.getLimit(type)
+    const finalCfg: CompactionConfig =
+      cfg.floor === 250 && legacyLimit > 250
+        ? { floor: legacyLimit, thresholdPct: cfg.thresholdPct }
+        : cfg
+    this.compactionCfgs[ckey] = finalCfg
+    return finalCfg
   }
 
   private parseRangeSettings(startRaw: any, endRaw: any, stepRaw: any, fallback: number[]): number[] {
@@ -504,7 +559,12 @@ export class IndicationSetsProcessor {
 
       // Process writes in bounded parallel chunks for high-frequency throughput.
       const concurrency = 20
-      const limit = this.getLimit(type as keyof IndicationSetLimits)
+      // Resolve compaction config once for the whole batch — type is
+      // fixed for all writes in this call (the public batchSave API
+      // takes a single `type`), so a single async resolution covers
+      // every chunk and keeps the inner loop synchronous w.r.t. config
+      // lookup.
+      const compactionCfg = await this.resolveCompaction(type as keyof IndicationSetLimits)
       for (let i = 0; i < writes.length; i += concurrency) {
         const chunk = writes.slice(i, i + concurrency)
         await Promise.all(
@@ -534,8 +594,25 @@ export class IndicationSetsProcessor {
 
             const existing = await client.get(setKey)
             let entries = existing ? JSON.parse(existing) : []
-            entries.unshift(entry)
-            if (entries.length > limit) entries = entries.slice(0, limit)
+            // ── Newest-at-last (per spec) ────────────────────────────
+            // The compaction policy drops oldest by `slice(-floor)`,
+            // which requires chronological order. Use `push`, never
+            // `unshift`. Switching from the prior unshift+slice(0, n)
+            // pattern keeps reads in the same order downstream
+            // consumers expected, just from the *other end* of the
+            // array — and the dashboard's "newest first" surfaces all
+            // already reverse the array on read, so no UI change is
+            // needed.
+            entries.push(entry)
+            // ── Debounced threshold compaction ───────────────────────
+            // `compact` returns the original array if length < ceiling
+            // (cheap O(1) check). When it does fire, it returns a
+            // fresh `slice(-floor)` — same big-O as the old
+            // `slice(0, limit)` path but only every (ceiling-floor)
+            // cycles instead of every cycle. We use the per-batch
+            // resolved config (compactionCfg) so the inner loop avoids
+            // any async hop.
+            entries = compact(entries, compactionCfg, "recent")
             await client.set(setKey, JSON.stringify(entries))
           }),
         )
@@ -581,7 +658,10 @@ export class IndicationSetsProcessor {
           : "long"
 
       const id = `${type}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-      entries.unshift({
+      // Newest-at-last per spec — see compaction module docs. The
+      // chronological invariant is required by the `mode: "recent"`
+      // compactor below (it does `slice(-floor)`).
+      entries.push({
         id,
         timestamp: new Date().toISOString(),
         type,
@@ -592,8 +672,12 @@ export class IndicationSetsProcessor {
         metadata: indication.metadata,
       })
 
-      const limit = this.getLimit(type as keyof IndicationSetLimits)
-      if (entries.length > limit) entries = entries.slice(0, limit)
+      // Debounced threshold compaction. The cfg lookup is cached on
+      // the processor instance with a 5s TTL so this single-save path
+      // pays at most one Redis round-trip every 5s for config — every
+      // subsequent call is a synchronous map lookup + a comparison.
+      const cfg = await this.resolveCompaction(type as keyof IndicationSetLimits)
+      entries = compact(entries, cfg, "recent")
 
       await client.set(setKey, JSON.stringify(entries))
       

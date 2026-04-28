@@ -194,6 +194,15 @@ export class TradeEngineManager {
   private healthCheckTimer?: NodeJS.Timeout
   private heartbeatTimer?: NodeJS.Timeout
 
+  /**
+   * Wall-clock timestamp at which this manager instance was constructed.
+   * Used by the coordinator's `pruneZombieManagers()` self-heal so a
+   * not-yet-running manager that's freshly constructed isn't mistaken
+   * for a zombie. Distinct from `startTime` (which is set on
+   * successful `start()`).
+   */
+  public readonly createdAt: number = Date.now()
+
   private indicationProcessor: IndicationProcessor
   private strategyProcessor: StrategyProcessor
   private pseudoPositionManager: PseudoPositionManager

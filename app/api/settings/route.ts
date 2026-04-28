@@ -6,6 +6,7 @@ import {
   getAllConnections,
 } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
+import { invalidateCompactionCache } from "@/lib/sets-compaction"
 
 /**
  * Fan out a single "settings_changed" progression log event to every
@@ -112,6 +113,12 @@ export async function POST(request: Request) {
     // indication-sets-processor — all of which read `all_settings`) see the
     // same snapshot on the next cycle.
     await setAppSettings(body)
+    // Bust the in-process compaction config cache so the new
+    // setCompactionFloor / setCompactionThresholdPct / per-type
+    // overrides apply on the very next save cycle (otherwise the 5s
+    // TTL inside `lib/sets-compaction.ts` would delay propagation in
+    // this Node instance).
+    invalidateCompactionCache()
     // Fan out a progression event so the operator can confirm the new
     // values reached every running engine.
     await emitSettingsChanged(Object.keys(body || {}).length)
@@ -146,6 +153,7 @@ export async function PUT(request: Request) {
     const mergedSettings = { ...existingSettings, ...incoming }
 
     await setAppSettings(mergedSettings)
+    invalidateCompactionCache()
     await emitSettingsChanged(Object.keys(incoming || {}).length)
 
     console.log("[v0] Settings updated successfully in Redis (canonical + legacy mirror)")

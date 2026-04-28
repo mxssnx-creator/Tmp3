@@ -7,6 +7,12 @@
 import { getRedisClient, initRedis, getSettings, setSettings } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { emitStrategyUpdate } from "@/lib/broadcast-helpers"
+import {
+  compact,
+  loadCompactionConfig,
+  type CompactionConfig,
+  type SetCompactionType,
+} from "@/lib/sets-compaction"
 
 // Pre-cached client reference
 let cachedClient: any = null
@@ -57,6 +63,41 @@ export interface StrategySet {
 export class StrategySetsProcessor {
   private connectionId: string
   private limits: StrategySetLimits = { ...DEFAULT_LIMITS }
+  /**
+   * Per-type compaction config cache. Refreshed lazily by the underlying
+   * `loadCompactionConfig` helper (5s TTL). Strategy pools use the
+   * "best" compaction mode — when the buffer overflows we keep the
+   * highest-PF entries, not the most recent ones, because what
+   * downstream Real/Live look up is "the best signals available", not
+   * "the most recent ones".
+   */
+  private compactionCfgs: Partial<Record<SetCompactionType, CompactionConfig>> = {}
+
+  /**
+   * Resolve the compaction config for a strategy pool, with the legacy
+   * per-type limit (`getLimit()`) as the floor when no operator-level
+   * override exists. Mirrors the indication-sets processor for
+   * uniformity.
+   */
+  private async resolveCompaction(
+    type: keyof StrategySetLimits,
+  ): Promise<CompactionConfig> {
+    const ckey = `strategy.${type}` as SetCompactionType
+    const cached = this.compactionCfgs[ckey]
+    if (cached) return cached
+    const cfg = await loadCompactionConfig(ckey)
+    const legacyLimit = this.getLimit(type)
+    // The user may have customised the legacy `strategy_sets_config`
+    // floor (e.g. base=900). Prefer that when no operator-level
+    // Set-Compaction override is set — detected by the resolved floor
+    // being the hard-coded 250 default.
+    const finalCfg: CompactionConfig =
+      cfg.floor === 250 && legacyLimit > 250
+        ? { floor: legacyLimit, thresholdPct: cfg.thresholdPct }
+        : cfg
+    this.compactionCfgs[ckey] = finalCfg
+    return finalCfg
+  }
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -287,7 +328,11 @@ export class StrategySetsProcessor {
         }
       }
 
-      // Add new strategy
+      // Newest-at-last (per spec) — use push, not unshift. The "best"
+      // compactor below sorts by PF when the buffer crosses the
+      // ceiling, so insertion order doesn't strictly matter for
+      // correctness, but staying chronological keeps the pre-compaction
+      // shape inspectable in admin tools.
       entries.push({
         id: `${strategyType}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         timestamp: new Date().toISOString(),
@@ -298,17 +343,19 @@ export class StrategySetsProcessor {
         metadata: strategy.metadata,
       })
 
-      // Get limit for this strategy type
-      const maxEntries = this.getLimit(strategyType as keyof StrategySetLimits)
-
-      // Sort by profitFactor descending so the best-performing entries are always
-      // processed first and retained when the pool is trimmed.
-      entries.sort((a: any, b: any) => (b.profitFactor ?? 0) - (a.profitFactor ?? 0))
-
-      // Trim to max entries — lowest-PF entries are dropped first
-      if (entries.length > maxEntries) {
-        entries = entries.slice(0, maxEntries)
-      }
+      // ── Debounced threshold compaction (mode: "best") ────────────────
+      // Strategy pools care about *quality* — when the buffer overflows
+      // we want to keep the highest-PF entries, not the most recent
+      // ones. The compactor stable-sorts by PF desc, keeps the top
+      // `floor`, then re-sorts by timestamp ascending so downstream
+      // consumers preserve chronological semantics.
+      //
+      // The pre-existing "sort + slice on every call" pattern was the
+      // dominant CPU cost on the strategy pipeline; the new debounced
+      // policy only pays the sort once every (ceiling - floor) calls.
+      const cfg = await this.resolveCompaction(strategyType as keyof StrategySetLimits)
+      entries = compact(entries, cfg, "best")
+      const maxEntries = cfg.floor
 
       // Save back
       await client.set(setKey, JSON.stringify(entries))
