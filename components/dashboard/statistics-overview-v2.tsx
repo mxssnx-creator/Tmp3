@@ -28,6 +28,20 @@ interface CompactStats {
   mainEvaluated: number
   mainCoordCreated: number
   mainBlockDcaSets: number
+  // ── Position-Count axis windows (cumulative) ─────────────────────
+  // Aggregated rollup of `mainCoordination.axisWindows.{prev|last|cont|pause}`
+  // emitted by the stats route. Each axis collapses to a single
+  // `{sets, pos, peakWindow}` triple here so the overview row stays
+  // compact — full per-window detail is shown in the dedicated
+  // axis strip. `peakWindow` = the N (1..maxN) with the highest
+  // `sets` count, i.e. the most-active operating window for that
+  // axis over the run. 0-bucket is intentionally skipped from peak
+  // selection (it would always dominate when the axis is mostly
+  // inactive and isn't actionable for the operator).
+  axisPrev:  { sets: number; pos: number; peakWindow: number }
+  axisLast:  { sets: number; pos: number; peakWindow: number }
+  axisCont:  { sets: number; pos: number; peakWindow: number }
+  axisPause: { sets: number; pos: number; peakWindow: number }
   // ── OPEN POSITIONS through the MIRRORING pipeline ────────────────
   // Pseudo (Base-stage strategy evaluation) → Real (Main→Real
   // promotions) → Live (actual exchange orders). These are the SAME
@@ -116,6 +130,10 @@ const EMPTY: CompactStats = {
   mainEvaluated: 0,
   mainCoordCreated: 0,
   mainBlockDcaSets: 0,
+  axisPrev:  { sets: 0, pos: 0, peakWindow: 0 },
+  axisLast:  { sets: 0, pos: 0, peakWindow: 0 },
+  axisCont:  { sets: 0, pos: 0, peakWindow: 0 },
+  axisPause: { sets: 0, pos: 0, peakWindow: 0 },
   pseudoOpen: 0,
   pseudoRunningSets: 0,
   realOpen: 0,
@@ -513,6 +531,41 @@ export function StatisticsOverviewV2() {
         const dcaSets   = d.strategyVariants?.dca?.createdSets   ?? 0
         const mainBlockDcaSets    = blockSets + dcaSets
 
+        // ── Roll up per-axis Position-Count windows ──────────────────
+        // Stats route emits `mainCoordination.axisWindows.{axis}` as an
+        // array of `{ window, sets, pos }` triples covering bucket 0..N.
+        // The dashboard wants a single compact summary per axis: total
+        // Sets, total entries (positions), and the *peak* operating
+        // window (the N with the most Sets) ignoring the 0-bucket
+        // (which represents "axis inactive" and isn't actionable for
+        // the operator). Falls back to all-zero when the route hasn't
+        // emitted the block yet (graceful degradation during rollout).
+        const rollupAxis = (arr: Array<{ window: number; sets: number; pos: number }> | undefined) => {
+          if (!Array.isArray(arr) || arr.length === 0) {
+            return { sets: 0, pos: 0, peakWindow: 0 }
+          }
+          let totalSets = 0
+          let totalPos  = 0
+          let peakWindow = 0
+          let peakSets   = -1
+          for (const b of arr) {
+            const sets = Number(b.sets) || 0
+            const pos  = Number(b.pos)  || 0
+            totalSets += sets
+            totalPos  += pos
+            if ((b.window ?? 0) > 0 && sets > peakSets) {
+              peakSets   = sets
+              peakWindow = Number(b.window) || 0
+            }
+          }
+          return { sets: totalSets, pos: totalPos, peakWindow }
+        }
+        const axisBlock = d.mainCoordination?.axisWindows
+        const axisPrev  = rollupAxis(axisBlock?.prev)
+        const axisLast  = rollupAxis(axisBlock?.last)
+        const axisCont  = rollupAxis(axisBlock?.cont)
+        const axisPause = rollupAxis(axisBlock?.pause)
+
         // ── Open positions through the mirroring pipeline ──────────
         // Shape: d.openPositions = {
         //   pseudo: { open, runningSets, topSets[{setKey,count}] },
@@ -542,6 +595,10 @@ export function StatisticsOverviewV2() {
           mainEvaluated:    mainBreakdownEval,
           mainCoordCreated,
           mainBlockDcaSets,
+          axisPrev,
+          axisLast,
+          axisCont,
+          axisPause,
           pseudoOpen:           Number(opPseudo.open)        || 0,
           pseudoRunningSets:    Number(opPseudo.runningSets) || 0,
           realOpen:             Number(opReal.open)          || 0,
@@ -784,6 +841,96 @@ export function StatisticsOverviewV2() {
             >
               <span className="text-muted-foreground">Real Open</span>
               <span className="font-semibold text-emerald-700 tabular-nums">{fmt(stats.realOpen)}</span>
+            </div>
+          </div>
+        )}
+
+        {/* ── Position-Count axis windows strip ───────────────────────────
+            Per spec: *"step 1 previous 1-12; Last (of previous) 1-4;
+            continuous 1-8 and Pause 1-8"*. Each tile shows the cumulative
+            count of Sets that landed under the axis, the total entry
+            count those Sets carried (≈ "Pos" in the spec), and the peak
+            operating window (the N ∈ 1..max that produced the most Sets).
+            Block + DCA Sets fold into these counters cleanly because
+            they share the same ctx snapshot — operator sees a unified
+            view of which axes are coordinating Set creation right now.
+            Hidden until at least one axis has any activity. */}
+        {(stats.axisPrev.sets > 0 ||
+          stats.axisLast.sets > 0 ||
+          stats.axisCont.sets > 0 ||
+          stats.axisPause.sets > 0) && (
+          <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-2 gap-2 text-[10px] sm:grid-cols-4">
+            <div
+              className="flex flex-col gap-0.5"
+              title={
+                `Previous (lookback) axis 1..12 — Sets created across cycles where\n` +
+                `the closed-position lookback bucket was N. Peak window shows the\n` +
+                `most-active N. Total: ${fmt(stats.axisPrev.sets)} Sets · ` +
+                `${fmt(stats.axisPrev.pos)} Pos.`
+              }
+            >
+              <span className="text-muted-foreground">Axis prev 1-12</span>
+              <span className="font-semibold text-yellow-700 tabular-nums">
+                {fmt(stats.axisPrev.sets)}
+                <span className="ml-1 text-muted-foreground">·{fmt(stats.axisPrev.pos)}p</span>
+                {stats.axisPrev.peakWindow > 0 && (
+                  <span className="ml-1 text-muted-foreground">@{stats.axisPrev.peakWindow}</span>
+                )}
+              </span>
+            </div>
+            <div
+              className="flex flex-col gap-0.5"
+              title={
+                `Last (of previous) axis 1..4 — Sets created where the last-N\n` +
+                `wins/losses magnitude bucket was N. Peak window indicates the\n` +
+                `dominant short-term skew dimension over the run.\n` +
+                `Total: ${fmt(stats.axisLast.sets)} Sets · ${fmt(stats.axisLast.pos)} Pos.`
+              }
+            >
+              <span className="text-muted-foreground">Axis last 1-4</span>
+              <span className="font-semibold text-yellow-700 tabular-nums">
+                {fmt(stats.axisLast.sets)}
+                <span className="ml-1 text-muted-foreground">·{fmt(stats.axisLast.pos)}p</span>
+                {stats.axisLast.peakWindow > 0 && (
+                  <span className="ml-1 text-muted-foreground">@{stats.axisLast.peakWindow}</span>
+                )}
+              </span>
+            </div>
+            <div
+              className="flex flex-col gap-0.5"
+              title={
+                `Continuous axis 1..8 — Sets created while N continuous open\n` +
+                `positions were live. This is the axis that gates Block-style\n` +
+                `add-on entries.\n` +
+                `Total: ${fmt(stats.axisCont.sets)} Sets · ${fmt(stats.axisCont.pos)} Pos.`
+              }
+            >
+              <span className="text-muted-foreground">Axis cont 1-8</span>
+              <span className="font-semibold text-yellow-700 tabular-nums">
+                {fmt(stats.axisCont.sets)}
+                <span className="ml-1 text-muted-foreground">·{fmt(stats.axisCont.pos)}p</span>
+                {stats.axisCont.peakWindow > 0 && (
+                  <span className="ml-1 text-muted-foreground">@{stats.axisCont.peakWindow}</span>
+                )}
+              </span>
+            </div>
+            <div
+              className="flex flex-col gap-0.5"
+              title={
+                `Pause axis 1..8 — Sets created where the last-N validation\n` +
+                `lookback bucket was N. Wider windows produce more conservative\n` +
+                `entry configurations.\n` +
+                `Total: ${fmt(stats.axisPause.sets)} Sets · ${fmt(stats.axisPause.pos)} Pos.`
+              }
+            >
+              <span className="text-muted-foreground">Axis pause 1-8</span>
+              <span className="font-semibold text-yellow-700 tabular-nums">
+                {fmt(stats.axisPause.sets)}
+                <span className="ml-1 text-muted-foreground">·{fmt(stats.axisPause.pos)}p</span>
+                {stats.axisPause.peakWindow > 0 && (
+                  <span className="ml-1 text-muted-foreground">@{stats.axisPause.peakWindow}</span>
+                )}
+              </span>
             </div>
           </div>
         )}

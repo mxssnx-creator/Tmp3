@@ -32,6 +32,17 @@ export interface RealPosition {
     consistencyRatio: number // Consistency score
   }
   status: "pending" | "ready" | "trading" | "closed"
+  // ── Set lineage (optional, populated when a real position descends
+  //    from a coordinated Main Set). These tags are the bridge from
+  //    Strategy-Coordinator → Live exchange so post-trade analytics can
+  //    dimension realised PnL by Set Type / axis-window / variant.
+  //    See `lib/trade-engine/stages/live-stage.ts:LivePosition` for the
+  //    full lineage contract — every field here is mirrored 1:1 onto
+  //    the LivePosition the executor produces. ────────────────────────
+  setKey?: string
+  parentSetKey?: string
+  setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
+  axisWindows?: { prev: number; last: number; cont: number; pause: number }
 }
 
 /**

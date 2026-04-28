@@ -57,6 +57,37 @@ export interface StrategySet {
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
   variant?: "default" | "trailing" | "block" | "dca" | "pause"
+  /**
+   * ── Position-count axis windows that this Set satisfies ────────────
+   *
+   * Spec: *"the created additional related Sets based on Pos counts.. step 1
+   * previous 1-12; Last (of previous) 1-4; continuous 1-8 and Pause 1-8
+   * so for each validated Base Set.. additional related cnt Sets of > 1000
+   * are created and async Calculated.. handled."*
+   *
+   * Each component records the **integer window** the Set was generated
+   * under. We clamp to spec maxima:
+   *   - prev   : 0..12  (closed lookback, ctx.prevPosCount)
+   *   - last   : 0..4   (the magnitude of last-N wins or losses dimension)
+   *   - cont   : 0..8   (open continuous positions, ctx.continuousCount)
+   *   - pause  : 0..8   (last-N validation window, ctx.lastPosCount)
+   *
+   * 0 means "axis not active for this Set" — we still emit it so consumers
+   * can dimensionalise stats by axis without re-deriving from ctx.
+   *
+   * Block + DCA Sets are **independent of these axes** (they fire on
+   * `continuousCount >= 1` and `prevLosses >= 1` respectively, which
+   * are intrinsic to the variant gates, not on a tagged window). Their
+   * axisWindows are still emitted (with `prev`/`pause` populated from
+   * ctx, `cont`/`last` left at 0) so the dashboard's per-variant
+   * counter blocks can roll up cleanly without special-casing.
+   */
+  axisWindows?: {
+    prev:  number
+    last:  number
+    cont:  number
+    pause: number
+  }
 }
 
 export interface StrategySetEntry {
@@ -467,8 +498,14 @@ export class StrategyCoordinator {
           } catch { /* fall through — regenerate on parse failure */ }
         }
 
-        // Cache miss — build a fresh related Set from this profile
-        const built = this.buildVariantSet(baseSet, profile, metrics, maxEntries)
+        // Cache miss — build a fresh related Set from this profile.
+        // We thread `ctx` through so the freshly-built Set carries an
+        // accurate `axisWindows` snapshot (prev/last/cont/pause) for
+        // downstream stats dimensioning. Cached Sets keep the axis
+        // window from the cycle they were materialised in (this is the
+        // correct semantics — the gate that admitted them was based on
+        // *that* ctx, and we don't want to retroactively re-bucket).
+        const built = this.buildVariantSet(baseSet, profile, metrics, maxEntries, ctx)
         if (!built) continue
 
         mainSets.push(built)
@@ -605,6 +642,54 @@ export class StrategyCoordinator {
           strategies_main_ctx_updated_at:    String(Date.now()),
         }),
       )
+
+      // ── Per-axis Position-Count window counters (cumulative) ──────────
+      //
+      // Spec: *"step 1 previous 1-12; Last (of previous) 1-4; continuous
+      // 1-8 and Pause 1-8"*. Every Main Set materialised this cycle was
+      // gated on a position context whose four axes fall into one of
+      // these step-1 buckets. We hincrby a per-axis-N counter so the
+      // dashboard can show "how many Main Sets were created under each
+      // axis window" without re-deriving from raw events.
+      //
+      // Axis windows are encoded on each Set via `axisWindows` — see
+      // `buildVariantSet`. A Set with `axisWindows.prev = 5` increments
+      // `strategies_main_axis_prev_5_sets` (and similarly for last/cont/
+      // pause). 0 buckets are still emitted (the operator may want to
+      // see how often a given axis was inactive). Block + DCA Sets share
+      // the same axis snapshot as the cycle's ctx, so they roll up to
+      // the same per-axis tile cleanly without special-casing.
+      //
+      // Storage cost is bounded: at most (12+5+9+9) = 35 sub-keys per
+      // axis lifetime, all on the same `axis_windows:{id}` hash so a
+      // single hgetall covers the whole panel. Counter writes are
+      // pipelined with the rest of the Main writes for free.
+      const axisHashKey = `axis_windows:${this.connectionId}`
+      const axisIncrements: Record<string, number> = {}
+      for (const set of mainSets) {
+        const aw = set.axisWindows
+        if (!aw) continue
+        // Per-axis-N bucket (count of *Sets* that landed under each window)
+        axisIncrements[`prev_${aw.prev}_sets`]  = (axisIncrements[`prev_${aw.prev}_sets`]  || 0) + 1
+        axisIncrements[`last_${aw.last}_sets`]  = (axisIncrements[`last_${aw.last}_sets`]  || 0) + 1
+        axisIncrements[`cont_${aw.cont}_sets`]  = (axisIncrements[`cont_${aw.cont}_sets`]  || 0) + 1
+        axisIncrements[`pause_${aw.pause}_sets`] = (axisIncrements[`pause_${aw.pause}_sets`] || 0) + 1
+        // Per-axis-N entries — entries are the "Pos counts" the dashboard
+        // labels as "positions" inside each axis window (one per (size ×
+        // leverage × state) config the variant projected through).
+        const ec = set.entryCount || 0
+        if (ec > 0) {
+          axisIncrements[`prev_${aw.prev}_pos`]   = (axisIncrements[`prev_${aw.prev}_pos`]   || 0) + ec
+          axisIncrements[`last_${aw.last}_pos`]   = (axisIncrements[`last_${aw.last}_pos`]   || 0) + ec
+          axisIncrements[`cont_${aw.cont}_pos`]   = (axisIncrements[`cont_${aw.cont}_pos`]   || 0) + ec
+          axisIncrements[`pause_${aw.pause}_pos`] = (axisIncrements[`pause_${aw.pause}_pos`] || 0) + ec
+        }
+      }
+      for (const [field, n] of Object.entries(axisIncrements)) {
+        if (n > 0) writes.push(client.hincrby(axisHashKey, field, n))
+      }
+      writes.push(client.hset(axisHashKey, { updated_at: String(Date.now()) }))
+      writes.push(client.expire(axisHashKey, 7 * 24 * 60 * 60))
 
       // ── Variant persistence (cumulative over the lifetime of the run) ──
       // For each variant we accumulate:
@@ -1571,6 +1656,7 @@ export class StrategyCoordinator {
     profile: ReturnType<StrategyCoordinator["variantProfiles"]>[number],
     metrics: EvaluationMetrics,
     maxEntries: number,
+    ctx?: PositionContext,
   ): StrategySet | null {
     const entries: StrategySetEntry[] = []
     let idx = 0
@@ -1604,6 +1690,22 @@ export class StrategyCoordinator {
     const avgCnf = capped.reduce((s, e) => s + Number(e.confidence    || 0), 0) / capped.length
     const avgDDT = capped.reduce((s, e) => s + Number(e.drawdownTime  || 0), 0) / capped.length
 
+    // ── Axis-window snapshot for this Set ───────────────────────────────
+    // Mirrors the spec's four position-count axes with the documented
+    // step-1 windows (see StrategySet.axisWindows). When ctx is absent
+    // (legacy diagnostic call paths) we emit zeros, signalling "no axis
+    // dimensioning available". The `last` axis encodes the *magnitude*
+    // of the most recent dimensional skew (max of wins or losses) so a
+    // single 0..4 figure suffices instead of two parallel counters.
+    const axisWindows = ctx
+      ? {
+          prev:  Math.max(0, Math.min(12, ctx.prevPosCount)),
+          last:  Math.max(0, Math.min(4,  Math.max(ctx.lastWins, ctx.lastLosses))),
+          cont:  Math.max(0, Math.min(8,  ctx.continuousCount)),
+          pause: Math.max(0, Math.min(8,  ctx.lastPosCount)),
+        }
+      : { prev: 0, last: 0, cont: 0, pause: 0 }
+
     return {
       // Variant-scoped setKey — `direction:long#default`, `direction:long#block`, …
       // This guarantees unique identity downstream so Real/Live treat each
@@ -1612,6 +1714,7 @@ export class StrategyCoordinator {
       setKey:          `${baseSet.setKey}#${profile.name}`,
       parentSetKey:    baseSet.setKey,
       variant:         profile.name,
+      axisWindows,
       indicationType:  baseSet.indicationType,
       direction:       baseSet.direction,
       avgProfitFactor: avgPF,

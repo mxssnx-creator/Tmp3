@@ -99,6 +99,28 @@ export interface LivePosition {
   accumulationCount?: number               // number of Set signals merged in (1 = single entry)
   lastAccumulatedAt?: number               // timestamp of the most recent merge
   accumulatedRealPositionIds?: string[]    // upstream Real position ids that contributed
+  // ── Set lineage (optional, threaded from Main → Real → Live) ────────
+  // These fields preserve the *Set Type* context that produced this
+  // exchange position. They let post-trade statistics dimensionalise
+  // realised PnL by:
+  //   - variant         (default / trailing / block / dca / pause)
+  //   - axisWindows     (which prev/last/cont/pause window was active)
+  //   - parentSetKey    (the Base Set the Main variant was derived from)
+  //   - setKey          (the materialised Main Set's identifier)
+  //
+  // All optional so legacy code paths that don't have lineage info
+  // (manual exchange operations, reconciliation) still work. When
+  // present, accumulation merges *do not* overwrite the original
+  // lineage — the first Set that opened the position keeps authorship,
+  // and subsequent absorbed Sets are appended into `accumulatedSetKeys`.
+  setKey?: string
+  parentSetKey?: string
+  setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
+  axisWindows?: { prev: number; last: number; cont: number; pause: number }
+  /** All upstream Set ids that contributed to this exchange position
+   *  (initial entry plus every accumulation). Useful for "which Sets
+   *  realised this PnL" stats. */
+  accumulatedSetKeys?: string[]
   progression: {
     step: string
     timestamp: number
@@ -437,6 +459,17 @@ async function accumulateIntoLivePosition(
       ...(existing.accumulatedRealPositionIds || []),
       realPosition.id,
     ].slice(-50) // cap to last 50 to bound payload size
+    // Track which Set keys contributed to this exchange position so
+    // post-trade stats can attribute realised PnL across every Set Type
+    // that absorbed into it. Same 50-entry cap as the realPositionIds
+    // ledger above; the original setKey is preserved on the position
+    // header (`existing.setKey`) so we never lose authorship.
+    if (realPosition.setKey) {
+      existing.accumulatedSetKeys = [
+        ...(existing.accumulatedSetKeys || []),
+        realPosition.setKey,
+      ].slice(-50)
+    }
     existing.updatedAt = Date.now()
     if (existing.status === "filled" || existing.status === "partially_filled") {
       existing.status = "open"
@@ -855,6 +888,19 @@ export async function executeLivePosition(
     progression: [],
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    // ── Set lineage propagation (Main → Real → Live) ──────────────────
+    // Carry the Set Type metadata from the upstream RealPosition into
+    // this LivePosition verbatim. The exchange-position storage layer
+    // serialises the entire LivePosition, so these fields ride along
+    // for free and become available to post-trade statistics queries.
+    // `accumulatedSetKeys` is seeded with the originating setKey so
+    // accumulation merges later append onto a non-empty list (rather
+    // than having to special-case the first entry).
+    setKey:        realPosition.setKey,
+    parentSetKey:  realPosition.parentSetKey,
+    setVariant:    realPosition.setVariant,
+    axisWindows:   realPosition.axisWindows,
+    accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
   }
 
   try {

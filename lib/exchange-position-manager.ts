@@ -29,6 +29,17 @@ export interface ExchangePositionCreateParams {
   trailStop?: number
   tradeMode: "preset" | "main"
   indicationType?: string
+  // ── Set lineage (optional, mirrored from the upstream Real position
+  //    when the real position descends from a coordinated Main Set) ────
+  // These tags travel from Strategy-Coordinator (Main) → Real → Live
+  // and end up on the persisted exchange-position record so post-trade
+  // statistics can dimension by Set Type. All optional; manual / legacy
+  // call sites continue to work unchanged. Field meaning matches
+  // `LivePosition.setKey` etc. exactly — see live-stage.ts for docs.
+  setKey?: string
+  parentSetKey?: string
+  setVariant?: "default" | "trailing" | "block" | "dca" | "pause"
+  axisWindows?: { prev: number; last: number; cont: number; pause: number }
 }
 
 export interface ExchangePositionUpdateParams {
@@ -75,6 +86,11 @@ export class ExchangePositionManager {
       const finalVolumeUsd = volumeResult.volumeUsd
       const finalLeverage = volumeResult.leverage
 
+      // Compute used balance (margin) alongside the leveraged notional
+      // so post-trade stats and dashboards can dimension by either
+      // figure without re-deriving on read. Margin = notional / leverage.
+      const marginUsd = finalLeverage > 0 ? finalVolumeUsd / finalLeverage : finalVolumeUsd
+
       const position = {
         id: positionId,
         connection_id: params.connectionId,
@@ -89,6 +105,7 @@ export class ExchangePositionManager {
         current_price: params.entryPrice,
         quantity: finalQuantity,
         volume_usd: finalVolumeUsd,
+        margin_usd: Math.round(marginUsd * 100) / 100,
         leverage: finalLeverage,
         takeprofit: params.takeprofit || null,
         stoploss: params.stoploss || null,
@@ -99,6 +116,15 @@ export class ExchangePositionManager {
         trail_high_price: null,
         trade_mode: params.tradeMode,
         indication_type: params.indicationType || null,
+        // ── Set lineage (Main → Real → Live → Exchange) ────────────────
+        // These tags let the operator and downstream analytics rebuild
+        // the Set Type chain that produced any given exchange position.
+        // Legacy callers that pass nothing default to null, so the JSON
+        // shape stays consistent across new and old records.
+        set_key:         params.setKey         || null,
+        parent_set_key:  params.parentSetKey   || null,
+        set_variant:     params.setVariant     || null,
+        axis_windows:    params.axisWindows    || null,
         status: "open",
         sync_status: "synced",
         unrealized_pnl: 0,
