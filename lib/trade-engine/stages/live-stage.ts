@@ -394,6 +394,11 @@ async function accumulateIntoLivePosition(
       )
       await savePosition(existing)
       await incrementMetric(connectionId, "live_orders_failed_count")
+      // Same cooldown trigger as the primary entry-order path —
+      // accumulation orders also count toward the margin-error gate.
+      if (isNonRecoverableExchangeError(orderResult)) {
+        recordMarginError(connectionId)
+      }
       await logProgressionEvent(
         connectionId,
         "live_trading",
@@ -549,7 +554,48 @@ async function accumulateIntoLivePosition(
 }
 
 /**
+ * Recognise exchange errors that CANNOT be fixed by retrying. For these
+ * the operator must take an out-of-band action (top up margin, fix
+ * leverage, restore symbol availability). Retrying just slams the
+ * exchange and burns event-loop time on hopeless attempts.
+ *
+ * Currently catches:
+ *   • BingX 101204 — Insufficient margin (top-up required)
+ *   • BingX 80012  — Symbol not available for trading
+ *   • Any error containing "insufficient margin" / "insufficient balance"
+ *     / "not enough" (cross-exchange variants we may encounter)
+ */
+function isNonRecoverableExchangeError(payload: unknown): boolean {
+  if (!payload) return false
+  let text = ""
+  if (typeof payload === "string") text = payload
+  else if (payload instanceof Error) text = payload.message
+  else if (typeof payload === "object") {
+    const obj = payload as Record<string, unknown>
+    text = String(obj.error ?? obj.message ?? "")
+  } else {
+    text = String(payload)
+  }
+  if (!text) return false
+  const lc = text.toLowerCase()
+  return (
+    /\bcode\s*=?\s*101204\b/.test(text) ||
+    /\bcode\s*=?\s*80012\b/.test(text) ||
+    lc.includes("insufficient margin") ||
+    lc.includes("insufficient balance") ||
+    lc.includes("not enough margin") ||
+    lc.includes("not enough balance")
+  )
+}
+
+/**
  * Retry a promise-returning function with exponential backoff.
+ *
+ * Short-circuits on non-recoverable exchange errors (insufficient margin,
+ * symbol not tradable, etc.) — see `isNonRecoverableExchangeError`. This
+ * stops the engine from making 3 hopeless API calls per signal cycle when
+ * the user has no balance, which was producing ~20 failed exchange calls
+ * per second under the observed cycle cadence.
  */
 async function retry<T>(
   fn: () => Promise<T>,
@@ -564,8 +610,23 @@ async function retry<T>(
       lastResult = result
       if (isSuccess(result)) return result
       console.warn(`${LOG_PREFIX} ${label} attempt ${attempt}/${maxAttempts} unsuccessful`)
+      // The connector returned `{ success: false, error: "…" }` — check
+      // whether that error is non-recoverable and bail early if so.
+      if (isNonRecoverableExchangeError(result)) {
+        console.warn(
+          `${LOG_PREFIX} ${label} non-recoverable error detected — skipping remaining ${maxAttempts - attempt} attempt(s)`,
+        )
+        return result
+      }
     } catch (err) {
       console.error(`${LOG_PREFIX} ${label} attempt ${attempt}/${maxAttempts} error:`, err)
+      // Thrown error variant — check the same predicate.
+      if (isNonRecoverableExchangeError(err)) {
+        console.warn(
+          `${LOG_PREFIX} ${label} non-recoverable error detected — skipping remaining ${maxAttempts - attempt} attempt(s)`,
+        )
+        return { success: false, error: err instanceof Error ? err.message : String(err) } as unknown as T
+      }
       lastResult = undefined as unknown as T
     }
     if (attempt < maxAttempts) {
@@ -574,6 +635,38 @@ async function retry<T>(
     }
   }
   return lastResult as T
+}
+
+// ── Per-connection cooldown after non-recoverable margin errors ──────
+//
+// When `executeLivePosition` fails with `code=101204` (Insufficient margin)
+// the operator's account literally has no funds — nothing the engine can
+// do programmatically will help. Without a cooldown, every Set evaluation
+// on the next cycle re-attempts the order, generating a continuous
+// stream of failed exchange API calls (~20/sec at observed cadence).
+//
+// We track the last margin-error timestamp PER CONNECTION in this
+// module-level Map and short-circuit `executeLivePosition` for
+// `MARGIN_ERROR_COOLDOWN_MS` after a hit. The skipped attempt is logged
+// once per cycle and recorded as a `warning` progression event so the
+// operator sees it in the dashboard.
+//
+// 60 s is the sweet spot: long enough to stop the API flood, short
+// enough that the system resumes promptly after a top-up. Operators
+// typically deposit and refresh within that window.
+const MARGIN_ERROR_COOLDOWN_MS = 60_000
+const marginErrorCooldownByConnection: Map<string, number> = new Map()
+
+function isMarginCooldownActive(connectionId: string): boolean {
+  const ts = marginErrorCooldownByConnection.get(connectionId)
+  if (!ts) return false
+  if (Date.now() - ts < MARGIN_ERROR_COOLDOWN_MS) return true
+  marginErrorCooldownByConnection.delete(connectionId)
+  return false
+}
+
+function recordMarginError(connectionId: string): void {
+  marginErrorCooldownByConnection.set(connectionId, Date.now())
 }
 
 /**
@@ -866,6 +959,57 @@ export async function executeLivePosition(
 ): Promise<LivePosition> {
   await initRedis()
   const client = getRedisClient()
+
+  // ── Non-recoverable-error cooldown gate ──
+  //
+  // If we hit `code=101204` (Insufficient margin) within the last
+  // MARGIN_ERROR_COOLDOWN_MS, skip this attempt entirely and return a
+  // synthetic "rejected" LivePosition. This prevents every Set evaluation
+  // in a no-balance state from spamming the BingX API with hopeless
+  // orders that just slow the event loop.
+  //
+  // Rationale: the operator must top up — there is no engine-side fix.
+  // The skip is silent at console level after the first occurrence so
+  // logs stay readable; the progression event still records it once per
+  // skipped attempt for dashboard visibility.
+  if (isMarginCooldownActive(connectionId)) {
+    const skipped: LivePosition = {
+      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}`,
+      connectionId,
+      symbol: realPosition.symbol,
+      direction: realPosition.direction,
+      realPositionId: realPosition.id,
+      quantity: realPosition.quantity,
+      executedQuantity: 0,
+      remainingQuantity: realPosition.quantity,
+      entryPrice: realPosition.entryPrice,
+      averageExecutionPrice: 0,
+      volumeUsd: 0,
+      leverage: realPosition.leverage,
+      marginType: "cross",
+      stopLoss: realPosition.stopLoss,
+      takeProfit: realPosition.takeProfit,
+      status: "rejected",
+      statusReason:
+        "Skipped — connection in margin-error cooldown (top up exchange balance to resume live trading)",
+      fills: [],
+      progression: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      setKey: realPosition.setKey,
+      parentSetKey: realPosition.parentSetKey,
+      setVariant: realPosition.setVariant,
+      axisWindows: realPosition.axisWindows,
+      accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
+    }
+    pushStep(skipped, "preflight", false, skipped.statusReason)
+    // Don't await — fire-and-forget is fine for the cooldown skip log.
+    logProgressionEvent(connectionId, "live_trading", "warning", skipped.statusReason!, {
+      symbol: realPosition.symbol,
+      direction: realPosition.direction,
+    }).catch(() => {})
+    return skipped
+  }
 
   const livePosition: LivePosition = {
     id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}`,
@@ -1192,6 +1336,14 @@ export async function executeLivePosition(
       pushStep(livePosition, "place_order", false, livePosition.statusReason)
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_failed_count")
+
+      // Arm the per-connection cooldown when the failure was a
+      // non-recoverable margin/balance error. This stops the engine
+      // from re-attempting on every subsequent cycle and lets the
+      // operator top up without the API getting hammered.
+      if (isNonRecoverableExchangeError(orderResult)) {
+        recordMarginError(connectionId)
+      }
 
       // Per-connection progression log (for the UI Progression panel).
       await logProgressionEvent(connectionId, "live_trading", "error", `Entry order failed for ${realPosition.symbol}`, {
