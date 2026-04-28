@@ -6,6 +6,7 @@
  */
 
 import { metricsCollector, MetricType } from './metrics-collector'
+// Plain `crypto` — Edge build aliases this to `false` via `next.config.mjs`.
 import * as crypto from 'crypto'
 
 export interface SecurityConfig {

@@ -63,6 +63,11 @@ interface Settings {
   baseRatioMin: number
   baseRatioMax: number
   trailingOption: boolean
+  // Multi-step trailing matrix — Settings → Strategy → Trailing.
+  // Each enabled (start, stop) combo spawns one independent Base Set per
+  // (indication_type × direction). See `lib/strategy-coordinator.ts`.
+  strategyBaseTrailingEnabled: boolean
+  strategyBaseTrailingVariants: string[]
   previousPositionsCount: number
   lastStateCount: number
   trailingEnabled: boolean
@@ -371,6 +376,16 @@ const initialSettings: Settings = {
   baseRatioMin: 0.2,
   baseRatioMax: 1,
   trailingOption: false,
+  // Multi-step trailing matrix defaults — full 5×5 matrix on.
+  // Spec: start ∈ {0.3,0.6,0.9,1.2,1.5}, stop ∈ {0.1,0.2,0.3,0.4,0.5}.
+  strategyBaseTrailingEnabled: true,
+  strategyBaseTrailingVariants: [
+    "0.3:0.1", "0.3:0.2", "0.3:0.3", "0.3:0.4", "0.3:0.5",
+    "0.6:0.1", "0.6:0.2", "0.6:0.3", "0.6:0.4", "0.6:0.5",
+    "0.9:0.1", "0.9:0.2", "0.9:0.3", "0.9:0.4", "0.9:0.5",
+    "1.2:0.1", "1.2:0.2", "1.2:0.3", "1.2:0.4", "1.2:0.5",
+    "1.5:0.1", "1.5:0.2", "1.5:0.3", "1.5:0.4", "1.5:0.5",
+  ],
 
   // Main Strategy
   previousPositionsCount: 5,

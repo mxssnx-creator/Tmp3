@@ -1,3 +1,12 @@
+// Plain `crypto` (NOT `node:crypto`). Webpack 5 cannot resolve `node:` URIs
+// in the Edge build, and this connector is reached via instrumentation.ts
+// (compiled for BOTH nodejs and edge runtimes). The Edge bundle never
+// actually executes this code — `instrumentation.ts` returns before
+// `await import("@/lib/startup-coordinator")` runs when
+// `NEXT_RUNTIME !== "nodejs"` — but Webpack still has to *build* the graph
+// for both targets. The Edge build resolves `crypto` to `false` via the
+// alias declared in `next.config.mjs`, so the build succeeds and the
+// runtime guard ensures the empty stub is never called.
 import * as crypto from "crypto"
 import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-connector"
 

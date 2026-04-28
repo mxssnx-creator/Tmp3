@@ -1,3 +1,6 @@
+// Plain `crypto` — Edge build is satisfied by the `crypto: false` alias
+// in `next.config.mjs` (runtime guard in `instrumentation.ts` ensures
+// the stub is never executed at request time).
 import * as crypto from "crypto"
 import {
   BaseExchangeConnector,
