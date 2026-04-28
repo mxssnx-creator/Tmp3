@@ -10,19 +10,32 @@
  * with any external imports of its named exports.
  */
 
-const COORDINATOR_VERSION = "4.1.0"
+const COORDINATOR_VERSION = "4.2.0"
 
-// Force clear stale engine instances on version change
-const coordGlobal = globalThis as unknown as { 
+// STABILITY: NEVER stop or clear live engines on version change.
+//
+// Previously this block tore down the global coordinator singleton every
+// time the module was reloaded (HMR, serverless cold-warm, redeploy). That
+// caused the symptom the user described: "GlobalTradeCoordinator
+// automatically stopping / Trade Engines restarting / no-sense
+// reassignments". The coordinator is supposed to be a long-lived overall
+// state holder; replacing it on every module reload is exactly the wrong
+// behaviour.
+//
+// We now record the running version for diagnostics only — no destructive
+// cleanup. The singleton on `globalThis.__tradeEngineCoordinator` is
+// preserved across reloads.
+const coordGlobal = globalThis as unknown as {
   __coordinator_version?: string
   __global_coordinator?: unknown
 }
-
-if (coordGlobal.__coordinator_version !== COORDINATOR_VERSION) {
-  console.log(`[v0] Coordinator version changed from ${coordGlobal.__coordinator_version} to ${COORDINATOR_VERSION}, clearing stale engines...`)
-  coordGlobal.__global_coordinator = undefined
-  coordGlobal.__coordinator_version = COORDINATOR_VERSION
+if (coordGlobal.__coordinator_version && coordGlobal.__coordinator_version !== COORDINATOR_VERSION) {
+  console.log(
+    `[v0] Coordinator version ${coordGlobal.__coordinator_version} -> ${COORDINATOR_VERSION} ` +
+      `(keeping live coordinator and engines)`,
+  )
 }
+coordGlobal.__coordinator_version = COORDINATOR_VERSION
 
 console.log(`[v0] Global Trade Engine V${COORDINATOR_VERSION} loading with cache patch...`)
 
@@ -88,6 +101,17 @@ export class GlobalTradeEngineCoordinator {
 
   constructor() {
     console.log("[v0] GlobalTradeEngineCoordinator initialized with advanced coordination")
+    // The coordinator is a long-lived overall state holder. Its background
+    // monitors must run as long as the singleton exists — not gated behind
+    // `startAll()` (which the user may never call when engines are toggled
+    // individually from the dashboard). Both methods are idempotent w.r.t.
+    // their internal `*Timer` fields, so calling them again later is safe.
+    try { this.startGlobalHealthMonitoring() } catch (e) {
+      console.warn("[v0] [Coordinator] health monitor init failed:", e)
+    }
+    try { this.startCoordinationMetricsTracking() } catch (e) {
+      console.warn("[v0] [Coordinator] metrics tracker init failed:", e)
+    }
   }
 
   /**
@@ -735,57 +759,118 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
-   * Start global health monitoring with connection refresh detection
+   * Start global health monitoring with connection refresh detection +
+   * per-engine stall watchdog.
+   *
+   * Watchdog: every 10s we read each running engine's
+   * `last_processor_heartbeat` from `trade_engine_state:{id}`. If it's
+   * older than `STALL_THRESHOLD_MS` we call `manager.rearmIfStalled()`,
+   * which re-arms only the missing processor timers in place. We do NOT
+   * stop + restart the engine, do NOT rebuild the manager, do NOT replay
+   * prehistoric — that was the cause of the user's "no-sense
+   * reassignments / restarts" complaint.
    */
   private startGlobalHealthMonitoring(): void {
-    const healthCheckInterval = 10000 // Check every 10 seconds for faster response
+    if (this.healthCheckTimer) {
+      // Already running — keep the existing timer.
+      return
+    }
+    const healthCheckInterval = 10000 // 10s
+    const STALL_THRESHOLD_MS = 60_000 // 60s without heartbeat = stalled
 
-    console.log("[v0] Starting global trade engine health monitoring with refresh detection")
+    console.log("[v0] Starting global trade engine health monitoring (refresh detection + stall watchdog)")
 
     this.healthCheckTimer = setInterval(async () => {
       try {
-        // Check for refresh requests from toggle-dashboard
+        // -- 1. Refresh-request handling ----------------------------------
         const refreshRequest = await getSettings("engine_coordinator:refresh_requested")
-        
         if (refreshRequest && refreshRequest.timestamp) {
           const requestTime = new Date(refreshRequest.timestamp).getTime()
           const now = Date.now()
-          
-          // Process refresh requests within the last 30 seconds
           if (now - requestTime < 30000) {
             console.log(`[v0] [Coordinator] Refresh requested for ${refreshRequest.connectionId}: ${refreshRequest.action}`)
-            
-            // Clear the request to prevent duplicate processing
             await setSettings("engine_coordinator:refresh_requested", {
               timestamp: null,
               connectionId: null,
               action: null,
               processed_at: new Date().toISOString(),
             })
-            
-            // Trigger engine refresh
             await this.refreshEngines()
           }
         }
-        
+
+        // -- 2. Per-engine stall watchdog (in-place re-arm) ---------------
+        //
+        // Always run, even when `isGloballyRunning` is false — individual
+        // engines can be running via dashboard toggle without the global
+        // run-all flag being set.
+        const now = Date.now()
+        for (const [connectionId, manager] of this.engineManagers.entries()) {
+          if (!manager.isEngineRunning) continue
+          try {
+            const state = (await getSettings(`trade_engine_state:${connectionId}`)) || {}
+            // Prefer the unified processor heartbeat; fall back to
+            // last_indication_run for engines that haven't been upgraded
+            // yet (heartbeat key is added in this same change-set).
+            const lastHb =
+              Number(state.last_processor_heartbeat) ||
+              (state.last_processor_heartbeat ? new Date(state.last_processor_heartbeat).getTime() : 0) ||
+              (state.last_indication_run ? new Date(state.last_indication_run).getTime() : 0)
+            if (lastHb === 0) continue // engine started but no heartbeat yet
+            const age = now - lastHb
+            if (age > STALL_THRESHOLD_MS) {
+              console.warn(
+                `[v0] [Watchdog] Engine ${connectionId} stalled (last heartbeat ${age}ms ago) — re-arming in place`,
+              )
+              try {
+                const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
+                await logProgressionEvent(
+                  connectionId,
+                  "engine_stall_recovered",
+                  "warning",
+                  `Engine stalled for ${Math.round(age / 1000)}s — watchdog re-arming in place`,
+                  { ageMs: age, connectionId },
+                )
+              } catch {
+                // Logging is best-effort; never block recovery on it.
+              }
+              try {
+                await manager.rearmIfStalled()
+              } catch (rearmError) {
+                console.error(
+                  `[v0] [Watchdog] rearmIfStalled threw for ${connectionId}:`,
+                  rearmError instanceof Error ? rearmError.message : String(rearmError),
+                )
+              }
+            }
+          } catch (perEngineError) {
+            // One bad engine read must not break the whole monitor.
+            console.warn(
+              `[v0] [Watchdog] Read error for ${connectionId}:`,
+              perEngineError instanceof Error ? perEngineError.message : String(perEngineError),
+            )
+          }
+        }
+
+        // -- 3. Aggregate health ------------------------------------------
         if (!this.isGloballyRunning) return
-
         const health = await this.getGlobalHealth()
-
         if (health.overall !== "healthy") {
           console.warn(`[v0] Global trade engine health: ${health.overall}`)
         }
-
-        // Log unhealthy connections
         for (const [connectionId, component] of Object.entries(health.components)) {
           if (component.status !== "healthy") {
             console.warn(`[v0] Connection ${connectionId} is ${component.status}`)
           }
         }
       } catch (error) {
+        // The monitor itself must NEVER throw out — that would silently
+        // kill the timer. Catch everything and continue on the next tick.
         console.error("[v0] Global health monitoring error:", error)
       }
     }, healthCheckInterval)
+    // Don't keep the process alive solely for this monitor.
+    if (typeof this.healthCheckTimer.unref === "function") this.healthCheckTimer.unref()
   }
 
   /**
@@ -811,7 +896,10 @@ export class GlobalTradeEngineCoordinator {
 
   private startCoordinationMetricsTracking(): void {
     if (this.coordinationMetricsTimer) {
-      clearInterval(this.coordinationMetricsTimer)
+      // Idempotent: don't replace an already-armed timer. (Previous
+      // behaviour cleared and re-armed, which on rapid re-init could leak
+      // listeners through the inner `getAllEnginesStatus` import chain.)
+      return
     }
     const metricsInterval = 60000 // Update every 60 seconds
 
@@ -847,6 +935,8 @@ export class GlobalTradeEngineCoordinator {
         console.error("[v0] Coordination metrics tracking error:", error)
       }
     }, metricsInterval)
+    // Don't keep the process alive solely for this metrics timer.
+    if (typeof this.coordinationMetricsTimer.unref === "function") this.coordinationMetricsTimer.unref()
   }
 
   /**
@@ -859,7 +949,18 @@ export class GlobalTradeEngineCoordinator {
 
 /**
  * The global trade engine coordinator singleton instance
- * V5: Aggressive timer cleanup - also clear timers from engine-manager.ts
+ *
+ * STABILITY: This module used to "aggressively clean up" on version-change
+ * by clearing every registered engine timer AND calling `manager.stop()` on
+ * every running engine AND clearing the singleton. That ran on every HMR
+ * reload, every serverless warm-restart, and every redeploy — which is
+ * exactly what produced the "engines auto-restart for no reason / no-sense
+ * reassignments / GlobalTradeCoordinator stops itself" symptom.
+ *
+ * The coordinator is supposed to be a SOLID overall state holder. We now
+ * only log a soft diagnostic on version change and preserve every live
+ * engine across module reloads. Real cleanup remains the job of explicit
+ * `coordinator.stopEngine()` / `coordinator.stopAll()` calls.
  */
 const engineGlobalThis = globalThis as unknown as {
   __tradeEngineCoordinator?: GlobalTradeEngineCoordinator
@@ -867,45 +968,16 @@ const engineGlobalThis = globalThis as unknown as {
   __engine_timers?: Set<ReturnType<typeof setInterval>>
 }
 
-const TRADE_ENGINE_VERSION = "5.1.0"
+const TRADE_ENGINE_VERSION = "5.2.0"
 
-// V5: Aggressive cleanup - clear ALL registered engine timers on version change
-if (engineGlobalThis.__tradeEngineVersion !== TRADE_ENGINE_VERSION) {
-  console.log(`[v0] Trade Engine version changed ${engineGlobalThis.__tradeEngineVersion} -> ${TRADE_ENGINE_VERSION}, aggressive cleanup...`)
-  
-  // Clear timers registered by engine-manager.ts
-  if (engineGlobalThis.__engine_timers) {
-    console.log(`[v0] Clearing ${engineGlobalThis.__engine_timers.size} registered engine timers...`)
-    for (const timer of engineGlobalThis.__engine_timers) {
-      try {
-        clearInterval(timer)
-      } catch {}
-    }
-    engineGlobalThis.__engine_timers.clear()
-  }
-  
-  // Stop old coordinator's engines
-  if (engineGlobalThis.__tradeEngineCoordinator) {
-    try {
-      const oldCoord = engineGlobalThis.__tradeEngineCoordinator
-      // @ts-expect-error - accessing private member for cleanup
-      if (oldCoord.engineManagers) {
-        // @ts-expect-error - accessing private member for cleanup
-        for (const manager of oldCoord.engineManagers.values()) {
-          try {
-            manager.stop().catch(() => {})
-          } catch {}
-        }
-        // @ts-expect-error - accessing private member for cleanup
-        oldCoord.engineManagers.clear()
-      }
-    } catch {
-      // Ignore cleanup errors
-    }
-    engineGlobalThis.__tradeEngineCoordinator = undefined
-  }
+if (engineGlobalThis.__tradeEngineVersion && engineGlobalThis.__tradeEngineVersion !== TRADE_ENGINE_VERSION) {
+  // Soft diagnostic only. NO timer clear, NO manager.stop(), NO singleton reset.
+  console.log(
+    `[v0] Trade Engine version ${engineGlobalThis.__tradeEngineVersion} -> ${TRADE_ENGINE_VERSION} ` +
+      `(keeping ${engineGlobalThis.__engine_timers?.size ?? 0} live timers and ` +
+      `${engineGlobalThis.__tradeEngineCoordinator ? "existing" : "no"} coordinator)`,
+  )
 }
-
 engineGlobalThis.__tradeEngineVersion = TRADE_ENGINE_VERSION
 let globalCoordinator: GlobalTradeEngineCoordinator | null = engineGlobalThis.__tradeEngineCoordinator || null
 

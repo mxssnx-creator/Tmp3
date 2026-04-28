@@ -30,28 +30,28 @@ interface EngineGlobalState {
 
 const engineGlobal = (typeof globalThis !== "undefined" ? globalThis : {}) as EngineGlobalState
 
-// Force clear ALL old timers when module version changes
-if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
-  console.log(`[v0] Engine version change: ${engineGlobal.__engine_version} -> ${_ENGINE_BUILD_VERSION}, clearing stale timers...`)
-  
-  // Clear any registered timers from old version
-  if (engineGlobal.__engine_timers) {
-    for (const timer of engineGlobal.__engine_timers) {
-      clearInterval(timer)
-    }
-    engineGlobal.__engine_timers.clear()
-    console.log(`[v0] Cleared stale engine timers`)
-  }
-  
-  // Clear old engine instances
-  if (engineGlobal.__engine_instances) {
-    engineGlobal.__engine_instances.clear()
-  }
-  
-  engineGlobal.__engine_version = _ENGINE_BUILD_VERSION
+// STABILITY: NEVER clear live engine timers on module reload.
+//
+// Previously this block ran on every module reload (HMR / serverless
+// warm-restart / redeploy) and cleared every interval handle that any live
+// engine had registered. After the clear the timer handles still existed
+// inside the engines' closures, but firing them did nothing — and the
+// per-tick "stale module version" guard (also removed in this changeset)
+// then refused to schedule the next cycle. Net effect: every running
+// engine silently went to sleep on every reload. Hence the
+// "engines silently stop running" symptom.
+//
+// We now log the version transition and preserve the timer set. Real
+// timer disposal is owned by `EngineManager.stop()` and `rearmIfStalled()`.
+if (engineGlobal.__engine_version && engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
+  console.log(
+    `[v0] Engine version ${engineGlobal.__engine_version} -> ${_ENGINE_BUILD_VERSION} ` +
+      `(keeping ${engineGlobal.__engine_timers?.size ?? 0} live timers)`,
+  )
 }
+engineGlobal.__engine_version = _ENGINE_BUILD_VERSION
 
-// Initialize timer set for this version
+// Initialize timer set if it doesn't exist yet (first load in this process).
 if (!engineGlobal.__engine_timers) {
   engineGlobal.__engine_timers = new Set()
 }
@@ -200,6 +200,15 @@ export class TradeEngineManager {
   private realtimeProcessor: RealtimeProcessor
   private startTime?: Date
 
+  /**
+   * Cached `EngineConfig` from the most recent successful `start()`.
+   * Used by the watchdog's in-place re-arm path (`rearmIfStalled`) so we
+   * can re-start ONLY the missing processor timers using the same intervals
+   * the user originally configured — without rebuilding the manager,
+   * re-loading market data, or re-running prehistoric.
+   */
+  private startConfig?: EngineConfig
+
   private componentHealth: {
     indications: ComponentHealth
     strategies: ComponentHealth
@@ -237,6 +246,17 @@ export class TradeEngineManager {
       return
     }
     this.isStarting = true
+
+    // Cache config for the watchdog's in-place re-arm path. We do this
+    // BEFORE any await so a fast-fail in startup still leaves a usable
+    // record of intended intervals.
+    this.startConfig = config
+
+    // Idempotent global unhandled-rejection handler. Defined here (not at
+    // module top) so it runs in the same process tick as the engine that
+    // would otherwise leak the rejection. Multiple managers calling this
+    // method only attach the listener once thanks to the global guard.
+    this.setupErrorRecovery()
 
     try {
       // Ensure Redis is initialized before using it
@@ -445,18 +465,114 @@ export class TradeEngineManager {
   }
 
   /**
-   * Graceful error recovery - catches errors in processors and logs them
+   * Graceful error recovery — catches unhandled rejections that escape the
+   * processor try/catch blocks and re-arms the engine in place instead of
+   * letting it die. Idempotent across re-init: the listener is attached
+   * exactly once per process via a global flag.
    */
   private setupErrorRecovery() {
-    // Processors already have internal error handling
-    // This ensures we log and recover from any unhandled errors
-    process.on("unhandledRejection", (reason, promise) => {
-      if (this.isRunning) {
-        console.error("[v0] Unhandled rejection in trade engine:", reason)
-        // Update engine state to degraded but keep running
-        this.updateEngineState("error", `Unhandled rejection: ${reason}`)
-      }
+    const g = globalThis as unknown as { __engine_unhandled_attached?: boolean }
+    if (g.__engine_unhandled_attached) return
+    g.__engine_unhandled_attached = true
+
+    try { (process as any).setMaxListeners?.(50) } catch {}
+
+    process.on("unhandledRejection", (reason) => {
+      // The listener is global and shared across all live managers. We
+      // can't tell which engine the rejection belongs to, so we route it
+      // through the global coordinator: every running engine gets a
+      // chance to re-arm any missing timers. This is what makes the
+      // "self-heal in-place, no engine restart" guarantee real — a stray
+      // unhandled rejection no longer silently kills the loop.
+      console.error("[v0] [Engine] Unhandled rejection:", reason)
+      ;(async () => {
+        try {
+          const { getGlobalCoordinator } = await import("@/lib/trade-engine")
+          const coord = getGlobalCoordinator?.()
+          if (!coord) return
+          // @ts-expect-error - reach into the coordinator's manager map
+          const managers: Map<string, TradeEngineManager> | undefined = coord.engineManagers
+          if (!managers) return
+          for (const [, mgr] of managers.entries()) {
+            if (!mgr.isEngineRunning) continue
+            try { await mgr.rearmIfStalled() } catch {}
+          }
+        } catch {
+          // If even the import fails (extremely unlikely), at least make
+          // sure the current manager survives.
+          if (this.isRunning) {
+            try { await this.rearmIfStalled() } catch {}
+            try { await this.updateEngineState("error", `Unhandled rejection: ${reason}`) } catch {}
+          }
+        }
+      })().catch(() => {})
     })
+  }
+
+  /**
+   * In-place self-heal for a stalled engine. Called by the coordinator's
+   * watchdog (heartbeat older than 60s) and the unhandled-rejection
+   * recovery path. Re-arms ONLY the processor timers that are currently
+   * missing — does NOT stop/start the engine, NOT rebuild the manager,
+   * NOT re-load market data, NOT re-run prehistoric.
+   *
+   * Returns true if at least one processor timer was re-armed, false if
+   * everything was already armed (in which case we just refresh the
+   * heartbeat so the watchdog sees liveness on the next pass).
+   */
+  async rearmIfStalled(): Promise<boolean> {
+    if (!this.isRunning || !this.startConfig) return false
+
+    const reasons: string[] = []
+    try {
+      if (!this.indicationTimer) {
+        this.startIndicationProcessor(this.startConfig.indicationInterval)
+        reasons.push("indication")
+      }
+    } catch (e) {
+      console.error(`[v0] [Engine ${this.connectionId}] re-arm indication failed:`, e)
+    }
+    try {
+      if (!this.strategyTimer) {
+        this.startStrategyProcessor(this.startConfig.strategyInterval)
+        reasons.push("strategy")
+      }
+    } catch (e) {
+      console.error(`[v0] [Engine ${this.connectionId}] re-arm strategy failed:`, e)
+    }
+    try {
+      if (!this.realtimeTimer) {
+        this.startRealtimeProcessor(this.startConfig.realtimeInterval)
+        reasons.push("realtime")
+      }
+    } catch (e) {
+      console.error(`[v0] [Engine ${this.connectionId}] re-arm realtime failed:`, e)
+    }
+
+    if (reasons.length === 0) {
+      // All timers already exist — they may simply be blocked on Redis
+      // I/O. Force a heartbeat write so the watchdog sees liveness on the
+      // next 10s pass and surfaces any I/O issue separately in the logs.
+      try { await this.updateEngineState("running") } catch {}
+      try {
+        const stateKey = `trade_engine_state:${this.connectionId}`
+        await setSettings(stateKey, { last_processor_heartbeat: Date.now() })
+      } catch {}
+      return false
+    }
+
+    try {
+      await logProgressionEvent(
+        this.connectionId,
+        "engine_rearmed",
+        "warning",
+        `Re-armed in place: ${reasons.join(", ")}`,
+        { reasons, connectionId: this.connectionId },
+      )
+    } catch {
+      // Logging is best-effort; never block recovery on it.
+    }
+    return true
   }
 
   async stop(): Promise<void> {
@@ -829,27 +945,39 @@ export class TradeEngineManager {
 
     const scheduleNext = (wasProductive: boolean) => {
       if (!this.isRunning) return
-      const base = getCyclePauseMsSync()
-      let pause = base
-      if (wasProductive) {
-        consecutiveEmptyCycles = 0
-      } else {
-        consecutiveEmptyCycles++
-        // Only back off once prehistoric is done — during warmup keep the fast
-        // cycle pause so we don't stall the initial data pipeline.
-        const prehistoricDone = prehistoricDoneFlag
-        if (prehistoricDone && consecutiveEmptyCycles > 2) {
-          // Exponential-ish: 2x, 4x, 8x base capped at MAX_IDLE_PAUSE_MS
-          const factor = Math.min(16, 1 << Math.min(4, consecutiveEmptyCycles - 2))
-          pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
+      // STABILITY: scheduleNext is the ONLY thing keeping this loop alive.
+      // If `setTimeout` or the unregister call ever throws (stale handle,
+      // weird runtime, etc.) we MUST still rearm — otherwise the engine
+      // silently dies. Catch everything and try a default-pause fallback.
+      try {
+        const base = getCyclePauseMsSync()
+        let pause = base
+        if (wasProductive) {
+          consecutiveEmptyCycles = 0
+        } else {
+          consecutiveEmptyCycles++
+          const prehistoricDone = prehistoricDoneFlag
+          if (prehistoricDone && consecutiveEmptyCycles > 2) {
+            const factor = Math.min(16, 1 << Math.min(4, consecutiveEmptyCycles - 2))
+            pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
+          }
+        }
+        // Unregister the prior handle BEFORE overwriting it so the global
+        // `__engine_timers` Set doesn't grow unbounded.
+        try {
+          if (this.indicationTimer) unregisterEngineTimer(this.indicationTimer)
+        } catch { /* stale handle is fine */ }
+        this.indicationTimer = setTimeout(tick, pause)
+        registerEngineTimer(this.indicationTimer)
+      } catch (err) {
+        console.error(`[v0] [Engine ${this.connectionId}] indication scheduleNext failed; fallback rearm:`, err)
+        try {
+          this.indicationTimer = setTimeout(tick, DEFAULT_CYCLE_PAUSE_MS)
+          registerEngineTimer(this.indicationTimer)
+        } catch (fatal) {
+          console.error(`[v0] [Engine ${this.connectionId}] FATAL: cannot rearm indication timer`, fatal)
         }
       }
-      // Unregister the prior handle BEFORE overwriting it — otherwise the
-      // global `__engine_timers` Set grows by one entry every cycle and
-      // stale handles accumulate forever (memory leak + slow HMR reloads).
-      if (this.indicationTimer) unregisterEngineTimer(this.indicationTimer)
-      this.indicationTimer = setTimeout(tick, pause)
-      registerEngineTimer(this.indicationTimer)
     }
 
     // Cheap cached flag — refreshed in the background every few seconds so the
@@ -881,15 +1009,14 @@ export class TradeEngineManager {
         void refreshPrehistoricDone()
       }
 
-      // V8: Early exit if this timer is from a stale module version
-      if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
-        console.log(`[v0] Stale timer detected (version mismatch), self-clearing...`)
-        if (this.indicationTimer) {
-          clearTimeout(this.indicationTimer)
-          unregisterEngineTimer(this.indicationTimer)
-        }
-        return
-      }
+      // STABILITY: removed the V8 "stale module version self-clear".
+      // Previously this block fired the moment `_ENGINE_BUILD_VERSION` was
+      // bumped, cleared the indication timer, and `return`-ed *without*
+      // calling `scheduleNext()`. The indication loop then went silent
+      // forever for every running engine — a primary cause of the
+      // "Trade Engines silently stop running after a deploy" symptom.
+      // The only valid loop-exit condition is `!this.isRunning`, checked
+      // at the top of this `tick`.
 
       try {
         const symbols = await this.getSymbols()
@@ -1104,22 +1231,33 @@ export class TradeEngineManager {
 
     const scheduleNext = (wasProductive: boolean) => {
       if (!this.isRunning) return
-      const base = getCyclePauseMsSync()
-      let pause = base
-      if (wasProductive) {
-        consecutiveEmptyCycles = 0
-      } else {
-        consecutiveEmptyCycles++
-        if (prehistoricDoneFlag && consecutiveEmptyCycles > 2) {
-          const factor = Math.min(16, 1 << Math.min(4, consecutiveEmptyCycles - 2))
-          pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
+      // See indication scheduleNext for the full stability rationale.
+      try {
+        const base = getCyclePauseMsSync()
+        let pause = base
+        if (wasProductive) {
+          consecutiveEmptyCycles = 0
+        } else {
+          consecutiveEmptyCycles++
+          if (prehistoricDoneFlag && consecutiveEmptyCycles > 2) {
+            const factor = Math.min(16, 1 << Math.min(4, consecutiveEmptyCycles - 2))
+            pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
+          }
+        }
+        try {
+          if (this.strategyTimer) unregisterEngineTimer(this.strategyTimer)
+        } catch { /* stale handle is fine */ }
+        this.strategyTimer = setTimeout(tick, pause)
+        registerEngineTimer(this.strategyTimer)
+      } catch (err) {
+        console.error(`[v0] [Engine ${this.connectionId}] strategy scheduleNext failed; fallback rearm:`, err)
+        try {
+          this.strategyTimer = setTimeout(tick, DEFAULT_CYCLE_PAUSE_MS)
+          registerEngineTimer(this.strategyTimer)
+        } catch (fatal) {
+          console.error(`[v0] [Engine ${this.connectionId}] FATAL: cannot rearm strategy timer`, fatal)
         }
       }
-      // See indication processor: unregister the previous handle so the
-      // global timer Set doesn't grow unbounded.
-      if (this.strategyTimer) unregisterEngineTimer(this.strategyTimer)
-      this.strategyTimer = setTimeout(tick, pause)
-      registerEngineTimer(this.strategyTimer)
     }
 
     const tick = async () => {
@@ -1132,15 +1270,9 @@ export class TradeEngineManager {
         void refreshPrehistoricDone()
       }
 
-      // V8: Early exit if this timer is from a stale module version
-      if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
-        console.log(`[v0] Stale strategy timer detected, self-clearing...`)
-        if (this.strategyTimer) {
-          clearTimeout(this.strategyTimer)
-          unregisterEngineTimer(this.strategyTimer)
-        }
-        return
-      }
+      // STABILITY: removed the V8 "stale module version self-clear" — see
+      // identical note in the indication tick. Loop-exit is gated only on
+      // `!this.isRunning`.
 
       try {
         const symbols = await this.getSymbols()
@@ -1321,28 +1453,38 @@ export class TradeEngineManager {
 
     const scheduleNext = (outcome: "productive" | "empty" | "gated") => {
       if (!this.isRunning) return
-      const base = getCyclePauseMsSync()
-      let pause = base
-      if (outcome === "productive") {
-        consecutiveEmptyCycles = 0
-      } else if (outcome === "gated") {
-        // Prehistoric-pending backoff. Don't inflate `consecutiveEmpty-
-        // Cycles` — a gated cycle isn't an "empty" cycle; it was skipped
-        // on purpose. We just wait the fixed short interval so we pick
-        // up the done-flag flip promptly.
-        pause = PREHISTORIC_WAIT_POLL_MS
-      } else {
-        consecutiveEmptyCycles++
-        if (prehistoricDoneFlag && consecutiveEmptyCycles > 2) {
-          const factor = Math.min(16, 1 << Math.min(4, consecutiveEmptyCycles - 2))
-          pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
+      // See indication scheduleNext for the full stability rationale.
+      try {
+        const base = getCyclePauseMsSync()
+        let pause = base
+        if (outcome === "productive") {
+          consecutiveEmptyCycles = 0
+        } else if (outcome === "gated") {
+          // Prehistoric-pending backoff. Don't inflate
+          // `consecutiveEmptyCycles` — a gated cycle isn't an "empty"
+          // cycle; it was skipped on purpose.
+          pause = PREHISTORIC_WAIT_POLL_MS
+        } else {
+          consecutiveEmptyCycles++
+          if (prehistoricDoneFlag && consecutiveEmptyCycles > 2) {
+            const factor = Math.min(16, 1 << Math.min(4, consecutiveEmptyCycles - 2))
+            pause = Math.min(MAX_IDLE_PAUSE_MS, base * factor)
+          }
+        }
+        try {
+          if (this.realtimeTimer) unregisterEngineTimer(this.realtimeTimer)
+        } catch { /* stale handle is fine */ }
+        this.realtimeTimer = setTimeout(tick, pause)
+        registerEngineTimer(this.realtimeTimer)
+      } catch (err) {
+        console.error(`[v0] [Engine ${this.connectionId}] realtime scheduleNext failed; fallback rearm:`, err)
+        try {
+          this.realtimeTimer = setTimeout(tick, DEFAULT_CYCLE_PAUSE_MS)
+          registerEngineTimer(this.realtimeTimer)
+        } catch (fatal) {
+          console.error(`[v0] [Engine ${this.connectionId}] FATAL: cannot rearm realtime timer`, fatal)
         }
       }
-      // See indication processor: unregister the previous handle so the
-      // global timer Set doesn't grow unbounded.
-      if (this.realtimeTimer) unregisterEngineTimer(this.realtimeTimer)
-      this.realtimeTimer = setTimeout(tick, pause)
-      registerEngineTimer(this.realtimeTimer)
     }
 
     const tick = async () => {
@@ -1351,14 +1493,9 @@ export class TradeEngineManager {
       // processor reports real work, or demoted to "gated" when the
       // prehistoric flag hasn't flipped yet.
       let outcome: "productive" | "empty" | "gated" = "empty"
-      // V8: Early exit if this timer is from a stale module version
-      if (engineGlobal.__engine_version !== _ENGINE_BUILD_VERSION) {
-        if (this.realtimeTimer) {
-          clearTimeout(this.realtimeTimer)
-          unregisterEngineTimer(this.realtimeTimer)
-        }
-        return
-      }
+      // STABILITY: removed the V8 "stale module version self-clear" — see
+      // identical note in the indication tick. Loop-exit is gated only on
+      // `!this.isRunning`.
       const startTime = Date.now()
 
       // While prehistoric is pending poll the flag every tick (cheap
@@ -1763,6 +1900,12 @@ export class TradeEngineManager {
         await setSettings(stateKey, {
           status: "running",
           last_indication_run: new Date().toISOString(),
+          // STABILITY: dedicated millis-epoch heartbeat read by the
+          // coordinator's stall watchdog. Numeric form is much cheaper
+          // for the watchdog to compare than re-parsing an ISO string,
+          // and it isolates "engine alive" from "indication ran" — the
+          // two used to be conflated which made stall detection unreliable.
+          last_processor_heartbeat: Date.now(),
           connection_id: this.connectionId,
         })
       } catch {
