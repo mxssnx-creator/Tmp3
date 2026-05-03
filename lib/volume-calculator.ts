@@ -104,7 +104,21 @@ export class VolumeCalculator {
     }
 
     if (positionCost) {
-      const positionSizeUsd = accountBalance * positionCost
+      // ── positions_average is now wired into the positionCost path ────
+      // Previously this branch ignored `positionsAverage`, so the
+      // operator's "Positions Average" setting only affected the
+      // (rarely-used) risk-percentage branch below. The real engine
+      // calls this branch on every live order, which meant raising the
+      // default 50 → 300 had no effect on per-position sizing.
+      //
+      // New formula:   pos_usd = (balance × positionCost) / posAvg
+      // With positionCost expressed as a fraction of balance (the same
+      // way the calling site already converts it: `pct/100`), the
+      // denominator divides total budgeted exposure across the expected
+      // concurrent position count. Falling back to 1 keeps legacy
+      // behaviour identical when the operator hasn't set a value.
+      const posAvg = positionsAverage && positionsAverage > 0 ? positionsAverage : 1
+      const positionSizeUsd = (accountBalance * positionCost) / posAvg
       const calculatedVolume = positionSizeUsd / currentPrice
       const { final, adjusted, reason } = clampUp(calculatedVolume)
 
@@ -170,6 +184,16 @@ export class VolumeCalculator {
       )
       const positionCost = positionCostPercent / 100
 
+      // Read `positions_average` so the positionCost path divides the
+      // global budget across the expected concurrent-position count.
+      // Default 300 mirrors components/settings/utils.ts; the prior
+      // default (50) is still honoured for users who explicitly chose
+      // that value because we read whatever's in app_settings as-is.
+      const positionsAverage = (() => {
+        const raw = parseFloat(String(settings.positions_average ?? "300"))
+        return Number.isFinite(raw) && raw > 0 ? raw : 300
+      })()
+
       const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))
       // `parseHash` coerces the stored "true"/"1" to boolean true, so a
       // strict `=== true` check is now safe (the old
@@ -227,6 +251,7 @@ export class VolumeCalculator {
 
       const result = this.calculatePositionVolume({
         positionCost,
+        positionsAverage,
         accountBalance,
         currentPrice,
         leverage: maxLeverage,

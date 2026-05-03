@@ -224,7 +224,12 @@ function fmtUsd(n: number | undefined): string {
   const abs = Math.abs(n)
   if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(2)}M`
   if (abs >= 1_000)     return `${sign}$${(abs / 1_000).toFixed(2)}K`
-  return `${sign}$${abs.toFixed(2)}`
+  if (abs >= 1)         return `${sign}$${abs.toFixed(2)}`
+  // Sub-dollar values (e.g. high-leverage margins like $0.04) need
+  // extra precision — without this, fmtUsd rendered "$0.00" and the
+  // operator couldn't tell zero from a few cents committed.
+  if (abs > 0)          return `${sign}$${abs.toFixed(4)}`
+  return "$0.00"
 }
 
 /** Normalise the `/stats` endpoint response into our sample shape. */

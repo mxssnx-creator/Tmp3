@@ -354,7 +354,10 @@ interface Settings {
 const initialSettings: Settings = {
   // Overall / Main
   base_volume_factor: 1.0,
-  positions_average: 50,
+  // Default raised 50 → 300; see components/settings/utils.ts for the
+  // rationale. The two defaults must stay in lock-step or first-load
+  // will paint stale UI before the live settings hydrate from Redis.
+  positions_average: 300,
   max_leverage: 125,
   negativeChangePercent: 20, // 5-30 step 5, Default 20 - used for loss trigger calculation
   leveragePercentage: 100, // 5-100 step 5, Default 100

@@ -1349,10 +1349,19 @@ export async function GET(
         // notional figure (per the operator's spec). Falls back to the
         // current portfolio aggregate when the cumulative counter is
         // empty (legacy connection that started before margin tracking).
-        const liveMarginUsdCumulative = n(progHash.live_margin_usd_total)
-        const liveMarginUsdR = liveMarginUsdCumulative > 0
-          ? Math.round(liveMarginUsdCumulative * 100) / 100
-          : Math.round(liveAggTotalMarginUsd * 100) / 100
+        // Prefer the new cent-precision counter so sub-dollar margins
+        // (a $5 fill at 125x leverage = $0.04 margin) survive integer
+        // truncation. Falls back to the legacy dollar counter, then
+        // to the open-portfolio aggregate.
+        const liveMarginCents = n(progHash.live_margin_cents_total)
+        const liveMarginUsdR = liveMarginCents > 0
+          ? Math.round(liveMarginCents) / 100
+          : (() => {
+              const dollars = n(progHash.live_margin_usd_total)
+              return dollars > 0
+                ? Math.round(dollars * 100) / 100
+                : Math.round(liveAggTotalMarginUsd * 100) / 100
+            })()
 
         // Full Exchange Position Details per live position. Contains
         // everything the operator needs to evaluate trade health
@@ -1487,12 +1496,23 @@ export async function GET(
         // Used-balance margin (cumulative notional/leverage). This is
         // the canonical "USDT" figure the dashboard should display:
         // the actual capital committed, not the leveraged exposure.
-        // Falls back to current portfolio margin aggregate so legacy
-        // connections (which started before this counter existed)
-        // still report a sensible value instead of zero.
-        marginUsdTotal:   n(progHash.live_margin_usd_total) > 0
-                            ? n(progHash.live_margin_usd_total)
-                            : Math.round(liveAggTotalMarginUsd * 100) / 100,
+        //
+        // PRIORITY ORDER:
+        //   1. `live_margin_cents_total` — cent-precision counter
+        //      (added 2026-05-03). Survives the rounding that wiped out
+        //      sub-dollar margins (e.g. $5 notional / 125x = $0.04
+        //      margin) on the legacy dollar counter.
+        //   2. `live_margin_usd_total` — legacy dollar counter, still
+        //      written in lock-step for backward-compat dashboards.
+        //   3. Current open-portfolio margin aggregate, for connections
+        //      that started before either counter existed.
+        marginUsdTotal:   (() => {
+          const cents = n(progHash.live_margin_cents_total)
+          if (cents > 0) return Math.round(cents) / 100
+          const dollars = n(progHash.live_margin_usd_total)
+          if (dollars > 0) return dollars
+          return Math.round(liveAggTotalMarginUsd * 100) / 100
+        })(),
         // Derived
         fillRate: (() => {
           const placed = n(progHash.live_orders_placed_count)
