@@ -150,6 +150,16 @@ interface LiveStats {
   historicFrames: number
   historicFramesMissing: number
   historicTimeframeSec: number
+  // ── Historic Profit Factor + Executed Positions ─────────────────────
+  // Spec ask: "Add also ExecutedPositions, AverageProfitFactor Infos."
+  // These come straight off the `historic` block of the /stats endpoint.
+  // `historicAvgProfitFactor` aggregates every closed prehistoric
+  // position into one PF number (sum(+pct)/|sum(-pct)|). `executedPositions`
+  // is the cumulative live-exchange-position count — the canonical
+  // "Executed Positions" metric across the whole engine lifetime.
+  historicAvgProfitFactor: number
+  historicAvgProfitFactorCount: number
+  executedPositions: number
   // realtime
   indicationCycles: number
   strategyCycles: number
@@ -229,6 +239,7 @@ const EMPTY_STATS: LiveStats = {
   historicSymbols: 0, historicSymbolsTotal: 0, historicCycles: 0,
   historicComplete: false, historicProgress: 0, historicCandles: 0, historicIndicators: 0,
   historicFrames: 0, historicFramesMissing: 0, historicTimeframeSec: 1,
+  historicAvgProfitFactor: 0, historicAvgProfitFactorCount: 0, executedPositions: 0,
   indicationCycles: 0, strategyCycles: 0, realtimeCycles: 0, indicationsTotal: 0,
   strategiesTotal: 0, positionsOpen: 0, successRate: 0, avgCycleMs: 0, isActive: false,
   indDirection: 0, indMove: 0, indActive: 0, indOptimal: 0, indAuto: 0,
@@ -428,6 +439,13 @@ export function QuickstartSection() {
         historicFrames:        s.historic?.framesProcessed     || 0,
         historicFramesMissing: s.historic?.framesMissingLoaded || 0,
         historicTimeframeSec:  s.historic?.timeframeSeconds    || 1,
+        // Historic PF + Executed Positions — spec-mandated overview metrics.
+        // Both fall back to 0 silently when the engine hasn't produced
+        // closed prehistoric positions or live exchange orders yet, so
+        // the QuickStart strip renders "—" instead of misleading zeros.
+        historicAvgProfitFactor:      Number(s.historic?.avgProfitFactor)      || 0,
+        historicAvgProfitFactorCount: Number(s.historic?.avgProfitFactorCount) || 0,
+        executedPositions:            Number(s.historic?.executedPositions)    || 0,
         indicationCycles:      indCycles,
         strategyCycles:        stratCycles,
         realtimeCycles:        s.realtime?.realtimeCycles      || 0,
@@ -1120,7 +1138,18 @@ export function QuickstartSection() {
               )}
               <div className="flex flex-wrap gap-1.5">
                 <MiniStat label="Symbols"    value={`${stats.historicSymbols}/${stats.historicSymbolsTotal}`} />
-                <MiniStat label="Preh Cycles" value={fmt(stats.historicCycles)} />
+                {/* Preh Cycles → relate to processed frames so the operator can
+                    judge whether cycles per frame are healthy. Sub-label shows
+                    "frames/cycle" when both counters are populated. */}
+                <MiniStat
+                  label="Preh Cycles"
+                  value={fmt(stats.historicCycles)}
+                  sub={
+                    stats.historicCycles > 0 && stats.historicFrames > 0
+                      ? `${fmt(Math.round(stats.historicFrames / Math.max(stats.historicCycles, 1)))}/cyc`
+                      : undefined
+                  }
+                />
                 {stats.historicFrames > 0 && (
                   <MiniStat
                     label={`Frames ${stats.historicTimeframeSec}s`}
@@ -1134,6 +1163,31 @@ export function QuickstartSection() {
                 {stats.historicIndicators > 0 && (
                   <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
                 )}
+                {/* ── Spec-mandated Historic overview tiles ──────────────
+                    "Add also ExecutedPositions, AverageProfitFactor Infos."
+                      • ExecPos — cumulative live exchange positions created
+                        since engine start (`historic.executedPositions`).
+                      • Avg PF — historic-wide profit factor across every
+                        closed prehistoric position. Sub label shows the
+                        sample size so the operator can judge confidence. */}
+                <MiniStat
+                  label="Exec Pos"
+                  value={fmt(stats.executedPositions)}
+                  sub={stats.livePositionsOpen > 0 ? `${fmt(stats.livePositionsOpen)} open` : undefined}
+                />
+                <MiniStat
+                  label="Avg PF"
+                  value={
+                    stats.historicAvgProfitFactor > 0
+                      ? stats.historicAvgProfitFactor.toFixed(2)
+                      : "—"
+                  }
+                  sub={
+                    stats.historicAvgProfitFactorCount > 0
+                      ? `n=${fmt(stats.historicAvgProfitFactorCount)}`
+                      : undefined
+                  }
+                />
               </div>
             </div>
 

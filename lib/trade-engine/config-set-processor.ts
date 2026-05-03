@@ -36,10 +36,44 @@ export class ConfigSetProcessor {
   private indicationManager: IndicationConfigManager
   private strategyManager: StrategyConfigManager
 
+  // Per-Set DB capacity used to clip the per-config indication-result and
+  // strategy-position arrays returned from each calculation pass. This
+  // value MUST track the operator-controlled `setCompactionFloor`
+  // setting (Settings → System → Set Compaction → Compaction Floor) so
+  // the per-pass slice does not artificially mask actual processed
+  // counts in the dashboard.
+  //
+  // Read once at the start of each `processPrehistoricData` run (cheap,
+  // already async) into `runtimeSetEntryCap`. Default 250 matches the
+  // historical hard-coded value, so behaviour is unchanged for fresh
+  // installs that haven't tuned the setting.
+  private runtimeSetEntryCap: number = 250
+
   constructor(connectionId: string) {
     this.connectionId = connectionId
     this.indicationManager = new IndicationConfigManager(connectionId)
     this.strategyManager = new StrategyConfigManager(connectionId)
+  }
+
+  /**
+   * Resolve the per-Set entry cap from settings (`setCompactionFloor`).
+   * Honours the same value the operator configured in Settings → System
+   * → Set Compaction. Returns 250 (the legacy default) when the
+   * setting is missing or invalid so behaviour is preserved.
+   *
+   * NOTE: this is called once per `processPrehistoricData` run. Per-call
+   * lookup avoids stale closures on long-lived process instances.
+   */
+  private async resolveSetEntryCap(): Promise<number> {
+    try {
+      const settingsRaw = await getSettings("global_settings").catch(() => null)
+      const settings: any = settingsRaw && typeof settingsRaw === "object" ? settingsRaw : {}
+      const fromSettings = Number(settings.setCompactionFloor)
+      if (Number.isFinite(fromSettings) && fromSettings >= 50 && fromSettings <= 100_000) {
+        return Math.floor(fromSettings)
+      }
+    } catch { /* non-critical */ }
+    return 250
   }
 
   /**
@@ -118,6 +152,17 @@ export class ConfigSetProcessor {
 
     await initRedis()
     const client = getRedisClient()
+
+    // Resolve the per-Set entry cap once for this whole run. Honours the
+    // operator-controlled `setCompactionFloor` setting so the dashboard
+    // counts (`indications_count`, `strategies_base_total`, the per-Set
+    // DB lengths) reflect the actual configured ceiling instead of the
+    // historical hard-coded 250.
+    this.runtimeSetEntryCap = await this.resolveSetEntryCap()
+    console.log(
+      `[v0] [ConfigSetProcessor] per-Set entry cap = ${this.runtimeSetEntryCap} ` +
+      `(from setCompactionFloor)`
+    )
 
     // Mutable aggregates updated from parallel workers — guard with a lightweight
     // local function since JS is single-threaded inside the event loop there's
@@ -687,7 +732,11 @@ export class ConfigSetProcessor {
       }
     }
 
-    return results.slice(0, 250)
+    // Honour the operator-configured per-Set entry cap (default 250 to
+    // preserve legacy behaviour). Slicing per-config keeps Set size bounded
+    // and the displayed totals in the dashboard now reflect the configured
+    // ceiling rather than a hard-coded magic number.
+    return results.slice(0, this.runtimeSetEntryCap)
   }
 
   /**
@@ -810,7 +859,11 @@ export class ConfigSetProcessor {
       })
     }
 
-    return positions.slice(0, 250)
+    // Honour the operator-configured per-Set entry cap (see
+    // `resolveSetEntryCap`). Default 250 — bumping the Set Compaction
+    // Floor in Settings → System raises this ceiling for every prehistoric
+    // strategy pass without code changes.
+    return positions.slice(0, this.runtimeSetEntryCap)
   }
 
   /**
