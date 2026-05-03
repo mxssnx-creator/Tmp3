@@ -802,7 +802,36 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     }
   }
 
+  // ── Honour operator-issued tombstones ────────────────────────────
+  // The DELETE endpoint (`app/api/settings/connections/[id]/route.ts`)
+  // adds deleted connection IDs to the `connections:tombstoned` Set so
+  // we don't immediately resurrect them on the next migration sweep
+  // (which historically ran every cold start and silently un-did the
+  // operator's delete). Read the set once up-front so we don't query
+  // Redis per-config inside the loop below.
+  const tombstonedIds = new Set<string>()
+  try {
+    const tombs = await client.smembers("connections:tombstoned")
+    if (Array.isArray(tombs)) {
+      for (const id of tombs) {
+        if (typeof id === "string" && id.length > 0) tombstonedIds.add(id)
+      }
+    }
+  } catch {
+    // Non-critical: a missing/corrupt set just means we treat it as empty.
+  }
+
   for (const cfg of BASE_CONNECTION_CONFIG) {
+    if (tombstonedIds.has(cfg.id)) {
+      // Operator explicitly deleted this base connection — don't
+      // recreate it. Logged at INFO so the cold-start log makes the
+      // skip visible.
+      console.log(
+        `[v0] [Migrations] Skipping tombstoned base connection ${cfg.id} ` +
+        `(deleted by operator; will not be auto-recreated)`,
+      )
+      continue
+    }
     const now = new Date().toISOString()
     const existing = await client.hgetall(`connection:${cfg.id}`)
     const hasExisting = existing && Object.keys(existing).length > 0

@@ -1,4 +1,4 @@
-// Force rebuild: 2026-05-03T16:30:00 — Bybit/BingX auto-active on bootstrap, configurable per-Set entry cap, ExecPos + AvgPF tiles, global engine cold-boot
+// Force rebuild: 2026-05-03T18:00:00 — connection delete tombstones (no auto-resurrect), one-shot startup-only auto-start (no interval reassignments)
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
