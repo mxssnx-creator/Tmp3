@@ -71,6 +71,39 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
 
     await deleteConnection(id)
 
+    // ── Tombstone the connection ID ───────────────────────────────────
+    // Bug being fixed: deleting a base/main connection (e.g. bybit-x03,
+    // bingx-x01) caused it to immediately reappear after the next page
+    // load because `ensureBaseConnections` in `lib/redis-migrations.ts`
+    // unconditionally re-creates every entry in `BASE_CONNECTION_CONFIG`
+    // on each migration run. Without a tombstone there is no way for
+    // the system to remember an explicit operator delete decision.
+    //
+    // Add the ID to `connections:tombstoned` (a Redis Set). The
+    // migration consults this set and skips any tombstoned ID. The
+    // tombstone persists indefinitely — to "un-delete" a base
+    // connection the operator removes it from the set explicitly
+    // (e.g. via the Recover button or by clearing the DB).
+    try {
+      const { getRedisClient } = await import("@/lib/redis-db")
+      const client = getRedisClient()
+      await client.sadd("connections:tombstoned", id)
+      // Also store the deletion timestamp for audit/UX (Recover button
+      // can show "deleted 3 days ago"). 90-day TTL on the per-id record
+      // bounds storage growth without affecting the tombstone itself.
+      await client.set(
+        `connection:${id}:tombstoned_at`,
+        new Date().toISOString(),
+        { EX: 90 * 24 * 60 * 60 },
+      )
+      console.log(`[v0] [DELETE] Tombstoned connection id=${id} (will not be auto-recreated)`)
+    } catch (tombErr) {
+      console.warn(
+        `[v0] [DELETE] Failed to tombstone ${id} (delete still succeeded):`,
+        tombErr instanceof Error ? tombErr.message : tombErr,
+      )
+    }
+
     await SystemLogger.logConnection(`Connection deleted`, id, "info")
 
     return NextResponse.json({ success: true, message: "Connection deleted and data archived" })
@@ -151,6 +184,21 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
     if (!connection) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
+
+    // Lift any tombstone on this id — operator is explicitly re-saving
+    // this connection, which is a clear "un-delete" intent. Without this
+    // a re-saved base connection would still be skipped by the next
+    // migration sweep (see `lib/redis-migrations.ts → ensureBaseConnections`).
+    try {
+      const { getRedisClient } = await import("@/lib/redis-db")
+      const client = getRedisClient()
+      const wasTombstoned = await client.sismember("connections:tombstoned", id)
+      if (wasTombstoned) {
+        await client.srem("connections:tombstoned", id)
+        await client.del(`connection:${id}:tombstoned_at`)
+        console.log(`[v0] [PUT] Lifted tombstone on ${id} (operator re-saved connection)`)
+      }
+    } catch { /* non-critical */ }
 
     const sanitizedBody = { ...body }
     if (sanitizedBody.api_key === "" && connection.api_key) {
