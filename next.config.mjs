@@ -1,4 +1,4 @@
-// Force rebuild: 2026-04-28T15:10:00 — native conditional SL/TP orders (BingX STOP_MARKET, Bybit triggerPrice); legacy fallback preserved
+// Force rebuild: 2026-05-03T16:30:00 — Bybit/BingX auto-active on bootstrap, configurable per-Set entry cap, ExecPos + AvgPF tiles, global engine cold-boot
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
