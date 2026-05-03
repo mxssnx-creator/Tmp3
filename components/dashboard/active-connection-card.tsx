@@ -932,10 +932,98 @@ export function ActiveConnectionCard({
                     {progression.subPhase && <span className="ml-1">- {progression.subPhase}</span>}
                   </p>
                 )}
-                
-                {/* Per-connection engine stats — always shown when connection is active */}
+
+                {/* ── Compact two-section overview ──────────────────────
+                    Per spec: "Show in Main Connections Connectioncard
+                    overview stats.. historic simple compact with the few
+                    values.. and realtime progress in own section under
+                    it with other color.. blue."
+
+                    Top section (amber, matches the rich Historical
+                    Processing block that lives below): the few essential
+                    historic numbers — Frames @ timeframe, Cycles, Avg
+                    PF (Base) and Strategies count. Renders only when
+                    prehistoric stats are available.
+
+                    Bottom section (blue, dedicated colour-coding): the
+                    realtime engine pulse — Cycles, Indications,
+                    Strategies, Positions. Renders whenever liveStats is
+                    populated; the previous in-flow row is replaced so
+                    we don't double up the realtime numbers below. */}
+                {prehistoricStats && (
+                  prehistoricStats.intervalsProcessed > 0 ||
+                  prehistoricStats.stratBase > 0 ||
+                  prehistoricStats.indicationsTotal > 0
+                ) && (
+                  <div
+                    className="mt-2 flex items-center gap-3 flex-wrap rounded border border-amber-200/60 dark:border-amber-800/40 bg-amber-50/40 dark:bg-amber-950/15 px-2 py-1.5"
+                    title="Historic (prehistoric) processing summary — consolidated from the detailed block below."
+                  >
+                    <div className="flex items-center gap-1.5 text-[10px]">
+                      <span className="text-amber-700/80 dark:text-amber-400/80 font-semibold uppercase tracking-wide text-[9px]">
+                        Historic
+                      </span>
+                    </div>
+                    {[
+                      {
+                        label: prehistoricStats.timeframeSeconds === 1
+                          ? "Frames 1s"
+                          : `Frames ${prehistoricStats.timeframeSeconds}s`,
+                        value: prehistoricStats.intervalsProcessed,
+                        title: "Total prehistoric frames (intervals) processed across all symbols.",
+                      },
+                      {
+                        label: "P Cycles",
+                        value: liveStats?.indicationCycles ?? 0,
+                        title: "Prehistoric processing cycles — relates to processed frames, not symbol count.",
+                      },
+                      {
+                        label: "Strat Base",
+                        value: prehistoricStats.stratBase,
+                        title: "Total Base strategies evaluated across the prehistoric run.",
+                      },
+                      {
+                        label: "Avg PF",
+                        value: prehistoricStats.avgProfitFactorBase,
+                        format: (v: number) => v > 0 ? v.toFixed(2) : "—",
+                        title: "Average Profit Factor across all closed Base strategies.",
+                      },
+                      {
+                        label: "Real Open",
+                        value: prehistoricStats.realOpen,
+                        title: "Currently active Real positions (valid, opened) across all running Sets.",
+                      },
+                    ].map(({ label, value, format, title }) => (
+                      <div
+                        key={label}
+                        className="flex items-center gap-1 text-[10px]"
+                        title={title}
+                      >
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="font-semibold tabular-nums text-amber-800 dark:text-amber-300">
+                          {format
+                            ? format(value)
+                            : (value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 {liveStats && phase !== "prehistoric_data" && (
-                  <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+                  <div
+                    className="mt-1.5 flex items-center gap-3 flex-wrap rounded border border-blue-200/60 dark:border-blue-800/40 bg-blue-50/50 dark:bg-blue-950/20 px-2 py-1.5"
+                    title="Realtime processing — counters update on every websocket tick after the historic backfill completes."
+                  >
+                    <div className="flex items-center gap-1.5 text-[10px]">
+                      <span className="text-blue-700 dark:text-blue-400 font-semibold uppercase tracking-wide text-[9px]">
+                        Realtime
+                      </span>
+                      <span
+                        className="inline-block h-1.5 w-1.5 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse"
+                        aria-hidden="true"
+                      />
+                    </div>
                     {[
                       { label: "Cycles",    value: liveStats.indicationCycles },
                       { label: "Ind.",      value: liveStats.indications },
@@ -944,7 +1032,7 @@ export function ActiveConnectionCard({
                     ].map(({ label, value }) => (
                       <div key={label} className="flex items-center gap-1 text-[10px]">
                         <span className="text-muted-foreground">{label}</span>
-                        <span className="font-semibold tabular-nums">
+                        <span className="font-semibold tabular-nums text-blue-800 dark:text-blue-300">
                           {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
                         </span>
                       </div>
