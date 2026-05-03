@@ -933,97 +933,9 @@ export function ActiveConnectionCard({
                   </p>
                 )}
 
-                {/* ── Compact two-section overview ──────────────────────
-                    Per spec: "Show in Main Connections Connectioncard
-                    overview stats.. historic simple compact with the few
-                    values.. and realtime progress in own section under
-                    it with other color.. blue."
-
-                    Top section (amber, matches the rich Historical
-                    Processing block that lives below): the few essential
-                    historic numbers — Frames @ timeframe, Cycles, Avg
-                    PF (Base) and Strategies count. Renders only when
-                    prehistoric stats are available.
-
-                    Bottom section (blue, dedicated colour-coding): the
-                    realtime engine pulse — Cycles, Indications,
-                    Strategies, Positions. Renders whenever liveStats is
-                    populated; the previous in-flow row is replaced so
-                    we don't double up the realtime numbers below. */}
-                {prehistoricStats && (
-                  prehistoricStats.intervalsProcessed > 0 ||
-                  prehistoricStats.stratBase > 0 ||
-                  prehistoricStats.indicationsTotal > 0
-                ) && (
-                  <div
-                    className="mt-2 flex items-center gap-3 flex-wrap rounded border border-amber-200/60 dark:border-amber-800/40 bg-amber-50/40 dark:bg-amber-950/15 px-2 py-1.5"
-                    title="Historic (prehistoric) processing summary — consolidated from the detailed block below."
-                  >
-                    <div className="flex items-center gap-1.5 text-[10px]">
-                      <span className="text-amber-700/80 dark:text-amber-400/80 font-semibold uppercase tracking-wide text-[9px]">
-                        Historic
-                      </span>
-                    </div>
-                    {[
-                      {
-                        label: prehistoricStats.timeframeSeconds === 1
-                          ? "Frames 1s"
-                          : `Frames ${prehistoricStats.timeframeSeconds}s`,
-                        value: prehistoricStats.intervalsProcessed,
-                        title: "Total prehistoric frames (intervals) processed across all symbols.",
-                      },
-                      {
-                        label: "P Cycles",
-                        value: liveStats?.indicationCycles ?? 0,
-                        title: "Prehistoric processing cycles — relates to processed frames, not symbol count.",
-                      },
-                      {
-                        label: "Strat Base",
-                        value: prehistoricStats.stratBase,
-                        title: "Total Base strategies evaluated across the prehistoric run.",
-                      },
-                      {
-                        label: "Avg PF",
-                        value: prehistoricStats.avgProfitFactorBase,
-                        format: (v: number) => v > 0 ? v.toFixed(2) : "—",
-                        title: "Average Profit Factor across all closed Base strategies.",
-                      },
-                      {
-                        label: "Real Open",
-                        value: prehistoricStats.realOpen,
-                        title: "Currently active Real positions (valid, opened) across all running Sets.",
-                      },
-                    ].map(({ label, value, format, title }) => (
-                      <div
-                        key={label}
-                        className="flex items-center gap-1 text-[10px]"
-                        title={title}
-                      >
-                        <span className="text-muted-foreground">{label}</span>
-                        <span className="font-semibold tabular-nums text-amber-800 dark:text-amber-300">
-                          {format
-                            ? format(value)
-                            : (value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
+                {/* Per-connection engine stats — always shown when connection is active */}
                 {liveStats && phase !== "prehistoric_data" && (
-                  <div
-                    className="mt-1.5 flex items-center gap-3 flex-wrap rounded border border-blue-200/60 dark:border-blue-800/40 bg-blue-50/50 dark:bg-blue-950/20 px-2 py-1.5"
-                    title="Realtime processing — counters update on every websocket tick after the historic backfill completes."
-                  >
-                    <div className="flex items-center gap-1.5 text-[10px]">
-                      <span className="text-blue-700 dark:text-blue-400 font-semibold uppercase tracking-wide text-[9px]">
-                        Realtime
-                      </span>
-                      <span
-                        className="inline-block h-1.5 w-1.5 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse"
-                        aria-hidden="true"
-                      />
-                    </div>
+                  <div className="flex items-center gap-3 mt-1.5 flex-wrap">
                     {[
                       { label: "Cycles",    value: liveStats.indicationCycles },
                       { label: "Ind.",      value: liveStats.indications },
@@ -1032,7 +944,7 @@ export function ActiveConnectionCard({
                     ].map(({ label, value }) => (
                       <div key={label} className="flex items-center gap-1 text-[10px]">
                         <span className="text-muted-foreground">{label}</span>
-                        <span className="font-semibold tabular-nums text-blue-800 dark:text-blue-300">
+                        <span className="font-semibold tabular-nums">
                           {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
                         </span>
                       </div>
@@ -1426,15 +1338,34 @@ export function ActiveConnectionCard({
                       </div>
                     )}
 
-                    {/* Live Exchange Execution — shown when any live-stage activity has occurred */}
+                    {/* ── Realtime Execution sub-section ────────────────
+                        Visually split inside the existing detailed panel:
+                        the historic backfill content (symbols/candles/
+                        intervals + indications + strategy stages) keeps the
+                        amber theme above; below this divider the realtime
+                        engine pulse (live orders, fills, wins, USDT) is
+                        re-themed in blue.
+
+                        The inner status chips deliberately keep their
+                        semantic colours (green for fills/wins, amber for
+                        rejected, red for failed/PnL-loss) so the operator
+                        can still read outcome quality at a glance. */}
                     {prehistoricStats && (
                       prehistoricStats.liveOrdersPlaced > 0 ||
                       prehistoricStats.liveOrdersSimulated > 0 ||
                       prehistoricStats.livePositionsCreated > 0
                     ) && (
-                      <div className="space-y-1 border-t border-border/40 pt-2">
+                      <div className="space-y-1 -mx-2 -mb-2 mt-1 px-2 pt-2 pb-2 border-t-2 border-blue-300/60 dark:border-blue-700/50 bg-blue-50/60 dark:bg-blue-950/25 rounded-b">
                         <div className="flex items-center justify-between">
-                          <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Live Execution</div>
+                          <div className="flex items-center gap-1.5">
+                            <div className="text-[9px] font-semibold text-blue-700 dark:text-blue-400 uppercase tracking-wide">
+                              Realtime Execution
+                            </div>
+                            <span
+                              className="inline-block h-1.5 w-1.5 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse"
+                              aria-hidden="true"
+                            />
+                          </div>
                           {prehistoricStats.livePositionsOpen > 0 && (
                             <div className="flex items-center gap-1 text-[9px]">
                               <span className="relative flex h-1.5 w-1.5">
