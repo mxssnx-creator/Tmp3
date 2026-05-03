@@ -435,6 +435,13 @@ async function accumulateIntoLivePosition(
 
     const addOrderId: string = orderResult.orderId || orderResult.id
     pushStep(existing, "accumulate_place", true, `addQty=${addQty.toFixed(6)} orderId=${addOrderId}`)
+    // Count the accumulation entry as an "order placed" — without
+    // this, Fill Rate (filled/placed) goes nonsense whenever an
+    // accumulation lands successfully (we'd bump filled at line ~510
+    // without ever bumping placed). The dedicated
+    // `live_orders_accumulated_count` still tracks accumulation as
+    // a separate metric for operators who want to break it out.
+    await incrementMetric(connectionId, "live_orders_placed_count")
 
     // ── 3. Poll the new fill ──────────────────────────────────────────
     const fill = await pollOrderFill(exchangeConnector, symbol, addOrderId)
@@ -520,7 +527,14 @@ async function accumulateIntoLivePosition(
       const lev = Math.max(1, Number(existing.leverage) || 1)
       const newMargin = newNotional / lev
       if (Number.isFinite(newMargin) && newMargin > 0) {
-        await incrementMetric(connectionId, "live_margin_usd_total", Math.round(newMargin))
+        // Cents counter — preserves sub-dollar margins (a $5 fill at
+        // 125x leverage is $0.04 margin → 4 cents, not 0). Reader
+        // divides by 100. The legacy `live_margin_usd_total` counter
+        // is no longer written (it would have to be inflated to avoid
+        // truncating to 0, which would lie about the true margin) —
+        // legacy connections without cents data fall back gracefully
+        // in the stats route.
+        await incrementMetric(connectionId, "live_margin_cents_total", Math.round(newMargin * 100))
       }
     }
 
@@ -1587,16 +1601,31 @@ export async function executeLivePosition(
     if (livePosition.status === "filled") livePosition.status = "open"
 
     await savePosition(livePosition)
-    await incrementMetric(connectionId, "live_positions_created_count")
-    await incrementMetric(connectionId, "live_volume_usd_total", Math.round(livePosition.volumeUsd))
-    // Used-balance (margin) cumulative counter — see accumulation
-    // path above for the rationale. Always increment in lock-step
-    // with `live_volume_usd_total` so the two series stay aligned.
-    {
+
+    // Only count this as a real "position created" when the entry
+    // order actually filled on the exchange. Previously we bumped this
+    // counter unconditionally — including when pollOrderFill timed
+    // out — which caused the dashboard to show ghost positions
+    // (`Positions Created` > zero with `Orders Filled` still 0). The
+    // user explicitly reported this asymmetry. Use executedQuantity as
+    // the source of truth: it's only set once the fill is confirmed
+    // (line 1450) or sync-confirmed (executeLivePosition exchange
+    // sync block above).
+    const hasRealFill = (livePosition.executedQuantity || 0) > 0
+    if (hasRealFill) {
+      await incrementMetric(connectionId, "live_positions_created_count")
+      await incrementMetric(connectionId, "live_volume_usd_total", Math.round(livePosition.volumeUsd))
+      // Used-balance (margin) cumulative counter — track in CENTS so
+      // small margins (e.g. $5 notional / 125x leverage = $0.04)
+      // survive integer rounding. Reader divides by 100 to display USD.
+      // The legacy `live_margin_usd_total` counter is no longer
+      // written: rounding any tiny margin to a whole dollar (or to 0)
+      // produced a misleading number, and the stats reader now prefers
+      // `live_margin_cents_total`.
       const lev = Math.max(1, Number(livePosition.leverage) || 1)
       const newMargin = (livePosition.volumeUsd || 0) / lev
       if (Number.isFinite(newMargin) && newMargin > 0) {
-        await incrementMetric(connectionId, "live_margin_usd_total", Math.round(newMargin))
+        await incrementMetric(connectionId, "live_margin_cents_total", Math.round(newMargin * 100))
       }
     }
     await logProgressionEvent(connectionId, "live_trading", "info", `Live position created ${realPosition.symbol}`, {
@@ -1781,12 +1810,22 @@ export async function closeLivePosition(
       `close @ ${closePrice} pnl=${pnl.toFixed(2)} roi=${roi.toFixed(2)}% reason=${closeReason}${exchangeConnector && !exchangeCloseSuccess ? " [exchange-close-uncertain]" : ""}`,
     )
     // savePosition() handles index move + idempotent archival.
+    // CHECK the moved-marker BEFORE savePosition() runs so we know
+    // whether THIS close is the first terminal write or a re-entry.
+    // Without this guard `closeLivePosition` and the reconcile loop
+    // could BOTH bump `live_positions_closed_count` for the same
+    // position — that's exactly the "Positions Closed (6) >
+    // Positions Created (4)" asymmetry the operator reported.
+    const movedMarker = `live:positions:${connectionId}:moved:${position.id}`
+    const wasAlreadyClosed = await client.get(movedMarker).catch(() => null)
     await savePosition(position)
 
     // ── 5. Release dedup lock + counters + audit log ──────────────────
     await releaseLock(connectionId, position.symbol, position.direction)
-    await incrementMetric(connectionId, "live_positions_closed_count")
-    if (pnl > 0) await incrementMetric(connectionId, "live_wins_count")
+    if (!wasAlreadyClosed) {
+      await incrementMetric(connectionId, "live_positions_closed_count")
+      if (pnl > 0) await incrementMetric(connectionId, "live_wins_count")
+    }
 
     await logProgressionEvent(connectionId, "live_trading", "info", `Closed live position ${position.symbol}`, {
       pnl,
@@ -2212,22 +2251,30 @@ export async function reconcileLivePositions(
           const alreadyMoved = await client.get(movedMarker).catch(() => null)
 
           const progKey = `progression:${connectionId}`
+          // Lock + TTL refresh always run (idempotent operations).
           const writes: Promise<any>[] = [
-            client.hincrby(progKey, "live_positions_closed_count", 1).catch(() => {}),
             client.expire(progKey, 7 * 24 * 60 * 60).catch(() => {}),
             client.del(`live:lock:${connectionId}:${pos.symbol}:${pos.direction}`).catch(() => {}),
           ]
-          if (realizedPnl > 0) {
-            writes.push(client.hincrby(progKey, "live_wins_count", 1).catch(() => {}))
-          }
+          // Counter increments + index move ONLY when this iteration
+          // is the first one to terminalise the position. The moved
+          // marker is shared with `closeLivePosition()` and
+          // `savePosition()` so an external close → reconcile sweep
+          // never double-counts. This is what was producing the
+          // operator's reported `Positions Closed > Positions Created`
+          // skew (counters drifted on every reconcile re-entry).
           if (!alreadyMoved) {
             writes.push(
+              client.hincrby(progKey, "live_positions_closed_count", 1).catch(() => {}),
               client.lrem(openIndexKey, 0, pos.id).catch(() => {}),
               client.lpush(closedIndexKey, pos.id).catch(() => {}),
               client.ltrim(closedIndexKey, 0, 4999).catch(() => {}),
               client.expire(closedIndexKey, 30 * 24 * 60 * 60).catch(() => {}),
               client.setex(movedMarker, 604800, "1").catch(() => {}),
             )
+            if (realizedPnl > 0) {
+              writes.push(client.hincrby(progKey, "live_wins_count", 1).catch(() => {}))
+            }
           }
           await Promise.all(writes)
 

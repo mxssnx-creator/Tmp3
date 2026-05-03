@@ -132,7 +132,7 @@ export function ExchangeConnectionSettingsDialog({
         trailingWithTrailing: loadedSettings.trailingWithTrailing ?? strategySettings?.trailing_enabled ?? true,
         blockEnabled: loadedSettings.blockEnabled ?? strategySettings?.block_enabled ?? true,
         dcaEnabled: loadedSettings.dcaEnabled ?? strategySettings?.dca_enabled ?? false,
-        targetPositions: loadedSettings.targetPositions ?? globalSettings?.positions_average ?? 50,
+        targetPositions: loadedSettings.targetPositions ?? globalSettings?.positions_average ?? 300,
       })
 
       const connResponse = await fetch(`/api/settings/connections/${connectionId}`)

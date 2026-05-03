@@ -543,7 +543,9 @@ function getDefaultSettings(): Settings {
   return {
     // Overall / Main
     base_volume_factor: 1.0,
-    positions_average: 50,
+    // Default raised 50 → 300 so volume math divides by 300 by
+    // default — see components/settings/utils.ts for the rationale.
+    positions_average: 300,
     max_leverage: 125,
     risk_percentage: 20,
 

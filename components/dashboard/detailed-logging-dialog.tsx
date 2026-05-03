@@ -402,10 +402,17 @@ export function DetailedLoggingDialog() {
                               : `Leveraged notional: $${summary.liveExecution.volumeUsdTotal.toFixed(2)} (margin counter not yet populated)`
                           }
                         >
-                          USDT <span className="font-semibold">
+                          USDT <span className="text-[8px] text-muted-foreground">(used)</span> <span className="font-semibold">
                             {(() => {
                               const v = summary.liveExecution.marginUsdTotal || summary.liveExecution.volumeUsdTotal
-                              return `$${v >= 1000 ? `${(v / 1000).toFixed(1)}K` : v.toFixed(2)}`
+                              // Sub-dollar margins (e.g. $5 notional at
+                              // 125x leverage = $0.04) need extra
+                              // precision so the operator doesn't read
+                              // "$0.00" and assume nothing committed.
+                              if (v >= 1000) return `$${(v / 1000).toFixed(1)}K`
+                              if (v >= 1)    return `$${v.toFixed(2)}`
+                              if (v > 0)     return `$${v.toFixed(4)}`
+                              return "$0.00"
                             })()}
                           </span>
                         </div>

@@ -562,7 +562,14 @@ export function QuickstartComprehensiveLogDialog() {
                         label="USDT (used)"
                         value={(() => {
                           const v = stats.liveExecution.marginUsdTotal || stats.liveExecution.volumeUsdTotal
-                          return v >= 1000 ? `$${(v / 1000).toFixed(1)}K` : `$${v.toFixed(2)}`
+                          // Sub-dollar margins (high leverage on tiny
+                          // notional) need 4-decimal precision so the
+                          // operator can see cents committed instead
+                          // of an apparent zero.
+                          if (v >= 1000) return `$${(v / 1000).toFixed(1)}K`
+                          if (v >= 1)    return `$${v.toFixed(2)}`
+                          if (v > 0)     return `$${v.toFixed(4)}`
+                          return "$0.00"
                         })()}
                       />
                     </div>

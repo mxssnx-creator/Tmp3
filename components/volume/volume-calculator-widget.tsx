@@ -10,7 +10,10 @@ import { Calculator } from "lucide-react"
 
 export default function VolumeCalculatorWidget() {
   const [baseVolumeFactor, setBaseVolumeFactor] = useState(1.0)
-  const [positionsAverage, setPositionsAverage] = useState(50)
+  // Default 300 mirrors the global Settings default in
+  // components/settings/utils.ts — keeps the standalone calculator
+  // widget showing the same per-position size the real engine uses.
+  const [positionsAverage, setPositionsAverage] = useState(300)
   const [riskPercentage, setRiskPercentage] = useState(20)
   const [maxLeverage, setMaxLeverage] = useState(125)
   const [currentPrice, setCurrentPrice] = useState(50000)

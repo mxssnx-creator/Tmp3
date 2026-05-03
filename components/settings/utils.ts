@@ -15,7 +15,11 @@ export const EXCHANGE_MAX_POSITIONS: Record<string, number> = {
 export const initialSettings: Settings = {
   // Overall / Main
   base_volume_factor: 1.0,
-  positions_average: 50,
+  // Default raised 50 → 300 so per-position USD shrinks by 6× and lots
+  // more concurrent positions fit inside a tiny live balance. The
+  // universal $5 minimum-notional floor in VolumeCalculator still
+  // protects every order from going below the exchange minimum.
+  positions_average: 300,
   max_leverage: 125,
   negativeChangePercent: 20, // 5-30 step 5, Default 20 - used for loss trigger calculation
   leveragePercentage: 100, // 5-100 step 5, Default 100

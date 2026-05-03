@@ -225,13 +225,13 @@ export function ExchangeTab({
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
                     <Label>Positions Average</Label>
-                    <span className="text-sm font-medium">{settings.positions_average || 50}</span>
+                    <span className="text-sm font-medium">{settings.positions_average || 300}</span>
                   </div>
                   <Slider
                     min={20}
                     max={300}
                     step={10}
-                    value={[settings.positions_average || 50]}
+                    value={[settings.positions_average || 300]}
                     onValueChange={([value]) => handleSettingChange("positions_average", value)}
                   />
                   <p className="text-xs text-muted-foreground">
