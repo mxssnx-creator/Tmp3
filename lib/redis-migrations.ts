@@ -774,8 +774,16 @@ const BASE_CONNECTION_CONFIG: Array<{
   credentialId: BaseConnectionId
   autoActive: boolean
 }> = [
-  { id: "bybit-x03", name: "Bybit Base", exchange: "bybit", credentialId: "bybit-x03", autoActive: false },
-  { id: "bingx-x01", name: "BingX Base", exchange: "bingx", credentialId: "bingx-x01", autoActive: false },
+  // Spec ask: "assign Main Connections bybit and bingx ON Startup."
+  // Bybit-X03 and BingX-X01 are the canonical primary live-trading
+  // connections — they are auto-inserted into the Active panel AND the
+  // dashboard toggle is defaulted ON during *first* creation. Any
+  // existing operator override (e.g. user explicitly disabled the
+  // dashboard toggle) is preserved by the existing `(existing?.is_*) || …`
+  // fallback chain in `ensureBaseConnections` below — autoActive only
+  // affects the initial-create defaults, never overwrites prior state.
+  { id: "bybit-x03", name: "Bybit Base", exchange: "bybit", credentialId: "bybit-x03", autoActive: true },
+  { id: "bingx-x01", name: "BingX Base", exchange: "bingx", credentialId: "bingx-x01", autoActive: true },
   { id: "pionex-x01", name: "Pionex Base", exchange: "pionex", credentialId: "pionex-x01", autoActive: false },
   { id: "orangex-x01", name: "OrangeX Base", exchange: "orangex", credentialId: "orangex-x01", autoActive: false },
 ]
@@ -812,9 +820,18 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
       is_active_inserted: cfg.autoActive ? "1" : ((existing?.is_active_inserted as string) || "0"),
       // Base connections are enabled in Settings by default.
       is_enabled: (existing?.is_enabled as string) || "1",
-      // Dashboard (Main) connections are OFF by default until user enables them.
-      is_enabled_dashboard: (existing?.is_enabled_dashboard as string) || "0",
-      is_active: (existing?.is_active as string) || "0",
+      // Dashboard (Main) toggle: preserve any prior operator choice
+      // (the slider is the authoritative gate per
+      // `lib/trade-engine-auto-start.ts`). Only when this is the FIRST
+      // run for the connection AND `autoActive=true` do we default the
+      // toggle ON — so Bybit/BingX engines auto-start on a fresh DB
+      // without the operator hunting for the slider. After that, this
+      // expression's `||` fallback short-circuits on the existing value
+      // and the user's choice is honoured indefinitely.
+      is_enabled_dashboard:
+        (existing?.is_enabled_dashboard as string) ||
+        (cfg.autoActive ? "1" : "0"),
+      is_active: (existing?.is_active as string) || (cfg.autoActive ? "1" : "0"),
       connection_method: (existing?.connection_method as string) || "library",
       connection_library: (existing?.connection_library as string) || "native",
       api_type: (existing?.api_type as string) || "perpetual_futures",
@@ -838,6 +855,54 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     await client.hset(`connection:${cfg.id}`, updateData)
     await client.sadd("connections", cfg.id)
     createdOrUpdated++
+  }
+
+  // ── Bootstrap the global engine status ────────────────────────────
+  // The auto-start monitor in `lib/trade-engine-auto-start.ts` only
+  // attempts to start missing connection engines when
+  // `trade_engine:global.status === "running"`. On a brand-new DB this
+  // hash is empty, so even the autoActive=true connections above would
+  // never have their engines spun up until an operator clicked "Start"
+  // in the UI. That is exactly the symptom reported in production:
+  // "Low Counts, Low DB Activity, No really processings".
+  //
+  // We bootstrap the hash to `running` ONLY when:
+  //   - at least one autoActive base connection is configured, AND
+  //   - the hash is currently empty OR carries no `status` field.
+  //
+  // We never overwrite an existing `status` (incl. `stopped`,
+  // `paused`, `error`) — those represent explicit operator state and
+  // must be preserved across reloads. This keeps the user's "Stop"
+  // button authoritative while solving the cold-boot dead-on-arrival
+  // problem.
+  const hasAutoActive = BASE_CONNECTION_CONFIG.some((c) => c.autoActive)
+  if (hasAutoActive) {
+    try {
+      const globalState = await client.hgetall("trade_engine:global")
+      const hasStatus =
+        globalState && typeof (globalState as any).status === "string" &&
+        (globalState as any).status.length > 0
+      if (!hasStatus) {
+        const nowIso = new Date().toISOString()
+        await client.hset("trade_engine:global", {
+          status: "running",
+          started_at: nowIso,
+          bootstrapped_at: nowIso,
+          bootstrapped_by: "ensureBaseConnections",
+        })
+        console.log(
+          `[v0] [Migrations] Bootstrapped trade_engine:global status=running ` +
+          `(autoActive base connections detected)`,
+        )
+      }
+    } catch (err) {
+      // Non-critical: the auto-start monitor will retry on the next
+      // tick and the operator can also press Start in the UI.
+      console.warn(
+        `[v0] [Migrations] Failed to bootstrap global engine status:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
   }
 
   return { createdOrUpdated, credentialsInjected }

@@ -31,6 +31,17 @@ interface OverallSummaryProps {
     }
     errorCount: number
     logCount: number
+    // ── Spec-mandated overview metrics ─────────────────────────────────
+    // Both fields are optional so existing callers (dashboards that
+    // pre-date the spec change) continue to render. When provided the
+    // dedicated tiles surface them in the metrics grid below.
+    //   * executedPositions — cumulative live-exchange-position count
+    //     since engine start (canonical "Executed Positions" metric).
+    //   * historicAvgProfitFactor — aggregate profit factor across every
+    //     closed prehistoric position (sum(+pct)/|sum(-pct)|, 0 ⇒ no
+    //     closed positions yet so the tile renders "—").
+    executedPositions?: number
+    historicAvgProfitFactor?: number
   }
 }
 
@@ -79,6 +90,35 @@ export function OverallSummary({ data }: OverallSummaryProps) {
             <div className="text-xs text-muted-foreground">Errors</div>
           </div>
         </div>
+
+        {/* ── Spec-mandated overview metrics ─────────────────────────────
+            Two tiles surfaced alongside the primary grid above when the
+            data payload supplies them. Both fall back gracefully when the
+            engine has yet to produce any executed positions / closed
+            prehistoric positions — the tile renders a placeholder so the
+            row stays visually balanced rather than collapsing the layout. */}
+        {(typeof data.executedPositions === "number" || typeof data.historicAvgProfitFactor === "number") && (
+          <div className="grid grid-cols-2 gap-3 mb-4">
+            <div className="text-center p-3 bg-amber-50 dark:bg-amber-950/20 rounded-lg">
+              <BarChart3 className="h-5 w-5 mx-auto mb-1 text-amber-600" />
+              <div className="text-2xl font-bold tabular-nums">
+                {typeof data.executedPositions === "number"
+                  ? data.executedPositions
+                  : "—"}
+              </div>
+              <div className="text-xs text-muted-foreground">Executed Positions</div>
+            </div>
+            <div className="text-center p-3 bg-emerald-50 dark:bg-emerald-950/20 rounded-lg">
+              <Activity className="h-5 w-5 mx-auto mb-1 text-emerald-600" />
+              <div className="text-2xl font-bold tabular-nums">
+                {typeof data.historicAvgProfitFactor === "number" && data.historicAvgProfitFactor > 0
+                  ? data.historicAvgProfitFactor.toFixed(2)
+                  : "—"}
+              </div>
+              <div className="text-xs text-muted-foreground">Avg Profit Factor</div>
+            </div>
+          </div>
+        )}
 
         {/* Detailed Metrics */}
         <div className="grid grid-cols-2 gap-3 text-xs">

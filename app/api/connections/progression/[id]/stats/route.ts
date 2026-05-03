@@ -1004,6 +1004,14 @@ export async function GET(
       missingIntervalsLoaded:  n(prehistoricHash.missing_intervals)   || n(progHash.prehistoric_missing_loaded),
       currentSymbol:           prehistoricHash.current_symbol         || progHash.prehistoric_current_symbol || "",
       isComplete:              prehistoricHash.is_complete === "1",
+      // Aggregate profit factor across every closed prehistoric position
+      // — written by `ConfigSetProcessor` after each prehistoric run
+      // (`historic_avg_profit_factor` field on the `prehistoric:{id}`
+      // hash). Surfaced here so the dashboard tile + Overall Summary can
+      // render it without computing PF client-side. 0 when no closed
+      // positions yet, so the UI can render "—" for empty states.
+      historicAvgProfitFactor: parseFloat(prehistoricHash.historic_avg_profit_factor || "0") || 0,
+      historicAvgProfitFactorCount: n(prehistoricHash.historic_avg_profit_factor_count),
     }
 
     // ── WINDOW DATA (last 5min / 60min) ──────────────────────────────────────
@@ -1070,6 +1078,27 @@ export async function GET(
         framesProcessed:        n(prehistoricMeta.intervalsProcessed),
         framesMissingLoaded:    n(prehistoricMeta.missingIntervalsLoaded),
         timeframeSeconds:       n(prehistoricMeta.timeframeSeconds) || 1,
+
+        // ── Historic profit factor + executed positions ────────────────
+        // Two operator-requested overview metrics that previously lived
+        // only inside the per-stage `strategyDetail` block (PF) or the
+        // `liveExecution` block (positions created/closed). Surfaced
+        // alongside the prehistoric counters so the QuickStart card and
+        // the Overall Summary can render them without re-deriving from
+        // multiple fields.
+        //
+        //   * `avgProfitFactor` — historic-wide PF (all closed
+        //     prehistoric positions, sum(+pct) / |sum(-pct)|, capped at
+        //     9.999). 0 ⇒ no closed positions yet.
+        //   * `avgProfitFactorCount` — sample count behind the average.
+        //   * `executedPositions` — cumulative live exchange positions
+        //     created since engine start (`live_positions_created_count`).
+        //     This is the canonical "Executed Positions" metric the spec
+        //     refers to: every Real→Live promotion that resulted in an
+        //     actual exchange order.
+        avgProfitFactor:        Math.round(prehistoricMeta.historicAvgProfitFactor * 1000) / 1000,
+        avgProfitFactorCount:   prehistoricMeta.historicAvgProfitFactorCount,
+        executedPositions:      n(progHash.live_positions_created_count),
 
         // Prehistoric-processing churn counters — tick every time the engine spins
         // through its evaluation loop, incl. idle/warmup ticks. Kept here so the UI
