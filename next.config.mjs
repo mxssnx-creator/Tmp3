@@ -1,4 +1,4 @@
-// Force rebuild: 2026-05-03T19:30:00 — Active Progressing block (Sets/Trackings/Positions per indication-type & per strategy-stage) surfaced in /stats + Overview + QuickStart + Dialog
+// Force rebuild: 2026-05-03T20:00:00 — Historical block: P-Cycles → cycle×frame magnitude, Avg PF rooted at Base strategies, Real Positions tile (QuickStart + Dialog)
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
