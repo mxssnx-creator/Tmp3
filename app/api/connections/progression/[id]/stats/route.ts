@@ -713,6 +713,24 @@ export async function GET(
     const activeStratByStage: Record<string, number> = {
       base: 0, main: 0, real: 0,
     }
+    // ── DISTINCT-SETS-PROGRESSING tally (per type / per stage) ────────
+    // The cumulative `indCounts.*` and `stratCounts.*` count the total
+    // *entries* ever produced by every Set since run start. The
+    // dashboard also needs a "how many distinct Sets are currently
+    // alive RIGHT NOW" view — i.e. per (symbol × type) or
+    // (symbol × stage) pairs whose latest cycle reported a non-zero
+    // qualified count. We count distinct hash fields with `value > 0`
+    // because each field encodes a unique "{symbol}:{type|stage}" pair
+    // — exactly the cardinality of "active progressing Sets" the
+    // operator asked for. Zero-valued fields (engine wrote a row but
+    // nothing qualified that cycle) are excluded so the number tracks
+    // currently-progressing pools, not all-ever-touched pools.
+    const activeSetsIndByType: Record<string, number> = {
+      direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
+    }
+    const activeSetsStratByStage: Record<string, number> = {
+      base: 0, main: 0, real: 0,
+    }
     try {
       const [indActiveHash, stratActiveHash] = await Promise.all([
         client.hgetall(`indications_active:${connectionId}`).catch(() => null),
@@ -725,8 +743,13 @@ export async function GET(
           const idx = field.lastIndexOf(":")
           if (idx <= 0) continue
           const type = field.slice(idx + 1)
+          const numVal = n(val)
           if (type in activeIndByType) {
-            activeIndByType[type] += n(val)
+            activeIndByType[type] += numVal
+            // Each non-zero (symbol×type) field == one Set actively
+            // producing qualified entries this cycle. Cardinality is
+            // the operator-asked "Active Progressing Sets" count.
+            if (numVal > 0) activeSetsIndByType[type] += 1
           }
         }
       }
@@ -735,14 +758,18 @@ export async function GET(
           const idx = field.lastIndexOf(":")
           if (idx <= 0) continue
           const stage = field.slice(idx + 1)
+          const numVal = n(val)
           if (stage in activeStratByStage) {
-            activeStratByStage[stage] += n(val)
+            activeStratByStage[stage] += numVal
+            if (numVal > 0) activeSetsStratByStage[stage] += 1
           }
         }
       }
     } catch { /* non-critical: dashboard falls back to cumulative */ }
     const activeIndTotal = Object.values(activeIndByType).reduce((s, v) => s + v, 0)
     const activeStratTotal = activeStratByStage.base + activeStratByStage.main + activeStratByStage.real
+    const activeSetsIndTotal   = Object.values(activeSetsIndByType).reduce((s, v) => s + v, 0)
+    const activeSetsStratTotal = activeSetsStratByStage.base + activeSetsStratByStage.main + activeSetsStratByStage.real
 
     // Strategy per-stage counts
     const stratTypes = ["base", "main", "real", "live"] as const
@@ -1225,6 +1252,77 @@ export async function GET(
           main:  activeStratByStage.main  || 0,
           real:  activeStratByStage.real  || 0,
           total: activeStratTotal,
+        },
+      },
+
+      // ── ACTIVE PROGRESSING (sets / trackings / positions) ───────────
+      // Per spec: "count for Indications and Strategies Active
+      // Progressing Sets, trackings .. active positions."
+      //
+      // Three orthogonal axes, computed per indication-type and per
+      // strategy-stage:
+      //
+      //   1. `sets`      — distinct (symbol × type/stage) pairs whose
+      //                    latest cycle reported a non-zero qualified
+      //                    count. This is the cardinality of Sets
+      //                    currently producing entries.
+      //   2. `trackings` — cumulative entries that have ever been
+      //                    written to those Sets. Mirrors the
+      //                    `breakdown` totals so the operator sees
+      //                    "how much tracked data has been observed".
+      //   3. `positions` — open positions held by that
+      //                    type/stage. For Strategies the canonical
+      //                    mapping is:
+      //                       base → pseudoOpen   (mark-to-market)
+      //                       main → pseudoOpen   (Main is a Set
+      //                                            evaluation stage,
+      //                                            shares the pseudo
+      //                                            ledger; surfaced for
+      //                                            symmetry, identical
+      //                                            value to base)
+      //                       real → realOpen     (Real-stage promotions)
+      //                       live → liveOpen     (exchange orders)
+      //                    For Indications `positions` is the count
+      //                    of currently-qualified indications (one
+      //                    per slot held).
+      //
+      // All three are read from already-collected variables — zero
+      // additional Redis calls.
+      activeProgressing: {
+        indications: {
+          direction:      { sets: activeSetsIndByType.direction       || 0, trackings: indCounts.direction       || 0, positions: activeIndByType.direction        || 0 },
+          move:           { sets: activeSetsIndByType.move            || 0, trackings: indCounts.move            || 0, positions: activeIndByType.move             || 0 },
+          active:         { sets: activeSetsIndByType.active          || 0, trackings: indCounts.active          || 0, positions: activeIndByType.active           || 0 },
+          activeAdvanced: { sets: activeSetsIndByType.active_advanced || 0, trackings: indCounts.active_advanced || 0, positions: activeIndByType.active_advanced  || 0 },
+          optimal:        { sets: activeSetsIndByType.optimal         || 0, trackings: indCounts.optimal         || 0, positions: activeIndByType.optimal          || 0 },
+          auto:           { sets: activeSetsIndByType.auto            || 0, trackings: indCounts.auto            || 0, positions: activeIndByType.auto             || 0 },
+          total:          { sets: activeSetsIndTotal,                       trackings: indTotal,                       positions: activeIndTotal },
+        },
+        strategies: {
+          base: { sets: activeSetsStratByStage.base || 0, trackings: stratCounts.base || 0, positions: pseudoOpen },
+          main: { sets: activeSetsStratByStage.main || 0, trackings: stratCounts.main || 0, positions: pseudoOpen },
+          real: { sets: activeSetsStratByStage.real || 0, trackings: stratCounts.real || 0, positions: realOpen },
+          live: {
+            // Live doesn't have an `_active` hash — we use
+            // `pseudoRunningSets` (distinct Sets currently feeding
+            // exchange orders) and `liveCreated - liveClosed` for
+            // open. Trackings = total live created.
+            sets:      pseudoRunningSets,
+            trackings: stratCounts.live || 0,
+            positions: Math.max(
+              0,
+              n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count),
+            ),
+          },
+          total: {
+            sets:      activeSetsStratTotal + (pseudoRunningSets > activeSetsStratTotal ? 0 : 0),
+            trackings: stratTotal,
+            // Pipeline-aware: open positions are NOT summed across
+            // stages (mirroring principle — same logical position
+            // exists at multiple stages). Use the deepest-active
+            // stage as the canonical "currently-progressing" total.
+            positions: Math.max(pseudoOpen, realOpen),
+          },
         },
       },
 

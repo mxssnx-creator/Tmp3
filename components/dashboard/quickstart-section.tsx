@@ -209,6 +209,18 @@ interface LiveStats {
   pseudoRunningSets: number
   realOpen: number
   liveVolumeUsd: number
+  // ── Active Progressing (per type / per stage) ──────────────────────
+  // Three orthogonal counters fed from `activeProgressing.*` of the
+  // /stats endpoint. Each row is one indication-type or one strategy-
+  // stage:
+  //   * sets       — distinct (symbol × type|stage) pairs that produced
+  //                  qualified entries on the latest cycle.
+  //   * trackings  — cumulative entries observed since run start.
+  //   * positions  — open positions held at that type/stage right now.
+  // Surfaced in dedicated tables in the QuickStart breakdown so the
+  // operator can see RIGHT-NOW health per pool rather than just totals.
+  apIndications: ActiveProgressingByName
+  apStrategies:  ActiveProgressingByName
   // windows
   indLast5m: number
   indLast60m: number
@@ -216,6 +228,17 @@ interface LiveStats {
   phase: string
   engineRunning: boolean
 }
+
+// One row of the Active Progressing breakdown — sets/trackings/positions.
+// Used for both indication-types and strategy-stages so the rendering
+// table can be reused across both blocks.
+type ActiveProgressingRow = {
+  sets:      number
+  trackings: number
+  positions: number
+}
+type ActiveProgressingByName = Record<string, ActiveProgressingRow>
+const EMPTY_AP_ROW: ActiveProgressingRow = { sets: 0, trackings: 0, positions: 0 }
 
 const EMPTY_STAGE: StageDetail = {
   createdSets: 0, avgPosPerSet: 0, avgProfitFactor: 0, avgDrawdownTime: 0,
@@ -256,6 +279,8 @@ const EMPTY_STATS: LiveStats = {
   livePositionsOpen: 0, livePositionsCreated: 0, livePositionsClosed: 0,
   liveOrdersPlaced: 0, liveOrdersFilled: 0, liveWinRate: 0,
   pseudoOpen: 0, pseudoRunningSets: 0, realOpen: 0, liveVolumeUsd: 0,
+  apIndications: {},
+  apStrategies:  {},
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
 }
 
@@ -490,6 +515,12 @@ export function QuickstartSection() {
         pseudoOpen:            Number(s.openPositions?.pseudo?.open)         || 0,
         pseudoRunningSets:     Number(s.openPositions?.pseudo?.runningSets)  || 0,
         realOpen:              Number(s.openPositions?.real?.open)           || 0,
+        // Active Progressing — per indication type and per strategy
+        // stage. Defaults silently to empty objects so the dashboard
+        // never crashes when the API hasn't shipped the new block yet
+        // (e.g. zero-arg upgrade window).
+        apIndications: (s.activeProgressing?.indications || {}) as ActiveProgressingByName,
+        apStrategies:  (s.activeProgressing?.strategies  || {}) as ActiveProgressingByName,
         // USDT figure on the QuickStart strip is the **used balance**
         // (margin actually committed to live exchange positions), NOT
         // the leveraged notional. We prefer the new `marginUsd` field
@@ -1005,7 +1036,50 @@ export function QuickstartSection() {
             {stats.historicIndicators > 0 && (
               <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
             )}
-            <MiniStat label="P-Cycles" value={fmt(stats.historicCycles)} />
+            {/* P-Cycles tile reflects the cycle-frame work magnitude, not
+                symbol count. Value = cycles × frames (the high-magnitude
+                number the operator sees grow during prehistoric processing).
+                Falls back to plain `historicCycles` only when no frames
+                have been counted yet (very early in a run) so we never
+                display a misleading "0" for non-zero work. */}
+            <MiniStat
+              label="P-Cycles"
+              value={
+                stats.historicFrames > 0 && stats.historicCycles > 0
+                  ? fmt(stats.historicCycles * stats.historicFrames)
+                  : fmt(stats.historicCycles)
+              }
+              sub={
+                stats.historicFrames > 0 && stats.historicCycles > 0
+                  ? `${fmt(stats.historicCycles)}×${fmt(stats.historicFrames)}`
+                  : undefined
+              }
+            />
+            {/* Avg PF (Base) — average Profit Factor across closed Base
+                strategies. Sourced from the per-stage detail block of
+                /stats. 0 ⇒ no closed Base positions yet, so render "—". */}
+            <MiniStat
+              label="Avg PF"
+              value={
+                stats.stageBase.avgProfitFactor > 0
+                  ? stats.stageBase.avgProfitFactor.toFixed(2)
+                  : "—"
+              }
+              sub={
+                stats.stageBase.passed > 0
+                  ? `Base n=${fmt(stats.stageBase.passed)}`
+                  : undefined
+              }
+            />
+            {/* Real Positions — currently active, valid, opened
+                Real-stage strategies (snapshot from openPositions.real.open). */}
+            {stats.realOpen > 0 && (
+              <MiniStat
+                label="Real Pos"
+                value={fmt(stats.realOpen)}
+                sub="active"
+              />
+            )}
           </div>
         </div>
 
@@ -1138,15 +1212,20 @@ export function QuickstartSection() {
               )}
               <div className="flex flex-wrap gap-1.5">
                 <MiniStat label="Symbols"    value={`${stats.historicSymbols}/${stats.historicSymbolsTotal}`} />
-                {/* Preh Cycles → relate to processed frames so the operator can
-                    judge whether cycles per frame are healthy. Sub-label shows
-                    "frames/cycle" when both counters are populated. */}
+                {/* Preh Cycles → cycle-frame work magnitude (cycles × frames).
+                    Replaces the previous symbol-magnitude display. Subtitle
+                    keeps the breakdown visible so the operator can read
+                    both counters at a glance. */}
                 <MiniStat
                   label="Preh Cycles"
-                  value={fmt(stats.historicCycles)}
+                  value={
+                    stats.historicCycles > 0 && stats.historicFrames > 0
+                      ? fmt(stats.historicCycles * stats.historicFrames)
+                      : fmt(stats.historicCycles)
+                  }
                   sub={
                     stats.historicCycles > 0 && stats.historicFrames > 0
-                      ? `${fmt(Math.round(stats.historicFrames / Math.max(stats.historicCycles, 1)))}/cyc`
+                      ? `${fmt(stats.historicCycles)}×${fmt(stats.historicFrames)}`
                       : undefined
                   }
                 />
@@ -1164,12 +1243,12 @@ export function QuickstartSection() {
                   <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
                 )}
                 {/* ── Spec-mandated Historic overview tiles ──────────────
-                    "Add also ExecutedPositions, AverageProfitFactor Infos."
-                      • ExecPos — cumulative live exchange positions created
-                        since engine start (`historic.executedPositions`).
-                      • Avg PF — historic-wide profit factor across every
-                        closed prehistoric position. Sub label shows the
-                        sample size so the operator can judge confidence. */}
+                      • ExecPos — cumulative live exchange positions created.
+                      • Avg PF — Base-strategy average Profit Factor (was
+                        previously the historic-wide overall PF; the spec
+                        asks for the Base-strategy specific number).
+                      • Real Pos — currently active Real-stage strategies
+                        with valid, opened positions (snapshot). */}
                 <MiniStat
                   label="Exec Pos"
                   value={fmt(stats.executedPositions)}
@@ -1178,16 +1257,23 @@ export function QuickstartSection() {
                 <MiniStat
                   label="Avg PF"
                   value={
-                    stats.historicAvgProfitFactor > 0
-                      ? stats.historicAvgProfitFactor.toFixed(2)
+                    stats.stageBase.avgProfitFactor > 0
+                      ? stats.stageBase.avgProfitFactor.toFixed(2)
                       : "—"
                   }
                   sub={
-                    stats.historicAvgProfitFactorCount > 0
-                      ? `n=${fmt(stats.historicAvgProfitFactorCount)}`
+                    stats.stageBase.passed > 0
+                      ? `Base n=${fmt(stats.stageBase.passed)}`
                       : undefined
                   }
                 />
+                {stats.realOpen > 0 && (
+                  <MiniStat
+                    label="Real Pos"
+                    value={fmt(stats.realOpen)}
+                    sub="active"
+                  />
+                )}
               </div>
             </div>
 
@@ -1338,6 +1424,55 @@ export function QuickstartSection() {
                   )
                 })}
               </div>
+
+              {/* ── Indications: Active Progressing breakdown ─────────────
+                  Per spec: surface per-type "Active Progressing Sets,
+                  trackings, active positions". `sets` is distinct
+                  (symbol×type) pairs producing qualified entries on the
+                  latest cycle; `trackings` is cumulative entries observed;
+                  `positions` is the indication slots currently filled.
+                  Shown only when the API surfaced the block (graceful
+                  degradation for older servers). */}
+              {stats.apIndications && Object.keys(stats.apIndications).length > 0 && (
+                <div className="rounded bg-muted/30 border border-border/30 p-1.5 mt-1">
+                  <div className="flex items-center justify-between text-[9px] text-muted-foreground/80 mb-1 px-1">
+                    <span className="uppercase tracking-wide font-semibold">Active Progressing</span>
+                    <span className="tabular-nums">
+                      {fmt(stats.apIndications.total?.sets ?? 0)} sets ·
+                      {" "}{fmt(stats.apIndications.total?.trackings ?? 0)} tracked ·
+                      {" "}{fmt(stats.apIndications.total?.positions ?? 0)} pos
+                    </span>
+                  </div>
+                  <table className="w-full text-[10px] tabular-nums">
+                    <thead>
+                      <tr className="text-muted-foreground/70 border-b border-border/30">
+                        <th className="text-left py-0.5 pr-1 font-medium">Type</th>
+                        <th className="text-right py-0.5 px-1 font-medium" title="Distinct (symbol × type) Sets producing qualified entries on the latest cycle.">Sets</th>
+                        <th className="text-right py-0.5 px-1 font-medium" title="Cumulative entries tracked across all Sets of this type since run start.">Trackings</th>
+                        <th className="text-right py-0.5 pl-1 font-medium" title="Indications currently passing thresholds (slots actively held).">Pos</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(["direction", "move", "active", "activeAdvanced", "optimal", "auto"] as const).map((k) => {
+                        const r = stats.apIndications[k] ?? EMPTY_AP_ROW
+                        if (r.sets === 0 && r.trackings === 0 && r.positions === 0) return null
+                        const labelMap: Record<string, string> = {
+                          direction: "Direction", move: "Move", active: "Active",
+                          activeAdvanced: "Active Adv", optimal: "Optimal", auto: "Auto",
+                        }
+                        return (
+                          <tr key={k} className="border-b border-border/20 last:border-0">
+                            <td className="text-left py-0.5 pr-1 text-muted-foreground capitalize">{labelMap[k]}</td>
+                            <td className="text-right py-0.5 px-1 font-medium text-violet-700 dark:text-violet-300">{fmt(r.sets)}</td>
+                            <td className="text-right py-0.5 px-1">{fmt(r.trackings)}</td>
+                            <td className="text-right py-0.5 pl-1 font-medium">{fmt(r.positions)}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
 
             {/* strategies breakdown
@@ -1377,6 +1512,56 @@ export function QuickstartSection() {
                   </div>
                 ))}
               </div>
+
+              {/* ── Strategies: Active Progressing breakdown ─────────────
+                  Per-stage view of Sets/Trackings/Positions currently
+                  alive. `Sets` reflects distinct (symbol×stage) pools
+                  producing qualified entries this cycle. `Positions`
+                  follows the mirroring pipeline:
+                    base/main → pseudoOpen
+                    real      → realOpen (Real-stage promotions)
+                    live      → exchange open (created − closed) */}
+              {stats.apStrategies && Object.keys(stats.apStrategies).length > 0 && (
+                <div className="rounded bg-muted/30 border border-border/30 p-1.5 mt-1">
+                  <div className="flex items-center justify-between text-[9px] text-muted-foreground/80 mb-1 px-1">
+                    <span className="uppercase tracking-wide font-semibold">Active Progressing</span>
+                    <span className="tabular-nums">
+                      {fmt(stats.apStrategies.total?.sets ?? 0)} sets ·
+                      {" "}{fmt(stats.apStrategies.total?.trackings ?? 0)} tracked ·
+                      {" "}{fmt(stats.apStrategies.total?.positions ?? 0)} pos
+                    </span>
+                  </div>
+                  <table className="w-full text-[10px] tabular-nums">
+                    <thead>
+                      <tr className="text-muted-foreground/70 border-b border-border/30">
+                        <th className="text-left py-0.5 pr-1 font-medium">Stage</th>
+                        <th className="text-right py-0.5 px-1 font-medium" title="Distinct (symbol × stage) Sets producing qualified entries on the latest cycle.">Sets</th>
+                        <th className="text-right py-0.5 px-1 font-medium" title="Cumulative entries tracked across all Sets of this stage since run start.">Trackings</th>
+                        <th className="text-right py-0.5 pl-1 font-medium" title="Open positions held at this stage right now (pseudo for base/main, Real-stage for real, exchange-open for live).">Pos</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {([
+                        { key: "base", label: "Base", color: "text-orange-600 dark:text-orange-400" },
+                        { key: "main", label: "Main", color: "text-yellow-600 dark:text-yellow-400" },
+                        { key: "real", label: "Real", color: "text-green-600 dark:text-green-400" },
+                        { key: "live", label: "Live", color: "text-blue-600 dark:text-blue-400" },
+                      ] as const).map(({ key, label, color }) => {
+                        const r = stats.apStrategies[key] ?? EMPTY_AP_ROW
+                        if (r.sets === 0 && r.trackings === 0 && r.positions === 0) return null
+                        return (
+                          <tr key={key} className="border-b border-border/20 last:border-0">
+                            <td className={`text-left py-0.5 pr-1 font-semibold ${color}`}>{label}</td>
+                            <td className="text-right py-0.5 px-1 font-medium">{fmt(r.sets)}</td>
+                            <td className="text-right py-0.5 px-1">{fmt(r.trackings)}</td>
+                            <td className="text-right py-0.5 pl-1 font-medium">{fmt(r.positions)}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
 
             {/* ── Strategy Stages — detailed per-stage metrics ───────────

@@ -130,9 +130,20 @@ interface CompactStats {
     resolution: "pseudo" | "real-fallback" | "unresolved"
   }>
   liveResolution: { pseudo: number; realFallback: number; unresolved: number }
+  // ── Active Progressing (sets / trackings / positions) ──────────────
+  // Per-type indication and per-stage strategy view fed from the
+  // /stats `activeProgressing` block. Kept as flexible name→row maps
+  // so the consumer simply walks the keys it knows about — graceful
+  // when older API revs omit the block.
+  apIndications: ActiveProgressingByName
+  apStrategies:  ActiveProgressingByName
   phase: string
   isActive: boolean
 }
+
+// Shared row shape — same as quickstart-section ActiveProgressingRow.
+type ActiveProgressingRow = { sets: number; trackings: number; positions: number }
+type ActiveProgressingByName = Record<string, ActiveProgressingRow>
 
 const EMPTY: CompactStats = {
   indicationCycles: 0,
@@ -166,6 +177,8 @@ const EMPTY: CompactStats = {
   realOpen: 0,
   liveOpen: 0,
   liveVolumeUsd: 0,
+  apIndications: {},
+  apStrategies: {},
   liveFilled: 0,
   liveClosed: 0,
   liveWinRate: 0,
@@ -644,6 +657,8 @@ export function StatisticsOverviewV2() {
           realOpen:             Number(opReal.open)          || 0,
           liveOpen:             Number(opLive.open)          || 0,
           liveVolumeUsd:        Number(opLive.volumeUsd)     || 0,
+          apIndications: (d.activeProgressing?.indications || {}) as ActiveProgressingByName,
+          apStrategies:  (d.activeProgressing?.strategies  || {}) as ActiveProgressingByName,
           liveFilled:       liveExec.ordersFilled     || 0,
           liveClosed:       liveExec.positionsClosed  || 0,
           liveWinRate:      liveExec.winRate          || liveDetail.winRate  || 0,
@@ -923,6 +938,99 @@ export function StatisticsOverviewV2() {
               <span className="font-semibold text-violet-700 tabular-nums">
                 {fmt(stats.activeIndOptimal)}
               </span>
+            </div>
+          </div>
+        )}
+
+        {/* ── Active Progressing — Sets / Trackings / Positions ─────────
+            Per spec: surface "count for Indications and Strategies
+            Active Progressing Sets, trackings .. active positions"
+            directly in the Overview. Two compact tables side-by-side
+            (or stacked on small screens) with one row per indication-
+            type / per strategy-stage. Hidden when both blocks are
+            empty so the Overview stays compact during cold start. */}
+        {((stats.apIndications && Object.keys(stats.apIndications).length > 0) ||
+          (stats.apStrategies && Object.keys(stats.apStrategies).length > 0)) && (
+          <div className="mt-2 pt-2 border-t border-border/40 grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {/* Indications side */}
+            <div className="rounded bg-muted/30 border border-border/30 p-2">
+              <div className="flex items-center justify-between text-[9px] text-muted-foreground/80 mb-1">
+                <span className="uppercase tracking-wide font-semibold">Indications · Active Progressing</span>
+                <span className="tabular-nums">
+                  {fmt(stats.apIndications?.total?.sets ?? 0)} sets ·
+                  {" "}{fmt(stats.apIndications?.total?.trackings ?? 0)} tracked ·
+                  {" "}{fmt(stats.apIndications?.total?.positions ?? 0)} pos
+                </span>
+              </div>
+              <table className="w-full text-[10px] tabular-nums">
+                <thead>
+                  <tr className="text-muted-foreground/70 border-b border-border/30">
+                    <th className="text-left py-0.5 pr-1 font-medium">Type</th>
+                    <th className="text-right py-0.5 px-1 font-medium" title="Distinct Sets producing qualified entries this cycle">Sets</th>
+                    <th className="text-right py-0.5 px-1 font-medium" title="Cumulative entries observed (trackings)">Track</th>
+                    <th className="text-right py-0.5 pl-1 font-medium" title="Indications currently passing thresholds">Pos</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(["direction", "move", "active", "activeAdvanced", "optimal", "auto"] as const).map((k) => {
+                    const r = stats.apIndications?.[k]
+                    if (!r || (r.sets === 0 && r.trackings === 0 && r.positions === 0)) return null
+                    const labelMap: Record<string, string> = {
+                      direction: "Direction", move: "Move", active: "Active",
+                      activeAdvanced: "Active Adv", optimal: "Optimal", auto: "Auto",
+                    }
+                    return (
+                      <tr key={k} className="border-b border-border/20 last:border-0">
+                        <td className="text-left py-0.5 pr-1 text-muted-foreground capitalize">{labelMap[k]}</td>
+                        <td className="text-right py-0.5 px-1 font-medium text-violet-700 dark:text-violet-300">{fmt(r.sets)}</td>
+                        <td className="text-right py-0.5 px-1">{fmt(r.trackings)}</td>
+                        <td className="text-right py-0.5 pl-1 font-medium">{fmt(r.positions)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Strategies side */}
+            <div className="rounded bg-muted/30 border border-border/30 p-2">
+              <div className="flex items-center justify-between text-[9px] text-muted-foreground/80 mb-1">
+                <span className="uppercase tracking-wide font-semibold">Strategies · Active Progressing</span>
+                <span className="tabular-nums">
+                  {fmt(stats.apStrategies?.total?.sets ?? 0)} sets ·
+                  {" "}{fmt(stats.apStrategies?.total?.trackings ?? 0)} tracked ·
+                  {" "}{fmt(stats.apStrategies?.total?.positions ?? 0)} pos
+                </span>
+              </div>
+              <table className="w-full text-[10px] tabular-nums">
+                <thead>
+                  <tr className="text-muted-foreground/70 border-b border-border/30">
+                    <th className="text-left py-0.5 pr-1 font-medium">Stage</th>
+                    <th className="text-right py-0.5 px-1 font-medium" title="Distinct Sets producing qualified entries this cycle">Sets</th>
+                    <th className="text-right py-0.5 px-1 font-medium" title="Cumulative entries observed (trackings)">Track</th>
+                    <th className="text-right py-0.5 pl-1 font-medium" title="Open positions held at this stage right now">Pos</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {([
+                    { key: "base", label: "Base", color: "text-orange-600 dark:text-orange-400" },
+                    { key: "main", label: "Main", color: "text-yellow-600 dark:text-yellow-400" },
+                    { key: "real", label: "Real", color: "text-green-600 dark:text-green-400" },
+                    { key: "live", label: "Live", color: "text-blue-600 dark:text-blue-400" },
+                  ] as const).map(({ key, label, color }) => {
+                    const r = stats.apStrategies?.[key]
+                    if (!r || (r.sets === 0 && r.trackings === 0 && r.positions === 0)) return null
+                    return (
+                      <tr key={key} className="border-b border-border/20 last:border-0">
+                        <td className={`text-left py-0.5 pr-1 font-semibold ${color}`}>{label}</td>
+                        <td className="text-right py-0.5 px-1 font-medium">{fmt(r.sets)}</td>
+                        <td className="text-right py-0.5 px-1">{fmt(r.trackings)}</td>
+                        <td className="text-right py-0.5 pl-1 font-medium">{fmt(r.positions)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
             </div>
           </div>
         )}
