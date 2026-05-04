@@ -54,6 +54,18 @@ interface StatsResponse {
   }
   strategyDetail: { base: StratDetail; main: StratDetail; real: StratDetail; live?: StratDetail }
   windows: { indications: { last5m: number; last60m: number }; strategies: { last5m: number; last60m: number } }
+  // ── Active Progressing — per-type / per-stage breakdown ────────────
+  // Each row: { sets, trackings, positions } where:
+  //   * sets       — distinct (symbol × type|stage) Sets producing
+  //                  qualified entries on the latest cycle.
+  //   * trackings  — cumulative entries observed since run start.
+  //   * positions  — open positions held at that type/stage.
+  // Optional because older API revs may not include it; consumers
+  // fall back to `breakdown` when this block is missing.
+  activeProgressing?: {
+    indications?: Record<string, { sets: number; trackings: number; positions: number }>
+    strategies?:  Record<string, { sets: number; trackings: number; positions: number }>
+  }
   metadata: { engineRunning: boolean; phase: string; progress: number; message: string; lastUpdate: string }
 }
 
@@ -304,7 +316,67 @@ export function QuickstartOverviewDialog() {
                 />
                 <StatCell label="Candles"     value={fmt(h?.candlesLoaded       || 0)} accent="text-sky-600 dark:text-sky-400" />
                 <StatCell label="Indicators"  value={fmt(h?.indicatorsCalculated|| 0)} accent="text-teal-600 dark:text-teal-400" />
-                <StatCell label="Preh Cycles" value={fmt(h?.cyclesCompleted     || 0)} accent="text-indigo-600 dark:text-indigo-400" />
+                {/* Preh Cycles → cycle×frame work magnitude (high number).
+                    Replaces the previous symbol-magnitude `cyclesCompleted`
+                    display with cycles × frames so operators can see real
+                    processing scale. Sub line shows the breakdown. */}
+                <StatCell
+                  label="Preh Cycles"
+                  value={
+                    (h?.cyclesCompleted || 0) > 0 && (h?.framesProcessed || 0) > 0
+                      ? fmt((h?.cyclesCompleted || 0) * (h?.framesProcessed || 0))
+                      : fmt(h?.cyclesCompleted || 0)
+                  }
+                  sub={
+                    (h?.cyclesCompleted || 0) > 0 && (h?.framesProcessed || 0) > 0
+                      ? `${fmt(h?.cyclesCompleted || 0)}×${fmt(h?.framesProcessed || 0)}`
+                      : undefined
+                  }
+                  accent="text-indigo-600 dark:text-indigo-400"
+                />
+              </div>
+              {/* ── New row: Avg PF (Base) + Avg Real Positions ───────────
+                  These two metrics live alongside the historical counters
+                  per spec: average profit factor across Base strategies
+                  (the operator-visible quality signal) plus the snapshot
+                  count of active, valid, opened Real-stage positions. */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2">
+                <StatCell
+                  label="Avg PF (Base)"
+                  value={
+                    (sd?.base?.avgProfitFactor || 0) > 0
+                      ? (sd?.base?.avgProfitFactor || 0).toFixed(2)
+                      : "—"
+                  }
+                  sub={
+                    (sd?.base?.passed || 0) > 0
+                      ? `n=${fmt(sd?.base?.passed || 0)}`
+                      : undefined
+                  }
+                  accent="text-orange-600 dark:text-orange-400"
+                />
+                <StatCell
+                  label="Real Positions"
+                  value={fmt(stats?.openPositions?.real?.positions || 0)}
+                  sub="active, valid"
+                  accent="text-green-600 dark:text-green-400"
+                />
+                <StatCell
+                  label="Frames"
+                  value={fmt(h?.framesProcessed || 0)}
+                  sub={
+                    (h?.timeframeSeconds || 1) === 1
+                      ? "1s timeframe"
+                      : `${h?.timeframeSeconds}s timeframe`
+                  }
+                  accent="text-cyan-600 dark:text-cyan-400"
+                />
+                <StatCell
+                  label="Exec Pos"
+                  value={fmt(h?.executedPositions || 0)}
+                  sub="cumulative"
+                  accent="text-amber-600 dark:text-amber-400"
+                />
               </div>
             </div>
 
@@ -419,7 +491,64 @@ export function QuickstartOverviewDialog() {
                 <StatCell label="Symbols"      value={fmt(h?.symbolsProcessed    || 0)} accent="text-blue-600 dark:text-blue-400" />
                 <StatCell label="Candles"      value={fmt(h?.candlesLoaded       || 0)} accent="text-sky-600 dark:text-sky-400" />
                 <StatCell label="Indicators"   value={fmt(h?.indicatorsCalculated|| 0)} accent="text-teal-600 dark:text-teal-400" />
-                <StatCell label="Preh Cycles"  value={fmt(h?.cyclesCompleted     || 0)} accent="text-indigo-600 dark:text-indigo-400" />
+                {/* Preh Cycles → cycle×frame work magnitude. See Overview
+                    tab comment above; same logic mirrored here so both
+                    surfaces tell the operator the same story. */}
+                <StatCell
+                  label="Preh Cycles"
+                  value={
+                    (h?.cyclesCompleted || 0) > 0 && (h?.framesProcessed || 0) > 0
+                      ? fmt((h?.cyclesCompleted || 0) * (h?.framesProcessed || 0))
+                      : fmt(h?.cyclesCompleted || 0)
+                  }
+                  sub={
+                    (h?.cyclesCompleted || 0) > 0 && (h?.framesProcessed || 0) > 0
+                      ? `${fmt(h?.cyclesCompleted || 0)}×${fmt(h?.framesProcessed || 0)}`
+                      : undefined
+                  }
+                  accent="text-indigo-600 dark:text-indigo-400"
+                />
+              </div>
+
+              {/* Quality + activity row: Base-strategy avg PF and active
+                  Real-stage open positions, mirrored from the Overview tab. */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <StatCell
+                  label="Avg PF (Base)"
+                  value={
+                    (sd?.base?.avgProfitFactor || 0) > 0
+                      ? (sd?.base?.avgProfitFactor || 0).toFixed(2)
+                      : "—"
+                  }
+                  sub={
+                    (sd?.base?.passed || 0) > 0
+                      ? `n=${fmt(sd?.base?.passed || 0)}`
+                      : undefined
+                  }
+                  accent="text-orange-600 dark:text-orange-400"
+                />
+                <StatCell
+                  label="Real Positions"
+                  value={fmt(stats?.openPositions?.real?.positions || 0)}
+                  sub="active, valid"
+                  accent="text-green-600 dark:text-green-400"
+                />
+                <StatCell
+                  label="Frames"
+                  value={fmt(h?.framesProcessed || 0)}
+                  sub={
+                    (h?.timeframeSeconds || 1) === 1
+                      ? "1s timeframe"
+                      : `${h?.timeframeSeconds}s timeframe`
+                  }
+                  accent="text-cyan-600 dark:text-cyan-400"
+                />
+                <StatCell
+                  label="Exec Pos"
+                  value={fmt(h?.executedPositions || 0)}
+                  sub="cumulative"
+                  accent="text-amber-600 dark:text-amber-400"
+                />
               </div>
 
               <div className="grid grid-cols-2 gap-2 text-[11px] pt-1">
@@ -507,6 +636,55 @@ export function QuickstartOverviewDialog() {
                 </div>
               </div>
             </div>
+
+            {/* ── Active Progressing — per type ───────────────────────────
+                Per spec: surface "Active Progressing Sets, trackings,
+                active positions" per indication type. Renders only when
+                the API ships the activeProgressing block (graceful
+                degradation for older servers). */}
+            {stats?.activeProgressing?.indications && (
+              <div className="rounded-md border p-3 space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold flex items-center gap-1.5">
+                    <Activity className="w-3.5 h-3.5 text-violet-500" />
+                    Active Progressing — Per Type
+                  </span>
+                  <span className="text-muted-foreground tabular-nums">
+                    {fmt(stats.activeProgressing.indications.total?.sets ?? 0)} sets ·
+                    {" "}{fmt(stats.activeProgressing.indications.total?.trackings ?? 0)} tracked ·
+                    {" "}{fmt(stats.activeProgressing.indications.total?.positions ?? 0)} pos
+                  </span>
+                </div>
+                <table className="w-full text-[11px] tabular-nums">
+                  <thead>
+                    <tr className="text-muted-foreground border-b border-border/40">
+                      <th className="text-left py-1 pr-2 font-medium">Type</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Distinct (symbol × type) Sets producing qualified entries on the latest cycle">Sets</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Cumulative entries observed (trackings)">Trackings</th>
+                      <th className="text-right py-1 pl-1 font-medium" title="Indications currently passing thresholds">Positions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(["direction", "move", "active", "activeAdvanced", "optimal", "auto"] as const).map((k) => {
+                      const r = stats.activeProgressing!.indications![k]
+                      if (!r || (r.sets === 0 && r.trackings === 0 && r.positions === 0)) return null
+                      const labelMap: Record<string, string> = {
+                        direction: "Direction", move: "Move", active: "Active",
+                        activeAdvanced: "Active Adv", optimal: "Optimal", auto: "Auto",
+                      }
+                      return (
+                        <tr key={k} className="border-b border-border/20 last:border-0">
+                          <td className="text-left py-1 pr-2">{labelMap[k]}</td>
+                          <td className="text-right py-1 px-1 font-medium text-violet-700 dark:text-violet-300">{fmt(r.sets)}</td>
+                          <td className="text-right py-1 px-1">{fmt(r.trackings)}</td>
+                          <td className="text-right py-1 pl-1 font-medium">{fmt(r.positions)}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </TabsContent>
 
           {/* ── Strategies ────────────────────────────────────────────────── */}
@@ -581,6 +759,52 @@ export function QuickstartOverviewDialog() {
                 )}
               </div>
             </div>
+
+            {/* ── Active Progressing — per stage ──────────────────────────
+                Per spec: per-stage "Active Progressing Sets, trackings,
+                active positions". Mirrors the indications tab table so
+                the operator gets the same shape on both sides. */}
+            {stats?.activeProgressing?.strategies && (
+              <div className="rounded-md border p-3 space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold">Active Progressing — Per Stage</span>
+                  <span className="text-muted-foreground tabular-nums">
+                    {fmt(stats.activeProgressing.strategies.total?.sets ?? 0)} sets ·
+                    {" "}{fmt(stats.activeProgressing.strategies.total?.trackings ?? 0)} tracked ·
+                    {" "}{fmt(stats.activeProgressing.strategies.total?.positions ?? 0)} pos
+                  </span>
+                </div>
+                <table className="w-full text-[11px] tabular-nums">
+                  <thead>
+                    <tr className="text-muted-foreground border-b border-border/40">
+                      <th className="text-left py-1 pr-2 font-medium">Stage</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Distinct (symbol × stage) Sets producing qualified entries on the latest cycle">Sets</th>
+                      <th className="text-right py-1 px-1 font-medium" title="Cumulative entries observed (trackings)">Trackings</th>
+                      <th className="text-right py-1 pl-1 font-medium" title="Open positions held at this stage right now">Positions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {([
+                      { key: "base", label: "Base", color: "text-orange-600 dark:text-orange-400" },
+                      { key: "main", label: "Main", color: "text-yellow-600 dark:text-yellow-400" },
+                      { key: "real", label: "Real", color: "text-green-600 dark:text-green-400" },
+                      { key: "live", label: "Live", color: "text-blue-600 dark:text-blue-400" },
+                    ] as const).map(({ key, label, color }) => {
+                      const r = stats.activeProgressing!.strategies![key]
+                      if (!r || (r.sets === 0 && r.trackings === 0 && r.positions === 0)) return null
+                      return (
+                        <tr key={key} className="border-b border-border/20 last:border-0">
+                          <td className={`text-left py-1 pr-2 font-semibold ${color}`}>{label}</td>
+                          <td className="text-right py-1 px-1 font-medium">{fmt(r.sets)}</td>
+                          <td className="text-right py-1 px-1">{fmt(r.trackings)}</td>
+                          <td className="text-right py-1 pl-1 font-medium">{fmt(r.positions)}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </TabsContent>
 
           {/* ── Logs ──────────────────────────────────────────────────────── */}

@@ -1,4 +1,4 @@
-// Force rebuild: 2026-05-03T18:00:00 — connection delete tombstones (no auto-resurrect), one-shot startup-only auto-start (no interval reassignments)
+// Force rebuild: 2026-05-03T19:30:00 — Active Progressing block (Sets/Trackings/Positions per indication-type & per strategy-stage) surfaced in /stats + Overview + QuickStart + Dialog
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
