@@ -1,4 +1,4 @@
-// Force rebuild: 2026-05-05T12:30:00 — Engine fan-out: bounded parallelism (mapWithConcurrency cap=16) on indication+strategy ticks + per-symbol error counters (indication_symbol_errors:* / strategy_symbol_errors:*) so partial-coverage failures are visible instead of silently swallowed
+// Force rebuild: 2026-05-05T13:00:00 — QuickStart connection picker now single-select (radio-style; uses useExchange.setSelectedConnectionId); historic blocks: removed Candles tile, switched Avg PF to historicAvgProfitFactor (overall pseudo-position aggregate), added "Avg Real Pos" tile from stageReal.avgPosPerSet
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {

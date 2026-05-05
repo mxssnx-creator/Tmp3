@@ -647,7 +647,7 @@ export function QuickstartSection() {
   const addLog = (msg: string, type: LogEntry["type"] = "info") =>
     setLogs(prev => [...prev, { id: Math.random().toString(), message: msg, type, timestamp: new Date() }])
 
-  // ── start / stop ���────────────────────────────────────────��─────────────────
+  // ── start / stop ���────────────────────────────────────────���─────────────────
   const handleStart = async () => {
     if (starting || isRunning) return
     setStarting(true)
@@ -1077,9 +1077,9 @@ export function QuickstartSection() {
                 sub={stats.historicFramesMissing > 0 ? `${fmt(stats.historicFramesMissing)} new` : undefined}
               />
             )}
-            {stats.historicCandles > 0 && (
-              <MiniStat label="Candles" value={fmt(stats.historicCandles)} />
-            )}
+            {/* "Candles" tile intentionally omitted — it duplicated the
+                250-set per-Set DB capacity counter shown elsewhere and
+                wasn't a true candle count, just confusing the operator. */}
             {stats.historicIndicators > 0 && (
               <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
             )}
@@ -1102,19 +1102,40 @@ export function QuickstartSection() {
                   : undefined
               }
             />
-            {/* Avg PF (Base) — average Profit Factor across closed Base
-                strategies. Sourced from the per-stage detail block of
-                /stats. 0 ⇒ no closed Base positions yet, so render "—". */}
+            {/* Base PF — average Profit Factor across ALL closed Base
+                pseudo positions in the prehistoric run, computed from
+                `historicAvgProfitFactor` (sum(+pct) / |sum(-pct)| over
+                every closed prehistoric position). Switched away from
+                the per-stage `stageBase.avgProfitFactor` because the
+                spec asks for the overall pseudo-position aggregate, not
+                the strategy-stage-specific number. */}
             <MiniStat
-              label="Avg PF"
+              label="Base PF"
               value={
-                stats.stageBase.avgProfitFactor > 0
-                  ? stats.stageBase.avgProfitFactor.toFixed(2)
+                stats.historicAvgProfitFactor > 0
+                  ? stats.historicAvgProfitFactor.toFixed(2)
                   : "—"
               }
               sub={
-                stats.stageBase.passed > 0
-                  ? `Base n=${fmt(stats.stageBase.passed)}`
+                stats.historicAvgProfitFactorCount > 0
+                  ? `n=${fmt(stats.historicAvgProfitFactorCount)}`
+                  : undefined
+              }
+            />
+            {/* Avg Real Pos — average count of validated, currently-active
+                Real-stage strategy positions. Sourced from
+                `stageReal.avgPosPerSet` (avg open positions per Real
+                set). 0 ⇒ no Real-stage activity yet, render "—". */}
+            <MiniStat
+              label="Avg Real Pos"
+              value={
+                stats.stageReal.avgPosPerSet > 0
+                  ? stats.stageReal.avgPosPerSet.toFixed(2)
+                  : "—"
+              }
+              sub={
+                stats.stageReal.passed > 0
+                  ? `n=${fmt(stats.stageReal.passed)}`
                   : undefined
               }
             />
@@ -1283,17 +1304,21 @@ export function QuickstartSection() {
                     sub={stats.historicFramesMissing > 0 ? `${fmt(stats.historicFramesMissing)} missing` : undefined}
                   />
                 )}
-                {stats.historicCandles > 0 && (
-                  <MiniStat label="Candles" value={fmt(stats.historicCandles)} />
-                )}
+                {/* "Candles" tile intentionally omitted — it duplicated the
+                    250-set per-Set DB capacity counter and wasn't a true
+                    candle count. See note in the always-visible row above. */}
                 {stats.historicIndicators > 0 && (
                   <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
                 )}
                 {/* ── Spec-mandated Historic overview tiles ──────────────
                       • ExecPos — cumulative live exchange positions created.
-                      • Avg PF — Base-strategy average Profit Factor (was
-                        previously the historic-wide overall PF; the spec
-                        asks for the Base-strategy specific number).
+                      • Base PF — overall Profit Factor across all closed
+                        Base pseudo positions in the prehistoric run
+                        (sum(+pct)/|sum(-pct)|). Sourced from
+                        `historicAvgProfitFactor`, not the per-stage
+                        Base aggregate.
+                      • Avg Real Pos — average open validated positions
+                        per Real-stage set (`stageReal.avgPosPerSet`).
                       • Real Pos — currently active Real-stage strategies
                         with valid, opened positions (snapshot). */}
                 <MiniStat
@@ -1302,15 +1327,28 @@ export function QuickstartSection() {
                   sub={stats.livePositionsOpen > 0 ? `${fmt(stats.livePositionsOpen)} open` : undefined}
                 />
                 <MiniStat
-                  label="Avg PF"
+                  label="Base PF"
                   value={
-                    stats.stageBase.avgProfitFactor > 0
-                      ? stats.stageBase.avgProfitFactor.toFixed(2)
+                    stats.historicAvgProfitFactor > 0
+                      ? stats.historicAvgProfitFactor.toFixed(2)
                       : "—"
                   }
                   sub={
-                    stats.stageBase.passed > 0
-                      ? `Base n=${fmt(stats.stageBase.passed)}`
+                    stats.historicAvgProfitFactorCount > 0
+                      ? `n=${fmt(stats.historicAvgProfitFactorCount)}`
+                      : undefined
+                  }
+                />
+                <MiniStat
+                  label="Avg Real Pos"
+                  value={
+                    stats.stageReal.avgPosPerSet > 0
+                      ? stats.stageReal.avgPosPerSet.toFixed(2)
+                      : "—"
+                  }
+                  sub={
+                    stats.stageReal.passed > 0
+                      ? `n=${fmt(stats.stageReal.passed)}`
                       : undefined
                   }
                 />
