@@ -4,13 +4,23 @@
  * QuickStart connection controls — a single compact strip mounted at the
  * top of the QuickStart card. Two responsibilities:
  *
- *   1. Connection picker — lists every BASE connection that is enabled in
- *      Settings but is NOT yet inserted into the Active panel ("Main
- *      connections"). The operator selects one and clicks "Add" to push
- *      it into the Active panel via /api/settings/connections/add-to-active.
- *      Empty state ("All base connections already added") is intentional
- *      — keeps the panel quiet on a steady state but obvious during
- *      bootstrapping a fresh install.
+ *   1. Connection picker — single-select. The popover lists every BASE
+ *      connection currently in the Active panel and lets the operator
+ *      choose exactly ONE active connection that the rest of QuickStart
+ *      (volatile-symbol pick, stats poll, live-trade actions, engine
+ *      controls) drives off via the `useExchange` context.
+ *
+ *      The picker also exposes the "Add to Active panel" action for
+ *      enabled BASE connections that aren't yet inserted, so the
+ *      operator never has to leave QuickStart to bootstrap a new
+ *      connection. Newly-added connections become immediately selectable.
+ *
+ *      Selection is mutually exclusive — a radio indicator on each row
+ *      makes the current pick obvious, and clicking a different row
+ *      flips the selection through `setSelectedConnectionId`. The
+ *      trigger button shows the active connection's name + exchange
+ *      tag so the operator always sees what's selected without opening
+ *      the popover.
  *
  *   2. Reset DB — destructive button that POSTs to
  *      /api/admin/clear-progressions. The endpoint surgically clears
@@ -25,7 +35,7 @@
  * clean slate.
  */
 
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useMemo } from "react"
 import { Button } from "@/components/ui/button"
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel,
@@ -37,10 +47,17 @@ import {
 } from "@/components/ui/popover"
 import {
   Plug, Plus, Trash2, Loader2, AlertCircle, CheckCircle2,
+  Circle as CircleIcon,
 } from "lucide-react"
 import {
   isBaseConnection, isConnectionEnabled,
 } from "@/lib/connection-utils"
+// Single source of truth for the currently-active connection across
+// QuickStart and the rest of the dashboard. Selecting a row in the
+// picker calls `setSelectedConnectionId` here, which causes
+// `selectedConnection` / `selectedExchange` to flow back through every
+// consumer of `useExchange`.
+import { useExchange } from "@/lib/exchange-context"
 
 interface ConnectionRow {
   id: string
@@ -62,6 +79,12 @@ function exchangeColor(exchange: string): string {
 }
 
 export function QuickstartConnectionControls() {
+  const {
+    selectedConnectionId,
+    setSelectedConnectionId,
+    activeConnections,
+    loadActiveConnections,
+  } = useExchange()
   const [connections, setConnections] = useState<ConnectionRow[]>([])
   const [loading, setLoading] = useState(false)
   const [adding, setAdding] = useState<string | null>(null)
@@ -128,7 +151,42 @@ export function QuickstartConnectionControls() {
     )
   })
 
+  // ── currently-selected connection (for the trigger label) ────────────
+  // Look it up from BOTH lists so the trigger renders correctly whether
+  // the active connection came from `activeConnections` (the canonical
+  // useExchange list) or just from the local /api/settings/connections
+  // fetch (e.g. during a fresh-add window before the context refreshes).
+  const selectedConnection = useMemo(() => {
+    if (!selectedConnectionId) return null
+    return (
+      activeConnections.find((c: any) => c.id === selectedConnectionId) ||
+      connections.find((c) => c.id === selectedConnectionId) ||
+      null
+    )
+  }, [selectedConnectionId, activeConnections, connections])
+
   // ── actions ────────────────────────────────────────────────────────────
+  const handleSelect = useCallback(
+    (connectionId: string) => {
+      // Single-select: clicking a row replaces the current selection.
+      // No-op if the same row is clicked twice — we don't want to
+      // accidentally clear the selection (other dashboard panels expect
+      // a non-null connection while the engine is running).
+      if (!connectionId || connectionId === selectedConnectionId) {
+        setPopoverOpen(false)
+        return
+      }
+      setSelectedConnectionId(connectionId)
+      // Tell QuickStart's own pollers to re-fetch using the new
+      // connection immediately, instead of waiting for the next poll
+      // tick. Same event QuickStart already listens for after Add /
+      // Reset DB actions.
+      window.dispatchEvent(new CustomEvent("quickstart:refresh"))
+      setPopoverOpen(false)
+    },
+    [selectedConnectionId, setSelectedConnectionId],
+  )
+
   const handleAdd = useCallback(
     async (connectionId: string) => {
       if (!connectionId || adding) return
@@ -149,6 +207,16 @@ export function QuickstartConnectionControls() {
           // Tell the rest of the app a new connection was activated.
           window.dispatchEvent(new CustomEvent("connections:refresh"))
           window.dispatchEvent(new CustomEvent("quickstart:refresh"))
+          // Refresh the canonical active-connections list so
+          // selecting the freshly-added one resolves immediately.
+          await loadActiveConnections({ force: true })
+          // Auto-select the new connection so the operator doesn't
+          // need a second click — this is the typical bootstrapping
+          // flow (add → use). Skip if the user already had something
+          // selected (preserve their explicit choice).
+          if (!selectedConnectionId) {
+            setSelectedConnectionId(connectionId)
+          }
         }
         await loadConnections()
       } catch (err) {
@@ -202,107 +270,171 @@ export function QuickstartConnectionControls() {
   // ── render ─────────────────────────────────────────────────────────────
   return (
     <div className="flex flex-wrap items-center gap-1.5 px-3 py-1.5 border-b border-primary/10 bg-muted/30">
-      {/* ── Connection picker ─────────────────────────────────────────── */}
+      {/* ── Connection picker (single-select) ─────────────────────────── */}
       <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
         <PopoverTrigger asChild>
           <Button
             size="sm"
             variant="outline"
-            className="h-7 text-[11px] px-2 gap-1.5"
-            aria-label="Add base connection to Active panel"
+            className="h-7 text-[11px] px-2 gap-1.5 max-w-[260px]"
+            aria-label="Select active connection"
+            title={
+              selectedConnection
+                ? `Active: ${selectedConnection.name}`
+                : "Select an active connection"
+            }
           >
-            <Plug className="w-3 h-3" />
-            <span>Connections</span>
-            <span className="text-muted-foreground tabular-nums">
+            <Plug
+              className={`w-3 h-3 ${
+                selectedConnection
+                  ? exchangeColor(selectedConnection.exchange)
+                  : "text-muted-foreground"
+              }`}
+            />
+            {selectedConnection ? (
+              <>
+                <span className="font-medium truncate">
+                  {selectedConnection.name}
+                </span>
+                <span
+                  className={`uppercase text-[9px] ${exchangeColor(
+                    selectedConnection.exchange,
+                  )}`}
+                >
+                  {selectedConnection.exchange}
+                </span>
+              </>
+            ) : (
+              <span>Connections</span>
+            )}
+            <span className="text-muted-foreground tabular-nums ml-auto">
               {alreadyAdded.length}
               {addable.length > 0 ? `+${addable.length}` : ""}
             </span>
           </Button>
         </PopoverTrigger>
-        <PopoverContent align="start" className="w-72 p-0">
+        <PopoverContent align="start" className="w-80 p-0">
           <div className="px-3 py-2 border-b">
-            <p className="text-xs font-semibold">Base connections</p>
+            <p className="text-xs font-semibold">Connections</p>
             <p className="text-[10px] text-muted-foreground">
-              Add an enabled base connection to the Active panel.
+              Pick the active connection. QuickStart, stats, and engine
+              actions follow your selection.
             </p>
           </div>
 
-          {/* Already-added group — informational so the operator knows
-              what's live without leaving the popover. */}
-          {alreadyAdded.length > 0 && (
+          {/* ── Active panel — single-select group ────────────────────────
+              Each row is a radio: the selected one shows a filled green
+              circle, the rest show an empty outline. Clicking a row
+              flips selection through useExchange and closes the popover. */}
+          {alreadyAdded.length > 0 ? (
             <div className="px-3 py-2 border-b">
               <p className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">
-                In Active panel
+                Active panel — select one
               </p>
-              <ul className="space-y-1">
-                {alreadyAdded.map((c) => (
-                  <li
-                    key={c.id}
-                    className="flex items-center gap-1.5 text-[11px]"
-                  >
-                    <CheckCircle2 className="w-3 h-3 text-green-600" />
-                    <span className="font-medium truncate">{c.name}</span>
-                    <span className={`uppercase text-[9px] ${exchangeColor(c.exchange)}`}>
-                      {c.exchange}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {/* Addable group — the actionable list. */}
-          <div className="px-3 py-2">
-            <p className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">
-              Available to add
-            </p>
-            {loading ? (
-              <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                <Loader2 className="w-3 h-3 animate-spin" />
-                Loading…
-              </div>
-            ) : addable.length === 0 ? (
-              <p className="text-[11px] text-muted-foreground italic">
-                {alreadyAdded.length > 0
-                  ? "All enabled base connections are already added."
-                  : "No enabled base connections found. Configure one in Settings first."}
-              </p>
-            ) : (
-              <ul className="space-y-1">
-                {addable.map((c) => {
-                  const busy = adding === c.id
+              <ul role="radiogroup" className="space-y-0.5">
+                {alreadyAdded.map((c) => {
+                  const isSelected = c.id === selectedConnectionId
                   return (
-                    <li
-                      key={c.id}
-                      className="flex items-center gap-1.5 text-[11px]"
-                    >
-                      <Plug className={`w-3 h-3 ${exchangeColor(c.exchange)}`} />
-                      <span className="font-medium truncate flex-1">
-                        {c.name}
-                      </span>
-                      <span className={`uppercase text-[9px] ${exchangeColor(c.exchange)}`}>
-                        {c.exchange}
-                      </span>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-6 px-1.5 text-[10px] gap-1"
-                        onClick={() => handleAdd(c.id)}
-                        disabled={busy}
+                    <li key={c.id} role="none">
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={isSelected}
+                        onClick={() => handleSelect(c.id)}
+                        className={`flex items-center gap-1.5 w-full text-left rounded px-1.5 py-1 text-[11px] transition-colors ${
+                          isSelected
+                            ? "bg-primary/10 ring-1 ring-primary/40"
+                            : "hover:bg-muted/60"
+                        }`}
                       >
-                        {busy ? (
-                          <Loader2 className="w-3 h-3 animate-spin" />
+                        {isSelected ? (
+                          <CheckCircle2 className="w-3.5 h-3.5 text-green-600 shrink-0" />
                         ) : (
-                          <Plus className="w-3 h-3" />
+                          <CircleIcon className="w-3.5 h-3.5 text-muted-foreground/50 shrink-0" />
                         )}
-                        Add
-                      </Button>
+                        <span className="font-medium truncate flex-1">
+                          {c.name}
+                        </span>
+                        <span
+                          className={`uppercase text-[9px] ${exchangeColor(
+                            c.exchange,
+                          )}`}
+                        >
+                          {c.exchange}
+                        </span>
+                      </button>
                     </li>
                   )
                 })}
               </ul>
-            )}
-          </div>
+            </div>
+          ) : (
+            <div className="px-3 py-2 border-b">
+              <p className="text-[11px] text-muted-foreground italic">
+                No connections in the Active panel yet — add one below.
+              </p>
+            </div>
+          )}
+
+          {/* ── Addable group — bootstrapping action ─────────────────────
+              Shown only when at least one enabled base connection is
+              not yet in the Active panel. Clicking Add inserts and
+              auto-selects (when nothing else is selected). */}
+          {(loading || addable.length > 0) && (
+            <div className="px-3 py-2">
+              <p className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">
+                Available to add
+              </p>
+              {loading ? (
+                <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  Loading…
+                </div>
+              ) : (
+                <ul className="space-y-0.5">
+                  {addable.map((c) => {
+                    const busy = adding === c.id
+                    return (
+                      <li
+                        key={c.id}
+                        className="flex items-center gap-1.5 text-[11px] px-1.5 py-1 rounded hover:bg-muted/40"
+                      >
+                        <Plug
+                          className={`w-3 h-3 shrink-0 ${exchangeColor(
+                            c.exchange,
+                          )}`}
+                        />
+                        <span className="font-medium truncate flex-1">
+                          {c.name}
+                        </span>
+                        <span
+                          className={`uppercase text-[9px] ${exchangeColor(
+                            c.exchange,
+                          )}`}
+                        >
+                          {c.exchange}
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 px-1.5 text-[10px] gap-1"
+                          onClick={() => handleAdd(c.id)}
+                          disabled={busy}
+                        >
+                          {busy ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <Plus className="w-3 h-3" />
+                          )}
+                          Add
+                        </Button>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+            </div>
+          )}
         </PopoverContent>
       </Popover>
 
