@@ -221,6 +221,14 @@ export function QuickstartOverviewDialog() {
   const rt  = stats?.realtime
   const bd  = stats?.breakdown
   const sd  = stats?.strategyDetail
+  // ── Active Progressing aliases ───────────────────────────────────────
+  // Used by the Live Processing tile to surface "actively processing
+  // Sets" (the headline operator metric) instead of the cumulative
+  // counts in `rt.indicationsTotal` / `rt.strategiesTotal`. Aliased
+  // here so the tile JSX stays readable.
+  const apInd   = stats?.activeProgressing?.indications
+  const apStrat = stats?.activeProgressing?.strategies
+  void apStrat // reserved for the strategies tile if/when added here
   const win = stats?.windows
 
   // MUST stay in sync with `DEFAULT_LIMITS` in `lib/indication-sets-processor.ts`
@@ -387,10 +395,31 @@ export function QuickstartOverviewDialog() {
                 Live Processing
                 {rt?.isActive && <Badge className="bg-blue-600 text-[10px] h-4 px-1.5 ml-auto">Active</Badge>}
               </div>
+              {/* Indications tile shows ACTIVELY-PROCESSING Sets (count of
+                  Sets producing qualified entries on the latest cycle),
+                  not the cumulative `indicationsTotal` that grows forever.
+                  Source = `activeProgressing.indications.total.sets` of
+                  /stats. Cumulative remains accessible as the sub-line.
+                  Falls back to legacy total when the field is missing
+                  (older API revs). */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                 <StatCell label="Ind Cycles"   value={fmt(rt?.indicationCycles || 0)}  accent="text-blue-600 dark:text-blue-400" />
                 <StatCell label="Strat Cycles" value={fmt(rt?.strategyCycles   || 0)}  accent="text-violet-600 dark:text-violet-400" />
-                <StatCell label="Indications"  value={fmt(rt?.indicationsTotal || 0)}  accent="text-green-600 dark:text-green-400" />
+                <StatCell
+                  label="Indications"
+                  value={fmt(
+                    apInd?.total?.sets ??
+                      (rt?.indicationsTotal || 0),
+                  )}
+                  sub={
+                    apInd?.total?.sets !== undefined && (rt?.indicationsTotal || 0) > 0
+                      ? `${fmt(rt?.indicationsTotal || 0)} total`
+                      : apInd?.total?.sets !== undefined
+                        ? "active sets"
+                        : undefined
+                  }
+                  accent="text-green-600 dark:text-green-400"
+                />
                 <StatCell label="Positions"    value={fmt(rt?.positionsOpen    || 0)}  accent="text-amber-600 dark:text-amber-400" />
               </div>
             </div>
