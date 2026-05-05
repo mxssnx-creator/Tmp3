@@ -1327,8 +1327,14 @@ export function ActiveConnectionCard({
                               {isLive && (
                                 <div className="flex items-center gap-2 text-[10px] pl-7">
                                   <span className="text-muted-foreground">ROI avg</span>
-                                  <span className={`font-medium tabular-nums ${avgPosEval > 0 ? "text-green-600 dark:text-green-400" : avgPosEval < 0 ? "text-red-500" : "text-foreground"}`}>
-                                    {avgPosEval !== 0 ? `${(avgPosEval * 100).toFixed(2)}%` : "—"}
+                                  {/* Narrow `avgPosEval` (typed `number | null`
+                                      across all tiers) before arithmetic so
+                                      strict TS doesn't flag possible-null
+                                      access. The live tier always populates
+                                      it from `avgPosEvalLive`, but the union
+                                      type comes from the other tiers. */}
+                                  <span className={`font-medium tabular-nums ${(avgPosEval ?? 0) > 0 ? "text-green-600 dark:text-green-400" : (avgPosEval ?? 0) < 0 ? "text-red-500" : "text-foreground"}`}>
+                                    {avgPosEval !== null && avgPosEval !== 0 ? `${(avgPosEval * 100).toFixed(2)}%` : "—"}
                                   </span>
                                   <span className="text-muted-foreground">
                                     WR <span className={`font-medium ${prehistoricStats.liveWinRate >= 60 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveWinRate >= 40 ? "text-amber-600 dark:text-amber-400" : "text-red-500"}`}>
