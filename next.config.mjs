@@ -1,4 +1,4 @@
-// Force rebuild: 2026-05-05T13:00:00 — QuickStart connection picker now single-select (radio-style; uses useExchange.setSelectedConnectionId); historic blocks: removed Candles tile, switched Avg PF to historicAvgProfitFactor (overall pseudo-position aggregate), added "Avg Real Pos" tile from stageReal.avgPosPerSet
+// Force rebuild: 2026-05-05T14:30:00 — Avg Real Pos tile now reads `realActivePosAvg` (true unbounded running mean of currently-active validated Real positions, accumulated server-side via realOpen samples in progression:{id}). Replaces the bounded `stageReal.avgPosPerSet` (mathematically capped at the per-set 250-entry DB capacity). Overview Dialog Real Positions tile fixed (was reading non-existent `.positions` field, silently rendered 0; canonical is `.open`) and now surfaces the running average in its sub-line.
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {

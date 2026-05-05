@@ -56,9 +56,22 @@ interface StatsResponse {
   }
   // Snapshot of currently-open positions across stages. Optional —
   // older API revs returned only the realtime aggregate.
+  //
+  // Field names note:
+  //   * `open` is the canonical current count (modern API)
+  //   * `positions` was the legacy alias for the same value (pre-2025)
+  //   * `activeAvg` / `activeSamples` are the unbounded running mean of
+  //     active validated Real positions (added 2026-05; the per-set
+  //     250-cap-bounded `stageReal.avgPosPerSet` is a different metric)
   openPositions?: {
-    real?: { open: number; total?: number }
-    live?: { open: number; total?: number }
+    real?: {
+      open: number
+      total?: number
+      positions?: number
+      activeAvg?: number
+      activeSamples?: number
+    }
+    live?: { open: number; total?: number; positions?: number }
   }
   breakdown: {
     indications: { direction: number; move: number; active: number; optimal: number; auto: number; total: number }
@@ -378,10 +391,27 @@ export function QuickstartOverviewDialog() {
                   }
                   accent="text-orange-600 dark:text-orange-400"
                 />
+                {/* Real Positions tile — was previously reading the
+                    non-existent `.positions` field (legacy alias) and
+                    silently rendered 0. Canonical field is `.open`.
+                    Sub-line surfaces the unbounded running mean
+                    (`activeAvg`, accumulated server-side, NOT capped
+                    by the per-set 250-entry DB capacity) so the
+                    operator sees both current snapshot + historical
+                    average without a second tile. */}
                 <StatCell
                   label="Real Positions"
-                  value={fmt(stats?.openPositions?.real?.positions || 0)}
-                  sub="active, valid"
+                  value={fmt(
+                    stats?.openPositions?.real?.open ??
+                      stats?.openPositions?.real?.positions ??
+                      0,
+                  )}
+                  sub={
+                    (stats?.openPositions?.real?.activeSamples || 0) > 0 &&
+                    (stats?.openPositions?.real?.activeAvg || 0) > 0
+                      ? `avg ${(stats?.openPositions?.real?.activeAvg || 0).toFixed(2)}`
+                      : "active, valid"
+                  }
                   accent="text-green-600 dark:text-green-400"
                 />
                 <StatCell
@@ -571,10 +601,27 @@ export function QuickstartOverviewDialog() {
                   }
                   accent="text-orange-600 dark:text-orange-400"
                 />
+                {/* Real Positions tile — was previously reading the
+                    non-existent `.positions` field (legacy alias) and
+                    silently rendered 0. Canonical field is `.open`.
+                    Sub-line surfaces the unbounded running mean
+                    (`activeAvg`, accumulated server-side, NOT capped
+                    by the per-set 250-entry DB capacity) so the
+                    operator sees both current snapshot + historical
+                    average without a second tile. */}
                 <StatCell
                   label="Real Positions"
-                  value={fmt(stats?.openPositions?.real?.positions || 0)}
-                  sub="active, valid"
+                  value={fmt(
+                    stats?.openPositions?.real?.open ??
+                      stats?.openPositions?.real?.positions ??
+                      0,
+                  )}
+                  sub={
+                    (stats?.openPositions?.real?.activeSamples || 0) > 0 &&
+                    (stats?.openPositions?.real?.activeAvg || 0) > 0
+                      ? `avg ${(stats?.openPositions?.real?.activeAvg || 0).toFixed(2)}`
+                      : "active, valid"
+                  }
                   accent="text-green-600 dark:text-green-400"
                 />
                 <StatCell
