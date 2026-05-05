@@ -72,6 +72,15 @@ export interface LivePosition {
   // exchange's reduce-only orders are armed at.
   stopLossPrice?: number
   takeProfitPrice?: number
+  // `protectionArmedQuantity` is the `executedQuantity` value that was
+  // in effect when SL/TP were last (re-)placed on the exchange. We
+  // compare against the current `executedQuantity` every reconcile
+  // cycle: if they differ by more than 0.25% we re-arm. This closes a
+  // bug where accumulation merges or delayed partial fills grew the
+  // position but the original SL/TP order on the exchange still only
+  // protected the *original* volume — leaving the additional volume
+  // unprotected. Optional for back-compat with existing positions.
+  protectionArmedQuantity?: number
   // Exchange references
   orderId?: string
   stopLossOrderId?: string
@@ -921,6 +930,20 @@ async function updateProtectionOrders(
   const { desiredSl, desiredTp } = computeDesiredProtectionPrices(pos)
   const closeSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
 
+  // ── Quantity drift detection ──────────────────────────────────────────
+  // When more volume joins the position (delayed partial fills, accumulation
+  // merges, post-fill sync detection) the SL/TP order on the exchange is
+  // still armed for the *original* qty, leaving the delta unprotected.
+  // Compare the current executed qty against the qty that was armed at
+  // last placement; >0.25% drift triggers a cancel-and-replace on each
+  // leg even if the trigger price hasn't moved. This is the missing
+  // fix the user reported as "TP/SL not working" after partial fills.
+  const armedQty = pos.protectionArmedQuantity ?? 0
+  const qtyDrifted =
+    pos.executedQuantity > 0 &&
+    (armedQty <= 0 ||
+      Math.abs(pos.executedQuantity - armedQty) / Math.max(armedQty, 1e-12) > 0.0025)
+
   // ── Stop-Loss leg ────────────────────────────────────────────────────
   if (desiredSl <= 0 && pos.stopLossOrderId) {
     // SL was turned off — yank the existing order.
@@ -928,7 +951,10 @@ async function updateProtectionOrders(
     pos.stopLossOrderId = undefined
     pos.stopLossPrice = 0
     result.changed = true
-  } else if (desiredSl > 0 && (!pos.stopLossOrderId || priceDrifted(pos.stopLossPrice, desiredSl))) {
+  } else if (
+    desiredSl > 0 &&
+    (!pos.stopLossOrderId || priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted)
+  ) {
     if (pos.stopLossOrderId) {
       await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
     }
@@ -953,7 +979,10 @@ async function updateProtectionOrders(
     pos.takeProfitOrderId = undefined
     pos.takeProfitPrice = 0
     result.changed = true
-  } else if (desiredTp > 0 && (!pos.takeProfitOrderId || priceDrifted(pos.takeProfitPrice, desiredTp))) {
+  } else if (
+    desiredTp > 0 &&
+    (!pos.takeProfitOrderId || priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted)
+  ) {
     if (pos.takeProfitOrderId) {
       await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
     }
@@ -970,6 +999,14 @@ async function updateProtectionOrders(
     pos.takeProfitPrice = desiredTp
     result.changed = true
     result.tpPlaced = !!id
+  }
+
+  // After (re-)placement record the qty we armed for, so the next pass
+  // can detect further drift accurately. Always update — even on a
+  // pure cancel-and-replace where qty didn't move — so we don't keep
+  // diffing against a stale baseline.
+  if (result.changed) {
+    pos.protectionArmedQuantity = pos.executedQuantity
   }
 
   if (result.changed) {
@@ -1534,6 +1571,14 @@ export async function executeLivePosition(
 
       if (slOrderId) livePosition.stopLossOrderId = slOrderId
       if (tpOrderId) livePosition.takeProfitOrderId = tpOrderId
+      // Record the qty SL/TP were armed for so the next reconcile
+      // pass can detect quantity drift (delayed partial fills,
+      // accumulation merges) and re-arm. Without this the drift
+      // detector in `updateProtectionOrders` would see an undefined
+      // baseline and re-arm on every cycle even when nothing changed.
+      if (slOrderId || tpOrderId) {
+        livePosition.protectionArmedQuantity = livePosition.executedQuantity
+      }
 
       // Step record + progression log carry BOTH the assigned percent
       // and the resulting absolute trigger price, so an operator
@@ -2011,6 +2056,105 @@ export async function calculateLivePositionStats(
 }
 
 /**
+ * Detect whether the latest mark price has crossed the position's
+ * desired SL or TP threshold and — if so — force-close the position
+ * via `closeLivePosition`. Returns the cross reason ("sl_hit" / "tp_hit")
+ * when a close was triggered (whether or not it succeeded), otherwise
+ * `null`.
+ *
+ * This is the safety net the user described as "check pos if to be
+ * updated or closed also independent of the control orders". Even if
+ * the exchange-placed reduce-only SL/TP orders fail to fire (illiquid
+ * pair gap, exchange order cancelled by the user, network race), this
+ * comparison guarantees we close the position once mark price has
+ * actually crossed the configured level.
+ *
+ * Used by:
+ *   - `reconcileLivePositions` (cron, full reconcile sweep)
+ *   - `syncWithExchange`        (engine loop, lighter mark-price refresh)
+ *   - `recalculateAndApplySLTP` (immediate check after operator override —
+ *     a tightened SL might already be breached at the new percentage)
+ *
+ * Pure side-effect helper: the caller decides what to do with `null`
+ * (typically: persist the mark refresh and continue) or with a non-null
+ * return (typically: skip further processing because the position was
+ * archived by `closeLivePosition`).
+ */
+async function checkAndForceCloseOnSltpCross(
+  connectionId: string,
+  pos: LivePosition,
+  markPrice: number,
+  exchangeConnector: any,
+): Promise<"sl_hit" | "tp_hit" | null> {
+  if (!Number.isFinite(markPrice) || markPrice <= 0) return null
+  if (pos.executedQuantity <= 0) return null
+  if (pos.status === "closed" || pos.status === "rejected" || pos.status === "error") return null
+
+  const fillPrice = pos.averageExecutionPrice || pos.entryPrice
+  if (!fillPrice || fillPrice <= 0) return null
+
+  const slPct = Math.max(0, pos.stopLoss || 0) / 100
+  const tpPct = Math.max(0, pos.takeProfit || 0) / 100
+  const desiredSl =
+    slPct > 0
+      ? pos.direction === "long"
+        ? fillPrice * (1 - slPct)
+        : fillPrice * (1 + slPct)
+      : 0
+  const desiredTp =
+    tpPct > 0
+      ? pos.direction === "long"
+        ? fillPrice * (1 + tpPct)
+        : fillPrice * (1 - tpPct)
+      : 0
+
+  let crossReason: "sl_hit" | "tp_hit" | null = null
+  if (pos.direction === "long") {
+    if (desiredSl > 0 && markPrice <= desiredSl) crossReason = "sl_hit"
+    else if (desiredTp > 0 && markPrice >= desiredTp) crossReason = "tp_hit"
+  } else {
+    if (desiredSl > 0 && markPrice >= desiredSl) crossReason = "sl_hit"
+    else if (desiredTp > 0 && markPrice <= desiredTp) crossReason = "tp_hit"
+  }
+
+  if (!crossReason) return null
+
+  console.log(
+    `${LOG_PREFIX} ${crossReason.toUpperCase()} detected for ${pos.symbol} ${pos.direction} @ mark=${markPrice} (sl=${desiredSl} tp=${desiredTp}) — force-closing`,
+  )
+  await logProgressionEvent(
+    connectionId,
+    "live_trading",
+    "warning",
+    `${crossReason === "sl_hit" ? "Stop-loss" : "Take-profit"} cross detected for ${pos.symbol} — force-closing`,
+    {
+      positionId: pos.id,
+      markPrice,
+      desiredSl,
+      desiredTp,
+      direction: pos.direction,
+      averageEntry: pos.averageExecutionPrice,
+      // Useful for the operator audit trail: was the cross because the
+      // exchange-placed control order failed to fire, or because the
+      // operator just tightened the band such that the position was
+      // already past it?
+      hadStopLossOrder: !!pos.stopLossOrderId,
+      hadTakeProfitOrder: !!pos.takeProfitOrderId,
+    },
+  )
+
+  try {
+    await closeLivePosition(connectionId, pos.id, markPrice, exchangeConnector, crossReason)
+  } catch (closeErr) {
+    console.warn(
+      `${LOG_PREFIX} force-close on ${crossReason} failed for ${pos.id}:`,
+      closeErr instanceof Error ? closeErr.message : String(closeErr),
+    )
+  }
+  return crossReason
+}
+
+/**
  * Reconcile Redis-tracked live positions with the exchange.
  *
  * For every Redis-tracked open position:
@@ -2111,81 +2255,26 @@ export async function reconcileLivePositions(
           }
 
           // ── Proactive close-in-time safety check ───────────────────
-          // The SL/TP orders we place are reduce-only LIMIT orders. On
-          // a price gap (illiquid pairs, news events) the exchange may
-          // skip past the limit price without filling, leaving the
-          // position open and unprotected. We compare the just-fetched
-          // mark price against the desired SL/TP levels and force-close
-          // if breached. This is the safety net that guarantees timely
-          // exits regardless of how the venue handled the limit fill.
+          // Even when the exchange-placed reduce-only SL/TP orders are
+          // armed, on a sharp price gap (illiquid pair / news / slow
+          // fill) the exchange may not fire them in time — leaving the
+          // position open past the configured threshold. We compare
+          // mark price vs. desired SL/TP and force-close if breached.
           //
-          // Only triggers when ALL of:
-          //   • markPrice is fresh (just synced this cycle)
-          //   • desired SL/TP price is non-zero (i.e. armed)
-          //   • mark has actually crossed the level for the position's
-          //     direction (long: price ≤ SL or ≥ TP; short: ≥ SL or ≤ TP)
-          //
-          // Closes via closeLivePosition() which cancels the orphan
-          // protection order on the OTHER side and archives properly.
-          if (markPrice > 0 && pos.executedQuantity > 0) {
-            const fillPrice = pos.averageExecutionPrice || pos.entryPrice
-            const slPct = Math.max(0, pos.stopLoss || 0) / 100
-            const tpPct = Math.max(0, pos.takeProfit || 0) / 100
-            const desiredSl =
-              slPct > 0 && fillPrice > 0
-                ? pos.direction === "long"
-                  ? fillPrice * (1 - slPct)
-                  : fillPrice * (1 + slPct)
-                : 0
-            const desiredTp =
-              tpPct > 0 && fillPrice > 0
-                ? pos.direction === "long"
-                  ? fillPrice * (1 + tpPct)
-                  : fillPrice * (1 - tpPct)
-                : 0
-
-            let crossReason: string | null = null
-            if (pos.direction === "long") {
-              if (desiredSl > 0 && markPrice <= desiredSl) crossReason = "sl_hit"
-              else if (desiredTp > 0 && markPrice >= desiredTp) crossReason = "tp_hit"
-            } else {
-              // short
-              if (desiredSl > 0 && markPrice >= desiredSl) crossReason = "sl_hit"
-              else if (desiredTp > 0 && markPrice <= desiredTp) crossReason = "tp_hit"
-            }
-
-            if (crossReason) {
-              console.log(
-                `${LOG_PREFIX} ${crossReason.toUpperCase()} detected for ${pos.symbol} ${pos.direction} @ mark=${markPrice} (sl=${desiredSl} tp=${desiredTp}) — force-closing`,
-              )
-              await logProgressionEvent(
-                connectionId,
-                "live_trading",
-                "warning",
-                `${crossReason === "sl_hit" ? "Stop-loss" : "Take-profit"} cross detected for ${pos.symbol} — force-closing`,
-                {
-                  positionId: pos.id,
-                  markPrice,
-                  desiredSl,
-                  desiredTp,
-                  direction: pos.direction,
-                  averageEntry: pos.averageExecutionPrice,
-                },
-              )
-              try {
-                await closeLivePosition(connectionId, pos.id, markPrice, exchangeConnector, crossReason)
-                summary.closed++
-                continue // skip the per-cycle setex below — close already persisted
-              } catch (closeErr) {
-                console.warn(
-                  `${LOG_PREFIX} force-close on ${crossReason} failed for ${pos.id}:`,
-                  closeErr instanceof Error ? closeErr.message : String(closeErr),
-                )
-                summary.errors++
-                // Fall through to the regular setex so the mark refresh
-                // is still persisted; next cycle will retry the close.
-              }
-            }
+          // Implementation lives in `checkAndForceCloseOnSltpCross` so
+          // the same logic runs from `syncWithExchange` (engine loop)
+          // and `recalculateAndApplySLTP` (operator override) too —
+          // the user explicitly asked for the close to happen
+          // "independent of the control orders".
+          const crossed = await checkAndForceCloseOnSltpCross(
+            connectionId,
+            pos,
+            markPrice,
+            exchangeConnector,
+          )
+          if (crossed) {
+            summary.closed++
+            continue // close already persisted by helper
           }
 
           await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
@@ -2337,10 +2426,18 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             roi: (exchangePos as any).roi,
           }
           position.updatedAt = Date.now()
-          const key = `live:position:${position.id}`
-          await client.setex(key, 604800, JSON.stringify(position))
         }
 
+        // ── Delayed-fill SL/TP arming ─────────────────────────────────
+        // If the entry order was still pending when `executeLivePosition`
+        // tried to place SL/TP, that step pushed `place_sl_tp = skipped`
+        // and the position ended up `placed` with no protection orders.
+        // When this loop now detects the order has filled, we transition
+        // to `open` AND must arm SL/TP — otherwise the operator gets
+        // an open exchange position with zero stop-loss / take-profit
+        // protection. This was a real bug the user reported as
+        // "TP/SL control orders are not working".
+        let justFilled = false
         if (position.status === "placed" && position.orderId) {
           try {
             const order = await exchangeConnector.getOrder(position.symbol, position.orderId)
@@ -2350,8 +2447,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               position.averageExecutionPrice = order.filledPrice || position.entryPrice
               position.status = "open"
               position.updatedAt = Date.now()
-              const key = `live:position:${position.id}`
-              await client.setex(key, 604800, JSON.stringify(position))
+              justFilled = true
               await incrementMetric(connectionId, "live_orders_filled_count")
               await logProgressionEvent(
                 connectionId,
@@ -2365,9 +2461,50 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               )
             }
           } catch {
-            /* ignore */
+            /* ignore — next sync cycle will retry */
           }
         }
+
+        // Arm or refresh protection orders. `updateProtectionOrders` is
+        // a no-op when nothing has drifted (price + qty stable, both
+        // legs already armed at correct levels) so this is cheap on the
+        // steady state. After a delayed fill (`justFilled`) it's a real
+        // place; after accumulation it re-arms for the new total qty;
+        // after an operator-cancelled SL on the exchange it re-places.
+        if (position.executedQuantity > 0) {
+          try {
+            await updateProtectionOrders(
+              exchangeConnector,
+              position,
+              justFilled ? "sync_fill_detected" : "sync_heal",
+            )
+          } catch (slTpErr) {
+            console.warn(
+              `${LOG_PREFIX} sync SL/TP heal error for ${position.id}:`,
+              slTpErr instanceof Error ? slTpErr.message : String(slTpErr),
+            )
+          }
+        }
+
+        // ── Proactive close-in-time SL/TP check ───────────────────────
+        // Same safety net `reconcileLivePositions` runs, applied here
+        // so the engine loop catches crosses between cron ticks. If a
+        // cross fires we skip the per-position setex below — the close
+        // helper already persisted the terminal state and moved the
+        // index entry to the closed archive.
+        const markPrice = Number(position.exchangeData?.markPrice ?? 0)
+        if (markPrice > 0) {
+          const crossed = await checkAndForceCloseOnSltpCross(
+            connectionId,
+            position,
+            markPrice,
+            exchangeConnector,
+          )
+          if (crossed) continue
+        }
+
+        const key = `live:position:${position.id}`
+        await client.setex(key, 604800, JSON.stringify(position))
       } catch (err) {
         console.warn(`${LOG_PREFIX} Error syncing ${position.id}:`, err)
       }
@@ -2454,6 +2591,30 @@ export async function recalculateAndApplySLTP(
     await updateProtectionOrders(exchangeConnector, position, "manual_recalc")
     position.updatedAt = Date.now()
     await savePosition(position)
+
+    // ── Immediate post-override cross check ────────────────────────────
+    // If the operator just tightened SL or TP to a level the position
+    // is already past, the exchange-placed reduce-only order may take
+    // a moment to fire (or be rejected outright as "trigger price
+    // already breached"). Run the same proactive close helper used by
+    // the engine loop so the position is reconciled to closed within
+    // the same call rather than waiting for the next cron tick.
+    try {
+      const markPrice = Number(position.exchangeData?.markPrice ?? 0)
+      if (markPrice > 0) {
+        await checkAndForceCloseOnSltpCross(
+          position.connectionId,
+          position,
+          markPrice,
+          exchangeConnector,
+        )
+      }
+    } catch (crossErr) {
+      console.warn(
+        `${LOG_PREFIX} post-override cross check error for ${position.id}:`,
+        crossErr instanceof Error ? crossErr.message : String(crossErr),
+      )
+    }
     return position
   } catch (err) {
     console.error(`${LOG_PREFIX} recalculateAndApplySLTP error:`, err)
