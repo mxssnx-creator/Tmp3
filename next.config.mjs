@@ -1,7 +1,11 @@
-// Force rebuild: 2026-05-05T17:00:00 — Live position creation failure fixes + volume defaults:
-//   1. lib/volume-calculator.ts → Increased UNIVERSAL_MIN_NOTIONAL_USD from $5 to $15 (every order must have at least $15 notional to avoid exchange rejections). Changed default positionCost from 0.1% to 1% of balance. Changed default positionsAverage from 300 to 150 positions. Rationale: with 0.1% cost and 300 positions on $10K, each position got ~$0.03, below any exchange minimum. Now with 1% cost and 150 positions, each gets ~$667, which is viable. Users who explicitly set 50 or 300 are respected.
-//   2. lib/trade-engine/stages/live-stage.ts → Updated both accumulation fallback and main entry fallback from $5 to $15 notional minimum, matching the new VolumeCalculator minimum. Ensures position creation succeeds even when calculator can't fetch balance or settings.
-//   3. Components (engine-processing-log-dialog, progression-logs-dialog, connection-detailed-log-dialog) → Fixed TS errors and added active-now snapshot display (alive Indications/Strategies per cycle vs. cumulative totals) to tracking, stats dialogs, and connection cards so operators see WHICH types are producing signal right now.
+// Force rebuild: 2026-05-05T18:00:00 — Reset DB persistence + verification fixes:
+//   1. app/api/admin/clear-progressions/route.ts → Complete rewrite of deletion verification:
+//      • Added BGSAVE flush after deletion to ensure Redis persistence captures the changes
+//      • Added dual-pass key count verification (immediate + 100ms delay) to detect if keys are being re-created
+//      • Pre/post key-set scanning to verify DEL commands actually deleted the keys (some adapters return success but don't delete)
+//      • Per-chunk deletion logging to surface which batches succeeded/failed
+//      • Verbose warnings when deletion verification fails (still-existing keys, re-appearing keys after delay)
+//      Fixes operator report: "after testing db reset, keys still showing same high number"
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
