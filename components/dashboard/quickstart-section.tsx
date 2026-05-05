@@ -213,6 +213,13 @@ interface LiveStats {
   pseudoOpen: number
   pseudoRunningSets: number
   realOpen: number
+  // Running average of currently-active validated Real positions,
+  // accumulated server-side across stats fetches. UNBOUNDED — unlike
+  // `stageReal.avgPosPerSet` (which is mathematically capped at the
+  // per-set 250-entry DB capacity), this is a true running mean of
+  // open Real-stage positions and can grow as deep as `realOpen` does.
+  realActivePosAvg: number
+  realActivePosSamples: number
   liveVolumeUsd: number
   // ── Active Progressing (per type / per stage) ──────────────────────
   // Three orthogonal counters fed from `activeProgressing.*` of the
@@ -283,7 +290,8 @@ const EMPTY_STATS: LiveStats = {
   },
   livePositionsOpen: 0, livePositionsCreated: 0, livePositionsClosed: 0,
   liveOrdersPlaced: 0, liveOrdersFilled: 0, liveWinRate: 0,
-  pseudoOpen: 0, pseudoRunningSets: 0, realOpen: 0, liveVolumeUsd: 0,
+  pseudoOpen: 0, pseudoRunningSets: 0, realOpen: 0,
+  realActivePosAvg: 0, realActivePosSamples: 0, liveVolumeUsd: 0,
   apIndications: {},
   apStrategies:  {},
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
@@ -523,6 +531,12 @@ export function QuickstartSection() {
         pseudoOpen:            Number(s.openPositions?.pseudo?.open)         || 0,
         pseudoRunningSets:     Number(s.openPositions?.pseudo?.runningSets)  || 0,
         realOpen:              Number(s.openPositions?.real?.open)           || 0,
+        // True running mean of active validated Real positions —
+        // unbounded, accumulated server-side across stats fetches.
+        // Used by the "Avg Real Pos" tile in place of the bounded
+        // `stageReal.avgPosPerSet` ratio (which caps at 250).
+        realActivePosAvg:      Number(s.openPositions?.real?.activeAvg)      || 0,
+        realActivePosSamples:  Number(s.openPositions?.real?.activeSamples)  || 0,
         // Active Progressing — per indication type and per strategy
         // stage. Defaults silently to empty objects so the dashboard
         // never crashes when the API hasn't shipped the new block yet
@@ -647,7 +661,7 @@ export function QuickstartSection() {
   const addLog = (msg: string, type: LogEntry["type"] = "info") =>
     setLogs(prev => [...prev, { id: Math.random().toString(), message: msg, type, timestamp: new Date() }])
 
-  // ── start / stop ���────────────────────────────────────────����─────────────────
+  // ── start / stop ���───────────────────────────────────────������─────────────────
   const handleStart = async () => {
     if (starting || isRunning) return
     setStarting(true)
@@ -1122,20 +1136,25 @@ export function QuickstartSection() {
                   : undefined
               }
             />
-            {/* Avg Real Pos — average count of validated, currently-active
-                Real-stage strategy positions. Sourced from
-                `stageReal.avgPosPerSet` (avg open positions per Real
-                set). 0 ⇒ no Real-stage activity yet, render "—". */}
+            {/* Avg Real Pos — true running mean of currently-active
+                validated Real-stage positions (unbounded). Sourced
+                from `realActivePosAvg`, NOT `stageReal.avgPosPerSet`:
+                the latter is mathematically capped at the per-set
+                250-entry DB capacity (entries/sets ≤ 250) and would
+                always be ≤ 250 even when the operator has many
+                hundreds of validated positions in flight. The new
+                source accumulates `realOpen` samples server-side
+                and is reset by ResetDB. 0 samples ⇒ render "—". */}
             <MiniStat
               label="Avg Real Pos"
               value={
-                stats.stageReal.avgPosPerSet > 0
-                  ? stats.stageReal.avgPosPerSet.toFixed(2)
+                stats.realActivePosSamples > 0 && stats.realActivePosAvg > 0
+                  ? stats.realActivePosAvg.toFixed(2)
                   : "—"
               }
               sub={
-                stats.stageReal.passed > 0
-                  ? `n=${fmt(stats.stageReal.passed)}`
+                stats.realActivePosSamples > 0
+                  ? `n=${fmt(stats.realActivePosSamples)}`
                   : undefined
               }
             />
@@ -1364,16 +1383,19 @@ export function QuickstartSection() {
                       : undefined
                   }
                 />
+                {/* See the always-visible row above for the rationale —
+                    `realActivePosAvg` is unbounded, `stageReal.avgPosPerSet`
+                    is capped at 250 by the per-set entry DB cap. */}
                 <MiniStat
                   label="Avg Real Pos"
                   value={
-                    stats.stageReal.avgPosPerSet > 0
-                      ? stats.stageReal.avgPosPerSet.toFixed(2)
+                    stats.realActivePosSamples > 0 && stats.realActivePosAvg > 0
+                      ? stats.realActivePosAvg.toFixed(2)
                       : "—"
                   }
                   sub={
-                    stats.stageReal.passed > 0
-                      ? `n=${fmt(stats.stageReal.passed)}`
+                    stats.realActivePosSamples > 0
+                      ? `n=${fmt(stats.realActivePosSamples)}`
                       : undefined
                   }
                 />

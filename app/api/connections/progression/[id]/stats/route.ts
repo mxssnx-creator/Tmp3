@@ -411,6 +411,48 @@ export async function GET(
       }
     } catch { /* non-critical */ }
 
+    // ── Running-avg of active validated Real positions ────────────────
+    // The dashboard "Avg Real Pos" tile previously sourced its value from
+    // `stageReal.avgPosPerSet` = entriesCount / createdSets. That ratio
+    // is mathematically bounded by the per-set 250-entry DB capacity:
+    // each Set holds at most 250 entries, so `entries/sets ≤ 250`. The
+    // operator wants the average count of CURRENTLY-ACTIVE validated
+    // Real positions, which has no such cap (it's bounded only by the
+    // 500-key safety ceiling on the realOpen scan above and is realistic
+    // many-hundreds-deep).
+    //
+    // We accumulate a true running average across stats fetches into the
+    // `progression:{connectionId}` hash:
+    //   * real_active_pos_sum_x100   — Σ(realOpen) × 100 (precision-preserving)
+    //   * real_active_pos_samples    — # of /stats fetches contributing
+    //   * real_active_pos_current    — last-observed snapshot for debug
+    //
+    // The UI tile reads `realActivePositions.average` below. Reset DB
+    // wipes the entire `progression:{id}` hash so these accumulators
+    // restart cleanly per run.
+    let realActivePosAverage = 0
+    let realActivePosSamples = 0
+    try {
+      // Atomic increment-and-read pattern: hincrby returns the new value,
+      // so we know the sample count and cumulative sum *post-increment*.
+      // No transaction needed — the average is approximate by design
+      // (sample rate = poll rate, drift is acceptable).
+      const progKey = `progression:${connectionId}`
+      const [newSumX100, newSamples] = await Promise.all([
+        client.hincrby(progKey, "real_active_pos_sum_x100", Math.round(realOpen * 100)),
+        client.hincrby(progKey, "real_active_pos_samples", 1),
+      ])
+      // Also write the current snapshot for ad-hoc inspection.
+      await client.hset(progKey, {
+        real_active_pos_current: String(realOpen),
+        real_active_pos_avg: (Number(newSamples) > 0 ? (Number(newSumX100) / 100) / Number(newSamples) : 0).toFixed(2),
+      })
+      realActivePosSamples = Number(newSamples) || 0
+      realActivePosAverage = realActivePosSamples > 0
+        ? (Number(newSumX100) / 100) / realActivePosSamples
+        : 0
+    } catch { /* non-critical */ }
+
     // ── Live-stage OPEN positions + Set-relation join ────────────────
     //
     // The operator asked for a coordination view that identifies which
@@ -1548,6 +1590,14 @@ export async function GET(
           },
           real: {
             open:         realOpen,                  // count only
+            // Running average of currently-active validated Real
+            // positions, accumulated across all /stats fetches for this
+            // connection. UNBOUNDED — does not share the per-set 250
+            // entry cap. See "Running-avg of active validated Real
+            // positions" block above for the storage layout. Resets
+            // when ResetDB clears `progression:{id}`.
+            activeAvg:    Math.round(realActivePosAverage * 100) / 100,
+            activeSamples: realActivePosSamples,
           },
           live: {
             open:         liveOpen,                  // count
