@@ -191,6 +191,56 @@ import { prefetchMarketDataBatch } from "./market-data-cache"
 const SYMBOL_CONCURRENCY = 16
 
 /**
+ * Per-cycle hard deadline (ms) for engine processor ticks.
+ *
+ * The engine has a strong self-scheduling design (try/catch + finally
+ * scheduleNext), but `finally` only fires when the awaited body settles.
+ * A single hung await — Redis network black-hole, exchange connector
+ * waiting on a stuck WebSocket frame, malformed promise that never
+ * resolves — would leave the tick suspended forever and the loop
+ * silently dead.
+ *
+ * `withCycleDeadline` wraps each tick's primary work in a `Promise.race`
+ * against a 30s timeout. When the deadline fires, the wrapper rejects,
+ * the rejection is caught by the tick's outer try/catch, `finally` runs,
+ * and `scheduleNext` re-arms the loop. Any in-flight promises continue
+ * to settle in the background — they just no longer block subsequent
+ * ticks.
+ */
+const CYCLE_DEADLINE_MS = 30_000
+
+function withCycleDeadline<T>(work: Promise<T>, label: string, ms: number = CYCLE_DEADLINE_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      reject(new Error(`${label} cycle deadline ${ms}ms exceeded — likely hung await`))
+    }, ms)
+    // Detach the deadline timer from the Node ref-count so it never holds
+    // the process open during shutdown — the tick's outer finally will
+    // settle and the timer fires only if the work itself wedges.
+    if (typeof (timer as any).unref === "function") {
+      try { (timer as any).unref() } catch { /* non-Node runtime */ }
+    }
+    work.then(
+      (v) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (e) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        reject(e)
+      },
+    )
+  })
+}
+
+/**
  * Run `task(item)` for each item with at most `concurrency` tasks
  * in flight at a time. Preserves input order in the result array
  * (so callers using `for (let i...)` indexing into both `symbols`
@@ -1161,7 +1211,7 @@ export class TradeEngineManager {
           }
         }
 
-        const totalIndications = indicationResults.reduce((sum, arr) => sum + (arr?.length || 0), 0)
+        const totalIndications = indicationResults.reduce((sum: number, arr: any[]) => sum + (arr?.length || 0), 0)
         producedIndications = totalIndications > 0
 
         // Increment cycle count BEFORE writing to Redis so the stored value is accurate
@@ -1263,7 +1313,7 @@ export class TradeEngineManager {
           await Promise.all(writes)
         } catch { /* non-critical */ }
 
-        const processedThisCycle = indicationResults.reduce((sum, arr) => sum + (arr?.length || 0), 0)
+        const processedThisCycle = indicationResults.reduce((sum: number, arr: any[]) => sum + (arr?.length || 0), 0)
 
         this.componentHealth.indications.lastCycleDuration = duration
         this.componentHealth.indications.cycleCount = cycleCount
@@ -1459,14 +1509,13 @@ export class TradeEngineManager {
           ),
           `Engine ${this.connectionId} strategy`,
         )
-        )
 
         const duration = Date.now() - startTime
         cycleCount++
         totalDuration += duration
 
-        const evaluatedThisCycle = strategyResults.reduce((sum, result) => sum + (result?.strategiesEvaluated || 0), 0)
-        const liveReadyThisCycle = strategyResults.reduce((sum, result) => sum + (result?.liveReady || 0), 0)
+        const evaluatedThisCycle = strategyResults.reduce((sum: number, result: any) => sum + (result?.strategiesEvaluated || 0), 0)
+        const liveReadyThisCycle = strategyResults.reduce((sum: number, result: any) => sum + (result?.liveReady || 0), 0)
         producedStrategies = evaluatedThisCycle > 0
         
         // Defensive: handle stale closures from HMR
