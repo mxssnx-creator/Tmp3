@@ -14,6 +14,11 @@ import { Progress } from "@/components/ui/progress"
 import { QuickstartComprehensiveLogDialog } from "./quickstart-comprehensive-log-dialog"
 import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
 import { EngineProgressionTestButton } from "./engine-progression-test-dialog"
+// Top-of-card controls strip — connection picker (add base connection
+// to Active panel) + Reset DB button. Lives in its own file because
+// QuickStart is already large; mounting it as a single child keeps
+// the header markup readable.
+import { QuickstartConnectionControls } from "./quickstart-connection-controls"
 import { useExchange } from "@/lib/exchange-context"
 
 // ─── types ────────────────────────────────────────────────────────────────────
@@ -731,6 +736,25 @@ export function QuickstartSection() {
     await refreshLiveTradeStatus()
   }
 
+  // ── External refresh hook ───────────────────────────────────────────────
+  // The new `QuickstartConnectionControls` strip emits a
+  // `quickstart:refresh` window event after Add-to-Active or Reset DB so
+  // QuickStart can re-fetch its derived state (volatile symbol, stats,
+  // live-trade flag) without forcing the operator to click Refresh
+  // manually. Same pattern as `connections:refresh` everywhere else.
+  useEffect(() => {
+    const handler = () => {
+      // Fire and forget — the wrapped functions all guard against
+      // concurrent calls internally.
+      void loadSymbol(true)
+      void fetchStats(true)
+      void refreshLiveTradeStatus()
+    }
+    window.addEventListener("quickstart:refresh", handler)
+    return () => window.removeEventListener("quickstart:refresh", handler)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshLiveTradeStatus])
+
   // ── live-trade toggle ─────────────────────────────────────���───────────────
   // Enables or disables real exchange trading for the active connection via
   // /api/settings/connections/[id]/live-trade. The server validates that
@@ -813,6 +837,17 @@ export function QuickstartSection() {
 
   return (
     <Card className="border-primary/20 overflow-hidden">
+      {/* ── connection picker + Reset DB strip ──────────────────────────────
+          Sits ABOVE the engine status header so the operator can:
+            • see at-a-glance which base connections are in the Active
+              panel (and add more directly without leaving QuickStart),
+            • clear runtime DB state in one click before starting a fresh
+              QuickStart run.
+          The component is self-fetching and emits `connections:refresh`
+          + `quickstart:refresh` events on success so this section's own
+          pollers (further down) pick the changes up immediately. */}
+      <QuickstartConnectionControls />
+
       {/* ── compact header bar ─────────────────────────────────────────────── */}
       <div className="flex items-center gap-2 px-3 py-2 bg-primary/5 border-b border-primary/10">
         {/* status dot + label */}

@@ -1,4 +1,4 @@
-// Force rebuild: 2026-05-03T20:00:00 — Historical block: P-Cycles → cycle×frame magnitude, Avg PF rooted at Base strategies, Real Positions tile (QuickStart + Dialog)
+// Force rebuild: 2026-05-05T12:00:00 — QuickStart top strip: base-connection picker (add to Active panel) + Reset DB button (clears progressions/sets/positions runtime state, preserves credentials)
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
