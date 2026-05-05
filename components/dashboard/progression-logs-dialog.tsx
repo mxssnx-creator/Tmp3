@@ -53,6 +53,23 @@ interface StatsShape {
     indications: { direction: number; move: number; active: number; optimal: number; auto: number; total: number }
     strategies: { base: number; main: number; real: number; live: number; total: number; baseEvaluated: number; mainEvaluated: number; realEvaluated: number }
   }
+  // ── Active-now snapshot ────────────────────────────────────────
+  // Two equivalent sources are accepted, in priority order:
+  //   1. `activeCounts.{indications,strategies}` — the fast per-cycle
+  //      accumulator written by indication-sets-processor and
+  //      strategy-coordinator (same block consumed by
+  //      `statistics-overview-v2`).
+  //   2. `activeProgressing.*.total.sets` — the explicit per-name
+  //      rollup; used as a fallback so older API revs still surface
+  //      a non-zero "alive now" number.
+  activeCounts?: {
+    indications?: { direction?: number; move?: number; active?: number; optimal?: number; total?: number }
+    strategies?:  { base?: number; main?: number; real?: number; total?: number }
+  }
+  activeProgressing?: {
+    indications?: Record<string, { sets?: number; trackings?: number; positions?: number }>
+    strategies?:  Record<string, { sets?: number; trackings?: number; positions?: number }>
+  }
   metadata: { engineRunning: boolean; phase: string; progress: number; message: string }
   // Legacy fields from /logs for trading activity
   progressionState?: {
@@ -152,6 +169,25 @@ export function ProgressionLogsDialog({
   const rt = stats?.realtime
   const h  = stats?.historic
   const bd = stats?.breakdown
+  // Active-now derived numbers — single source of truth for both the
+  // headline "Active Now" card and the inline breakdown headers. The
+  // helper falls through `activeCounts` → `activeProgressing` → 0
+  // so the dialog renders deterministically across API revs.
+  const ac = stats?.activeCounts
+  const ap = stats?.activeProgressing
+  const activeIndications = {
+    direction: Number(ac?.indications?.direction) || Number(ap?.indications?.direction?.sets) || 0,
+    move:      Number(ac?.indications?.move)      || Number(ap?.indications?.move?.sets)      || 0,
+    active:    Number(ac?.indications?.active)    || Number(ap?.indications?.active?.sets)    || 0,
+    optimal:   Number(ac?.indications?.optimal)   || Number(ap?.indications?.optimal?.sets)   || 0,
+    total:     Number(ac?.indications?.total)     || Number(ap?.indications?.total?.sets)     || 0,
+  }
+  const activeStrategies = {
+    base:  Number(ac?.strategies?.base)  || Number(ap?.strategies?.base?.sets)  || 0,
+    main:  Number(ac?.strategies?.main)  || Number(ap?.strategies?.main?.sets)  || 0,
+    real:  Number(ac?.strategies?.real)  || Number(ap?.strategies?.real?.sets)  || 0,
+    total: Number(ac?.strategies?.total) || Number(ap?.strategies?.total?.sets) || 0,
+  }
 
   // MUST stay in sync with `DEFAULT_LIMITS` in `lib/indication-sets-processor.ts`
   // and the breakdown shape returned by `/api/connections/progression/[id]/stats`.
@@ -274,6 +310,69 @@ export function ProgressionLogsDialog({
           <TabsContent value="info" className="flex-1 overflow-hidden">
             <ScrollArea className="h-full">
               <div className="space-y-4 p-4">
+                {/*
+                  Active Now — headline "alive in this cycle" tiles.
+                  Renders only when the engine is running so the card
+                  doesn't add noise to a stopped connection. Sub-line
+                  shows the cumulative-since-run-start number for
+                  context, identical pattern to the breakdown headers
+                  and to statistics-overview-v2's headline strip.
+                */}
+                {(rt?.isActive || activeIndications.total > 0 || activeStrategies.total > 0) && (
+                  <div className="rounded-lg border p-4 space-y-3 border-primary/20 bg-primary/5">
+                    <div className="flex items-center gap-2">
+                      <Activity className="w-4 h-4 text-primary" />
+                      <h3 className="font-semibold">Active Now</h3>
+                      <Badge variant="default" className="ml-auto text-[10px] h-5">LIVE</Badge>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div
+                        className="p-3 rounded-lg bg-violet-50 dark:bg-violet-950/40"
+                        title={
+                          `Indications passing thresholds this cycle: ${fmt(activeIndications.total)}\n` +
+                          `Per-type alive: D=${fmt(activeIndications.direction)} M=${fmt(activeIndications.move)} A=${fmt(activeIndications.active)} O=${fmt(activeIndications.optimal)}\n` +
+                          `Cumulative since run start: ${fmt(rt?.indicationsTotal || 0)}`
+                        }
+                      >
+                        <div className="text-2xl font-bold tabular-nums text-violet-700 dark:text-violet-400 flex items-baseline gap-1.5">
+                          {fmt(activeIndications.total)}
+                          <span className="text-[11px] font-normal text-muted-foreground">
+                            / {fmt(rt?.indicationsTotal || 0)} total
+                          </span>
+                        </div>
+                        <div className="text-xs text-muted-foreground mt-1">Indications (alive)</div>
+                        <div className="text-[10px] text-muted-foreground mt-1 tabular-nums">
+                          D {fmt(activeIndications.direction)} ·
+                          M {fmt(activeIndications.move)} ·
+                          A {fmt(activeIndications.active)} ·
+                          O {fmt(activeIndications.optimal)}
+                        </div>
+                      </div>
+                      <div
+                        className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/40"
+                        title={
+                          `Strategy Sets alive across Base + Main + Real this cycle: ${fmt(activeStrategies.total)}\n` +
+                          `Per-stage alive: B=${fmt(activeStrategies.base)} M=${fmt(activeStrategies.main)} R=${fmt(activeStrategies.real)}\n` +
+                          `Cumulative Real-stage Sets since run start: ${fmt(rt?.strategiesTotal || 0)}`
+                        }
+                      >
+                        <div className="text-2xl font-bold tabular-nums text-amber-700 dark:text-amber-400 flex items-baseline gap-1.5">
+                          {fmt(activeStrategies.total)}
+                          <span className="text-[11px] font-normal text-muted-foreground">
+                            / {fmt(rt?.strategiesTotal || 0)} total
+                          </span>
+                        </div>
+                        <div className="text-xs text-muted-foreground mt-1">Strategies (alive)</div>
+                        <div className="text-[10px] text-muted-foreground mt-1 tabular-nums">
+                          B {fmt(activeStrategies.base)} ·
+                          M {fmt(activeStrategies.main)} ·
+                          R {fmt(activeStrategies.real)}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {/* Engine Cycles — from realtime section of /stats */}
                 <div className="rounded-lg border p-4 space-y-3">
                   <div className="flex items-center gap-2">
@@ -365,8 +464,28 @@ export function ProgressionLogsDialog({
                   <div className="flex items-center gap-2">
                     <Activity className="w-4 h-4 text-violet-500" />
                     <h3 className="font-semibold">Indications by Type</h3>
-                    <span className="ml-auto text-xs text-muted-foreground">
-                      Total: {fmt(bd?.indications.total || rt?.indicationsTotal || 0)}
+                    {/*
+                      Header shows BOTH numbers so the operator sees
+                      what's alive right now (left, accent color)
+                      versus what was cumulatively seen since run
+                      start (right, muted). Same pattern as
+                      statistics-overview-v2 and engine-processing-log.
+                    */}
+                    <span
+                      className="ml-auto text-xs flex items-center gap-1.5"
+                      title={
+                        `Active now (passing thresholds this cycle): ${fmt(activeIndications.total)}\n` +
+                        `Cumulative since run start: ${fmt(bd?.indications.total || rt?.indicationsTotal || 0)}`
+                      }
+                    >
+                      <span className="text-violet-600 dark:text-violet-400 font-semibold tabular-nums">
+                        {fmt(activeIndications.total)}
+                      </span>
+                      <span className="text-muted-foreground">alive</span>
+                      <span className="text-muted-foreground">/</span>
+                      <span className="text-muted-foreground tabular-nums">
+                        {fmt(bd?.indications.total || rt?.indicationsTotal || 0)} total
+                      </span>
                     </span>
                   </div>
                   <div className="space-y-2.5">
@@ -397,8 +516,29 @@ export function ProgressionLogsDialog({
                   <div className="flex items-center gap-2">
                     <Zap className="w-4 h-4 text-amber-500" />
                     <h3 className="font-semibold">Strategies — Pipeline Stages</h3>
-                    <span className="ml-auto text-xs text-muted-foreground">
-                      Final (Real): {fmt(bd?.strategies.total || rt?.strategiesTotal || 0)}
+                    {/*
+                      Header shows alive Sets across the active stages
+                      (Base + Main + Real, summed by the engine writer
+                      itself — NOT a UI sum) versus the cumulative
+                      Real-stage output. Same paired layout as the
+                      Indications header above.
+                    */}
+                    <span
+                      className="ml-auto text-xs flex items-center gap-1.5"
+                      title={
+                        `Active Sets across stages right now: ${fmt(activeStrategies.total)}\n` +
+                        `Per-stage alive: B=${fmt(activeStrategies.base)} M=${fmt(activeStrategies.main)} R=${fmt(activeStrategies.real)}\n` +
+                        `Cumulative final-stage (Real) Sets since run start: ${fmt(bd?.strategies.total || rt?.strategiesTotal || 0)}`
+                      }
+                    >
+                      <span className="text-amber-600 dark:text-amber-400 font-semibold tabular-nums">
+                        {fmt(activeStrategies.total)}
+                      </span>
+                      <span className="text-muted-foreground">alive</span>
+                      <span className="text-muted-foreground">/</span>
+                      <span className="text-muted-foreground tabular-nums">
+                        {fmt(bd?.strategies.total || rt?.strategiesTotal || 0)} final
+                      </span>
                     </span>
                   </div>
                   <p className="text-[10px] text-muted-foreground -mt-1">

@@ -44,6 +44,21 @@ interface ConnectionMetrics {
   cpuUsage: number
   memoryUsage: number
   positionsGenerated: number
+  // ── Active-now snapshot (per cycle, NOT cumulative) ────────────
+  // Pulled from the same `/stats` `activeCounts` / `activeProgressing`
+  // blocks that drive `statistics-overview-v2`. Defaults to 0 when
+  // the engine hasn't yet emitted them so older deploys still
+  // render this dialog deterministically.
+  activeIndicationsTotal: number
+  activeStrategiesTotal:  number
+  // Per-type / per-stage breakdown for the dialog tooltip & Data tab.
+  activeIndDirection: number
+  activeIndMove:      number
+  activeIndActive:    number
+  activeIndOptimal:   number
+  activeStratBase:    number
+  activeStratMain:    number
+  activeStratReal:    number
 }
 
 interface ConnectionDetailedLogDialogProps {
@@ -63,31 +78,65 @@ export function ConnectionDetailedLogDialog({ connection }: ConnectionDetailedLo
     setIsLoading(true)
 
     try {
-      // Load progression logs
-      const logsRes = await fetch(`/api/connections/progression/${connection.id}/logs`, { cache: 'no-store' })
-      const logsData = await logsRes.json().catch(() => ({ logs: [] }))
-      
-      // Load connection metrics
-      const metricsRes = await fetch(`/api/connections/progression/${connection.id}`, { cache: 'no-store' })
+      // Load progression logs + cumulative metrics + active-now snapshot.
+      // The `/stats` endpoint is the single source of truth for the
+      // active-now counters (same one consumed by statistics-overview-v2
+      // and progression-logs-dialog), so we fetch it alongside the
+      // legacy `/progression/[id]` endpoint that supplies the
+      // cumulative totals + monitoring (cpu/memory) figures.
+      const [logsRes, metricsRes, statsRes] = await Promise.all([
+        fetch(`/api/connections/progression/${connection.id}/logs`,  { cache: 'no-store' }),
+        fetch(`/api/connections/progression/${connection.id}`,       { cache: 'no-store' }),
+        fetch(`/api/connections/progression/${connection.id}/stats`, { cache: 'no-store' }),
+      ])
+      const logsData    = await logsRes.json().catch(()    => ({ logs: [] }))
       const metricsData = await metricsRes.json().catch(() => ({}))
+      const statsData   = await statsRes.json().catch(()   => ({}))
+
+      // Active-now: prefer fast `activeCounts`, fall back to
+      // `activeProgressing.*.total.sets` for older API revs that emit
+      // only the per-name rollup. Non-finite values normalize to 0.
+      const ac = statsData?.activeCounts
+      const ap = statsData?.activeProgressing
+      const activeIndDirection = Number(ac?.indications?.direction) || Number(ap?.indications?.direction?.sets) || 0
+      const activeIndMove      = Number(ac?.indications?.move)      || Number(ap?.indications?.move?.sets)      || 0
+      const activeIndActive    = Number(ac?.indications?.active)    || Number(ap?.indications?.active?.sets)    || 0
+      const activeIndOptimal   = Number(ac?.indications?.optimal)   || Number(ap?.indications?.optimal?.sets)   || 0
+      const activeIndTotal     = Number(ac?.indications?.total)     || Number(ap?.indications?.total?.sets)
+                              || (activeIndDirection + activeIndMove + activeIndActive + activeIndOptimal)
+      const activeStratBase    = Number(ac?.strategies?.base)       || Number(ap?.strategies?.base?.sets)       || 0
+      const activeStratMain    = Number(ac?.strategies?.main)       || Number(ap?.strategies?.main?.sets)       || 0
+      const activeStratReal    = Number(ac?.strategies?.real)       || Number(ap?.strategies?.real?.sets)       || 0
+      const activeStratTotal   = Number(ac?.strategies?.total)      || Number(ap?.strategies?.total?.sets)
+                              || (activeStratBase + activeStratMain + activeStratReal)
 
       setMetrics({
         cyclesCompleted: metricsData.state?.cyclesCompleted || metricsData.progressionState?.cyclesCompleted || 0,
         cycleSuccessRate: metricsData.state?.cycleSuccessRate || metricsData.progressionState?.cycleSuccessRate || 0,
         averageCycleTime: metricsData.metrics?.cycleTimeMs || metricsData.progressionState?.cycleTimeMs || 0,
         indicationsTotal: metricsData.state?.indicationsCount || metricsData.progressionState?.indicationsCount || 
-                          metricsData.metrics?.indicationsCount || 0,
+                          metricsData.metrics?.indicationsCount
+                          || Number(statsData?.realtime?.indicationsTotal) || 0,
         // Canonical "strategies evaluated" = Real-stage count only.
         // Base → Main → Real is a cascade filter of the SAME strategies;
         // summing the three evaluated counters would multi-count them.
         strategiesEvaluated: metricsData.metrics?.totalStrategiesEvaluated
                           || metricsData.progressionState?.strategyEvaluatedReal
-                          || 0,
+                          || Number(statsData?.realtime?.strategiesTotal) || 0,
         prehistoricCandles: metricsData.metrics?.prehistoricCandlesProcessed || metricsData.progressionState?.prehistoricCandlesProcessed || 0,
         symbolsLoaded: metricsData.metrics?.prehistoricSymbolsProcessed || metricsData.progressionState?.prehistoricSymbolsProcessedCount || 0,
         cpuUsage: metricsData.monitoring?.cpu || 0,
         memoryUsage: metricsData.monitoring?.memory || 0,
         positionsGenerated: metricsData.metrics?.intervalsProcessed || metricsData.progressionState?.intervalsProcessed || 0,
+        activeIndicationsTotal: activeIndTotal,
+        activeStrategiesTotal:  activeStratTotal,
+        activeIndDirection,
+        activeIndMove,
+        activeIndActive,
+        activeIndOptimal,
+        activeStratBase,
+        activeStratMain,
+        activeStratReal,
       })
 
       setLogs(logsData.logs?.slice(-200) || [])
@@ -193,9 +242,31 @@ export function ConnectionDetailedLogDialog({ connection }: ConnectionDetailedLo
                 <div className="text-xl font-bold text-emerald-600">{metrics?.cycleSuccessRate?.toFixed(1) || 0}%</div>
                 <Progress value={metrics?.cycleSuccessRate || 0} className="h-1 bg-emerald-100" />
               </Card>
-              <Card className="p-3 space-y-1">
-                <div className="text-xs text-slate-500">Indications</div>
-                <div className="text-xl font-bold text-blue-600">{metrics?.indicationsTotal || 0}</div>
+              {/*
+                Indications tile = active-now headline + cumulative
+                subtext. Tooltip carries the full per-type breakdown
+                (Direction / Move / Active / Optimal) so the operator
+                can see WHICH type is producing signal without
+                expanding the Data tab.
+              */}
+              <Card
+                className="p-3 space-y-1"
+                title={
+                  `Active now (passing thresholds this cycle): ${metrics?.activeIndicationsTotal || 0}\n` +
+                  `Per-type alive: D=${metrics?.activeIndDirection || 0} ` +
+                  `M=${metrics?.activeIndMove || 0} ` +
+                  `A=${metrics?.activeIndActive || 0} ` +
+                  `O=${metrics?.activeIndOptimal || 0}\n` +
+                  `Cumulative since run start: ${metrics?.indicationsTotal || 0}`
+                }
+              >
+                <div className="text-xs text-slate-500">Indications (alive)</div>
+                <div className="text-xl font-bold text-violet-600 tabular-nums flex items-baseline gap-1">
+                  {metrics?.activeIndicationsTotal || 0}
+                  <span className="text-[10px] font-normal text-slate-500">
+                    / {metrics?.indicationsTotal || 0}
+                  </span>
+                </div>
               </Card>
               <Card className="p-3 space-y-1">
                 <div className="text-xs text-slate-500">Avg Cycle Time</div>
@@ -288,18 +359,54 @@ export function ConnectionDetailedLogDialog({ connection }: ConnectionDetailedLo
                   <div className="flex justify-between"><span className="text-slate-500">Symbols Loaded</span><span>{metrics?.symbolsLoaded || 0}</span></div>
                 </div>
               </Card>
+              {/*
+                Indications & Strategies cards now show BOTH the
+                cumulative total (since run start) AND the active-now
+                snapshot (alive in the current cycle). The active row
+                is split per-type / per-stage so the operator can see
+                WHICH type is producing signal and WHICH stage is
+                carrying live Sets without leaving the Data tab.
+              */}
               <Card className="p-3 space-y-2">
                 <h5 className="text-xs font-semibold text-slate-700">Indications</h5>
                 <div className="text-xs space-y-1">
-                  <div className="flex justify-between"><span className="text-slate-500">Total Generated</span><span>{metrics?.indicationsTotal || 0}</span></div>
-                  <div className="flex justify-between"><span className="text-slate-500">Types Active</span><span>5</span></div>
+                  <div className="flex justify-between"><span className="text-slate-500">Total Generated</span><span className="tabular-nums">{metrics?.indicationsTotal || 0}</span></div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Active Now</span>
+                    <span className="tabular-nums font-semibold text-violet-700">
+                      {metrics?.activeIndicationsTotal || 0}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-[10px] text-slate-500">
+                    <span>D / M / A / O</span>
+                    <span className="tabular-nums">
+                      {metrics?.activeIndDirection || 0} ·
+                      {metrics?.activeIndMove || 0} ·
+                      {metrics?.activeIndActive || 0} ·
+                      {metrics?.activeIndOptimal || 0}
+                    </span>
+                  </div>
                 </div>
               </Card>
               <Card className="p-3 space-y-2">
                 <h5 className="text-xs font-semibold text-slate-700">Strategies</h5>
                 <div className="text-xs space-y-1">
-                  <div className="flex justify-between"><span className="text-slate-500">Evaluated</span><span>{metrics?.strategiesEvaluated || 0}</span></div>
-                  <div className="flex justify-between"><span className="text-slate-500">Positions Generated</span><span>{metrics?.positionsGenerated || 0}</span></div>
+                  <div className="flex justify-between"><span className="text-slate-500">Evaluated</span><span className="tabular-nums">{metrics?.strategiesEvaluated || 0}</span></div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Active Now</span>
+                    <span className="tabular-nums font-semibold text-amber-700">
+                      {metrics?.activeStrategiesTotal || 0}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-[10px] text-slate-500">
+                    <span>B / M / R</span>
+                    <span className="tabular-nums">
+                      {metrics?.activeStratBase || 0} ·
+                      {metrics?.activeStratMain || 0} ·
+                      {metrics?.activeStratReal || 0}
+                    </span>
+                  </div>
+                  <div className="flex justify-between"><span className="text-slate-500">Positions Generated</span><span className="tabular-nums">{metrics?.positionsGenerated || 0}</span></div>
                 </div>
               </Card>
             </div>

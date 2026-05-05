@@ -39,6 +39,16 @@ interface ProcessingStats {
     isActive: boolean
     cycleTimeMs: number
     successRate: number
+    // ── ACTIVE-NOW (per cycle) ─────────────────────────────────────
+    // Snapshot counts read from the engine's per-cycle "alive now"
+    // accumulators (`activeCounts.{indications,strategies}.total`).
+    // The dialog renders these as the headline numbers and the
+    // cumulative totals above as the smaller subscript — matching the
+    // pattern already used by `statistics-overview-v2`. Defaults to 0
+    // when the server hasn't emitted the block yet so older API revs
+    // keep rendering deterministically.
+    activeIndTotal: number
+    activeStratTotal: number
   }
   performance: {
     avgCycleTimeMs: number
@@ -110,6 +120,24 @@ export function EngineProcessingLogDialog({ connectionId: propConnectionId }: { 
       const cycleTimeMs       = s.realtime?.avgCycleTimeMs   || 0
       const hasErrors         = s.metadata?.phase === "error"
 
+      // ── Active-now snapshot ──────────────────────────────────────
+      // Two equivalent sources are tried, in order:
+      //   1. `activeCounts` — the per-cycle accumulator written by
+      //      indication-sets-processor + strategy-coordinator. Same
+      //      block consumed by `statistics-overview-v2`.
+      //   2. `activeProgressing.*.total.sets` — the explicit per-name
+      //      rollup populated by the unified active-progressing route.
+      //      Used as a fallback so older deploys (which only emit
+      //      `activeProgressing`) still surface non-zero numbers.
+      const activeIndTotal =
+        Number(s.activeCounts?.indications?.total) ||
+        Number(s.activeProgressing?.indications?.total?.sets) ||
+        0
+      const activeStratTotal =
+        Number(s.activeCounts?.strategies?.total) ||
+        Number(s.activeProgressing?.strategies?.total?.sets) ||
+        0
+
       const newStats: ProcessingStats = {
         historic: {
           symbolsLoaded:   historicSymbols,
@@ -125,6 +153,8 @@ export function EngineProcessingLogDialog({ connectionId: propConnectionId }: { 
           realtimeCycles,
           indicationsTotal,
           strategiesTotal,
+          activeIndTotal,
+          activeStratTotal,
           positionsOpen,
           isActive,
           cycleTimeMs,
@@ -325,21 +355,47 @@ export function EngineProcessingLogDialog({ connectionId: propConnectionId }: { 
                       {stats.realtime.isActive ? "RUNNING" : "IDLE"}
                     </Badge>
                   </div>
+                  {/*
+                    Headline = active-now sets ("alive in this cycle"),
+                    sub-line = cumulative-since-run-start. Hover tooltips
+                    spell out both numbers so the operator never has to
+                    guess which one is which. Mirrors the layout used by
+                    statistics-overview-v2 so the two surfaces line up
+                    when an operator pivots between them.
+                  */}
                   <div className="grid grid-cols-4 gap-2 text-center text-xs">
                     <div className="bg-green-50 dark:bg-green-950/30 rounded p-2">
-                      <div className="font-semibold">{fmt(stats.realtime.indicationCycles)}</div>
+                      <div className="font-semibold tabular-nums">{fmt(stats.realtime.indicationCycles)}</div>
                       <div className="text-muted-foreground">Ind. Cycles</div>
                     </div>
-                    <div className="bg-green-50 dark:bg-green-950/30 rounded p-2">
-                      <div className="font-semibold">{fmt(stats.realtime.indicationsTotal)}</div>
-                      <div className="text-muted-foreground">Indications</div>
+                    <div
+                      className="bg-green-50 dark:bg-green-950/30 rounded p-2"
+                      title={
+                        `Indications currently alive (passing thresholds this cycle): ${fmt(stats.realtime.activeIndTotal)}\n` +
+                        `Cumulative indications since run start: ${fmt(stats.realtime.indicationsTotal)}`
+                      }
+                    >
+                      <div className="font-semibold tabular-nums text-violet-700 dark:text-violet-300 flex items-baseline justify-center gap-1">
+                        {fmt(stats.realtime.activeIndTotal)}
+                        <span className="text-[9px] font-normal text-muted-foreground">/ {fmt(stats.realtime.indicationsTotal)}</span>
+                      </div>
+                      <div className="text-muted-foreground">Indications (alive)</div>
+                    </div>
+                    <div
+                      className="bg-green-50 dark:bg-green-950/30 rounded p-2"
+                      title={
+                        `Strategy Sets currently alive across stages (Base + Main + Real): ${fmt(stats.realtime.activeStratTotal)}\n` +
+                        `Cumulative Sets since run start: ${fmt(stats.realtime.strategiesTotal)}`
+                      }
+                    >
+                      <div className="font-semibold tabular-nums text-amber-700 dark:text-amber-300 flex items-baseline justify-center gap-1">
+                        {fmt(stats.realtime.activeStratTotal)}
+                        <span className="text-[9px] font-normal text-muted-foreground">/ {fmt(stats.realtime.strategiesTotal)}</span>
+                      </div>
+                      <div className="text-muted-foreground">Strategies (alive)</div>
                     </div>
                     <div className="bg-green-50 dark:bg-green-950/30 rounded p-2">
-                      <div className="font-semibold">{fmt(stats.realtime.strategiesTotal)}</div>
-                      <div className="text-muted-foreground">Strategies</div>
-                    </div>
-                    <div className="bg-green-50 dark:bg-green-950/30 rounded p-2">
-                      <div className="font-semibold">{stats.realtime.positionsOpen}</div>
+                      <div className="font-semibold tabular-nums">{stats.realtime.positionsOpen}</div>
                       <div className="text-muted-foreground">Positions</div>
                     </div>
                   </div>
