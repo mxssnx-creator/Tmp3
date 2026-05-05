@@ -1,4 +1,4 @@
-// Force rebuild: 2026-05-05T14:30:00 — Avg Real Pos tile now reads `realActivePosAvg` (true unbounded running mean of currently-active validated Real positions, accumulated server-side via realOpen samples in progression:{id}). Replaces the bounded `stageReal.avgPosPerSet` (mathematically capped at the per-set 250-entry DB capacity). Overview Dialog Real Positions tile fixed (was reading non-existent `.positions` field, silently rendered 0; canonical is `.open`) and now surfaces the running average in its sub-line.
+// Force rebuild: 2026-05-05T15:00:00 — QuickStart unique-progression-per-connection: every Start now stops any already-running engine for THIS connection first (coordinator.stopEngine), wipes stale `prehistoric:{id}.is_complete` markers + `progression:{id}.real_active_pos_*` running-avg accumulators, then restarts cleanly so the new symbol selection actually applies. Auto-pick fallbacks (public top-symbols + connector) honour `requestedCount` end-to-end (was hardcoded 1 → produced "1/1" overview even when the user picked 2).
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
