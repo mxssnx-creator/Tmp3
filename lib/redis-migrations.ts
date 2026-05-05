@@ -839,51 +839,106 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     const { apiKey, apiSecret } = getBaseConnectionCredentials(cfg.credentialId)
     const hasRealCredentials = apiKey.length > 10 && apiSecret.length > 10
 
-    const updateData: Record<string, string> = {
-      id: cfg.id,
-      name: (existing?.name as string) || cfg.name,
-      exchange: (existing?.exchange as string) || cfg.exchange,
-      is_predefined: "0",
-      is_inserted: (existing?.is_inserted as string) || "1",
-      is_dashboard_inserted: (existing?.is_dashboard_inserted as string) || "1",
-      is_active_inserted: cfg.autoActive ? "1" : ((existing?.is_active_inserted as string) || "0"),
-      // Base connections are enabled in Settings by default.
-      is_enabled: (existing?.is_enabled as string) || "1",
-      // Dashboard (Main) toggle: preserve any prior operator choice
-      // (the slider is the authoritative gate per
-      // `lib/trade-engine-auto-start.ts`). Only when this is the FIRST
-      // run for the connection AND `autoActive=true` do we default the
-      // toggle ON — so Bybit/BingX engines auto-start on a fresh DB
-      // without the operator hunting for the slider. After that, this
-      // expression's `||` fallback short-circuits on the existing value
-      // and the user's choice is honoured indefinitely.
-      is_enabled_dashboard:
-        (existing?.is_enabled_dashboard as string) ||
-        (cfg.autoActive ? "1" : "0"),
-      is_active: (existing?.is_active as string) || (cfg.autoActive ? "1" : "0"),
-      connection_method: (existing?.connection_method as string) || "library",
-      connection_library: (existing?.connection_library as string) || "native",
-      api_type: (existing?.api_type as string) || "perpetual_futures",
-      updated_at: now,
-      created_at: (existing?.created_at as string) || now,
+    // ── OPERATOR-STATE PRESERVATION CONTRACT ──────────────────────────
+    // Bug being fixed (operator report): "after removing main connections,
+    // it's getting re-added by some procedure".
+    //
+    // Root cause: previous version unconditionally set
+    //   is_active_inserted: cfg.autoActive ? "1" : ...
+    // for autoActive base connections (bybit-x03, bingx-x01). Every
+    // cold-start (or any code path that calls `initRedis` followed by
+    // `runMigrations` — which is essentially every Vercel function
+    // invocation) re-flipped the flag back to "1", undoing the
+    // operator's explicit DELETE on `/api/settings/connections/[id]/active`.
+    //
+    // Same class of bug applies to is_inserted, is_dashboard_inserted,
+    // is_enabled, is_enabled_dashboard, is_active — the previous code
+    // used `(existing || default)` patterns which mostly worked for
+    // string "0" (truthy in JS), but the autoActive override branch did
+    // not, AND the structural fields (api_type, connection_method, etc)
+    // could clobber operator-chosen values via the `||` fallback.
+    //
+    // New contract for EXISTING connections:
+    //   * STRUCTURAL fields  → kept as-is (id, name, exchange,
+    //                          api_type, connection_method, etc).
+    //                          Migrations 015-018 are the canonical
+    //                          place for one-time structural rewrites;
+    //                          this ensure-pass is a SAFETY NET, not a
+    //                          schema enforcer.
+    //   * OPERATOR FLAG fields (is_inserted, is_active_inserted,
+    //                          is_dashboard_inserted, is_enabled,
+    //                          is_enabled_dashboard, is_active) →
+    //                          NEVER touched. The operator's last
+    //                          choice via the dashboard wins.
+    //   * CREDENTIALS         → injected from env when available, even
+    //                          on existing rows (so credential rotation
+    //                          via env var works without re-saving).
+    //   * `updated_at`        → bumped only when credentials actually
+    //                          changed, so we don't generate spurious
+    //                          dashboard "connection updated" toasts on
+    //                          every cold-start.
+    //
+    // For BRAND-NEW connections (no existing row in Redis): seed every
+    // field with the canonical defaults — that's the only time we get
+    // to choose. The `autoActive` hint controls the initial insertion +
+    // dashboard-enable defaults so a fresh DB still surfaces Bybit/BingX
+    // ready to go.
+
+    if (!hasExisting) {
+      // First-time seed. Apply full canonical defaults.
+      const seedData: Record<string, string> = {
+        id: cfg.id,
+        name: cfg.name,
+        exchange: cfg.exchange,
+        is_predefined: "0",
+        is_inserted: "1",
+        is_dashboard_inserted: cfg.autoActive ? "1" : "0",
+        is_active_inserted: cfg.autoActive ? "1" : "0",
+        is_enabled: "1",
+        is_enabled_dashboard: cfg.autoActive ? "1" : "0",
+        is_active: cfg.autoActive ? "1" : "0",
+        connection_method: "library",
+        connection_library: "native",
+        api_type: "perpetual_futures",
+        api_key: hasRealCredentials ? apiKey : "",
+        api_secret: hasRealCredentials ? apiSecret : "",
+        created_at: now,
+        updated_at: now,
+      }
+      await client.hset(`connection:${cfg.id}`, seedData)
+      await client.sadd("connections", cfg.id)
+      if (hasRealCredentials) credentialsInjected++
+      createdOrUpdated++
+      continue
     }
+
+    // Existing connection: PRESERVE every operator-controlled field.
+    // The only values we touch are:
+    //   1. Credentials (rotate from env when available).
+    //   2. The connection-set membership (in case a manual SREM ever
+    //      desyncs the index from the hash — defensive only).
+    const updates: Record<string, string> = {}
+    let didChange = false
 
     if (hasRealCredentials) {
-      updateData.api_key = apiKey
-      updateData.api_secret = apiSecret
-      credentialsInjected++
-    } else if (!hasExisting) {
-      updateData.api_key = ""
-      updateData.api_secret = ""
-    } else {
-      // Preserve previously stored credentials if env vars are not present.
-      updateData.api_key = (existing?.api_key as string) || ""
-      updateData.api_secret = (existing?.api_secret as string) || ""
+      const existingApiKey = (existing.api_key as string) || ""
+      const existingApiSecret = (existing.api_secret as string) || ""
+      if (existingApiKey !== apiKey || existingApiSecret !== apiSecret) {
+        updates.api_key = apiKey
+        updates.api_secret = apiSecret
+        updates.updated_at = now
+        didChange = true
+        credentialsInjected++
+      }
     }
 
-    await client.hset(`connection:${cfg.id}`, updateData)
+    if (Object.keys(updates).length > 0) {
+      await client.hset(`connection:${cfg.id}`, updates)
+    }
+    // Always re-assert index membership; HSET above doesn't manage it.
     await client.sadd("connections", cfg.id)
-    createdOrUpdated++
+
+    if (didChange) createdOrUpdated++
   }
 
   // ── Bootstrap the global engine status ────────────────────────────
