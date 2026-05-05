@@ -1,4 +1,4 @@
-// Force rebuild: 2026-05-05T12:00:00 — QuickStart top strip: base-connection picker (add to Active panel) + Reset DB button (clears progressions/sets/positions runtime state, preserves credentials)
+// Force rebuild: 2026-05-05T12:30:00 — Engine fan-out: bounded parallelism (mapWithConcurrency cap=16) on indication+strategy ticks + per-symbol error counters (indication_symbol_errors:* / strategy_symbol_errors:*) so partial-coverage failures are visible instead of silently swallowed
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {

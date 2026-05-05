@@ -166,6 +166,74 @@ import { engineMonitor } from "@/lib/engine-performance-monitor"
 import { ConfigSetProcessor } from "./config-set-processor"
 import { prefetchMarketDataBatch } from "./market-data-cache"
 
+/**
+ * Per-symbol fan-out concurrency cap.
+ *
+ * `Promise.all(symbols.map(...))` is conceptually parallel but practically
+ * unbounded: at 50+ symbols every per-symbol task fires simultaneously,
+ * each performing several Redis reads + indicator math + (sometimes)
+ * a market-data refetch. The cumulative pressure can:
+ *   • saturate the Redis client's pipeline depth → tail latency spikes
+ *   • starve the Node event loop while indicator math runs → other
+ *     timers (heartbeat, /api requests, watchdog) drift
+ *   • cause the per-cycle deadline to fire even though no single task
+ *     was hung — the whole batch was just queued behind itself
+ *
+ * Capping concurrency at 16 keeps p99 cycle latency stable across watchlist
+ * sizes from 1 to a few hundred symbols. The cap is intentionally
+ * larger than typical symbol counts (most operators run 1–25) so the
+ * common case still runs fully in parallel; the cap only kicks in for
+ * heavy workloads where it provides real protection.
+ *
+ * If a future operator runs hundreds of symbols and the cap becomes the
+ * bottleneck, expose this as a setting — but don't remove the cap.
+ */
+const SYMBOL_CONCURRENCY = 16
+
+/**
+ * Run `task(item)` for each item with at most `concurrency` tasks
+ * in flight at a time. Preserves input order in the result array
+ * (so callers using `for (let i...)` indexing into both `symbols`
+ * and the result array remain correct).
+ *
+ * Failures inside `task` should be caught by the task itself and
+ * mapped to a sentinel value — this helper does NOT swallow rejections,
+ * because losing track of an erroring symbol is exactly the bug we're
+ * fixing. The existing call sites already wrap with `.catch(...)`.
+ */
+async function mapWithConcurrency<TIn, TOut>(
+  items: readonly TIn[],
+  concurrency: number,
+  task: (item: TIn, index: number) => Promise<TOut>,
+): Promise<TOut[]> {
+  if (items.length === 0) return []
+  // Fast path: when the list fits inside the cap there's no benefit to
+  // the worker-pool overhead — defer to plain Promise.all.
+  if (items.length <= concurrency) {
+    return Promise.all(items.map((item, index) => task(item, index)))
+  }
+
+  const results = new Array<TOut>(items.length)
+  let nextIndex = 0
+  // Worker draining a shared cursor. Each worker pulls the next index,
+  // awaits the task, stores the result at the original position, and
+  // loops until the cursor is exhausted. This is the classic
+  // bounded-parallelism pattern (no third-party dependency, no Symbol
+  // iterator overhead, deterministic ordering).
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const i = nextIndex++
+      if (i >= items.length) return
+      results[i] = await task(items[i], i)
+    }
+  }
+  const workers: Promise<void>[] = []
+  const poolSize = Math.min(concurrency, items.length)
+  for (let i = 0; i < poolSize; i++) workers.push(worker())
+  await Promise.all(workers)
+  return results
+}
+
 export interface EngineConfig {
   connectionId: string
   connection_name?: string
@@ -1053,14 +1121,30 @@ export class TradeEngineManager {
         // Batch-prefetch all symbols' market data in one Redis pipeline pass
         await prefetchMarketDataBatch(symbols).catch(() => { /* non-critical */ })
 
-        // Process indications for every symbol in parallel.
-        const indicationResults = await Promise.all(
-          symbols.map((symbol) =>
+        // Process indications for every symbol in parallel — but with a
+        // hard concurrency cap (`SYMBOL_CONCURRENCY`) so dense watchlists
+        // don't saturate the Redis pipeline or starve the event loop.
+        // Wrapped in `withCycleDeadline` so a single hung await inside
+        // any `processIndication` call (Redis stall / network black-hole)
+        // can never wedge the loop — the deadline fires, the tick falls
+        // through to `finally`, and `scheduleNext` re-arms.
+        //
+        // Per-symbol failures are converted into an empty-indications
+        // sentinel AND an entry in `failedSymbols` so we can surface
+        // partial-coverage telemetry (operator-visible Redis counter +
+        // progression-event ledger) instead of silently swallowing it.
+        const failedSymbols: { symbol: string; error: string }[] = []
+        const indicationResults = await withCycleDeadline(
+          mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, (symbol) =>
             this.indicationProcessor.processIndication(symbol).catch((err) => {
-              console.error(`[v0] [IndicationProcessor] Error for ${symbol}:`, err instanceof Error ? err.message : String(err))
+              const msg = err instanceof Error ? err.message : String(err)
+              failedSymbols.push({ symbol, error: msg })
+              console.error(`[v0] [IndicationProcessor] Error for ${symbol}:`, msg)
               return [] as any[]
-            })
-          )
+            }),
+          ),
+          `Engine ${this.connectionId} indication`,
+        )
         )
 
         // Comprehensive indication logging with per-type breakdown
@@ -1143,6 +1227,39 @@ export class TradeEngineManager {
               writes.push(client.hincrby(redisKey, `indications_${type}_count`, count))
             }
             writes.push(client.hincrby(redisKey, "indications_count", totalIndications))
+          }
+          // ── Per-symbol error visibility ────────────────────────────────
+          // Without this, a chronically-failing symbol (bad ticker,
+          // delisted pair, persistent connector error) would have its
+          // errors swallowed by the per-task `.catch` and the dashboard
+          // would report green. We track:
+          //   * indication_symbol_errors_count           — cumulative
+          //   * indication_symbol_errors_last_cycle      — this tick
+          //   * indication_symbol_errors:<SYMBOL>        — per-symbol counter
+          //   * indication_symbol_last_error:<SYMBOL>    — most recent message
+          // The dashboard's "partial coverage" badge can read these to
+          // surface a list of failing symbols immediately.
+          if (failedSymbols.length > 0) {
+            writes.push(
+              client.hincrby(redisKey, "indication_symbol_errors_count", failedSymbols.length),
+            )
+            writes.push(
+              client.hset(redisKey, {
+                indication_symbol_errors_last_cycle: String(failedSymbols.length),
+                indication_symbol_errors_last_at: new Date().toISOString(),
+              }),
+            )
+            for (const { symbol, error } of failedSymbols) {
+              writes.push(client.hincrby(redisKey, `indication_symbol_errors:${symbol}`, 1))
+              // Truncate error message to a sane length so a noisy stack
+              // trace can't bloat the progression hash.
+              const safeMsg = error.slice(0, 240)
+              writes.push(
+                client.hset(redisKey, {
+                  [`indication_symbol_last_error:${symbol}`]: safeMsg,
+                }),
+              )
+            }
           }
           await Promise.all(writes)
         } catch { /* non-critical */ }
@@ -1320,10 +1437,29 @@ export class TradeEngineManager {
 
       try {
         const symbols = await this.getSymbols()
-        const strategyResults = await Promise.all(
-          symbols.map((symbol) =>
-            this.strategyProcessor.processStrategy(symbol).catch(() => ({ strategiesEvaluated: 0, liveReady: 0 }))
-          )
+        // Per-cycle deadline — see `withCycleDeadline` rationale at the
+        // top of this file. Guards against a single hung
+        // `processStrategy(symbol)` blocking the entire strategy loop.
+        // Bounded fan-out (`mapWithConcurrency`) caps in-flight tasks at
+        // SYMBOL_CONCURRENCY so dense watchlists don't saturate Redis or
+        // stall the event loop.
+        //
+        // Per-symbol errors are now tracked (previously silently
+        // swallowed): the rejection is recorded, a sentinel returned so
+        // counts stay correct, and the failing symbol is logged so the
+        // operator can see a chronic per-symbol breakage.
+        const strategyFailedSymbols: { symbol: string; error: string }[] = []
+        const strategyResults = await withCycleDeadline(
+          mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, (symbol) =>
+            this.strategyProcessor.processStrategy(symbol).catch((err) => {
+              const msg = err instanceof Error ? err.message : String(err)
+              strategyFailedSymbols.push({ symbol, error: msg })
+              console.error(`[v0] [StrategyProcessor] Error for ${symbol}:`, msg)
+              return { strategiesEvaluated: 0, liveReady: 0 }
+            }),
+          ),
+          `Engine ${this.connectionId} strategy`,
+        )
         )
 
         const duration = Date.now() - startTime
@@ -1376,15 +1512,45 @@ export class TradeEngineManager {
         try {
           const client = getRedisClient()
           const redisKey = `progression:${this.connectionId}`
-          // Cycle counters (per-processor + cross-processor frame total).
-          await client.hincrby(redisKey, "strategy_cycle_count", 1)
-          await client.hincrby(redisKey, "frames_processed", 1)
+          // Fan-out cycle counters in parallel — same atomic-counter
+          // pattern as the indication tick. Replacing the previous
+          // sequential awaits saves multiple RTTs per cycle and lets us
+          // include the per-symbol error fields in the same batch.
+          const writes: Promise<any>[] = [
+            client.hincrby(redisKey, "strategy_cycle_count", 1),
+            client.hincrby(redisKey, "frames_processed", 1),
+            client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle)),
+            client.expire(redisKey, 7 * 24 * 60 * 60),
+          ]
           if (evaluatedThisCycle > 0) {
-            await client.hincrby(redisKey, "strategy_live_cycle_count", 1)
-            await client.hincrby(redisKey, "strategies_count", evaluatedThisCycle)
+            writes.push(client.hincrby(redisKey, "strategy_live_cycle_count", 1))
+            writes.push(client.hincrby(redisKey, "strategies_count", evaluatedThisCycle))
           }
-          await client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle))
-          await client.expire(redisKey, 7 * 24 * 60 * 60)
+          // ── Per-symbol error visibility ────────────────────────────────
+          // Mirrors the indication tick. Without this a chronically-
+          // failing symbol's strategy errors would be silently swallowed
+          // by the per-task `.catch` and the dashboard would show green.
+          if (strategyFailedSymbols.length > 0) {
+            writes.push(
+              client.hincrby(redisKey, "strategy_symbol_errors_count", strategyFailedSymbols.length),
+            )
+            writes.push(
+              client.hset(redisKey, {
+                strategy_symbol_errors_last_cycle: String(strategyFailedSymbols.length),
+                strategy_symbol_errors_last_at: new Date().toISOString(),
+              }),
+            )
+            for (const { symbol, error } of strategyFailedSymbols) {
+              writes.push(client.hincrby(redisKey, `strategy_symbol_errors:${symbol}`, 1))
+              const safeMsg = error.slice(0, 240)
+              writes.push(
+                client.hset(redisKey, {
+                  [`strategy_symbol_last_error:${symbol}`]: safeMsg,
+                }),
+              )
+            }
+          }
+          await Promise.all(writes)
         } catch { /* non-critical */ }
 
         // Only count productive strategy cycles toward cycles_completed
