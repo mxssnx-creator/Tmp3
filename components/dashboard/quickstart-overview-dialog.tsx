@@ -38,14 +38,27 @@ interface StratDetail {
 }
 
 interface StatsResponse {
+  // The /stats endpoint actually returns a much richer historic block
+  // than originally typed here. Adding the missing fields as optional
+  // so the JSX below compiles and the older callers keep working.
   historic: {
     symbolsProcessed: number; symbolsTotal: number; candlesLoaded: number
     indicatorsCalculated: number; cyclesCompleted: number; isComplete: boolean; progressPercent: number
+    framesProcessed?: number
+    timeframeSeconds?: number
+    executedPositions?: number
+    livePositionsOpen?: number
   }
   realtime: {
     indicationCycles: number; strategyCycles: number; realtimeCycles: number
     indicationsTotal: number; strategiesTotal: number; positionsOpen: number
     isActive: boolean; successRate: number; avgCycleTimeMs: number
+  }
+  // Snapshot of currently-open positions across stages. Optional —
+  // older API revs returned only the realtime aggregate.
+  openPositions?: {
+    real?: { open: number; total?: number }
+    live?: { open: number; total?: number }
   }
   breakdown: {
     indications: { direction: number; move: number; active: number; optimal: number; auto: number; total: number }
@@ -189,7 +202,9 @@ export function QuickstartOverviewDialog() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null)
   const [expandedLog, setExpandedLog] = useState<number | null>(null)
-  const pollRef = useRef<NodeJS.Timeout>()
+  // Newer `@types/react` rejects `useRef<T>()` with no args — pass an
+  // explicit `undefined` initial value so the call shape is unambiguous.
+  const pollRef = useRef<NodeJS.Timeout | undefined>(undefined)
 
   const load = useCallback(async (silent = false) => {
     if (!connectionId) return
