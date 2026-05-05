@@ -643,11 +643,11 @@ export function QuickstartSection() {
     return () => clearInterval(livePollRef.current)
   }, [expanded])
 
-  // ── log helper ─────────────────────────────────────────────────────────────
+  // ── log helper ──────────────────────────────────────���──────────────────────
   const addLog = (msg: string, type: LogEntry["type"] = "info") =>
     setLogs(prev => [...prev, { id: Math.random().toString(), message: msg, type, timestamp: new Date() }])
 
-  // ── start / stop ���────────────────────────────────────────���─────────────────
+  // ── start / stop ���────────────────────────────────────────����─────────────────
   const handleStart = async () => {
     if (starting || isRunning) return
     setStarting(true)
@@ -1151,11 +1151,36 @@ export function QuickstartSection() {
           </div>
         </div>
 
-        {/* ── live processing row (always visible, AFTER historical) ───── */}
+        {/* ── live processing row (always visible, AFTER historical) ─────
+              Indications / Strategies tiles now show the count of
+              ACTIVELY-PROCESSING Sets — the headline operator metric for
+              "what's alive RIGHT NOW" — instead of the cumulative
+              `indicationsTotal` / `strategiesTotal` counters that grew
+              forever even when the engine was idle. The cumulative
+              total is preserved as the `sub` so it's still visible in
+              one glance. Source = `apIndications.total.sets` and
+              `apStrategies.total.sets` from `activeProgressing.*` of
+              the /stats response. */}
         <div className="flex flex-wrap gap-1.5">
           <MiniStat label="Ind Cycles"   value={fmt(stats.indicationCycles)}  />
-          <MiniStat label="Indications"  value={fmt(stats.indicationsTotal)}   />
-          <MiniStat label="Strategies"   value={fmt(stats.strategiesTotal)}    />
+          <MiniStat
+            label="Indications"
+            value={fmt(stats.apIndications?.total?.sets ?? 0)}
+            sub={
+              stats.indicationsTotal > 0
+                ? `${fmt(stats.indicationsTotal)} total`
+                : "active sets"
+            }
+          />
+          <MiniStat
+            label="Strategies"
+            value={fmt(stats.apStrategies?.total?.sets ?? 0)}
+            sub={
+              stats.strategiesTotal > 0
+                ? `${fmt(stats.strategiesTotal)} total`
+                : "active sets"
+            }
+          />
           <MiniStat label="Positions"    value={fmt(stats.positionsOpen)}      />
           {/* Live positions — real exchange positions mirrored by the live engine.
               Always shown (even at 0) so users can see the counter spin up. */}
@@ -1379,8 +1404,28 @@ export function QuickstartSection() {
                 {stats.realtimeCycles > 0 && (
                   <MiniStat label="RT Cycles" value={fmt(stats.realtimeCycles)} />
                 )}
-                <MiniStat label="Indications" value={fmt(stats.indicationsTotal)} sub={stats.indicationCycles > 0 ? `${(stats.indicationsTotal / Math.max(stats.indicationCycles, 1)).toFixed(1)}/cyc` : undefined} />
-                <MiniStat label="Strategies"  value={fmt(stats.strategiesTotal)}  sub={stats.strategyCycles > 0 ? `${(stats.strategiesTotal / Math.max(stats.strategyCycles, 1)).toFixed(1)}/cyc` : undefined} />
+                {/* Active processing Sets — see note in the compact row.
+                    Sub shows cumulative-per-cycle ratio so the operator
+                    can still see the throughput rate (which is what
+                    the previous total/cycle ratio expressed). */}
+                <MiniStat
+                  label="Indications"
+                  value={fmt(stats.apIndications?.total?.sets ?? 0)}
+                  sub={
+                    stats.indicationCycles > 0 && stats.indicationsTotal > 0
+                      ? `${(stats.indicationsTotal / Math.max(stats.indicationCycles, 1)).toFixed(1)}/cyc`
+                      : "active sets"
+                  }
+                />
+                <MiniStat
+                  label="Strategies"
+                  value={fmt(stats.apStrategies?.total?.sets ?? 0)}
+                  sub={
+                    stats.strategyCycles > 0 && stats.strategiesTotal > 0
+                      ? `${(stats.strategiesTotal / Math.max(stats.strategyCycles, 1)).toFixed(1)}/cyc`
+                      : "active sets"
+                  }
+                />
               </div>
             </div>
 

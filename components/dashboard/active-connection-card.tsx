@@ -420,8 +420,25 @@ export function ActiveConnectionCard({
             data.realtime?.strategyCycles ||
             data.strategyCycleCount ||
             0,
-          indications:      data.realtime?.indicationsTotal  || data.totalIndicationsCount || 0,
-          strategies:       data.realtime?.strategiesTotal   || data.totalStrategyCount    || 0,
+          // ── Indications / Strategies — actively processing Sets ───────
+          // Operators want the "Ind." / "Strat." counters on the live
+          // card to reflect what's processing RIGHT NOW (Sets currently
+          // producing qualified entries on the latest cycle), not the
+          // cumulative `indicationsTotal` / `strategiesTotal` which
+          // only ever grew. Source = `activeProgressing.{indications|
+          // strategies}.total.sets`. Falls back to the legacy
+          // cumulative counters when the new field is absent (older
+          // API revs).
+          indications:
+            data.activeProgressing?.indications?.total?.sets ??
+            data.realtime?.indicationsTotal ??
+            data.totalIndicationsCount ??
+            0,
+          strategies:
+            data.activeProgressing?.strategies?.total?.sets ??
+            data.realtime?.strategiesTotal ??
+            data.totalStrategyCount ??
+            0,
           positions:        data.realtime?.positionsOpen     || data.positionsCount        || 0,
         })
 
