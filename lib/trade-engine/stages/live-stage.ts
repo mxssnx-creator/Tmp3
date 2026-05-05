@@ -390,7 +390,10 @@ async function accumulateIntoLivePosition(
 
     let addQty = volumeResult?.finalVolume || volumeResult?.volume || 0
     if (addQty <= 0 || !Number.isFinite(addQty)) {
-      const FALLBACK_NOTIONAL_USD = 5
+      // Fallback when volume calc fails: use $15 minimum notional.
+      // Matches the universal $15 floor in VolumeCalculator so any
+      // position is executable even in worst-case scenarios.
+      const FALLBACK_NOTIONAL_USD = 15
       addQty = currentPrice > 0 ? FALLBACK_NOTIONAL_USD / currentPrice : 0
     }
     if (addQty <= 0) {
@@ -1338,11 +1341,13 @@ export async function executeLivePosition(
     let computedVolume = volumeResult?.finalVolume || volumeResult?.volume || 0
     let volumeNote = ""
     if (computedVolume <= 0 || !Number.isFinite(computedVolume)) {
-      // Synthesize at $5 notional / currentPrice so the order still has a
-      // valid size. Any subsequent exchange-side rejection (e.g. a venue
-      // requiring a higher minimum) will then come back from the connector
-      // with a real error, not from us pre-emptively dropping the signal.
-      const FALLBACK_NOTIONAL_USD = 5
+      // Synthesize at $15 notional (the universal floor from
+      // VolumeCalculator) to ensure every order has a reasonable size.
+      // At $5 fallback with 300 positions on a $10K balance, orders
+      // would be ~0.0008 BTC, below most exchange minimums and leading to
+      // constant order rejections. $15 ensures at least a few cents worth
+      // of the quote asset per position.
+      const FALLBACK_NOTIONAL_USD = 15
       computedVolume = currentPrice > 0
         ? FALLBACK_NOTIONAL_USD / currentPrice
         : 0
