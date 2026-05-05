@@ -430,12 +430,18 @@ export function EngineProgressionTestDialog({ trigger, autoRun = true }: DialogP
 
     // ── P3: enable with 1 symbol ─────────────────────────────────────
     const p3 = await run(2, async () => {
+      // Use `symbolCount` (an explicit number) instead of the legacy
+      // `symbols: 1` ambiguity. The route accepted only string arrays
+      // for `symbols` and crashed with "symbols.join is not a function"
+      // when it received a number, which is why P3 failed every run.
+      // The route now also normalizes both shapes defensively, but the
+      // client should still send the right one.
       const r = await jsonFetch(
         "/api/trade-engine/quick-start",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "enable", symbols: 1 }),
+          body: JSON.stringify({ action: "enable", symbolCount: 1 }),
         },
       )
       if (!r.ok || !r.body?.success) {

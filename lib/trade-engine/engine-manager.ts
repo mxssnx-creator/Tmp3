@@ -1145,7 +1145,6 @@ export class TradeEngineManager {
           ),
           `Engine ${this.connectionId} indication`,
         )
-        )
 
         // Comprehensive indication logging with per-type breakdown
         const indicationTypeCounts: Record<string, number> = {}

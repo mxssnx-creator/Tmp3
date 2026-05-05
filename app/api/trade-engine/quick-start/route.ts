@@ -247,7 +247,51 @@ export async function POST(request: Request) {
     
     // Step 2: Get symbols (single most-volatile symbol for quickstart)
     console.log(`${LOG_PREFIX}: [2/4] Configuring symbol...`)
-    let symbols: string[] = body.symbols || []
+
+    // ── Defensive symbols normalization ─────────────────────────────────
+    // Earlier this route did `let symbols: string[] = body.symbols || []`,
+    // which silently assigned a non-array value (number, string, anything)
+    // to a variable typed as `string[]`. Two consequences:
+    //   - `symbols.length` was `undefined` for a number, skipping the
+    //     auto-pick branch
+    //   - `symbols.join(", ")` crashed with "join is not a function"
+    //     and the surrounding try/catch returned a generic 500.
+    // The Engine Progression Test sent `{ action: "enable", symbols: 1 }`
+    // (intending "1 auto-picked symbol") and tripped this every run.
+    //
+    // Normalize early — accept all three legitimate shapes:
+    //   • Array of strings → use directly (after string-only filter)
+    //   • Single non-empty string → wrap into [string]
+    //   • Number / anything else → ignore, fall through to auto-pick
+    //
+    // `body.symbolCount` is the explicit, typed way to request "N
+    // auto-picked symbols". An explicit array on `body.symbols` always
+    // wins over `symbolCount`.
+    const rawSymbols = body.symbols
+    let symbols: string[] = []
+    if (Array.isArray(rawSymbols)) {
+      symbols = rawSymbols.filter(
+        (s: unknown): s is string => typeof s === "string" && s.length > 0,
+      )
+    } else if (typeof rawSymbols === "string" && rawSymbols.length > 0) {
+      symbols = [rawSymbols]
+    }
+    // requestedCount controls the eventual auto-pick count when no
+    // explicit symbols are provided. Quickstart still picks 1 today,
+    // but we accept `body.symbolCount` so a future caller can request N
+    // without forcing array construction. Bound to [1, 50] to defend
+    // against accidental absurd values.
+    let requestedCount = 1
+    if (typeof rawSymbols === "number" && Number.isFinite(rawSymbols) && rawSymbols > 0) {
+      requestedCount = Math.max(1, Math.min(50, Math.floor(rawSymbols)))
+    } else if (
+      typeof body.symbolCount === "number" &&
+      Number.isFinite(body.symbolCount) &&
+      body.symbolCount > 0
+    ) {
+      requestedCount = Math.max(1, Math.min(50, Math.floor(body.symbolCount)))
+    }
+    void requestedCount // reserved for multi-symbol auto-pick (future)
 
     // PRIMARY: fetch most volatile symbol from public exchange API (no auth required)
     if (symbols.length === 0) {
