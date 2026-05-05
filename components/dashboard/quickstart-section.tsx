@@ -362,9 +362,12 @@ export function QuickstartSection() {
   const [liveSummary, setLiveSummary] = useState<ExchangeLiveSummary | null>(null)
 
   const logsEndRef = useRef<HTMLDivElement>(null)
-  const pollRef    = useRef<NodeJS.Timeout>()
-  const configPollRef = useRef<NodeJS.Timeout>()
-  const livePollRef   = useRef<NodeJS.Timeout>()
+  // `useRef<T>()` with no argument is rejected by stricter `@types/react`
+  // versions ("Expected 1 arguments, but got 0"). Pass an explicit
+  // `undefined` initial value so the call shape is unambiguous.
+  const pollRef       = useRef<NodeJS.Timeout | undefined>(undefined)
+  const configPollRef = useRef<NodeJS.Timeout | undefined>(undefined)
+  const livePollRef   = useRef<NodeJS.Timeout | undefined>(undefined)
 
   // ── fetch live stats ──────────────────────────────────────────────────────
   const fetchStats = useCallback(async (silent = false) => {

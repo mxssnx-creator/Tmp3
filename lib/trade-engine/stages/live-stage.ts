@@ -410,7 +410,7 @@ async function accumulateIntoLivePosition(
           "market",
           { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
         ),
-      (r) => !!r?.success && !!(r.orderId || r.id),
+      (r: any) => !!r?.success && !!(r.orderId || r.id),
       "accumulatePlaceOrder",
     )
 
@@ -1156,7 +1156,7 @@ export async function executeLivePosition(
   }
 
   try {
-    // ── Step 1: Pre-flight validation ──────────────────────────────────────
+    // ── Step 1: Pre-flight validation ───────────────��──────────────────────
     if (!realPosition.direction || !realPosition.symbol) {
       livePosition.status = "rejected"
       livePosition.statusReason = `Invalid inputs: symbol=${realPosition.symbol}, direction=${realPosition.direction}`
@@ -1434,7 +1434,7 @@ export async function executeLivePosition(
           positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
         },
       ),
-      r => !!r?.success && !!(r.orderId || r.id),
+      (r: any) => !!r?.success && !!(r.orderId || r.id),
       "placeOrder"
     )
 
