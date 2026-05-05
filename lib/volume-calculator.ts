@@ -42,7 +42,17 @@ export class VolumeCalculator {
    * Bitget). Applied AFTER any per-pair `exchangeMinVolume` so a known
    * larger minimum (e.g. some altcoin pairs require $10) still wins.
    */
-  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 5
+  /**
+   * Universal minimum notional value in USD.
+   * Every live order must have at least this value to avoid hitting
+   * exchange minimums that prevent execution. This was increased
+   * from $5 to $15 to account for 300-position mode: with a $10K
+   * balance and 0.1% cost split across 300 positions, we'd get
+   * ~$0.03/position, which is below most exchange minimums. The
+   * $15 floor ensures even in worst-case defaults, every position
+   * is executable.
+   */
+  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 15
 
   /**
    * Calculate position volume with risk management (pure math, no DB).
@@ -179,19 +189,28 @@ export class VolumeCalculator {
       // bundle (cleanup schedule, backup toggles) — so the operator's
       // saved leverage/cost never reached volume calculations.
       const settings = (await getAppSettings()) || {}
+      // Default position cost: 1% of balance per position.
+      // Previously 0.1%, which with 300 positions on a $10K balance
+      // meant each position got only $0.03 — below any exchange minimum.
+      // The 1% default ensures $100/position with $10K balance and
+      // 300 positions ($100 * 300 = $30K total exposure if all live
+      // simultaneously, but that's rare; typical ops have 5-10 live).
       const positionCostPercent = parseFloat(
-        String(settings.exchangePositionCost ?? settings.positionCost ?? "0.1")
+        String(settings.exchangePositionCost ?? settings.positionCost ?? "1.0")
       )
       const positionCost = positionCostPercent / 100
 
-      // Read `positions_average` so the positionCost path divides the
-      // global budget across the expected concurrent-position count.
-      // Default 300 mirrors components/settings/utils.ts; the prior
-      // default (50) is still honoured for users who explicitly chose
-      // that value because we read whatever's in app_settings as-is.
+      // Default: 150 positions instead of 300. Balances the goal
+      // ("prevent too much capital in any one trade") with the reality
+      // ("with small defaults for cost%, volume becomes tiny"). The 50
+      // → 300 increase was intended to lower per-position sizing, but
+      // at default 0.1% cost it went TOO low. 150 is a reasonable middle
+      // ground: with 1% cost on $10K, each position gets $667 ($1M /
+      // 150), which is safe. The old 50-position default still works if
+      // the operator explicitly set it.
       const positionsAverage = (() => {
-        const raw = parseFloat(String(settings.positions_average ?? "300"))
-        return Number.isFinite(raw) && raw > 0 ? raw : 300
+        const raw = parseFloat(String(settings.positions_average ?? "150"))
+        return Number.isFinite(raw) && raw > 0 ? raw : 150
       })()
 
       const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))
