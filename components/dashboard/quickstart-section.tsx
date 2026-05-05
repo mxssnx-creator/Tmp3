@@ -644,7 +644,7 @@ export function QuickstartSection() {
   const addLog = (msg: string, type: LogEntry["type"] = "info") =>
     setLogs(prev => [...prev, { id: Math.random().toString(), message: msg, type, timestamp: new Date() }])
 
-  // ── start / stop ─────────────────────────────────────────��─────────────────
+  // ── start / stop ���────────────────────────────────────────��─────────────────
   const handleStart = async () => {
     if (starting || isRunning) return
     setStarting(true)
@@ -735,25 +735,13 @@ export function QuickstartSection() {
     await fetchStats(true)
     await refreshLiveTradeStatus()
   }
-
-  // ── External refresh hook ───────────────────────────────────────────────
-  // The new `QuickstartConnectionControls` strip emits a
-  // `quickstart:refresh` window event after Add-to-Active or Reset DB so
-  // QuickStart can re-fetch its derived state (volatile symbol, stats,
-  // live-trade flag) without forcing the operator to click Refresh
-  // manually. Same pattern as `connections:refresh` everywhere else.
-  useEffect(() => {
-    const handler = () => {
-      // Fire and forget — the wrapped functions all guard against
-      // concurrent calls internally.
-      void loadSymbol(true)
-      void fetchStats(true)
-      void refreshLiveTradeStatus()
-    }
-    window.addEventListener("quickstart:refresh", handler)
-    return () => window.removeEventListener("quickstart:refresh", handler)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshLiveTradeStatus])
+  // NOTE: the `quickstart:refresh` window-event listener that re-runs
+  // loadSymbol/fetchStats/refreshLiveTradeStatus lives further down,
+  // immediately after `refreshLiveTradeStatus` is declared — a previous
+  // version placed it here and crashed with a TDZ error
+  // ("Cannot access 'refreshLiveTradeStatus' before initialization")
+  // because the dependency array is evaluated synchronously during
+  // render, before the `useCallback` further down has executed.
 
   // ── live-trade toggle ─────────────────────────────────────���───────────────
   // Enables or disables real exchange trading for the active connection via
@@ -816,6 +804,27 @@ export function QuickstartSection() {
   useEffect(() => {
     refreshLiveTradeStatus()
   }, [refreshLiveTradeStatus])
+
+  // ── External `quickstart:refresh` listener ─────────────────────────────
+  // The `QuickstartConnectionControls` strip (mounted at the top of the
+  // card) dispatches a `quickstart:refresh` window event after the
+  // operator adds a base connection or runs Reset DB, so this section
+  // re-fetches volatile-symbol pick, stats, and live-trade flag without
+  // requiring a manual Refresh click. Placed after `refreshLiveTradeStatus`
+  // is declared to avoid the TDZ crash mentioned above.
+  useEffect(() => {
+    const handler = () => {
+      // Fire and forget — each wrapped function guards against
+      // concurrent invocations internally (`loadSymbol` has a ref-based
+      // guard, `fetchStats` is debounced, and `refreshLiveTradeStatus`
+      // is idempotent).
+      void loadSymbol(true)
+      void fetchStats(true)
+      void refreshLiveTradeStatus()
+    }
+    window.addEventListener("quickstart:refresh", handler)
+    return () => window.removeEventListener("quickstart:refresh", handler)
+  }, [loadSymbol, fetchStats, refreshLiveTradeStatus])
 
   const logColor = (type: string) => {
     switch (type) {
