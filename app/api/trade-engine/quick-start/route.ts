@@ -291,21 +291,31 @@ export async function POST(request: Request) {
     ) {
       requestedCount = Math.max(1, Math.min(50, Math.floor(body.symbolCount)))
     }
-    void requestedCount // reserved for multi-symbol auto-pick (future)
+    // The auto-pick branches honour `requestedCount` so a caller that
+    // posts `{ symbolCount: 2 }` (or `symbols: 2`) gets two symbols, not
+    // one. Previously both fallback paths were hard-coded to 1, which
+    // is what caused the dashboard to display "1/1" even when the
+    // user-facing slot picker advertised two symbols.
 
-    // PRIMARY: fetch most volatile symbol from public exchange API (no auth required)
+    // PRIMARY: fetch most volatile symbol(s) from public exchange API (no auth required)
     if (symbols.length === 0) {
       try {
         const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"
         const topRes = await fetch(
-          `${baseUrl}/api/exchange/${exchangeName}/top-symbols?t=${Date.now()}`,
+          `${baseUrl}/api/exchange/${exchangeName}/top-symbols?limit=${requestedCount}&t=${Date.now()}`,
           { signal: AbortSignal.timeout(5000), cache: "no-store" }
         )
         if (topRes.ok) {
           const topData = await topRes.json()
-          if (topData.symbol) {
-            symbols = [topData.symbol]
-            console.log(`${LOG_PREFIX}: [2/4] Most volatile symbol from public API: ${topData.symbol} (${(topData.priceChangePercent || 0).toFixed(2)}%)`)
+          // Prefer the new `symbolList` (string[]) when N>1; fall back to
+          // the single `symbol` for the limit=1 fast-path. The endpoint
+          // already returns `symbolList` for every response.
+          const list: string[] = Array.isArray(topData.symbolList) && topData.symbolList.length > 0
+            ? topData.symbolList.filter((s: unknown): s is string => typeof s === "string" && s.length > 0).slice(0, requestedCount)
+            : (topData.symbol ? [topData.symbol] : [])
+          if (list.length > 0) {
+            symbols = list
+            console.log(`${LOG_PREFIX}: [2/4] Top ${list.length}/${requestedCount} symbol(s) from public API: ${list.join(", ")} (top: ${(topData.priceChangePercent || 0).toFixed(2)}%)`)
           }
         }
       } catch (e) {
@@ -322,10 +332,10 @@ export async function POST(request: Request) {
           isTestnet: false,
         })
         if (typeof connector.getTopSymbols === "function") {
-          const topSymbols = await connector.getTopSymbols(1)
+          const topSymbols = await connector.getTopSymbols(requestedCount)
           if (topSymbols && topSymbols.length > 0) {
-            symbols = topSymbols
-            console.log(`${LOG_PREFIX}: [2/4] Top symbol from exchange connector: ${symbols.join(", ")}`)
+            symbols = topSymbols.slice(0, requestedCount)
+            console.log(`${LOG_PREFIX}: [2/4] Top ${symbols.length}/${requestedCount} symbol(s) from exchange connector: ${symbols.join(", ")}`)
           }
         }
       } catch {
@@ -426,6 +436,85 @@ export async function POST(request: Request) {
       try {
         // ALWAYS start global coordinator - ensures all workers and progression systems are active
         const coordinator = getGlobalTradeEngineCoordinator()
+
+        // ── End any already-running progression for THIS connection ─────
+        // Operator requirement: "ensure unique progressions for Connection,
+        // end running progression before starting active one." A running
+        // engine that started with N symbols caches its symbol list for
+        // ~5s and then re-reads — but its prehistoric phase has already
+        // emitted `prehistoric:{id}.symbols_total = OLD_N` and won't
+        // re-run, so the dashboard shows "1/1" forever even though we
+        // just wrote `symbols_total = NEW_N`. Plus `progression:{id}`
+        // accumulators (cycle counters, running averages) keep being
+        // appended to from the OLD run, producing the "stats jumping
+        // between values" the operator reported.
+        //
+        // Fix: if the engine is already running for this connection,
+        // stop it cleanly first, wipe per-connection accumulator hashes
+        // so the new run starts from zero, then proceed to startEngine
+        // below. The coordinator's `Map<connectionId, manager>` already
+        // guarantees uniqueness — this just makes the user-facing
+        // "click Start to apply new symbols" flow actually apply them.
+        try {
+          const wasRunning = coordinator.isEngineRunning(connectionId)
+          if (wasRunning) {
+            console.log(`${LOG_PREFIX}: Connection ${connectionId} already running — stopping for clean re-start with new symbols`)
+            await logProgressionEvent(connectionId, "quickstart_engine_restart", "info",
+              "Stopping running engine to re-start with current symbol selection",
+              { previousState: "running", newSymbols: symbols, newSymbolCount: symbols.length },
+            )
+            await coordinator.stopEngine(connectionId)
+          }
+          // Wipe progression-accumulator fields and stale prehistoric
+          // completion markers whether or not the engine was running —
+          // both can carry forward "1/1" / running-avg values from a
+          // previous QuickStart attempt. We do NOT `del` the whole
+          // `prehistoric:{id}` hash here because the route already
+          // wrote `symbols_total: <new>` to it at Step 3 (line 391-398
+          // above); a `del` now would erase that and leave the new
+          // engine to re-init from scratch.
+          //
+          // Cleared (per-connection only — does NOT touch
+          // `progression:{otherId}` or any global state):
+          //   * `prehistoric:{id}.is_complete / completed_at /
+          //      symbols_processed / candles_loaded /
+          //      indicators_calculated / total_duration_ms`
+          //     — the previous run's "done" markers; the new
+          //       prehistoric phase rewrites them all on success.
+          //   * `prehistoric:{id}:done` flag — re-emitted by the new
+          //     prehistoric phase.
+          //   * `progression:{id}.real_active_pos_*` — running-avg of
+          //     active Real positions; resetting prevents the new
+          //     run's tile from inheriting the old run's mean.
+          //   * `progression:{id}.prehistoric_*` — legacy mirror fields.
+          await Promise.allSettled([
+            client.del(`prehistoric:${connectionId}:done`),
+            client.hdel(`prehistoric:${connectionId}`,
+              "is_complete",
+              "completed_at",
+              "symbols_processed",
+              "candles_loaded",
+              "indicators_calculated",
+              "total_duration_ms",
+            ).catch(() => 0),
+            client.hdel(`progression:${connectionId}`,
+              "real_active_pos_sum_x100",
+              "real_active_pos_samples",
+              "real_active_pos_current",
+              "real_active_pos_avg",
+              "prehistoric_symbols_processed_count",
+              "prehistoric_candles_processed",
+              "prehistoric_cycles_completed",
+              "prehistoric_phase_active",
+            ).catch(() => 0),
+          ])
+        } catch (restartErr) {
+          // Don't fail the whole quickstart on a stop/cleanup hiccup —
+          // the new engine start below will still work; worst case the
+          // dashboard briefly shows transitional values.
+          console.warn(`${LOG_PREFIX}: Pre-start cleanup warning:`, restartErr)
+        }
+
         await coordinator.startAll()
         await coordinator.refreshEngines()
         
