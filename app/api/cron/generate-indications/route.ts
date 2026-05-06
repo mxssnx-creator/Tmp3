@@ -100,7 +100,7 @@ async function getMarketDataForSymbol(symbol: string, client: any): Promise<{
  * Fetch real price from BingX public API as fallback for market data
  */
 async function fetchLivePriceFromExchange(symbol: string): Promise<{
-  close: number; open: number; high: number; low: number
+  close: number; open: number; high: number; low: number; volume?: number
 } | null> {
   try {
     // BingX public ticker endpoint — no auth required
