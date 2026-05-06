@@ -237,9 +237,9 @@ export function ConnectionCard({
             baseVolumeFactor: 1.0,
             liveTradeVolumeFactor: data.liveTradeVolumeFactor || 1.0,
             presetTradeVolumeFactor: data.presetTradeVolumeFactor || 1.0,
-            profitFactorBase: data.profitFactorBase || 0.6,
-            profitFactorMain: data.profitFactorMain || 0.6,
-            profitFactorReal: data.profitFactorReal || 0.6,
+            profitFactorBase: data.profitFactorBase || 0.7,
+            profitFactorMain: data.profitFactorMain || 0.8,
+            profitFactorReal: data.profitFactorReal || 0.9,
             maxDrawdownTime: data.maxDrawdownTime || 12,
             presetType: data.presetType || "momentum",
             strategyStates: {

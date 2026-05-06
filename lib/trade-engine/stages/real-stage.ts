@@ -65,11 +65,13 @@ export async function evaluateToRealPositions(
   const client = getRedisClient()
   const realPositions: RealPosition[] = []
 
-  const minScore = config?.minEvaluationScore || 0.65
+  const minScore = config?.minEvaluationScore || 0.7
   const maxRisk = config?.maxAccountRiskPerTrade || 0.02
   const minProfit = config?.minProfitabilityRatio || 2
-  const minSuccess = config?.minSuccessRate || 0.55
-  const minConsist = config?.minConsistency || 0.6
+  // Main stage: 0.8 (strict bar for entry to main pipeline)
+  const minSuccess = config?.minSuccessRate || 0.8
+  // Real (Live) stage: 0.9 (highest bar for actual live trading positions)
+  const minConsist = config?.minConsistency || 0.9
 
   console.log(
     `${LOG_PREFIX} Evaluating ${mainPositions.length} main positions to real trading positions`
