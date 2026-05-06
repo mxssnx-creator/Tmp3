@@ -1,11 +1,17 @@
-// Force rebuild: 2026-05-05T18:00:00 — Reset DB persistence + verification fixes:
-//   1. app/api/admin/clear-progressions/route.ts → Complete rewrite of deletion verification:
-//      • Added BGSAVE flush after deletion to ensure Redis persistence captures the changes
-//      • Added dual-pass key count verification (immediate + 100ms delay) to detect if keys are being re-created
-//      • Pre/post key-set scanning to verify DEL commands actually deleted the keys (some adapters return success but don't delete)
-//      • Per-chunk deletion logging to surface which batches succeeded/failed
-//      • Verbose warnings when deletion verification fails (still-existing keys, re-appearing keys after delay)
-//      Fixes operator report: "after testing db reset, keys still showing same high number"
+// Force rebuild: 2026-05-05T19:30:00 — Fixed staling/jumping stats (root cause: multiple counter writers):
+//   1. app/api/cron/generate-indications/route.ts → Removed indications_count and strategies_count writes
+//      • Cron was writing to progression hash counters, conflicting with realtime engine-manager writes
+//      • Separated stage-specific counters (base/main/real/total) but removed canonical counter writes
+//      Result: Cron now only tracks stage-specific variants, not aggregate counters
+//   2. lib/trade-engine/config-set-processor.ts → Isolated prehistoric from realtime counters
+//      • Changed from incrementing shared indications_count/strategies_count to prehistoric-specific keys
+//      • Now writes to prehistoric_indications_total and prehistoric_strategies_total instead
+//      Result: Prehistoric data load doesn't bleed into realtime counting
+//   3. Consolidated counter sources:
+//      • engine-manager is NOW the single authoritative source for indications_count and strategies_count
+//      • config-set-processor writes to separate prehistoric namespace (reference only)
+//      • cron/generate-indications writes to stage-specific keys (base/main/real) not canonical counter
+//   Result: Stats no longer jump or stale - single source of truth per counter, no race conditions
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {

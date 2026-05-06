@@ -328,10 +328,16 @@ export class ConfigSetProcessor {
         totalStrategyPositions += strategyPositions
 
         // Fan-out the counter writes & completion marker.
+        // NOTE: Track prehistoric stats separately so they don't bleed into
+        // realtime counts. The `indications_count` and `strategies_count` are
+        // realtime-authoritative (written by engine-manager). Prehistoric phase
+        // writes to separate `prehistoric_indications_total` and
+        // `prehistoric_strategies_total` keys. This prevents the "jumped counters"
+        // effect when transitioning from setup to live trading.
         await Promise.all([
           progressWrite,
-          client.hincrby(progressKey, "indications_count", indicationResults),
-          client.hincrby(progressKey, "strategies_base_total", strategyPositions),
+          client.hincrby(progressKey, "prehistoric_indications_total", indicationResults),
+          client.hincrby(progressKey, "prehistoric_strategies_total", strategyPositions),
           client.expire(progressKey, 7 * 24 * 60 * 60),
           client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol),
           client.expire(`prehistoric:${this.connectionId}:symbols`, 86400),
