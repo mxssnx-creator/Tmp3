@@ -1151,7 +1151,9 @@ export function ActiveConnectionCard({
                     {/* Indications breakdown */}
                     {prehistoricStats && prehistoricStats.indicationsTotal > 0 && (
                       <div className="space-y-0.5">
-                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Indications ({prehistoricStats.indicationsTotal.toLocaleString()})</div>
+                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">
+                          Indications Evaluated ({prehistoricStats.indicationsTotal.toLocaleString()})
+                        </div>
                         <div className="grid grid-cols-5 gap-1">
                           {[
                             { label: "Dir", value: prehistoricStats.indicationsDirection },
@@ -1188,7 +1190,9 @@ export function ActiveConnectionCard({
                       prehistoricStats.avgProfitFactorReal > 0
                     ) && (
                       <div className="space-y-1">
-                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Strategy Sets</div>
+                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">
+                          Strategy Sets with Open Positions
+                        </div>
                         {/* Stage rows: Base → Main → Real → Live (exchange-side outcomes) */}
                         {[
                           {

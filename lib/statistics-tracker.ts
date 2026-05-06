@@ -26,6 +26,11 @@ export async function trackIndicationStats(
   // Track in Redis using counters (not unbounded sets) for dashboard counts.
   // Fan out all writes concurrently so we don't pay 9 sequential Redis
   // round-trips for every indication result.
+  //
+  // NOTE: Do NOT increment progression hash counters here.
+  // Processors (engine-manager, config-set-processor) already write aggregate
+  // counts to progression:{connectionId}:indications_count on their cycle completion.
+  // Tracking per-indication here would double-count (statement-level vs. aggregate-level).
   try {
     await initRedis()
     const client = getRedisClient()
@@ -33,7 +38,6 @@ export async function trackIndicationStats(
     const typeCountKey = `indications:${connectionId}:${indicationType}:count`
     const totalCountKey = `indications:${connectionId}:count`
     const latestKey = `indications:${connectionId}:${indicationType}:latest`
-    const progKey = `progression:${connectionId}`
 
     await Promise.all([
       client.incr(typeCountKey),
@@ -42,9 +46,6 @@ export async function trackIndicationStats(
       client.expire(totalCountKey, 86400),
       client.set(latestKey, JSON.stringify({ symbol, value, confidence, timestamp: Date.now() })),
       client.expire(latestKey, 3600),
-      client.hincrby(progKey, `indications_${indicationType}_count`, 1),
-      client.hincrby(progKey, "indications_count", 1),
-      client.expire(progKey, 7 * 24 * 60 * 60),
     ])
   } catch (e) {
     console.error(`[v0] [Stats] Failed to track indication in Redis:`, e instanceof Error ? e.message : String(e))
