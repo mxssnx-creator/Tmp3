@@ -32,7 +32,7 @@ export async function GET() {
     for (const connection of activeConnections) {
       for (const symbol of SYMBOLS) {
         try {
-          const marketData = await getMarketData(symbol)
+          const marketData = await getMarketData(symbol, "1m")
           if (!marketData) continue
           
           const close = parseFloat(marketData?.close || marketData?.c || "0")

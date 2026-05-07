@@ -439,10 +439,10 @@ const initialSettings: Settings = {
   maxActiveBasePseudoPositionsPerDirection: 1,
   maxPositionsLong: 1, // Max 1 long position per configuration
   maxPositionsShort: 1, // Max 1 short position per configuration
-    indicationTimeoutMs: 1000, // 100ms to 3000ms, step 100ms, default 1000ms
-    maxConcurrentOperations: 100, // 10-250, default 100
-    cyclePauseMs: 50, // 10-200ms, step 10, default 50ms — pause between engine cycles
-    prehistoric_range_hours: 8, // 1-50h, step 1, default 8h — look-back window for prehistoric calc
+  indicationTimeoutMs: 1000, // 100ms to 3000ms, step 100ms, default 1000ms
+  maxConcurrentOperations: 100, // 10-250, default 100
+  cyclePauseMs: 50, // 10-200ms, step 10, default 50ms — pause between engine cycles
+  prehistoric_range_hours: 8, // 1-50h, step 1, default 8h — look-back window for prehistoric calc
 
   // System Configuration
   autoRestartOnErrors: true,
