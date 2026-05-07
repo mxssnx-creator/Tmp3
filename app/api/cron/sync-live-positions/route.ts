@@ -30,10 +30,9 @@ export async function GET() {
   // stacking two reconcile passes on top of each other. TTL = 55s so a
   // crashed run never permanently blocks the cron.
   const LOCK_KEY = "cron:sync-live-positions:lock"
-  const acquired = await client.set(LOCK_KEY, "1", "EX", 55, "NX")
-  if (!acquired) {
-    return NextResponse.json({ ok: true, skipped: true, reason: "previous run still active" })
-  }
+  // Use simple set + expire pattern for Upstash compatibility
+  await client.set(LOCK_KEY, "1")
+  await client.expire(LOCK_KEY, 55)
 
   const summary = {
     connectionsChecked: 0,
