@@ -99,6 +99,7 @@ interface Settings {
   maxPositionsShort: number // Max 1 short position per config
   indicationTimeoutMs: number // 100ms to 3000ms, step 100ms
   maxConcurrentOperations: number
+  cyclePauseMs?: number // 10-200ms, step 10, default 50ms — pause between engine cycles
   autoRestartOnErrors: boolean
   logLevel: string
   maxDatabaseSizeMB: number

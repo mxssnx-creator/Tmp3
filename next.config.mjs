@@ -1,17 +1,17 @@
-// Force rebuild: 2026-05-05T19:30:00 — Fixed staling/jumping stats (root cause: multiple counter writers):
-//   1. app/api/cron/generate-indications/route.ts → Removed indications_count and strategies_count writes
-//      • Cron was writing to progression hash counters, conflicting with realtime engine-manager writes
-//      • Separated stage-specific counters (base/main/real/total) but removed canonical counter writes
-//      Result: Cron now only tracks stage-specific variants, not aggregate counters
-//   2. lib/trade-engine/config-set-processor.ts → Isolated prehistoric from realtime counters
-//      • Changed from incrementing shared indications_count/strategies_count to prehistoric-specific keys
-//      • Now writes to prehistoric_indications_total and prehistoric_strategies_total instead
-//      Result: Prehistoric data load doesn't bleed into realtime counting
-//   3. Consolidated counter sources:
-//      • engine-manager is NOW the single authoritative source for indications_count and strategies_count
-//      • config-set-processor writes to separate prehistoric namespace (reference only)
-//      • cron/generate-indications writes to stage-specific keys (base/main/real) not canonical counter
-//   Result: Stats no longer jump or stale - single source of truth per counter, no race conditions
+// Force rebuild: 2026-05-05T20:30:00 — Comprehensive system fixes for live positions & progression tracking:
+//   1. Fixed sync-live-positions Redis set API (app/api/cron/sync-live-positions)
+//      • Changed from old Redis format (EX, 55, NX) to Upstash-compatible set + expire pattern
+//   2. Fixed progression state manager null type (lib/progression-state-manager.ts)
+//      • Added explicit null type and proper null coalescing for Redis hgetall results
+//   3. Added missing redis-db exports (lib/redis-db.ts)
+//      • Added createTrade, updateTrade, updatePosition functions and Connection interface for missing imports
+//   4. Fixed structure page Tabs import (app/structure/page.tsx)
+//      • Added missing Tabs, TabsList, TabsTrigger, TabsContent imports from ui/tabs
+//   5. Fixed settings page Settings interface (app/settings/page.tsx)
+//      • Added cyclePauseMs field to Settings interface (optional, used by engine cycle controller)
+//   6. Fixed market-data connector arguments (app/api/market-data/route.ts)
+//      • Added apiPassphrase and apiType fields to ExchangeCredentials for proper exchange init
+//   Result: Critical TypeScript errors fixed, live position sync ready, progression tracking enabled, stats consolidated
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
