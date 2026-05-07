@@ -118,7 +118,7 @@ async function fetchHistoricalData(symbols: string[], days: number): Promise<Map
   const cutoffTime = Date.now() - days * 24 * 60 * 60 * 1000
   
   for (const symbol of symbols) {
-    const marketData = await getMarketData(symbol)
+    const marketData = await getMarketData(symbol, "1m")
     if (marketData && marketData.candles && Array.isArray(marketData.candles)) {
       const filteredCandles = marketData.candles.filter((c: any) => 
         new Date(c.timestamp).getTime() >= cutoffTime
