@@ -3,8 +3,6 @@
  * Provides clean helpers for building connection update objects for Main Connections
  */
 
-import type { Connection } from './redis-db'
-
 export interface ConnectionState {
   main_assigned: boolean
   main_enabled: boolean

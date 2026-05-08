@@ -1,4 +1,12 @@
-import { redisDb } from "@/lib/redis-db"
+import { getRedisClient } from "@/lib/redis-db"
+// shim: existing code uses redisDb.set/get/del/keys; map to InlineLocalRedis.
+const redisDb = {
+  get:  (key: string)            => getRedisClient().get(key),
+  set:  (key: string, val: string, opts?: { ex?: number }) =>
+    opts?.ex ? getRedisClient().setex(key, opts.ex, val) : getRedisClient().set(key, val),
+  del:  (key: string)            => getRedisClient().del(key),
+  keys: (pattern: string)        => getRedisClient().keys(pattern),
+}
 
 /**
  * PHASE 3: Live Position Tracking System

@@ -442,7 +442,7 @@ const initialSettings: Settings = {
   indicationTimeoutMs: 1000, // 100ms to 3000ms, step 100ms, default 1000ms
   maxConcurrentOperations: 100, // 10-250, default 100
   cyclePauseMs: 50, // 10-200ms, step 10, default 50ms — pause between engine cycles
-  prehistoric_range_hours: 8, // 1-50h, step 1, default 8h — look-back window for prehistoric calc
+  // prehistoric_range_hours is already set at line 366 above (first occurrence wins)
 
   // System Configuration
   autoRestartOnErrors: true,
