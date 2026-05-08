@@ -335,8 +335,12 @@ function MiniStat({ label, value, sub }: { label: string; value: string; sub?: s
 
 export function QuickstartSection() {
   const { selectedConnectionId, selectedExchange } = useExchange()
-  // Default to bingx-x01 — the canonical BingX base connection ID used by the engine
-  const connectionId = selectedConnectionId || "bingx-x01"
+  // Use the exchange-selected connection. Fall back to "bingx-x01" ONLY
+  // once a connection has been added to the Active panel so the QuickStart
+  // strip shows meaningful stats rather than a stale 404 response from a
+  // connection that doesn't exist yet. An explicit null means "no selection
+  // yet" and the polling useEffect guards against it below.
+  const connectionId = selectedConnectionId ?? null
 
   // volatile symbol for start button label
   const [volatileSymbol, setVolatileSymbol] = useState<{ symbol: string | null; exchange: string | null; pct: number | null; loading: boolean }>({
@@ -357,7 +361,7 @@ export function QuickstartSection() {
   const [liveTradeLoading, setLiveTradeLoading] = useState<boolean>(false)
   // Connection the quickstart actually bound to on last start (or the
   // component default) — used as the target for the Live toggle.
-  const [activeConnectionId, setActiveConnectionId] = useState<string>(connectionId)
+  const [activeConnectionId, setActiveConnectionId] = useState<string>(connectionId ?? "")
 
   // ── Indication configuration Set-count snapshot (static enumeration) ─
   // Pulled from /api/indications/config-counts. Refreshed every 60s since it
@@ -379,7 +383,12 @@ export function QuickstartSection() {
 
   // ── fetch live stats ──────────────────────────────────────────────────────
   const fetchStats = useCallback(async (silent = false) => {
-    if (!connectionId) return
+    // No connection selected yet — clear stats and bail rather than
+    // polling a nonexistent id and getting confusing 404s.
+    if (!connectionId) {
+      setStats(EMPTY_STATS)
+      return
+    }
     if (!silent) setLoadingStats(true)
     try {
       // Primary: /stats endpoint (full breakdown)
@@ -641,7 +650,7 @@ export function QuickstartSection() {
     return () => clearInterval(configPollRef.current)
   }, [expanded])
 
-  // ── Poll live exchange summary (positions + balance) ──────────────────────
+  // ── Poll live exchange summary (positions + balance) ���─────────────────────
   // 10s when expanded, 30s otherwise. Kept lightweight — this endpoint just
   // reads already-materialised Redis hashes, so frequent polling is fine.
   useEffect(() => {
@@ -743,8 +752,29 @@ export function QuickstartSection() {
 
   const handleStop = async () => {
     addLog("Stopping engine...", "info")
-    setIsRunning(false)
-    addLog("Engine stopped", "success")
+    try {
+      // Determine which connection to stop — prefer the one we actually
+      // started with over the component default so the right engine is
+      // targeted when the user changed the selection mid-run.
+      const targetId = activeConnectionId || connectionId
+      const res = await fetch("/api/trade-engine/quick-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "disable", connectionId: targetId }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({} as any))
+        addLog(`Stop warning: ${body?.error || res.statusText} (engine may already be stopped)`, "warning")
+      } else {
+        addLog("Engine stopped", "success")
+      }
+    } catch (err) {
+      addLog(`Stop error: ${err instanceof Error ? err.message : String(err)}`, "error")
+    } finally {
+      setIsRunning(false)
+      // Refresh stats after stop so counters reset to idle state.
+      setTimeout(() => void fetchStats(true), 800)
+    }
   }
 
   const handleRefresh = async () => {

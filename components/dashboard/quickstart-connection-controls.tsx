@@ -225,7 +225,7 @@ export function QuickstartConnectionControls() {
         setAdding(null)
       }
     },
-    [adding, loadConnections],
+    [adding, loadConnections, loadActiveConnections, selectedConnectionId, setSelectedConnectionId],
   )
 
   const handleReset = useCallback(async () => {

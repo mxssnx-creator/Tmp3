@@ -489,7 +489,7 @@ export class InlineLocalRedis {
   async flushRuntimeKeys(
     protectedPrefixes: readonly string[],
     forceClearPrefixes: readonly string[] = [],
-  ): Promise<{ deleted: number; protected: number }> {
+  ): Promise<{ deleted: number; protected: number; buckets: Record<string, number> }> {
     const checkProtected = (key: string): boolean => {
       for (const fc of forceClearPrefixes) {
         if (key.startsWith(fc)) return false
@@ -498,6 +498,10 @@ export class InlineLocalRedis {
         if (key.startsWith(p)) return true
       }
       return false
+    }
+    const bucketOf = (key: string): string => {
+      const idx = key.indexOf(":")
+      return idx > 0 ? key.slice(0, idx) + ":*" : key
     }
     const allKeys = new Set<string>([
       ...this.data.strings.keys(),
@@ -508,10 +512,15 @@ export class InlineLocalRedis {
     ])
     let deleted = 0
     let protectedCount = 0
+    // Build bucket summary BEFORE deletion so the response reflects what
+    // was actually removed — not what survived.
+    const buckets: Record<string, number> = {}
     for (const key of allKeys) {
       if (checkProtected(key)) {
         protectedCount++
       } else {
+        const b = bucketOf(key)
+        buckets[b] = (buckets[b] || 0) + 1
         this.deleteKey(key)
         deleted++
       }
@@ -522,9 +531,19 @@ export class InlineLocalRedis {
       }
     }
     // Immediately overwrite the snapshot so loadFromDisk() on the next
-    // cold-start or hot-reload only restores protected keys.
+    // cold-start or hot-reload only restores protected keys. Without this
+    // step, a hot-reload or cold-start resurrects the deleted runtime data.
     await this.saveToDisk()
-    return { deleted, protected: protectedCount }
+    return { deleted, protected: protectedCount, buckets }
+  }
+
+  /**
+   * Flush the in-memory state to disk without any deletions.
+   * Call this after any batch of writes that MUST be durable before the
+   * next request (e.g. after connection-flag resets in clear-progressions).
+   */
+  async persistNow(): Promise<boolean> {
+    return this.saveToDisk()
   }
 
   async hset(key: string, dataOrField: Record<string, string> | string, value?: string): Promise<number> {

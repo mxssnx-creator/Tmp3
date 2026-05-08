@@ -149,17 +149,23 @@ export async function POST() {
       const result = await (client as any).flushRuntimeKeys(
         PROTECTED_PREFIXES,
         FORCE_CLEAR_PREFIXES,
-      ) as { deleted: number; protected: number }
+      ) as { deleted: number; protected: number; buckets: Record<string, number> }
       totalDeleted = result.deleted
       protectedSkippedCount = result.protected
+      // Use the bucket breakdown returned from flushRuntimeKeys — it was
+      // built BEFORE deletion so it accurately reflects what was removed
+      // (not what survived, which was the previous incorrect approach).
+      Object.assign(removed, result.buckets)
       console.log(
-        `[v0] [ClearProgressions] flushRuntimeKeys: deleted=${totalDeleted} protected=${protectedSkippedCount}`,
+        `[v0] [ClearProgressions] flushRuntimeKeys: deleted=${totalDeleted} protected=${protectedSkippedCount} buckets=${Object.keys(removed).length}`,
       )
     } else {
-      // Fallback for external Redis adapters: chunked DEL + BGSAVE.
+      // Fallback for external Redis adapters: scan BEFORE deletion so the
+      // bucket summary is accurate, then chunked DEL.
       const allKeys = await client.keys("*").catch(() => [] as string[])
       const safeKeys = allKeys.filter((k) => typeof k === "string" && !isProtected(k))
       protectedSkippedCount = allKeys.length - safeKeys.length
+      // Build bucket summary from keys TO DELETE (before deletion).
       for (const k of safeKeys) {
         const bucket = bucketOf(k)
         removed[bucket] = (removed[bucket] || 0) + 1
@@ -177,29 +183,27 @@ export async function POST() {
         }
       }
       // Attempt persistence flush for adapters that support it.
-      const persistFn = (client as any).bgsave || (client as any).save
+      const persistFn = (client as any).bgsave || (client as any).save || (client as any).persistNow
       if (typeof persistFn === "function") {
         await persistFn.call(client).catch(() => null)
       }
     }
 
-    // Build bucket summary from surviving key count delta for the UI toast.
-    const remainingKeys = await client.keys("*").catch(() => [] as string[])
-    const endingKeyCount = remainingKeys.length
-    for (const k of remainingKeys) {
-      if (!isProtected(k)) {
-        const bucket = bucketOf(k)
-        removed[bucket] = (removed[bucket] || 0) + 1
-      }
-    }
+    const endingKeyCountBeforeStep3 = (await client.keys("*").catch(() => [])).length
     console.log(
-      `[v0] [ClearProgressions] Done: deleted=${totalDeleted} starting=${startingKeyCount} ending=${endingKeyCount} protected=${protectedSkippedCount}`,
+      `[v0] [ClearProgressions] After deletion: deleted=${totalDeleted} starting=${startingKeyCount} ending=${endingKeyCountBeforeStep3} protected=${protectedSkippedCount}`,
     )
 
     // ── 3. Reset per-connection runtime flags on connection records ───
-    // The connection row itself is preserved, but transient flags
-    // (paused-by-global, dashboard-active, live-trade) should reset so
-    // the operator gets a clean slate on the next QuickStart run.
+    // The connection row itself is preserved (protected prefix), but the
+    // transient flags (paused-by-global, dashboard-active, live-trade)
+    // must reset so the operator gets a clean slate on the next QuickStart.
+    //
+    // CRITICAL: after updateConnection() writes new values to memory we
+    // MUST call persistNow() / saveToDisk() again. The earlier saveToDisk()
+    // inside flushRuntimeKeys() ran BEFORE these updates, so a hot-reload
+    // without a second flush would restore the old flag values (e.g.
+    // is_enabled_dashboard:"1") from the stale snapshot.
     try {
       const { getAllConnections, updateConnection } = await import("@/lib/redis-db")
       const conns = await getAllConnections()
@@ -208,6 +212,8 @@ export async function POST() {
           ...c,
           is_enabled_dashboard: "0",
           is_active: "0",
+          is_active_inserted: "0",
+          is_assigned: "0",
           is_live_trade: "0",
           is_preset_trade: "0",
           paused_by_global: "0",
@@ -216,6 +222,15 @@ export async function POST() {
         })
       }
       console.log(`[v0] [ClearProgressions] reset runtime flags on ${conns.length} connections`)
+      // Second persist — captures the connection-flag resets so they are
+      // durable on disk, not just in-memory. Without this, a Next.js
+      // hot-reload between the reset and the next request restores the
+      // pre-reset connection flags from the snapshot written in step 2.
+      if (typeof (client as any).persistNow === "function") {
+        await (client as any).persistNow().catch(() => null)
+      } else if (typeof (client as any).saveToDisk === "function") {
+        await (client as any).saveToDisk().catch(() => null)
+      }
     } catch (err) {
       console.warn(
         "[v0] [ClearProgressions] connection flag reset failed:",
@@ -223,7 +238,22 @@ export async function POST() {
       )
     }
 
-    // ── 4. Final verification: re-count keys after the deletion ───────
+    // ── 4. Re-initialise trade_engine:global to stopped ──────────────
+    // Ensures the status API returns "stopped" immediately after reset
+    // instead of keeping the last "running" value. Also clears any
+    // coordinator-ready flag so the engine won't auto-restart until
+    // the operator explicitly clicks Start in the QuickStart panel.
+    try {
+      await client.hset("trade_engine:global", {
+        status: "stopped",
+        stopped_at: new Date().toISOString(),
+        coordinator_ready: "false",
+      })
+    } catch { /* non-critical */ }
+
+    const endingKeyCount = (await client.keys("*").catch(() => [])).length
+
+    // ── 5. Log + respond ─────────────────────────────────────────────
     await SystemLogger.logTradeEngine(
       `Reset DB: cleared ${totalDeleted} runtime keys ` +
       `(starting=${startingKeyCount}, ending=${endingKeyCount}, protected=${protectedSkippedCount})`,
