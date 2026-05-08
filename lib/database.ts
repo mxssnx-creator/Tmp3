@@ -35,7 +35,6 @@ export {
   getActiveStrategies,
   getBestPerformingStrategies,
   getStrategyStatistics,
-  getAllPositions,
   getAllIndicationPerformance,
   getAllStrategyPerformance,
   getDailyPerformanceSummary,

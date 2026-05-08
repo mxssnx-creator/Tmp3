@@ -45,7 +45,7 @@ async function seedMarketData() {
     for (let i = 0; i < 20; i += 1) {
       const variation = base * 0.02
       const close = base + (Math.random() - 0.5) * variation
-      await saveMarketData(symbol, {
+      await saveMarketData(symbol, "1m", {
         symbol,
         exchange: "bybit",
         interval: "1m",

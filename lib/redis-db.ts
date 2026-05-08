@@ -844,6 +844,39 @@ export class InlineLocalRedis {
     return before - remaining.length
   }
 
+  /** Return members in ascending score order between indices start and stop (inclusive). */
+  async zrange(key: string, start: number, stop: number): Promise<string[]> {
+    if (this.isExpired(key)) return []
+    const set = this.data.sorted_sets.get(key) || []
+    const sorted = [...set].sort((a, b) => a.score - b.score)
+    const end = stop < 0 ? sorted.length + stop + 1 : stop + 1
+    return sorted.slice(start < 0 ? Math.max(0, sorted.length + start) : start, end).map(e => e.member)
+  }
+
+  /** Return members in descending score order between indices start and stop (inclusive). */
+  async zrevrange(key: string, start: number, stop: number): Promise<string[]> {
+    if (this.isExpired(key)) return []
+    const set = this.data.sorted_sets.get(key) || []
+    const sorted = [...set].sort((a, b) => b.score - a.score)
+    const end = stop < 0 ? sorted.length + stop + 1 : stop + 1
+    return sorted.slice(start < 0 ? Math.max(0, sorted.length + start) : start, end).map(e => e.member)
+  }
+
+  /** Return the score of a member in a sorted set. */
+  async zscore(key: string, member: string): Promise<string | null> {
+    if (this.isExpired(key)) return null
+    const set = this.data.sorted_sets.get(key)
+    if (!set) return null
+    const entry = set.find(e => e.member === member)
+    return entry !== undefined ? String(entry.score) : null
+  }
+
+  /** Return the cardinality (number of members) of a sorted set. */
+  async zcard(key: string): Promise<number> {
+    if (this.isExpired(key)) return 0
+    return (this.data.sorted_sets.get(key) || []).length
+  }
+
   async trackDatabaseOperation(limit: number): Promise<{ current: number; limit: number; exceeded: boolean }> {
     const globalTracker = globalThis as unknown as { __db_ops_tracker?: { timestamp: number; count: number } }
     const now = Date.now()

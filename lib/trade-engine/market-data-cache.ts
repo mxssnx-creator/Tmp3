@@ -38,7 +38,7 @@ export async function getMarketDataCached(symbol: string): Promise<any> {
   const fetchPromise = (async () => {
     try {
       await initRedis()
-      const rawData = await getMarketData(symbol)
+      const rawData = await getMarketData(symbol, "1m")
 
       if (!rawData) {
         return null

@@ -104,13 +104,8 @@ export interface StrategyStageTracking {
     maxDrawdownTime: number           // gate threshold (e.g. 1440 min)
     // Variant breakdown — Main CLONES Base's positions and strategically
     // adjusts them into new relative Sets (does NOT open new positions).
-    variants: {
-      default: number
-      trailing: number
-      block: number                   // clones Base's COMPLETE positions, different config
-      dca: number                     // clones Base's COMPLETE positions, recovery config
-      pause: number
-    }
+    // Indexed by variant name ("default" | "trailing" | "block" | "dca" | "pause")
+    variants: Record<string, number>
   }
   real: {
     // ── Accumulation stage ──
@@ -152,13 +147,8 @@ export interface StrategyStageTracking {
       pause: Record<string, number>
     }
     // Per-variant cumulative counts at Real (post-filter)
-    variantsAccumulated: {
-      default: number
-      trailing: number
-      block: number
-      dca: number
-      pause: number
-    }
+    // Indexed by variant name ("default" | "trailing" | "block" | "dca" | "pause")
+    variantsAccumulated: Record<string, number>
   }
   live: {
     setsActive: number                // currently on exchange with open positions

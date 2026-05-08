@@ -357,7 +357,7 @@ export class IndicationProcessor {
         }
         
         for (const ind of prehistoricIndications) {
-          await saveIndication(`${this.connectionId}:${symbol}:prehistoric`, ind)
+          await saveIndication({ ...ind, connection_id: `${this.connectionId}:${symbol}:prehistoric` })
         }
         console.log(`[v0] [PrehistoricIndication] ✓ Saved ${prehistoricIndications.length} indication types to Redis for ${symbol}`)
       } catch (saveErr) {

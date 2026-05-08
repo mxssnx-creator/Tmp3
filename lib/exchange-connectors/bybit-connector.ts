@@ -326,8 +326,8 @@ export class BybitConnector extends BaseExchangeConnector {
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
       const category = this.getTradingCategory()
-      if (category !== "linear" && category !== "inverse") {
-        // Spot etc. — no native trigger family, fall back to legacy.
+      if (category !== "linear") {
+        // Spot — no native trigger order family; fall back to legacy implementation.
         return super.placeStopOrder(symbol, closeSide, quantity, triggerPrice, kind, options)
       }
 
