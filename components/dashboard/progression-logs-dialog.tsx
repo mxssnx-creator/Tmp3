@@ -9,6 +9,8 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { Loader2, Zap, TrendingUp, Clock, AlertCircle, RefreshCw, Trash2, Database, Activity } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
+import { IndicationsDetail } from "@/components/dashboard/indications-detail"
+import { StrategyPipeline } from "@/components/dashboard/strategy-pipeline"
 
 // ─── interfaces ────────────────────────────────────────────────────────────────
 
@@ -98,7 +100,7 @@ export function ProgressionLogsDialog({
   const [stats, setStats] = useState<StatsShape | null>(null)
   const [tradingState, setTradingState] = useState<StatsShape["progressionState"] | null>(null)
   const [isLoading, setIsLoading] = useState(false)
-  const [activeTab, setActiveTab] = useState<"log" | "info" | "breakdown">("log")
+  const [activeTab, setActiveTab] = useState<"log" | "info" | "breakdown" | "indications" | "strategies">("log")
   // Category filter for the log list — "all" by default, otherwise by level
   const [logFilter, setLogFilter] = useState<"all" | "info" | "warning" | "error" | "debug">("all")
 
@@ -222,10 +224,12 @@ export function ProgressionLogsDialog({
           onValueChange={(v) => setActiveTab(v as typeof activeTab)}
           className="flex-1 flex flex-col min-h-0"
         >
-          <TabsList className="grid w-full grid-cols-3">
+          <TabsList className="grid w-full grid-cols-5">
             <TabsTrigger value="log">Logs</TabsTrigger>
             <TabsTrigger value="info">Info</TabsTrigger>
             <TabsTrigger value="breakdown">Breakdown</TabsTrigger>
+            <TabsTrigger value="indications">Indications</TabsTrigger>
+            <TabsTrigger value="strategies">Strategies</TabsTrigger>
           </TabsList>
 
           {/* ── Logs ── */}
@@ -593,6 +597,24 @@ export function ProgressionLogsDialog({
                     </div>
                   )}
                 </div>
+              </div>
+            </ScrollArea>
+          </TabsContent>
+
+          {/* ── Indications detail ── */}
+          <TabsContent value="indications" className="flex-1 overflow-hidden">
+            <ScrollArea className="h-full">
+              <div className="p-4">
+                <IndicationsDetail connectionId={connectionId} />
+              </div>
+            </ScrollArea>
+          </TabsContent>
+
+          {/* ── Strategies pipeline ── */}
+          <TabsContent value="strategies" className="flex-1 overflow-hidden">
+            <ScrollArea className="h-full">
+              <div className="p-4">
+                <StrategyPipeline connectionId={connectionId} />
               </div>
             </ScrollArea>
           </TabsContent>

@@ -681,7 +681,7 @@ export class StrategyCoordinator {
       }
     }
 
-    // ─── VARIANT accounting ───────────────────────���───────────────────────
+    // ─── VARIANT accounting ───────────────────────�����───────────────────────
     // Each related Main Set now carries an authoritative `variant` tag set
     // at build time, so we no longer have to heuristically classify
     // individual entries. Entries within a Set share the variant label.
@@ -1134,6 +1134,49 @@ export class StrategyCoordinator {
           client.expire(vKey, 7 * 24 * 60 * 60),
         )
       }
+
+      // ── POSITION-COUNT AXIS ACCUMULATION (Real stage) ──────────────
+      // Per spec: "Do the Additional Sets / Position Counts Accumulation
+      // in Strategies Real instead of in Main". The axis windows are
+      // tagged at Main creation time but the cumulative accumulation
+      // (across cycles) is tracked HERE so the dashboard can show how
+      // many Real Sets exist per axis window over time.
+      //
+      // Axes (per axisWindows definition in StrategySet):
+      //   prev:  0..12   (closed lookback window)
+      //   last:  0..4    (last-N magnitude window)
+      //   cont:  0..8    (open continuous positions)
+      //   pause: 0..8    (last-N validation window)
+      // Each axis is keyed by its integer window value. We hincrby per
+      // window so multiple cycles accumulate into the dashboard's
+      // "Position-Counts Accumulation" tile.
+      const axisCounts: Record<"prev" | "last" | "cont" | "pause", Record<string, number>> = {
+        prev:  {},
+        last:  {},
+        cont:  {},
+        pause: {},
+      }
+      for (const set of realSets) {
+        const aw = set.axisWindows
+        if (!aw) continue
+        for (const axis of ["prev", "last", "cont", "pause"] as const) {
+          const w = aw[axis]
+          if (typeof w !== "number") continue
+          const key = String(w)
+          axisCounts[axis][key] = (axisCounts[axis][key] || 0) + 1
+        }
+      }
+      for (const axis of ["prev", "last", "cont", "pause"] as const) {
+        const aKey = `strategy_axis_real:${this.connectionId}:${axis}`
+        let touched = false
+        for (const [window, count] of Object.entries(axisCounts[axis])) {
+          if (count <= 0) continue
+          touched = true
+          writes.push(client.hincrby(aKey, window, count))
+        }
+        if (touched) writes.push(client.expire(aKey, 7 * 24 * 60 * 60))
+      }
+
       await Promise.all(writes)
 
       // Second pass — derive averages from freshly-incremented counters
