@@ -1,3 +1,20 @@
+// Force rebuild: 2026-05-05T22:30:00 — Reset-DB now stops all progressions first:
+//   1. New: lib/db-reset-helper.ts
+//      • stopAllProgressionsBeforeReset() — single shared helper
+//      • Stops global trade-engine coordinator (every per-connection EngineManager)
+//      • Stops globalIntervalManager (prehistoric / indication interval timers)
+//      • Clears stale __engine_timers Set leaked across HMR / hot-reload
+//      • Marks trade_engine:global as { status: "stopped", reason: "db_reset" }
+//        so racing crons short-circuit instead of writing to a wiped DB
+//      • Each step wrapped in try/catch — a crashed coordinator never
+//        permanently blocks the operator from resetting state
+//   2. Wired into ALL three reset endpoints:
+//      • app/api/install/database/flush/route.ts — Step 1.5 before FLUSHALL
+//      • app/api/install/database/reset/route.ts — before flushAll()
+//      • app/api/admin/reset-and-init/route.ts   — before flushAll()
+//      All three return the stop result so the operator can see whether
+//      the coordinator / interval manager / timers were successfully stopped.
+// ──────────────────────────────────────────────────────────────────────────
 // Force rebuild: 2026-05-05T22:00:00 — Position limit ownership + minimal volume:
 //   1. lib/volume-calculator.ts: Volume MINIMIZATION
 //      • UNIVERSAL_MIN_NOTIONAL_USD lowered $15 → $5 (spec floor across all major venues)
