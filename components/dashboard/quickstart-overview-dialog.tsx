@@ -130,6 +130,17 @@ function StratSection({
   label: string; count: number; evaluated: number; evaluatedOf: number
   detail: StratDetail | undefined; accentCls: string; bgCls: string
 }) {
+  // ── eval/pass semantics ───────────────────────────────────────────
+  // `evaluated` here is actually PASSED sets (the numerator we want to
+  // show in "eval X/Y pass"). It's named `evaluated` for historical
+  // reasons in the API schema but the UI semantics should reflect that
+  // it's the pass count. The denominator `evaluatedOf` is the INPUT
+  // count for this stage (parent stage's output).
+  //
+  // Display: "Evaluated of Base: X / Y sets (Z%)" where
+  //   - X = evaluated (actually: passed at this stage)
+  //   - Y = evaluatedOf (the parent stage's output / this stage's input)
+  //   - Z = (X / Y) × 100%
   const evalPct = evaluatedOf > 0 ? Math.round((evaluated / evaluatedOf) * 1000) / 10 : (detail?.evalPct ?? 0)
 
   return (
@@ -149,7 +160,7 @@ function StratSection({
           </div>
           <Progress value={Math.min(100, evalPct)} className="h-1" />
           <div className="text-[9px] text-muted-foreground text-right">
-            {fmt(evaluated)} / {fmt(evaluatedOf)} sets
+            {fmt(evaluated)} / {fmt(evaluatedOf)} sets passed
           </div>
         </div>
       )}
@@ -788,7 +799,7 @@ export function QuickstartOverviewDialog() {
 
             <StratSection
               label="Base"
-              count={bd?.strategies.base || 0}
+              count={stats?.activeCounts?.strategies?.base || 0}
               evaluated={bd?.strategies.baseEvaluated || 0}
               evaluatedOf={0}
               detail={sd?.base}
@@ -798,9 +809,9 @@ export function QuickstartOverviewDialog() {
 
             <StratSection
               label="Main"
-              count={bd?.strategies.main || 0}
+              count={stats?.activeCounts?.strategies?.main || 0}
               evaluated={bd?.strategies.mainEvaluated || 0}
-              evaluatedOf={bd?.strategies.base || 0}
+              evaluatedOf={stats?.activeCounts?.strategies?.base || 0}
               detail={sd?.main}
               accentCls="text-yellow-600 dark:text-yellow-400"
               bgCls="bg-yellow-50/50 dark:bg-yellow-950/20 border-yellow-200/50 dark:border-yellow-800/30"
@@ -808,9 +819,9 @@ export function QuickstartOverviewDialog() {
 
             <StratSection
               label="Real"
-              count={bd?.strategies.real || 0}
+              count={stats?.activeCounts?.strategies?.real || 0}
               evaluated={bd?.strategies.realEvaluated || 0}
-              evaluatedOf={bd?.strategies.main || 0}
+              evaluatedOf={stats?.activeCounts?.strategies?.main || 0}
               detail={sd?.real}
               accentCls="text-green-600 dark:text-green-400"
               bgCls="bg-green-50/50 dark:bg-green-950/20 border-green-200/50 dark:border-green-800/30"
