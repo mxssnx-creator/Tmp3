@@ -218,10 +218,10 @@ export class StrategyCoordinator {
       description: "Sets promoted from MAIN with profitFactor >= 1.4 + DDT <= 16h",
     },
     live: {
-      maxDrawdownTime: 120,   // 2 hours — realistic for current strategy output
+      maxDrawdownTime: 960,   // Match REAL stage (16 hours) — ensure valid Sets from REAL flow through to LIVE
       minProfitFactor: 1.4,   // Match REAL stage minimum so Sets can flow through
       confidence: 0.65,       // advisory only
-      description: "Best 500 Sets from REAL (PF >= 1.4 + DDT <= 2h) ready for live trading",
+      description: "Best 500 Sets from REAL (PF >= 1.4 + DDT <= 16h) ready for live trading",
     },
   }
 
@@ -1471,7 +1471,7 @@ export class StrategyCoordinator {
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
 
-    console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime})`)
+    console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime}min)`)
     if (realSets.length > 0 && qualifying.length === 0) {
       const sample = realSets[0]
       console.log(`[v0] [StrategyFlow] ${symbol} LIVE filter rejected all real sets: sample={pf=${sample.avgProfitFactor.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}, conf=${sample.avgConfidence.toFixed(2)} (advisory)}`)
@@ -1590,6 +1590,30 @@ export class StrategyCoordinator {
       ])
     } catch { /* non-critical */ }
 
+    // Pre-fetch the current market price ONCE so both the live exchange dispatch
+    // and the pseudo-position creation below share the same price without
+    // duplicate Redis reads. The live-stage will still validate / re-fetch if
+    // we hand it 0, but providing a good seed eliminates the most common cause
+    // of "no market price" failures when market_data is just milliseconds stale.
+    let _cachedMarketPrice = 0
+    try {
+      const _priceClient = getRedisClient()
+      const _mdhash = await _priceClient.hgetall(`market_data:${symbol}`)
+      _cachedMarketPrice = parseFloat(String(_mdhash?.close ?? _mdhash?.price ?? _mdhash?.last ?? "0"))
+      if (!_cachedMarketPrice || isNaN(_cachedMarketPrice)) {
+        const _mdraw = await _priceClient.get(`market_data:${symbol}:1m`)
+        if (_mdraw) {
+          const _mdobj = typeof _mdraw === "string" ? JSON.parse(_mdraw) : _mdraw
+          const _candles = _mdobj?.candles
+          if (Array.isArray(_candles) && _candles.length > 0) {
+            _cachedMarketPrice = parseFloat(String(_candles[_candles.length - 1]?.close ?? "0")) || 0
+          } else {
+            _cachedMarketPrice = parseFloat(String(_mdobj?.close ?? _mdobj?.price ?? _mdobj?.last ?? "0")) || 0
+          }
+        }
+      }
+    } catch { /* best-effort; live-stage falls back internally */ }
+
     // Attempt real exchange trading for qualifying LIVE sets when the connection has live trading enabled.
     // This is guarded by is_live_trade flag on the connection — if disabled, only pseudo positions are created.
     if (qualifying.length > 0) {
@@ -1634,14 +1658,16 @@ export class StrategyCoordinator {
                 const liveResult = await executeLivePosition(
                   this.connectionId,
                   {
-                    id: `real:${this.connectionId}:${set.setKey}:${symbol}:${Date.now()}`,
+                    id: `real:${this.connectionId}:${set.setKey}:${symbol}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`,
                     connectionId: this.connectionId,
                     symbol,
                     direction: set.direction,
-                    // Seed values — the live pipeline will recalc both from
-                    // the exchange connector and VolumeCalculator.
+                    // Provide the pre-fetched market price so the live pipeline
+                    // can skip its own price fetch when the price is fresh. The
+                    // pipeline validates > 0 and re-fetches if needed, so passing
+                    // 0 here remains safe as a fallback.
                     quantity: 0,
-                    entryPrice: 0,
+                    entryPrice: _cachedMarketPrice,
                     leverage: bestEntry.leverage || 1,
                     riskAmount: 0,
                     rewardTarget: 0,
@@ -1742,23 +1768,29 @@ export class StrategyCoordinator {
       try {
         const posManager = new PseudoPositionManager(this.connectionId)
 
-        // Fetch current market price for entry
-        let entryPrice = 0
-        try {
-          const client = getRedisClient()
-          const mdhash = await client.hgetall(`market_data:${symbol}`)
-          entryPrice = parseFloat(mdhash?.close || mdhash?.price || "0")
-          if (!entryPrice || isNaN(entryPrice)) {
-            const mdraw = await client.get(`market_data:${symbol}:1m`)
-            if (mdraw) {
-              const mdobj = JSON.parse(mdraw)
-              const candles = mdobj?.candles
-              if (Array.isArray(candles) && candles.length > 0) {
-                entryPrice = parseFloat(candles[candles.length - 1]?.close || "0")
+        // Reuse the market price already fetched above (_cachedMarketPrice).
+        // Fall back to a fresh fetch only if the cached value is missing (e.g.
+        // when live-trade gate was disabled and the price block above was skipped).
+        let entryPrice = _cachedMarketPrice
+        if (!entryPrice || isNaN(entryPrice)) {
+          try {
+            const client = getRedisClient()
+            const mdhash = await client.hgetall(`market_data:${symbol}`)
+            entryPrice = parseFloat(String(mdhash?.close ?? mdhash?.price ?? mdhash?.last ?? "0"))
+            if (!entryPrice || isNaN(entryPrice)) {
+              const mdraw = await client.get(`market_data:${symbol}:1m`)
+              if (mdraw) {
+                const mdobj = typeof mdraw === "string" ? JSON.parse(mdraw) : mdraw
+                const candles = mdobj?.candles
+                if (Array.isArray(candles) && candles.length > 0) {
+                  entryPrice = parseFloat(String(candles[candles.length - 1]?.close ?? "0")) || 0
+                } else {
+                  entryPrice = parseFloat(String(mdobj?.close ?? mdobj?.price ?? mdobj?.last ?? "0")) || 0
+                }
               }
             }
-          }
-        } catch { /* skip price lookup */ }
+          } catch { /* skip price lookup */ }
+        }
 
         if (entryPrice > 0) {
           // Pseudo-position creation is local Redis work with per-Set idempotency
@@ -1827,7 +1859,7 @@ export class StrategyCoordinator {
     }
 
     console.log(
-      `[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor})`
+      `[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime}min)`
     )
 
     return {
