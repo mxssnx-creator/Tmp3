@@ -1,3 +1,27 @@
+// Force rebuild: 2026-05-05T21:30:00 — Architecture: Real-stage accumulation correctness:
+//   1. New: lib/detailed-tracking.ts
+//      • Authoritative read API for indications + strategy stages
+//      • Reads from progression:{id}, strategy_detail:{id}:{stage},
+//        strategy_variant_{stage}:{id}:{variant}, strategy_axis_real:{id}:{axis}
+//      • Encodes canonical pipeline:
+//          Base (independent) → Main (variants/Base) → Real (accumulation) → Live
+//   2. New: app/api/connections/progression/[id]/tracking/{indications,strategies}/route.ts
+//   3. New: components/dashboard/indications-detail.tsx
+//      • Active count (most important "asked value") + Last 5 / Last 60 min windows
+//      • Per-type breakdown + pseudo-position limit + setsAtLimit capacity
+//   4. New: components/dashboard/strategy-pipeline.tsx
+//      • Cascade: Base → Main → Real → Live with set counts at each stage
+//      • Base: independent sets, own pseudo-positions
+//      • Main: variant sets per Base (Default/Trailing/Block/DCA/Pause) — REUSE Base positions
+//      • Real: ACCUMULATION — position-count axis (prev/last/cont/pause) + variants
+//      • Live: top 500 ranked by avgPF
+//   5. strategy-coordinator.ts: Real-stage axis accumulation
+//      • Added strategy_axis_real:{id}:{axis} hincrby per axis window
+//      • Tracks prev (1-12), last (1-4), cont (1-8), pause (1-8) cumulative across cycles
+//      • Per spec: "Position Counts Accumulation in Real instead of Main"
+//   6. progression-logs-dialog.tsx: Added Indications + Strategies tabs (5 tabs total)
+//   Symbol parallel processing: confirmed via SYMBOL_CONCURRENCY=16 in engine-manager
+//   ────────────────────────────────────────────────────────────────────────────
 // Force rebuild: 2026-05-05T21:00:00 — Continuing comprehensive system fixes (93 errors remaining):
 //   1. Fixed getMarketData call signatures (auto-optimal, generate-safe-indications, etc)
 //      • Changed from { isTestnet: boolean } to "1m" (string interval parameter)
