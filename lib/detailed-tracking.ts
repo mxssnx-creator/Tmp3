@@ -75,7 +75,9 @@ export interface IndicationTracking {
 
 export interface StrategyStageTracking {
   base: {
-    setsActivelyProcessing: number   // Sets with open pseudo-positions right now
+    setsActivelyProcessing: number   // Sets alive this cycle (per-symbol snapshot)
+    setsWithOpenPositions: number    // Sets currently holding ≥ 1 open pseudo-position
+    setsProgressing: number          // Sets in active calculation this cycle
     setsTotal: number                 // total Base Sets (cumulative)
     setsCurrent: number               // Base Sets in last cycle
     avgProfitFactor: number
@@ -92,24 +94,31 @@ export interface StrategyStageTracking {
     evaluatedFromBase: number
     setsCreated: number               // current cycle: variants per qualifying Base
     setsTotal: number                 // cumulative across cycles
+    setsWithOpenPositions: number    // CLONED positions from Base — count of Sets actually holding
+    setsProgressing: number          // Sets currently in calculation
     avgProfitFactor: number
     avgDrawdownTime: number
     minProfitFactor: number           // gate threshold (e.g. 1.2)
     maxDrawdownTime: number           // gate threshold (e.g. 1440 min)
-    // Variant breakdown - these reuse Base's positions
+    // Variant breakdown — Main CLONES Base's positions and strategically
+    // adjusts them into new relative Sets (does NOT open new positions).
     variants: {
       default: number
       trailing: number
-      block: number                   // uses Base's COMPLETE positions, different config
-      dca: number                     // uses Base's COMPLETE positions, recovery config
+      block: number                   // clones Base's COMPLETE positions, different config
+      dca: number                     // clones Base's COMPLETE positions, recovery config
       pause: number
     }
   }
   real: {
     // ── Accumulation stage ──
-    // Multi-dimensional axis expansion accumulates HERE
+    // Multi-dimensional axis expansion accumulates HERE.
+    // Real CLONES Main's already-cloned positions and strategically
+    // adjusts them across the position-count axis windows.
     setsCurrent: number               // current cycle Real Sets (post filter+sort+cap)
     setsTotal: number                 // cumulative Real Sets across cycles
+    setsWithOpenPositions: number    // CLONED positions held — count of Sets with open clones
+    setsProgressing: number          // Sets currently in calculation
     evaluatedFromMain: number         // Main Sets evaluated (input to Real)
     avgProfitFactor: number
     avgDrawdownTime: number
@@ -135,6 +144,8 @@ export interface StrategyStageTracking {
   }
   live: {
     setsActive: number                // currently on exchange with open positions
+    setsWithOpenPositions: number    // alias of setsActive (real exchange orders)
+    setsProgressing: number          // Sets being evaluated for live execution
     setsTotal: number                 // best 500 ranked
     avgProfitFactor: number
     cap: number                       // maxLiveSets, default 500
@@ -265,9 +276,15 @@ export async function getStrategyTracking(
     if (k.endsWith(":live")) liveActive += Number(v || "0")
   }
 
+  // Live data: read from `strategy_detail:{conn}:live` for symmetry
+  const liveDetailKey = `strategy_detail:${connectionId}:live`
+  const liveDetail = (await client.hgetall(liveDetailKey).catch(() => ({}))) as Record<string, string>
+
   return {
     base: {
       setsActivelyProcessing: baseActivelyProcessing,
+      setsWithOpenPositions: Number(base.sets_with_open_positions || "0"),
+      setsProgressing: Number(base.sets_progressing || base.created_sets || "0"),
       setsTotal: Number(prog.strategies_base_total || "0"),
       setsCurrent: Number(prog.strategies_base_current || base.created_sets || "0"),
       avgProfitFactor: Number(base.avg_profit_factor || "0"),
@@ -282,6 +299,8 @@ export async function getStrategyTracking(
       evaluatedFromBase: Number(main.evaluated || "0"),
       setsCreated: Number(prog.strategies_main_current || main.created_sets || "0"),
       setsTotal: Number(prog.strategies_main_total || "0"),
+      setsWithOpenPositions: Number(main.sets_with_open_positions || "0"),
+      setsProgressing: Number(main.sets_progressing || main.created_sets || "0"),
       avgProfitFactor: Number(main.avg_profit_factor || "0"),
       avgDrawdownTime: Number(main.avg_drawdown_time || "0"),
       minProfitFactor: Number(settings.minProfitFactorMain || "1.2"),
@@ -291,6 +310,8 @@ export async function getStrategyTracking(
     real: {
       setsCurrent: Number(prog.strategies_real_current || real.created_sets || "0"),
       setsTotal: Number(prog.strategies_real_total || "0"),
+      setsWithOpenPositions: Number(real.sets_with_open_positions || "0"),
+      setsProgressing: Number(real.sets_progressing || real.created_sets || "0"),
       evaluatedFromMain: Number(real.evaluated || "0"),
       avgProfitFactor: Number(real.avg_profit_factor || "0"),
       avgDrawdownTime: Number(real.avg_drawdown_time || "0"),
@@ -302,6 +323,8 @@ export async function getStrategyTracking(
     },
     live: {
       setsActive: liveActive,
+      setsWithOpenPositions: Number(liveDetail.sets_with_open_positions || liveActive),
+      setsProgressing: Number(liveDetail.sets_progressing || "0"),
       setsTotal: Number(prog.strategies_live_total || "0"),
       avgProfitFactor: Number(prog.live_avg_profit_factor || "0"),
       cap: Number(settings.maxLiveSets || "500"),

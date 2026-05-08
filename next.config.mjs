@@ -1,3 +1,35 @@
+// Force rebuild: 2026-05-05T23:00:00 — Clone semantics + Active+Pos / Progressing Sets metrics:
+//   The architectural correction the operator requested: Main and Real do
+//   NOT open new exchange positions, but they DO clone the parent stage's
+//   positions and strategically adjust them into new relative variant Sets.
+//   Two new explicit metrics now flow end-to-end through the system.
+//
+//   1. lib/strategy-coordinator.ts — emit per-stage detail hash now writes:
+//      • sets_with_open_positions — count of Sets actually holding positions
+//        (Base: own pseudo-positions; Main/Real: cloned & adjusted; Live:
+//        executed exchange orders).
+//      • sets_progressing — count of Sets in active calculation this cycle
+//        (Base/Main/Real: created_sets; Live: realSets evaluated input).
+//
+//   2. lib/detailed-tracking.ts — StrategyStageTracking now exposes both
+//      `setsWithOpenPositions` and `setsProgressing` for every stage.
+//      The reader fans out an extra hgetall on `strategy_detail:{c}:live`
+//      so Live participates symmetrically.
+//
+//   3. components/dashboard/strategy-pipeline.tsx — every stage card now
+//      surfaces a 2-tile row: green-accent "Active Sets w/ Open/Cloned
+//      Positions" and primary-accent "Progressing Sets". Subtitle copy
+//      replaces "REUSE Base's positions" with "CLONE Base's positions and
+//      strategically adjust them into new relative Sets" for both Main
+//      and Real, matching the documented architecture.
+//      Variant boxes Block/DCA now read "Clones Base positions" not "Reuses".
+//
+//   4. components/dashboard/statistics-overview-v2.tsx — Strategies ·
+//      Active Progressing table headers renamed: "Sets" → "Progress" and
+//      "Pos" → "Active+Pos" with extended title tooltips that spell out
+//      the limit-gating policy (Base only) and the clone semantics
+//      (Main/Real).
+// ──────────────────────────────────────────────────────────────────────────
 // Force rebuild: 2026-05-05T22:30:00 — Reset-DB now stops all progressions first:
 //   1. New: lib/db-reset-helper.ts
 //      • stopAllProgressionsBeforeReset() — single shared helper

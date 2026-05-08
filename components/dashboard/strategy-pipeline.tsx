@@ -15,6 +15,8 @@ import {
 interface StrategyTracking {
   base: {
     setsActivelyProcessing: number
+    setsWithOpenPositions: number
+    setsProgressing: number
     setsTotal: number
     setsCurrent: number
     avgProfitFactor: number
@@ -29,6 +31,8 @@ interface StrategyTracking {
     evaluatedFromBase: number
     setsCreated: number
     setsTotal: number
+    setsWithOpenPositions: number
+    setsProgressing: number
     avgProfitFactor: number
     avgDrawdownTime: number
     minProfitFactor: number
@@ -44,6 +48,8 @@ interface StrategyTracking {
   real: {
     setsCurrent: number
     setsTotal: number
+    setsWithOpenPositions: number
+    setsProgressing: number
     evaluatedFromMain: number
     avgProfitFactor: number
     avgDrawdownTime: number
@@ -66,6 +72,8 @@ interface StrategyTracking {
   }
   live: {
     setsActive: number
+    setsWithOpenPositions: number
+    setsProgressing: number
     setsTotal: number
     avgProfitFactor: number
     cap: number
@@ -157,6 +165,20 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             <Metric label="Avg PF" value={data.base.avgProfitFactor.toFixed(3)} />
             <Metric label="Avg Pos / Set" value={data.base.avgPosPerSet.toFixed(1)} />
           </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <Metric
+              label="Active Sets w/ Open Positions"
+              value={data.base.setsWithOpenPositions}
+              accent="success"
+              hint="Sets currently holding ≥ 1 open pseudo-position"
+            />
+            <Metric
+              label="Progressing Sets"
+              value={data.base.setsProgressing}
+              accent="primary"
+              hint="Sets in active calculation this cycle"
+            />
+          </div>
           <div className="mt-3 rounded-md border bg-muted/30 p-3">
             <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
               Pseudo-position limit per Base Set
@@ -186,11 +208,13 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             </Badge>
           </CardTitle>
           <p className="text-xs text-muted-foreground">
-            Variant Sets REUSE Base&apos;s pseudo-positions (no new positions
-            created). Block + DCA validate Base&apos;s COMPLETE positions through
-            different config gates. NO Position Limits / Direction caps —
-            calculated freely. Filter: PF ≥ {data.main.minProfitFactor.toFixed(2)},
-            DDT ≤ {data.main.maxDrawdownTime}m
+            Variant Sets <strong>CLONE</strong> Base&apos;s pseudo-positions and
+            strategically adjust them into new relative Sets — they do NOT open
+            new exchange positions. Block + DCA clone Base&apos;s COMPLETE
+            positions through different config gates. NO Position Limits /
+            Direction caps — calculated freely. Filter: PF ≥{" "}
+            {data.main.minProfitFactor.toFixed(2)}, DDT ≤{" "}
+            {data.main.maxDrawdownTime}m
           </p>
         </CardHeader>
         <CardContent>
@@ -203,9 +227,23 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
               value={Math.round(data.main.avgDrawdownTime)}
             />
           </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <Metric
+              label="Active Sets w/ Cloned Positions"
+              value={data.main.setsWithOpenPositions}
+              accent="success"
+              hint="Cloned from Base — Sets actually holding adjusted positions"
+            />
+            <Metric
+              label="Progressing Sets"
+              value={data.main.setsProgressing}
+              accent="primary"
+              hint="Sets in active calculation this cycle"
+            />
+          </div>
           <div className="mt-3">
             <div className="mb-2 text-[11px] uppercase tracking-wide text-muted-foreground">
-              Variants per Base Set
+              Variants per Base Set (cloned & adjusted)
             </div>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
               <VariantBox label="Default" value={data.main.variants.default} />
@@ -213,12 +251,12 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
               <VariantBox
                 label="Block"
                 value={data.main.variants.block}
-                hint="Reuses Base positions"
+                hint="Clones Base positions"
               />
               <VariantBox
                 label="DCA"
                 value={data.main.variants.dca}
-                hint="Reuses Base positions"
+                hint="Clones Base positions"
               />
               <VariantBox label="Pause" value={data.main.variants.pause} />
             </div>
@@ -240,8 +278,11 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             </Badge>
           </CardTitle>
           <p className="text-xs text-muted-foreground">
-            Multi-axis variant accumulation happens HERE (not Main). NO Position
-            Limits / Direction caps — calculated freely. Filter: PF ≥{" "}
+            Multi-axis variant accumulation happens HERE. Real <strong>CLONES
+            </strong> Main&apos;s already-cloned positions and strategically
+            adjusts them along the position-count axis (prev / last / cont /
+            pause). NO new exchange positions opened, NO Position Limits /
+            Direction caps. Filter: PF ≥{" "}
             {data.real.minProfitFactor.toFixed(2)}, DDT ≤{" "}
             {data.real.maxDrawdownTime}m
           </p>
@@ -252,6 +293,20 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             <Metric label="Sets (cumulative)" value={data.real.setsTotal} />
             <Metric label="Avg PF" value={data.real.avgProfitFactor.toFixed(3)} />
             <Metric label="Avg Pos / Set" value={data.real.avgPosPerSet.toFixed(1)} />
+          </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <Metric
+              label="Active Sets w/ Cloned Positions"
+              value={data.real.setsWithOpenPositions}
+              accent="success"
+              hint="Cloned from Main — Sets holding axis-adjusted positions"
+            />
+            <Metric
+              label="Progressing Sets"
+              value={data.real.setsProgressing}
+              accent="primary"
+              hint="Sets in active calculation this cycle"
+            />
           </div>
 
           {/* Position-count axis accumulation */}
@@ -330,6 +385,20 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             <Metric label="Cap" value={data.live.cap} />
             <Metric label="Avg PF" value={data.live.avgProfitFactor.toFixed(3)} />
           </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <Metric
+              label="Active Sets w/ Open Positions"
+              value={data.live.setsWithOpenPositions}
+              accent="success"
+              hint="Sets with executed orders on the exchange"
+            />
+            <Metric
+              label="Progressing Sets"
+              value={data.live.setsProgressing}
+              accent="primary"
+              hint="Sets being ranked & capped for live execution"
+            />
+          </div>
         </CardContent>
       </Card>
     </div>
@@ -370,13 +439,30 @@ function StageBadge({
   )
 }
 
-function Metric({ label, value }: { label: string; value: number | string }) {
+function Metric({
+  label,
+  value,
+  accent,
+  hint,
+}: {
+  label: string
+  value: number | string
+  accent?: "primary" | "success"
+  hint?: string
+}) {
+  const ringClass =
+    accent === "primary"
+      ? "border-primary/40 bg-primary/5"
+      : accent === "success"
+        ? "border-emerald-500/40 bg-emerald-500/5"
+        : "border-border bg-card"
   return (
-    <div className="rounded-md border bg-card p-2">
+    <div className={`rounded-md border p-2 ${ringClass}`} title={hint}>
       <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
         {label}
       </div>
       <div className="font-mono text-lg tabular-nums">{value}</div>
+      {hint ? <div className="mt-0.5 text-[10px] text-muted-foreground">{hint}</div> : null}
     </div>
   )
 }

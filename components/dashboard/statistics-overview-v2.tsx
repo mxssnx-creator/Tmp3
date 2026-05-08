@@ -1006,9 +1006,24 @@ export function StatisticsOverviewV2() {
                 <thead>
                   <tr className="text-muted-foreground/70 border-b border-border/30">
                     <th className="text-left py-0.5 pr-1 font-medium">Stage</th>
-                    <th className="text-right py-0.5 px-1 font-medium" title="Distinct Sets producing qualified entries this cycle">Sets</th>
-                    <th className="text-right py-0.5 px-1 font-medium" title="Cumulative entries observed (trackings)">Track</th>
-                    <th className="text-right py-0.5 pl-1 font-medium" title="Open positions held at this stage right now">Pos</th>
+                    <th
+                      className="text-right py-0.5 px-1 font-medium"
+                      title="PROGRESSING SETS — distinct Sets in active calculation this cycle. Base is limit-gated (1L+1S); Main and Real calculate freely (clone & adjust Base's positions)."
+                    >
+                      Progress
+                    </th>
+                    <th
+                      className="text-right py-0.5 px-1 font-medium"
+                      title="Cumulative entries observed (trackings)"
+                    >
+                      Track
+                    </th>
+                    <th
+                      className="text-right py-0.5 pl-1 font-medium"
+                      title="ACTIVE SETS WITH OPEN POSITIONS — Base holds its own pseudo-positions (capped); Main/Real hold cloned, strategically-adjusted copies of Base's positions; Live holds real exchange orders."
+                    >
+                      Active+Pos
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
