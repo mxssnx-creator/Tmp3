@@ -37,6 +37,14 @@ import {
 import { ConnectionInfoDialog } from "@/components/settings/connection-info-dialog"
 import { ConnectionSettingsDialog } from "@/components/settings/connection-settings-dialog"
 import { ProgressionLogsDialog } from "@/components/dashboard/progression-logs-dialog"
+// ── Additional diagnostic dialogs surfaced for operator review ─────
+// All three render their own button + DialogTrigger, so they slot in
+// as buttons inside the "Diagnostic Tools" row at the bottom of the
+// expanded card. The operator can compare them side-by-side and decide
+// which to keep / consolidate later.
+import { ConnectionDetailedLogDialog } from "@/components/dashboard/connection-detailed-log-dialog"
+import { EngineProcessingLogDialog }   from "@/components/dashboard/engine-processing-log-dialog"
+import { DetailedLoggingDialog }       from "@/components/dashboard/detailed-logging-dialog"
 import { VolumeConfigurationPanel } from "@/components/dashboard/volume-configuration-panel"
 import { OrderSettingsPanel } from "@/components/dashboard/order-settings-panel"
 import { MainTradeCard } from "@/components/dashboard/main-trade-card"
@@ -1705,6 +1713,33 @@ export function ActiveConnectionCard({
                   </div>
                 </div>
               )}
+              {/* ── Diagnostic Tools row ───────────────────────────
+                  Renders the additional dialogs the user asked us to
+                  expose so they can pick which to keep. Each component
+                  brings its own DialogTrigger button — we just lay them
+                  out in a flexible row with a sub-heading for context.
+                  Once the operator decides which to keep, the unwanted
+                  imports + entries can be removed without touching the
+                  rest of the card. */}
+              <div className="mt-3 pt-3 border-t border-dashed">
+                <div className="flex items-center gap-1.5 mb-2">
+                  <Activity className="h-3 w-3 text-muted-foreground" />
+                  <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    Diagnostic Tools
+                  </span>
+                  <Badge variant="outline" className="text-[9px] h-3.5 px-1 ml-auto">
+                    review
+                  </Badge>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {/* Per-connection categorized log dialog */}
+                  {details && <ConnectionDetailedLogDialog connection={details as any} />}
+                  {/* Engine processing log + live stats */}
+                  <EngineProcessingLogDialog connectionId={connection.connectionId} />
+                  {/* System-wide detailed logging stream */}
+                  <DetailedLoggingDialog />
+                </div>
+              </div>
             </CardContent>
           </CollapsibleContent>
         </Card>

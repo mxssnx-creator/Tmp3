@@ -204,19 +204,53 @@ export function ProgressionLogsDialog({
   ]
   const totalIndByType = indTypes.reduce((s, r) => s + r.value, 0) || 1
 
+  // ── Header status pills ────────────────────────────────────────
+  // Shows engine state, cycle counter and "alive now" indications/
+  // strategies on a single line so the operator gets the most
+  // important state-of-the-world signals at a glance, even before
+  // diving into a tab.
+  const isEngineLive = rt?.isActive
+  const totalCycles  = (rt?.indicationCycles || 0) + (rt?.strategyCycles || 0) + (rt?.realtimeCycles || 0)
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-4xl max-h-[82vh] overflow-hidden flex flex-col">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Zap className="w-5 h-5" />
-            {connectionName} — Engine Progression
-            {(rt?.indicationCycles || 0) > 0 && (
-              <Badge variant="default" className="bg-green-600 text-[11px]">
-                {fmt(rt?.indicationCycles || 0)} cycles
-              </Badge>
-            )}
-          </DialogTitle>
+      <DialogContent className="max-w-4xl max-h-[82vh] overflow-hidden flex flex-col p-0">
+        {/* Header — modernized: brand mark + name + status pills */}
+        <DialogHeader className="px-5 pt-4 pb-3 border-b">
+          <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary/10 shrink-0">
+              <Zap className="h-4 w-4 text-primary" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <DialogTitle className="text-base font-semibold truncate">
+                {connectionName} <span className="text-muted-foreground font-normal">— Engine Progression</span>
+              </DialogTitle>
+              <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                <Badge
+                  variant={isEngineLive ? "default" : "outline"}
+                  className={`text-[10px] h-4 px-1.5 gap-1 ${isEngineLive ? "bg-green-600 hover:bg-green-600" : ""}`}
+                >
+                  <span className={`h-1.5 w-1.5 rounded-full ${isEngineLive ? "bg-white animate-pulse" : "bg-muted-foreground"}`} />
+                  {isEngineLive ? "Live" : "Idle"}
+                </Badge>
+                {totalCycles > 0 && (
+                  <Badge variant="secondary" className="text-[10px] h-4 px-1.5 tabular-nums">
+                    {fmt(totalCycles)} cycles
+                  </Badge>
+                )}
+                {activeIndications.total > 0 && (
+                  <Badge variant="outline" className="text-[10px] h-4 px-1.5 tabular-nums">
+                    {fmt(activeIndications.total)} ind alive
+                  </Badge>
+                )}
+                {activeStrategies.total > 0 && (
+                  <Badge variant="outline" className="text-[10px] h-4 px-1.5 tabular-nums">
+                    {fmt(activeStrategies.total)} strat alive
+                  </Badge>
+                )}
+              </div>
+            </div>
+          </div>
         </DialogHeader>
 
         <Tabs
@@ -224,12 +258,12 @@ export function ProgressionLogsDialog({
           onValueChange={(v) => setActiveTab(v as typeof activeTab)}
           className="flex-1 flex flex-col min-h-0"
         >
-          <TabsList className="grid w-full grid-cols-5">
-            <TabsTrigger value="log">Logs</TabsTrigger>
-            <TabsTrigger value="info">Info</TabsTrigger>
-            <TabsTrigger value="breakdown">Breakdown</TabsTrigger>
-            <TabsTrigger value="indications">Indications</TabsTrigger>
-            <TabsTrigger value="strategies">Strategies</TabsTrigger>
+          <TabsList className="mx-5 mt-3 grid grid-cols-5 h-9">
+            <TabsTrigger value="log" className="text-xs">Logs</TabsTrigger>
+            <TabsTrigger value="info" className="text-xs">Info</TabsTrigger>
+            <TabsTrigger value="breakdown" className="text-xs">Breakdown</TabsTrigger>
+            <TabsTrigger value="indications" className="text-xs">Indications</TabsTrigger>
+            <TabsTrigger value="strategies" className="text-xs">Strategies</TabsTrigger>
           </TabsList>
 
           {/* ── Logs ── */}

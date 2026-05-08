@@ -1,20 +1,49 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { useState, useEffect, useCallback, useMemo } from "react"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
-import { Switch } from "@/components/ui/switch"
-import { Badge } from "@/components/ui/badge"
-import { Separator } from "@/components/ui/separator"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Slider } from "@/components/ui/slider"
-import { Checkbox } from "@/components/ui/checkbox"
-import { Card, CardContent } from "@/components/ui/card"
-import { Loader2, Save, RefreshCw, ArrowUp, ArrowDown, GripVertical, TrendingUp } from "lucide-react"
+import { Switch } from "@/components/ui/switch"
+import { Badge } from "@/components/ui/badge"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { Separator } from "@/components/ui/separator"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import {
+  Loader2,
+  Save,
+  RefreshCw,
+  Plus,
+  X,
+  TrendingUp,
+  Zap,
+  ArrowDownUp,
+  ListFilter,
+  Sparkles,
+  Database,
+  Activity,
+} from "lucide-react"
 import { toast } from "@/lib/simple-toast"
+
+// ─────────────────────────────────────────────────────────────────────
+// PUBLIC API
+// ─────────────────────────────────────────────────────────────────────
 
 interface ConnectionSettingsDialogProps {
   open: boolean
@@ -24,38 +53,70 @@ interface ConnectionSettingsDialogProps {
   exchange?: string
 }
 
-interface IndicationSettings {
-  indication_type: string
-  indication_name: string
-  is_enabled: boolean
-  range?: number
-  timeout?: number
-  interval?: number
+// ─────────────────────────────────────────────────────────────────────
+// DATA SHAPES
+// ─────────────────────────────────────────────────────────────────────
+
+const INDICATION_TYPES = ["direction", "move", "active", "optimal", "auto"] as const
+type IndicationType = (typeof INDICATION_TYPES)[number]
+
+interface IndicationParams {
+  enabled: boolean
+  range: number
+  timeout: number
+  interval: number
+}
+type ChannelProfile = Record<IndicationType, IndicationParams>
+
+const STRATEGY_TYPES = ["base", "main", "real"] as const
+type StrategyType = (typeof STRATEGY_TYPES)[number]
+
+interface StrategyParams {
+  enabled: boolean
+  min_profit_factor: number
+  max_drawdown_time: number
+  max_positions: number
+}
+type StrategyChannel = Record<StrategyType, StrategyParams>
+
+type SymbolOrder =
+  | "volume_24h"
+  | "volume_1h"
+  | "volatility_24h"
+  | "volatility_1h"
+  | "newest"
+  | "manual"
+
+interface OverviewSettings {
+  volumeFactorBase:   number
+  volumeFactorLive:   number
+  volumeFactorPreset: number
+  marginMode:  "cross" | "isolated"
+  volumeType:  "usdt" | "contract" | "spot"
 }
 
-interface StrategySettings {
-  strategy_type: string
-  is_enabled: boolean
-  min_profit_factor?: number
-  max_positions?: number
+interface SymbolsSettings {
+  symbols:     string[]
+  symbolOrder: SymbolOrder
+  symbolCount: number
 }
 
-interface ExchangeSymbol {
-  symbol: string
-  volume24h: number
-  selected: boolean
-  rank: number
+const DEFAULT_INDICATION_PROFILE: ChannelProfile = {
+  direction: { enabled: true,  range: 5,  timeout: 30, interval: 1 },
+  move:      { enabled: true,  range: 10, timeout: 30, interval: 1 },
+  active:    { enabled: true,  range: 15, timeout: 60, interval: 5 },
+  optimal:   { enabled: false, range: 20, timeout: 60, interval: 5 },
+  auto:      { enabled: false, range: 25, timeout: 90, interval: 15 },
+}
+const DEFAULT_STRATEGY_PROFILE: StrategyChannel = {
+  base: { enabled: true, min_profit_factor: 1.10, max_drawdown_time: 180, max_positions: 250 },
+  main: { enabled: true, min_profit_factor: 1.15, max_drawdown_time: 180, max_positions: 250 },
+  real: { enabled: true, min_profit_factor: 1.20, max_drawdown_time: 180, max_positions: 100 },
 }
 
-interface ConnectionSettings {
-  symbols: string[]
-  order_type: "main" | "retrieving"
-  symbol_order: "volume" | "alphabetical" | "custom"
-  symbol_count: number
-  volume_ratio: number
-  volume_ratio_min: number
-  volume_ratio_max: number
-}
+// ─────────────────────────────────────────────────────────────────────
+// COMPONENT
+// ─────────────────────────────────────────────────────────────────────
 
 export function ConnectionSettingsDialog({
   open,
@@ -64,606 +125,666 @@ export function ConnectionSettingsDialog({
   connectionName,
   exchange = "bingx",
 }: ConnectionSettingsDialogProps) {
-  const [loading, setLoading] = useState(true)
+  const [tab, setTab] = useState<"overview" | "symbols" | "indications" | "strategies">("overview")
+  const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [activeTab, setActiveTab] = useState("symbols")
-  const [indications, setIndications] = useState<IndicationSettings[]>([])
-  const [strategies, setStrategies] = useState<StrategySettings[]>([])
-  const [exchangeSymbols, setExchangeSymbols] = useState<ExchangeSymbol[]>([])
-  const [loadingSymbols, setLoadingSymbols] = useState(false)
-  const [settings, setSettings] = useState<ConnectionSettings>({
-    symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
-    order_type: "main",
-    symbol_order: "volume",
-    symbol_count: 3,
-    volume_ratio: 1.0,
-    volume_ratio_min: 0.5,
-    volume_ratio_max: 2.0,
+  const [exchangeKey, setExchangeKey] = useState<string>(exchange)
+
+  // ── Overview state ──────────────────────────────────────────────
+  const [overview, setOverview] = useState<OverviewSettings>({
+    volumeFactorBase: 1.0,
+    volumeFactorLive: 1.0,
+    volumeFactorPreset: 1.0,
+    marginMode: "cross",
+    volumeType: "usdt",
+  })
+
+  // ── Symbols state ───────────────────────────────────────────────
+  const [symbolsCfg, setSymbolsCfg] = useState<SymbolsSettings>({
+    symbols: [],
+    symbolOrder: "volume_24h",
+    symbolCount: 3,
   })
   const [symbolInput, setSymbolInput] = useState("")
+  const [exchangeSymbols, setExchangeSymbols] = useState<string[]>([])
+  const [loadingSymbols, setLoadingSymbols] = useState(false)
 
-  useEffect(() => {
-    if (open) {
-      loadSettings()
-      loadExchangeSymbols()
-    }
-  }, [open, connectionId, exchange])
+  // ── Indications & Strategies state (per channel) ────────────────
+  const [indMain,   setIndMain]   = useState<ChannelProfile>(DEFAULT_INDICATION_PROFILE)
+  const [indPreset, setIndPreset] = useState<ChannelProfile>(DEFAULT_INDICATION_PROFILE)
+  const [stratMain,   setStratMain]   = useState<StrategyChannel>(DEFAULT_STRATEGY_PROFILE)
+  const [stratPreset, setStratPreset] = useState<StrategyChannel>(DEFAULT_STRATEGY_PROFILE)
 
-  const loadExchangeSymbols = async () => {
+  // ─────────────────────────────────────────────────────────────────
+  // LOAD
+  // ─────────────────────────────────────────────────────────────────
+
+  const loadAll = useCallback(async () => {
+    setLoading(true)
     try {
-      setLoadingSymbols(true)
-      const res = await fetch(`/api/exchange/${exchange}/symbols?limit=50`)
-      if (res.ok) {
-        const data = await res.json()
-        if (data.symbols && Array.isArray(data.symbols)) {
-          const symbols: ExchangeSymbol[] = data.symbols.map((s: any, index: number) => ({
-            symbol: s.symbol || s,
-            volume24h: s.volume24h || 0,
-            selected: settings.symbols.includes(s.symbol || s),
-            rank: index + 1,
-          }))
-          setExchangeSymbols(symbols)
-        }
-      } else {
-        // Fallback to default symbols
-        const defaultSymbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "SOLUSDT", "LINKUSDT", "AVAXUSDT", "MATICUSDT"]
-        setExchangeSymbols(defaultSymbols.map((s, i) => ({
-          symbol: s,
-          volume24h: 1000000 - i * 100000,
-          selected: settings.symbols.includes(s),
-          rank: i + 1,
-        })))
-      }
-    } catch (error) {
-      console.error("[v0] Failed to load exchange symbols:", error)
-      // Fallback to default symbols
-      const defaultSymbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT"]
-      setExchangeSymbols(defaultSymbols.map((s, i) => ({
-        symbol: s,
-        volume24h: 1000000 - i * 100000,
-        selected: settings.symbols.includes(s),
-        rank: i + 1,
-      })))
-    } finally {
-      setLoadingSymbols(false)
-    }
-  }
+      // Settings (volume factors, margin, volume type, symbols, strategies)
+      const [settingsRes, indRes, symRes] = await Promise.all([
+        fetch(`/api/settings/connections/${connectionId}/settings`).catch(() => null),
+        fetch(`/api/settings/connections/${connectionId}/active-indications`).catch(() => null),
+        fetch(`/api/settings/connections/${connectionId}/symbols`).catch(() => null),
+      ])
 
-  const loadSettings = async () => {
-    try {
-      setLoading(true)
-
-      // Load active indications for this connection
-      const indicationsRes = await fetch(`/api/settings/connections/${connectionId}/active-indications`)
-      if (indicationsRes.ok) {
-        const indicationsData = await indicationsRes.json()
-        setIndications(indicationsData.indications || [])
+      // ── Settings → Overview + Symbols + Strategies ─────────────
+      if (settingsRes?.ok) {
+        const data = await settingsRes.json()
+        const settings = data.settings || {}
+        const conn     = data.connection || {}
+        setExchangeKey(String(conn.exchange || exchange).toLowerCase())
+        setOverview({
+          volumeFactorBase:   Number(settings.volume_factor)        ?? Number(conn.volume_factor) ?? 1.0,
+          volumeFactorLive:   Number(settings.volume_factor_live)   || 1.0,
+          volumeFactorPreset: Number(settings.volume_factor_preset) || 1.0,
+          marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
+          volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
+        })
+        setSymbolsCfg(prev => ({
+          ...prev,
+          symbols:     Array.isArray(settings.symbols) ? settings.symbols : prev.symbols,
+          symbolOrder: (settings.symbol_order as SymbolOrder) || prev.symbolOrder,
+          symbolCount: Number(settings.symbol_count) || prev.symbolCount,
+        }))
+        if (settings.strategies?.main)   setStratMain(settings.strategies.main)
+        if (settings.strategies?.preset) setStratPreset(settings.strategies.preset)
       }
 
-      // Load connection settings including strategies
-      const settingsRes = await fetch(`/api/settings/connections/${connectionId}/settings`)
-      if (settingsRes.ok) {
-        const settingsData = await settingsRes.json()
-        setStrategies(
-          settingsData.strategies || [
-            { strategy_type: "base", is_enabled: true, min_profit_factor: 1.1, max_positions: 250 },
-            { strategy_type: "main", is_enabled: true, min_profit_factor: 1.15, max_positions: 250 },
-            { strategy_type: "real", is_enabled: true, min_profit_factor: 1.2, max_positions: 250 },
-            { strategy_type: "preset", is_enabled: false, min_profit_factor: 1.1, max_positions: 250 },
-          ],
-        )
-        
-        // Load connection-specific settings
-        if (settingsData.symbols) setSettings(prev => ({ ...prev, symbols: settingsData.symbols }))
-        if (settingsData.order_type) setSettings(prev => ({ ...prev, order_type: settingsData.order_type }))
-        if (settingsData.symbol_order) setSettings(prev => ({ ...prev, symbol_order: settingsData.symbol_order }))
-        if (settingsData.symbol_count) setSettings(prev => ({ ...prev, symbol_count: settingsData.symbol_count }))
-        if (settingsData.volume_ratio) setSettings(prev => ({ ...prev, volume_ratio: settingsData.volume_ratio }))
-        if (settingsData.volume_ratio_min) setSettings(prev => ({ ...prev, volume_ratio_min: settingsData.volume_ratio_min }))
-        if (settingsData.volume_ratio_max) setSettings(prev => ({ ...prev, volume_ratio_max: settingsData.volume_ratio_max }))
+      // ── Active indications → Main + Preset ─────────────────────
+      if (indRes?.ok) {
+        const data = await indRes.json()
+        if (data?.channels?.main)   setIndMain(data.channels.main)
+        if (data?.channels?.preset) setIndPreset(data.channels.preset)
       }
-    } catch (error) {
-      console.error("[v0] Failed to load connection settings:", error)
-      toast.error("Error loading settings", {
-        description: error instanceof Error ? error.message : "Failed to load settings",
-      })
+
+      // ── Available symbols list (used by Symbols tab picker) ────
+      if (symRes?.ok) {
+        const data = await symRes.json()
+        if (Array.isArray(data.symbols)) setExchangeSymbols(data.symbols)
+      }
+    } catch (err) {
+      console.error("[v0] [Settings Dialog] load error:", err)
+      toast.error("Load failed", { description: err instanceof Error ? err.message : String(err) })
     } finally {
       setLoading(false)
     }
-  }
+  }, [connectionId, exchange])
 
-  const toggleIndication = (index: number, enabled: boolean) => {
-    setIndications((prev) => prev.map((ind, i) => (i === index ? { ...ind, is_enabled: enabled } : ind)))
-  }
+  useEffect(() => { if (open) loadAll() }, [open, loadAll])
 
-  const toggleStrategy = (index: number, enabled: boolean) => {
-    setStrategies((prev) => prev.map((strat, i) => (i === index ? { ...strat, is_enabled: enabled } : strat)))
-  }
+  // ─────────────────────────────────────────────────────────────────
+  // EXCHANGE SYMBOLS REFRESH
+  // ─────────────────────────────────────────────────────────────────
 
-  const addSymbol = () => {
-    const sym = symbolInput.toUpperCase().trim()
-    if (sym && !settings.symbols.includes(sym)) {
-      setSettings(prev => ({ ...prev, symbols: [...prev.symbols, sym] }))
-      setSymbolInput("")
-    }
-  }
-
-  const removeSymbol = (symbol: string) => {
-    setSettings(prev => ({ ...prev, symbols: prev.symbols.filter(s => s !== symbol) }))
-  }
-
-  const toggleSymbolSelection = (symbol: string) => {
-    const isSelected = settings.symbols.includes(symbol)
-    if (isSelected) {
-      setSettings(prev => ({ ...prev, symbols: prev.symbols.filter(s => s !== symbol) }))
-    } else {
-      setSettings(prev => ({ ...prev, symbols: [...prev.symbols, symbol] }))
-    }
-    setExchangeSymbols(prev => prev.map(s => 
-      s.symbol === symbol ? { ...s, selected: !s.selected } : s
-    ))
-  }
-
-  const selectTopSymbols = (count: number) => {
-    const sortedSymbols = [...exchangeSymbols]
-      .sort((a, b) => {
-        if (settings.symbol_order === "volume") return b.volume24h - a.volume24h
-        if (settings.symbol_order === "alphabetical") return a.symbol.localeCompare(b.symbol)
-        return a.rank - b.rank
-      })
-      .slice(0, count)
-      .map(s => s.symbol)
-    
-    setSettings(prev => ({ ...prev, symbols: sortedSymbols, symbol_count: count }))
-    setExchangeSymbols(prev => prev.map(s => ({
-      ...s,
-      selected: sortedSymbols.includes(s.symbol)
-    })))
-  }
-
-  const moveSymbol = (index: number, direction: "up" | "down") => {
-    const newSymbols = [...settings.symbols]
-    const newIndex = direction === "up" ? index - 1 : index + 1
-    if (newIndex < 0 || newIndex >= newSymbols.length) return
-    ;[newSymbols[index], newSymbols[newIndex]] = [newSymbols[newIndex], newSymbols[index]]
-    setSettings(prev => ({ ...prev, symbols: newSymbols }))
-  }
-
-  const handleSymbolCountChange = (value: number[]) => {
-    const count = value[0]
-    setSettings(prev => ({ ...prev, symbol_count: count }))
-    selectTopSymbols(count)
-  }
-
-  const handleSave = async () => {
+  const refreshExchangeSymbols = useCallback(async () => {
+    setLoadingSymbols(true)
     try {
-      setSaving(true)
+      // Use the top-symbols endpoint when ordering by volume/volatility/listed,
+      // otherwise the static cache fallback below.
+      const window = symbolsCfg.symbolOrder.includes("1h") ? "1h" : "24h"
+      const sortMap: Record<SymbolOrder, string> = {
+        volume_24h:     "volume",
+        volume_1h:      "volume",
+        volatility_24h: "volatility",
+        volatility_1h:  "volatility",
+        newest:         "listed_at",
+        manual:         "volume",
+      }
+      const sort = sortMap[symbolsCfg.symbolOrder]
+      const url = `/api/exchange/${exchangeKey}/top-symbols?window=${window}&sort=${sort}&limit=50`
+      const res = await fetch(url)
+      if (res.ok) {
+        const data = await res.json()
+        const symbols: string[] = (data?.symbols || []).map((s: any) => s.symbol || s).filter(Boolean)
+        if (symbols.length > 0) setExchangeSymbols(symbols)
+      }
+    } catch (err) {
+      console.warn("[v0] [Settings Dialog] refresh symbols failed:", err)
+    } finally {
+      setLoadingSymbols(false)
+    }
+  }, [exchangeKey, symbolsCfg.symbolOrder])
 
-      // Save indication settings
-      await fetch(`/api/settings/connections/${connectionId}/active-indications`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ indications }),
-      })
+  // ─────────────────────────────────────────────────────────────────
+  // SAVE
+  // ─────────────────────────────────────────────────────────────────
 
-      // Save strategy settings
-      await fetch(`/api/settings/connections/${connectionId}/settings`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          strategies,
-          symbols: settings.symbols,
-          order_type: settings.order_type,
-          symbol_order: settings.symbol_order,
-          symbol_count: settings.symbol_count,
-          volume_ratio: settings.volume_ratio,
-          volume_ratio_min: settings.volume_ratio_min,
-          volume_ratio_max: settings.volume_ratio_max,
+  const saveAll = useCallback(async () => {
+    setSaving(true)
+    try {
+      const payload = {
+        // Overview
+        volume_factor:        overview.volumeFactorBase,
+        volume_factor_live:   overview.volumeFactorLive,
+        volume_factor_preset: overview.volumeFactorPreset,
+        margin_mode: overview.marginMode,
+        volume_type: overview.volumeType,
+        // Symbols
+        symbols:      symbolsCfg.symbols,
+        symbol_order: symbolsCfg.symbolOrder,
+        symbol_count: symbolsCfg.symbolCount,
+        // Strategies (per channel)
+        strategies: {
+          main:   stratMain,
+          preset: stratPreset,
+        },
+      }
+
+      const [settingsRes, indRes] = await Promise.all([
+        fetch(`/api/settings/connections/${connectionId}/settings`, {
+          method:  "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify(payload),
         }),
-      })
+        fetch(`/api/settings/connections/${connectionId}/active-indications`, {
+          method:  "PUT",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({ channels: { main: indMain, preset: indPreset } }),
+        }),
+      ])
 
-      toast.success("Settings saved", {
-        description: "Connection settings have been updated successfully",
-      })
+      if (!settingsRes.ok) throw new Error("Settings save failed")
+      if (!indRes.ok)      throw new Error("Indications save failed")
 
+      toast.success("Settings saved", { description: `Updated ${connectionName}` })
+      window.dispatchEvent(new CustomEvent("connection-settings-updated", { detail: { connectionId } }))
       onOpenChange(false)
-    } catch (error) {
-      console.error("[v0] Failed to save settings:", error)
-      toast.error("Save failed", {
-        description: error instanceof Error ? error.message : "Failed to save settings",
-      })
+    } catch (err) {
+      console.error("[v0] [Settings Dialog] save error:", err)
+      toast.error("Save failed", { description: err instanceof Error ? err.message : String(err) })
     } finally {
       setSaving(false)
     }
+  }, [connectionId, connectionName, overview, symbolsCfg, stratMain, stratPreset, indMain, indPreset, onOpenChange])
+
+  // ─────────────────────────────────────────────────────────────────
+  // SYMBOL HELPERS
+  // ─────────────────────────────────────────────────────────────────
+
+  const addSymbol = useCallback((sym: string) => {
+    const clean = sym.trim().toUpperCase()
+    if (!clean) return
+    setSymbolsCfg(prev =>
+      prev.symbols.includes(clean) ? prev : { ...prev, symbols: [...prev.symbols, clean] },
+    )
+    setSymbolInput("")
+  }, [])
+
+  const removeSymbol = useCallback((sym: string) => {
+    setSymbolsCfg(prev => ({ ...prev, symbols: prev.symbols.filter(s => s !== sym) }))
+  }, [])
+
+  const orderLabel: Record<SymbolOrder, string> = {
+    volume_24h:     "Top Volume (24h)",
+    volume_1h:      "Top Volume (1h)",
+    volatility_24h: "Top Volatility (24h)",
+    volatility_1h:  "Top Volatility (1h)",
+    newest:         "Newest Listings",
+    manual:         "Manual",
   }
+
+  const availableSymbols = useMemo(
+    () => exchangeSymbols.filter(s => !symbolsCfg.symbols.includes(s)).slice(0, 25),
+    [exchangeSymbols, symbolsCfg.symbols],
+  )
+
+  // ─────────────────────────────────────────────────────────────────
+  // RENDER
+  // ─────────────────────────────────────────────────────────────────
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>Connection Settings - {connectionName}</DialogTitle>
-          <DialogDescription>Configure symbols, volume ratios, order type, strategies and indications</DialogDescription>
+      <DialogContent className="max-w-3xl max-h-[90vh] overflow-hidden flex flex-col p-0">
+        {/* Header */}
+        <DialogHeader className="px-5 pt-4 pb-3 border-b">
+          <div className="flex items-center gap-2">
+            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary/10">
+              <Sparkles className="h-4 w-4 text-primary" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <DialogTitle className="text-base font-semibold truncate">
+                Update Settings — {connectionName}
+              </DialogTitle>
+              <DialogDescription className="text-xs">
+                Configure volumes, symbols, indications and strategies for this connection.
+              </DialogDescription>
+            </div>
+            <Badge variant="outline" className="text-[10px] uppercase">
+              {exchangeKey}
+            </Badge>
+          </div>
         </DialogHeader>
 
-        {loading ? (
-          <div className="flex items-center justify-center p-8">
-            <Loader2 className="h-8 w-8 animate-spin" />
-          </div>
-        ) : (
-          <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-            <TabsList className="grid w-full grid-cols-5">
-              <TabsTrigger value="symbols">Symbols</TabsTrigger>
-              <TabsTrigger value="volume">Volume Ratios</TabsTrigger>
-              <TabsTrigger value="order">Order Type</TabsTrigger>
-              <TabsTrigger value="indications">Indications</TabsTrigger>
-              <TabsTrigger value="strategies">Strategies</TabsTrigger>
-            </TabsList>
+        {/* Top Tabs */}
+        <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="flex-1 flex flex-col overflow-hidden">
+          <TabsList className="mx-5 mt-3 grid grid-cols-4 h-9">
+            <TabsTrigger value="overview" className="text-xs gap-1.5">
+              <Activity className="h-3.5 w-3.5" /> Overview
+            </TabsTrigger>
+            <TabsTrigger value="symbols" className="text-xs gap-1.5">
+              <Database className="h-3.5 w-3.5" /> Symbols
+            </TabsTrigger>
+            <TabsTrigger value="indications" className="text-xs gap-1.5">
+              <TrendingUp className="h-3.5 w-3.5" /> Indications
+            </TabsTrigger>
+            <TabsTrigger value="strategies" className="text-xs gap-1.5">
+              <Zap className="h-3.5 w-3.5" /> Strategies
+            </TabsTrigger>
+          </TabsList>
 
-            {/* Symbols Tab */}
-            <TabsContent value="symbols" className="space-y-4 mt-4">
-              <div className="grid grid-cols-2 gap-4">
-                {/* Left: Symbol Selection from Exchange */}
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <Label className="text-base font-semibold">Exchange Symbols</Label>
-                    <Button 
-                      variant="outline" 
-                      size="sm" 
-                      onClick={loadExchangeSymbols}
-                      disabled={loadingSymbols}
-                    >
-                      {loadingSymbols ? (
-                        <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                      ) : (
-                        <RefreshCw className="h-3 w-3 mr-1" />
-                      )}
-                      Refresh
-                    </Button>
-                  </div>
+          <ScrollArea className="flex-1 px-5 py-4">
+            {loading && (
+              <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-sm">
+                <Loader2 className="h-4 w-4 animate-spin" /> Loading settings…
+              </div>
+            )}
 
-                  {/* Symbol Count Slider */}
-                  <Card className="p-3">
-                    <div className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <Label className="text-sm font-medium">Symbol Count</Label>
-                        <Badge variant="secondary">{settings.symbol_count} symbols</Badge>
-                      </div>
-                      <Slider
-                        value={[settings.symbol_count]}
-                        onValueChange={handleSymbolCountChange}
-                        min={1}
-                        max={15}
-                        step={1}
-                        className="w-full"
-                      />
-                      <div className="flex justify-between text-xs text-muted-foreground">
-                        <span>1</span>
-                        <span>5</span>
-                        <span>10</span>
-                        <span>15</span>
-                      </div>
-                    </div>
-                  </Card>
+            {!loading && (
+              <>
+                {/* OVERVIEW ──────────────────────────────────────── */}
+                <TabsContent value="overview" className="mt-0 space-y-5">
+                  <SectionHeading icon={ArrowDownUp} title="Volume Factors" subtitle="Multiplier applied to position size for each trade channel." />
+                  <VolumeSlider
+                    label="Base"
+                    description="Default multiplier for the standard pipeline."
+                    value={overview.volumeFactorBase}
+                    onChange={(v) => setOverview(p => ({ ...p, volumeFactorBase: v }))}
+                  />
+                  <VolumeSlider
+                    label="Live"
+                    description="Applied while a Live position is open."
+                    value={overview.volumeFactorLive}
+                    onChange={(v) => setOverview(p => ({ ...p, volumeFactorLive: v }))}
+                  />
+                  <VolumeSlider
+                    label="Preset"
+                    description="Applied to the preset profile when active."
+                    value={overview.volumeFactorPreset}
+                    onChange={(v) => setOverview(p => ({ ...p, volumeFactorPreset: v }))}
+                  />
 
-                  {/* Order Type Selection */}
-                  <Card className="p-3">
-                    <div className="space-y-2">
-                      <Label className="text-sm font-medium">Sort Order</Label>
-                      <Select 
-                        value={settings.symbol_order} 
-                        onValueChange={(value: any) => {
-                          setSettings(prev => ({ ...prev, symbol_order: value }))
-                          selectTopSymbols(settings.symbol_count)
-                        }}
+                  <Separator className="my-4" />
+                  <SectionHeading icon={ListFilter} title="Position Mode" subtitle="Margin and volume denomination applied to all orders." />
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">Margin Mode</Label>
+                      <Select
+                        value={overview.marginMode}
+                        onValueChange={(v) => setOverview(p => ({ ...p, marginMode: v as "cross" | "isolated" }))}
                       >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
+                        <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="volume">
-                            <span className="flex items-center gap-2">
-                              <TrendingUp className="h-3 w-3" /> By 24h Volume
-                            </span>
-                          </SelectItem>
-                          <SelectItem value="alphabetical">Alphabetical (A-Z)</SelectItem>
-                          <SelectItem value="custom">Custom Order</SelectItem>
+                          <SelectItem value="cross">Cross Margin</SelectItem>
+                          <SelectItem value="isolated">Isolated Margin</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
-                  </Card>
 
-                  {/* Available Symbols List */}
-                  <div className="border rounded-md max-h-[200px] overflow-y-auto">
-                    {loadingSymbols ? (
-                      <div className="flex items-center justify-center p-4">
-                        <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                        Loading symbols...
-                      </div>
-                    ) : (
-                      <div className="divide-y">
-                        {exchangeSymbols
-                          .sort((a, b) => {
-                            if (settings.symbol_order === "volume") return b.volume24h - a.volume24h
-                            if (settings.symbol_order === "alphabetical") return a.symbol.localeCompare(b.symbol)
-                            return a.rank - b.rank
-                          })
-                          .map((sym, index) => (
-                          <div 
-                            key={sym.symbol} 
-                            className={`flex items-center justify-between p-2 hover:bg-accent/50 cursor-pointer ${
-                              settings.symbols.includes(sym.symbol) ? "bg-primary/10" : ""
-                            }`}
-                            onClick={() => toggleSymbolSelection(sym.symbol)}
-                          >
-                            <div className="flex items-center gap-2">
-                              <Checkbox 
-                                checked={settings.symbols.includes(sym.symbol)}
-                                onCheckedChange={() => toggleSymbolSelection(sym.symbol)}
-                              />
-                              <span className="text-xs text-muted-foreground w-4">{index + 1}</span>
-                              <span className="text-sm font-medium">{sym.symbol}</span>
-                            </div>
-                            <span className="text-xs text-muted-foreground">
-                              {sym.volume24h > 0 ? `$${(sym.volume24h / 1000000).toFixed(1)}M` : ""}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* Right: Selected Symbols with Reordering */}
-                <div className="space-y-3">
-                  <Label className="text-base font-semibold">Selected Symbols ({settings.symbols.length})</Label>
-                  
-                  {/* Manual Add */}
-                  <div className="flex gap-2">
-                    <Input
-                      placeholder="Add custom symbol..."
-                      value={symbolInput}
-                      onChange={(e) => setSymbolInput(e.target.value)}
-                      onKeyPress={(e) => {
-                        if (e.key === "Enter") addSymbol()
-                      }}
-                      className="flex-1 h-8 text-sm"
-                    />
-                    <Button onClick={addSymbol} variant="outline" size="sm">
-                      Add
-                    </Button>
-                  </div>
-
-                  {/* Selected Symbols with Drag/Reorder */}
-                  <div className="border rounded-md max-h-[280px] overflow-y-auto">
-                    {settings.symbols.length === 0 ? (
-                      <div className="p-4 text-center text-sm text-muted-foreground">
-                        No symbols selected. Use the slider or click symbols on the left.
-                      </div>
-                    ) : (
-                      <div className="divide-y">
-                        {settings.symbols.map((symbol, index) => (
-                          <div 
-                            key={symbol} 
-                            className="flex items-center justify-between p-2 hover:bg-accent/50 group"
-                          >
-                            <div className="flex items-center gap-2">
-                              <GripVertical className="h-3 w-3 text-muted-foreground opacity-50 group-hover:opacity-100" />
-                              <span className="text-xs text-muted-foreground w-4">{index + 1}</span>
-                              <span className="text-sm font-medium">{symbol}</span>
-                            </div>
-                            <div className="flex items-center gap-1">
-                              <Button 
-                                variant="ghost" 
-                                size="sm" 
-                                className="h-6 w-6 p-0"
-                                onClick={() => moveSymbol(index, "up")}
-                                disabled={index === 0}
-                              >
-                                <ArrowUp className="h-3 w-3" />
-                              </Button>
-                              <Button 
-                                variant="ghost" 
-                                size="sm" 
-                                className="h-6 w-6 p-0"
-                                onClick={() => moveSymbol(index, "down")}
-                                disabled={index === settings.symbols.length - 1}
-                              >
-                                <ArrowDown className="h-3 w-3" />
-                              </Button>
-                              <Button 
-                                variant="ghost" 
-                                size="sm" 
-                                className="h-6 w-6 p-0 text-destructive hover:text-destructive"
-                                onClick={() => removeSymbol(symbol)}
-                              >
-                                ×
-                              </Button>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Quick Actions */}
-                  <div className="flex flex-wrap gap-2">
-                    <Button variant="outline" size="sm" onClick={() => selectTopSymbols(3)}>
-                      Top 3
-                    </Button>
-                    <Button variant="outline" size="sm" onClick={() => selectTopSymbols(5)}>
-                      Top 5
-                    </Button>
-                    <Button variant="outline" size="sm" onClick={() => selectTopSymbols(10)}>
-                      Top 10
-                    </Button>
-                    <Button 
-                      variant="outline" 
-                      size="sm" 
-                      onClick={() => {
-                        setSettings(prev => ({ ...prev, symbols: [] }))
-                        setExchangeSymbols(prev => prev.map(s => ({ ...s, selected: false })))
-                      }}
-                    >
-                      Clear All
-                    </Button>
-                  </div>
-                </div>
-              </div>
-            </TabsContent>
-
-            {/* Volume Ratios Tab */}
-            <TabsContent value="volume" className="space-y-4 mt-4">
-              <div className="space-y-4">
-                <div className="space-y-2">
-                  <Label htmlFor="volume-ratio" className="text-base font-semibold">
-                    Base Volume Ratio: {settings.volume_ratio.toFixed(2)}x
-                  </Label>
-                  <Input
-                    id="volume-ratio"
-                    type="number"
-                    step="0.1"
-                    min="0.1"
-                    max="5"
-                    value={settings.volume_ratio}
-                    onChange={(e) => setSettings(prev => ({ ...prev, volume_ratio: parseFloat(e.target.value) }))}
-                  />
-                  <p className="text-xs text-muted-foreground">Multiplier for trading volume</p>
-                </div>
-
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <Label htmlFor="volume-min" className="text-sm font-semibold">
-                      Minimum Ratio: {settings.volume_ratio_min.toFixed(2)}x
-                    </Label>
-                    <Input
-                      id="volume-min"
-                      type="number"
-                      step="0.1"
-                      min="0.1"
-                      value={settings.volume_ratio_min}
-                      onChange={(e) => setSettings(prev => ({ ...prev, volume_ratio_min: parseFloat(e.target.value) }))}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="volume-max" className="text-sm font-semibold">
-                      Maximum Ratio: {settings.volume_ratio_max.toFixed(2)}x
-                    </Label>
-                    <Input
-                      id="volume-max"
-                      type="number"
-                      step="0.1"
-                      min="0.1"
-                      value={settings.volume_ratio_max}
-                      onChange={(e) => setSettings(prev => ({ ...prev, volume_ratio_max: parseFloat(e.target.value) }))}
-                    />
-                  </div>
-                </div>
-              </div>
-            </TabsContent>
-
-            {/* Order Type Tab */}
-            <TabsContent value="order" className="space-y-4 mt-4">
-              <div className="space-y-3">
-                <Label className="text-base font-semibold">Order Type Configuration</Label>
-                <Select value={settings.order_type} onValueChange={(value: any) => setSettings(prev => ({ ...prev, order_type: value }))}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="main">Main Order</SelectItem>
-                    <SelectItem value="retrieving">Retrieving Order</SelectItem>
-                  </SelectContent>
-                </Select>
-                <p className="text-sm text-muted-foreground mt-2">
-                  {settings.order_type === "main" 
-                    ? "Main orders execute immediately when signal is triggered"
-                    : "Retrieving orders wait for better prices before execution"
-                  }
-                </p>
-              </div>
-            </TabsContent>
-
-            {/* Indications Tab */}
-            <TabsContent value="indications" className="space-y-4 mt-4">
-              <div className="space-y-4">
-                <h3 className="text-base font-semibold">Active Indications</h3>
-                {indications.length === 0 ? (
-                  <p className="text-sm text-muted-foreground">No indications configured</p>
-                ) : (
-                  <div className="space-y-3">
-                    {indications.map((indication, index) => (
-                      <div
-                        key={`${indication.indication_type}-${indication.indication_name}`}
-                        className="flex items-center justify-between p-3 border rounded-lg"
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">Volume Type</Label>
+                      <Select
+                        value={overview.volumeType}
+                        onValueChange={(v) => setOverview(p => ({ ...p, volumeType: v as "usdt" | "contract" | "spot" }))}
                       >
-                        <div className="flex items-center gap-3 flex-1">
-                          <Badge variant="outline" className="capitalize">
-                            {indication.indication_type}
-                          </Badge>
-                          <div className="text-sm">
-                            <div className="font-medium">{indication.indication_name}</div>
-                            <div className="text-muted-foreground text-xs">
-                              Range: {indication.range || "N/A"} | Timeout: {indication.timeout || "N/A"}ms
-                            </div>
-                          </div>
-                        </div>
-                        <Switch
-                          checked={indication.is_enabled}
-                          onCheckedChange={(checked) => toggleIndication(index, checked)}
-                        />
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </TabsContent>
-
-            {/* Strategies Tab */}
-            <TabsContent value="strategies" className="space-y-4 mt-4">
-              <div className="space-y-4">
-                <h3 className="text-base font-semibold">Strategy Configuration</h3>
-                <div className="space-y-3">
-                  {strategies.map((strategy, index) => (
-                    <div key={strategy.strategy_type} className="flex items-center justify-between p-3 border rounded-lg">
-                      <div className="flex items-center gap-3 flex-1">
-                        <Badge variant="outline" className="capitalize">
-                          {strategy.strategy_type}
-                        </Badge>
-                        <div className="text-sm text-muted-foreground">
-                          Min PF: {strategy.min_profit_factor} | Max: {strategy.max_positions}
-                        </div>
-                      </div>
-                      <Switch
-                        checked={strategy.is_enabled}
-                        onCheckedChange={(checked) => toggleStrategy(index, checked)}
-                      />
+                        <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="usdt">USDT-M Linear</SelectItem>
+                          <SelectItem value="contract">Coin-M Inverse</SelectItem>
+                          <SelectItem value="spot">Spot</SelectItem>
+                        </SelectContent>
+                      </Select>
                     </div>
-                  ))}
-                </div>
-              </div>
-            </TabsContent>
-          </Tabs>
-        )}
+                  </div>
+                </TabsContent>
 
-        <div className="flex justify-end gap-2 pt-4">
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>
-            Cancel
-          </Button>
-          <Button onClick={handleSave} disabled={saving}>
-            {saving ? (
-              <>
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                Saving...
-              </>
-            ) : (
-              <>
-                <Save className="h-4 w-4 mr-2" />
-                Save Changes
+                {/* SYMBOLS ──────────────────────────────────────── */}
+                <TabsContent value="symbols" className="mt-0 space-y-5">
+                  <SectionHeading icon={Database} title="Symbol Selection" subtitle="Choose how the engine ranks and picks symbols from the exchange." />
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">Order from Exchange</Label>
+                      <Select
+                        value={symbolsCfg.symbolOrder}
+                        onValueChange={(v) => setSymbolsCfg(p => ({ ...p, symbolOrder: v as SymbolOrder }))}
+                      >
+                        <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          {(Object.keys(orderLabel) as SymbolOrder[]).map((k) => (
+                            <SelectItem key={k} value={k}>{orderLabel[k]}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between">
+                        <Label className="text-xs">Symbol Count</Label>
+                        <span className="text-xs font-mono tabular-nums">{symbolsCfg.symbolCount}</span>
+                      </div>
+                      <Slider
+                        min={1} max={25} step={1}
+                        value={[symbolsCfg.symbolCount]}
+                        onValueChange={([v]) => setSymbolsCfg(p => ({ ...p, symbolCount: v }))}
+                        className="py-2"
+                      />
+                      <div className="flex justify-between text-[10px] text-muted-foreground">
+                        <span>1</span><span>default 3</span><span>25</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <Separator />
+
+                  {/* Symbol chips */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs">Selected Symbols ({symbolsCfg.symbols.length})</Label>
+                      <Button
+                        type="button"
+                        size="sm" variant="outline"
+                        className="h-7 text-xs gap-1"
+                        onClick={refreshExchangeSymbols}
+                        disabled={loadingSymbols}
+                      >
+                        {loadingSymbols ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+                        Refresh listings
+                      </Button>
+                    </div>
+
+                    <div className="flex flex-wrap gap-1.5 min-h-[2.5rem] rounded-md border border-dashed p-2">
+                      {symbolsCfg.symbols.length === 0 && (
+                        <span className="text-[11px] text-muted-foreground italic">
+                          No symbols selected — engine will use top-{symbolsCfg.symbolCount} from exchange ordering.
+                        </span>
+                      )}
+                      {symbolsCfg.symbols.map((s) => (
+                        <Badge key={s} variant="secondary" className="gap-1 pr-1 text-[10px]">
+                          {s}
+                          <button
+                            type="button"
+                            className="rounded-sm p-0.5 hover:bg-destructive/20"
+                            onClick={() => removeSymbol(s)}
+                            aria-label={`Remove ${s}`}
+                          >
+                            <X className="h-2.5 w-2.5" />
+                          </button>
+                        </Badge>
+                      ))}
+                    </div>
+
+                    <div className="flex gap-2">
+                      <Input
+                        placeholder="Add symbol e.g. BTCUSDT"
+                        value={symbolInput}
+                        onChange={(e) => setSymbolInput(e.target.value.toUpperCase())}
+                        onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), addSymbol(symbolInput))}
+                        className="h-8 text-xs"
+                      />
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="h-8 text-xs gap-1"
+                        onClick={() => addSymbol(symbolInput)}
+                      >
+                        <Plus className="h-3 w-3" /> Add
+                      </Button>
+                    </div>
+
+                    {availableSymbols.length > 0 && (
+                      <div className="rounded-md border bg-muted/30 p-2">
+                        <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1.5">
+                          Suggested ({orderLabel[symbolsCfg.symbolOrder]})
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {availableSymbols.map((s) => (
+                            <button
+                              key={s}
+                              type="button"
+                              className="rounded-md border bg-background px-2 py-0.5 text-[10px] hover:bg-accent"
+                              onClick={() => addSymbol(s)}
+                            >
+                              + {s}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </TabsContent>
+
+                {/* INDICATIONS ─────────────────────────────────── */}
+                <TabsContent value="indications" className="mt-0">
+                  <Tabs defaultValue="main" className="w-full">
+                    <TabsList className="grid grid-cols-2 h-8 mb-4 w-fit">
+                      <TabsTrigger value="main"   className="text-xs px-4">Main</TabsTrigger>
+                      <TabsTrigger value="preset" className="text-xs px-4">Preset</TabsTrigger>
+                    </TabsList>
+                    <TabsContent value="main">
+                      <IndicationProfileEditor profile={indMain} onChange={setIndMain} />
+                    </TabsContent>
+                    <TabsContent value="preset">
+                      <IndicationProfileEditor profile={indPreset} onChange={setIndPreset} />
+                    </TabsContent>
+                  </Tabs>
+                </TabsContent>
+
+                {/* STRATEGIES ─────────────────────────────────── */}
+                <TabsContent value="strategies" className="mt-0">
+                  <Tabs defaultValue="main" className="w-full">
+                    <TabsList className="grid grid-cols-2 h-8 mb-4 w-fit">
+                      <TabsTrigger value="main"   className="text-xs px-4">Main</TabsTrigger>
+                      <TabsTrigger value="preset" className="text-xs px-4">Preset</TabsTrigger>
+                    </TabsList>
+                    <TabsContent value="main">
+                      <StrategyProfileEditor profile={stratMain} onChange={setStratMain} />
+                    </TabsContent>
+                    <TabsContent value="preset">
+                      <StrategyProfileEditor profile={stratPreset} onChange={setStratPreset} />
+                    </TabsContent>
+                  </Tabs>
+                </TabsContent>
               </>
             )}
+          </ScrollArea>
+        </Tabs>
+
+        <DialogFooter className="px-5 py-3 border-t bg-muted/30">
+          <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
+            Cancel
           </Button>
-        </div>
+          <Button size="sm" onClick={saveAll} disabled={saving || loading} className="gap-1.5">
+            {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+            {saving ? "Saving…" : "Save Changes"}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SUB-COMPONENTS
+// ─────────────────────────────────────────────────────────────────────
+
+function SectionHeading({
+  icon: Icon, title, subtitle,
+}: { icon: React.ComponentType<{ className?: string }>; title: string; subtitle?: string }) {
+  return (
+    <div className="flex items-start gap-2">
+      <div className="mt-0.5 flex h-6 w-6 items-center justify-center rounded-md bg-primary/10">
+        <Icon className="h-3.5 w-3.5 text-primary" />
+      </div>
+      <div className="flex-1">
+        <div className="text-sm font-medium">{title}</div>
+        {subtitle && <div className="text-[11px] text-muted-foreground">{subtitle}</div>}
+      </div>
+    </div>
+  )
+}
+
+function VolumeSlider({
+  label, description, value, onChange,
+}: {
+  label: string; description: string; value: number; onChange: (v: number) => void
+}) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between">
+        <div>
+          <Label className="text-xs">{label}</Label>
+          <div className="text-[10px] text-muted-foreground">{description}</div>
+        </div>
+        <span className="text-xs font-mono tabular-nums w-12 text-right">{value.toFixed(2)}×</span>
+      </div>
+      <Slider
+        min={0.1} max={5} step={0.05}
+        value={[value]}
+        onValueChange={([v]) => onChange(v)}
+        className="py-1"
+      />
+      <div className="flex justify-between text-[10px] text-muted-foreground">
+        <span>0.1×</span><span>1.0×</span><span>5.0×</span>
+      </div>
+    </div>
+  )
+}
+
+function IndicationProfileEditor({
+  profile, onChange,
+}: { profile: ChannelProfile; onChange: (p: ChannelProfile) => void }) {
+  const update = (type: IndicationType, patch: Partial<IndicationParams>) => {
+    onChange({ ...profile, [type]: { ...profile[type], ...patch } })
+  }
+  return (
+    <div className="space-y-3">
+      {INDICATION_TYPES.map((type) => {
+        const p = profile[type]
+        return (
+          <div key={type} className={`rounded-md border p-3 transition-opacity ${p.enabled ? "" : "opacity-60"}`}>
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Switch
+                  checked={p.enabled}
+                  onCheckedChange={(v) => update(type, { enabled: v })}
+                />
+                <Label className="text-sm font-medium capitalize">{type}</Label>
+              </div>
+              <Badge variant={p.enabled ? "default" : "outline"} className="text-[9px]">
+                {p.enabled ? "Enabled" : "Disabled"}
+              </Badge>
+            </div>
+
+            <div className="grid grid-cols-3 gap-3">
+              <NumberField
+                label="Range" suffix="" min={1} max={100} step={1}
+                value={p.range} onChange={(v) => update(type, { range: v })} disabled={!p.enabled}
+              />
+              <NumberField
+                label="Timeout" suffix="s" min={5} max={600} step={5}
+                value={p.timeout} onChange={(v) => update(type, { timeout: v })} disabled={!p.enabled}
+              />
+              <NumberField
+                label="Interval" suffix="m" min={1} max={120} step={1}
+                value={p.interval} onChange={(v) => update(type, { interval: v })} disabled={!p.enabled}
+              />
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function StrategyProfileEditor({
+  profile, onChange,
+}: { profile: StrategyChannel; onChange: (p: StrategyChannel) => void }) {
+  const update = (type: StrategyType, patch: Partial<StrategyParams>) => {
+    onChange({ ...profile, [type]: { ...profile[type], ...patch } })
+  }
+  return (
+    <div className="space-y-3">
+      {STRATEGY_TYPES.map((type) => {
+        const p = profile[type]
+        const accent =
+          type === "base" ? "border-orange-300/50 bg-orange-50/30 dark:bg-orange-950/10" :
+          type === "main" ? "border-yellow-300/50 bg-yellow-50/30 dark:bg-yellow-950/10" :
+          "border-green-300/50 bg-green-50/30 dark:bg-green-950/10"
+        return (
+          <div key={type} className={`rounded-md border p-3 transition-opacity ${accent} ${p.enabled ? "" : "opacity-60"}`}>
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Switch
+                  checked={p.enabled}
+                  onCheckedChange={(v) => update(type, { enabled: v })}
+                />
+                <Label className="text-sm font-medium capitalize">{type} Strategy</Label>
+              </div>
+              <Badge variant={p.enabled ? "default" : "outline"} className="text-[9px]">
+                {p.enabled ? "Enabled" : "Disabled"}
+              </Badge>
+            </div>
+
+            <div className="grid grid-cols-3 gap-3">
+              <NumberField
+                label="Min PF" suffix="×" min={1} max={3} step={0.05}
+                value={p.min_profit_factor} onChange={(v) => update(type, { min_profit_factor: v })} disabled={!p.enabled}
+              />
+              <NumberField
+                label="Max DDT" suffix="m" min={1} max={1440} step={1}
+                value={p.max_drawdown_time} onChange={(v) => update(type, { max_drawdown_time: v })} disabled={!p.enabled}
+              />
+              <NumberField
+                label="Max Pos" suffix="" min={1} max={1000} step={1}
+                value={p.max_positions} onChange={(v) => update(type, { max_positions: v })} disabled={!p.enabled}
+              />
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function NumberField({
+  label, value, onChange, suffix, min, max, step, disabled,
+}: {
+  label: string
+  value: number
+  onChange: (v: number) => void
+  suffix: string
+  min: number
+  max: number
+  step: number
+  disabled?: boolean
+}) {
+  return (
+    <div className="space-y-1">
+      <Label className="text-[10px] text-muted-foreground uppercase tracking-wide">{label}</Label>
+      <div className="relative">
+        <Input
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          disabled={disabled}
+          onChange={(e) => {
+            const v = Number(e.target.value)
+            if (!Number.isFinite(v)) return
+            onChange(Math.max(min, Math.min(max, v)))
+          }}
+          className="h-8 text-xs pr-7 tabular-nums"
+        />
+        {suffix && (
+          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-muted-foreground pointer-events-none">
+            {suffix}
+          </span>
+        )}
+      </div>
+    </div>
   )
 }
