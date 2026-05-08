@@ -83,13 +83,13 @@ export class ExchangePositionManager {
       )
 
       const finalQuantity = volumeResult.volume
-      const finalVolumeUsd = volumeResult.volumeUsd
+      const finalVolumeUsd = volumeResult.volumeUsd ?? 0
       const finalLeverage = volumeResult.leverage
 
       // Compute used balance (margin) alongside the leveraged notional
       // so post-trade stats and dashboards can dimension by either
       // figure without re-deriving on read. Margin = notional / leverage.
-      const marginUsd = finalLeverage > 0 ? finalVolumeUsd / finalLeverage : finalVolumeUsd
+      const marginUsd = (finalLeverage ?? 0) > 0 ? finalVolumeUsd / (finalLeverage ?? 1) : finalVolumeUsd
 
       const position = {
         id: positionId,

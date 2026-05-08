@@ -119,7 +119,7 @@ class EnginePerformanceMonitor {
     // Calculate cycles per minute
     const now = Date.now()
     const lastMinute = now - 60000
-    const recentCycles = (await client.lrange(cycleKey, 0, this.MAX_HISTORY))
+    const recentCycles = (await client.lrange(cycleKey, 0, this.MAX_HISTORY as number))
       .map((c: string) => JSON.parse(c))
       .filter((c: CycleMetrics) => new Date(c.timestamp).getTime() > lastMinute)
       .length

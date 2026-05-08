@@ -31,7 +31,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
         enabled: ind.enabled !== false,
         config: ind,
       }
-      await saveIndication(id, indication)
+      await saveIndication({ ...indication, connection_id: id })
     }
 
     return NextResponse.json({ success: true })

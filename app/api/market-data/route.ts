@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server"
-import { initRedis, getSettings, setSettings, getConnection } from "@/lib/redis-db"
+import { initRedis, getSettings, setSettings, getConnection, getRedisClient } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors"
 
 export const runtime = "nodejs"

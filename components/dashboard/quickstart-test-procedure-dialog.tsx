@@ -156,7 +156,7 @@ export function QuickstartTestProcedureDialog() {
   const [isRunning, setIsRunning] = useState(false)
   const [currentStepIndex, setCurrentStepIndex] = useState(-1)
   const [liveMonitor, setLiveMonitor] = useState<LiveMonitorSnapshot | null>(null)
-  const liveMonitorRef = useRef<NodeJS.Timeout>()
+  const liveMonitorRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined)
 
   // Poll live stats while test is running so we can see cycles incrementing
   useEffect(() => {
