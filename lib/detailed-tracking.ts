@@ -76,6 +76,7 @@ export interface IndicationTracking {
 export interface StrategyStageTracking {
   base: {
     setsActivelyProcessing: number   // Sets alive this cycle (per-symbol snapshot)
+    setsRunningNow: number           // ★ canonical "active": setKey ∈ active_config_keys
     setsWithOpenPositions: number    // Sets currently holding ≥ 1 open pseudo-position
     setsProgressing: number          // Sets in active calculation this cycle
     setsTotal: number                 // total Base Sets (cumulative)
@@ -94,6 +95,7 @@ export interface StrategyStageTracking {
     evaluatedFromBase: number
     setsCreated: number               // current cycle: variants per qualifying Base
     setsTotal: number                 // cumulative across cycles
+    setsRunningNow: number           // ★ parentSetKey ∈ active_config_keys (clone-and-filter)
     setsWithOpenPositions: number    // CLONED positions from Base — count of Sets actually holding
     setsProgressing: number          // Sets currently in calculation
     avgProfitFactor: number
@@ -117,7 +119,8 @@ export interface StrategyStageTracking {
     // adjusts them across the position-count axis windows.
     setsCurrent: number               // current cycle Real Sets (post filter+sort+cap)
     setsTotal: number                 // cumulative Real Sets across cycles
-    setsWithOpenPositions: number    // CLONED positions held — count of Sets with open clones
+    setsRunningNow: number           // ★ parent ∈ active_config_keys (alive right now)
+    setsWithOpenPositions: number    // alias of setsRunningNow (operator-friendly label)
     setsProgressing: number          // Sets currently in calculation
     evaluatedFromMain: number         // Main Sets evaluated (input to Real)
     avgProfitFactor: number
@@ -125,6 +128,21 @@ export interface StrategyStageTracking {
     avgPosPerSet: number
     minProfitFactor: number           // 1.4 gate
     maxDrawdownTime: number           // 960 min gate
+    /**
+     * Operator's 4-perspective Real stats (per spec):
+     *   - overall:     cumulative Real Sets ever produced (lifetime)
+     *   - accumulated: axis-window accumulation across cycles (∑ axes)
+     *   - general:     this cycle (latest snapshot)
+     *   - combined:    actively-running RIGHT NOW (= setsRunningNow)
+     * The dashboard surfaces all four as a small panel so operators see
+     * "lifetime / axis / current / alive" at a glance.
+     */
+    fourPerspective: {
+      overall: number
+      accumulated: number
+      general: number
+      combined: number
+    }
     // ── Position-count axis accumulation ──
     // prev (1-12) × last (1-4) × cont (1-8) × pause (1-8) = up to 384
     axisAccumulation: {
@@ -144,6 +162,7 @@ export interface StrategyStageTracking {
   }
   live: {
     setsActive: number                // currently on exchange with open positions
+    setsRunningNow: number           // ★ alias of setsActive (running orders)
     setsWithOpenPositions: number    // alias of setsActive (real exchange orders)
     setsProgressing: number          // Sets being evaluated for live execution
     setsTotal: number                 // best 500 ranked
@@ -280,10 +299,28 @@ export async function getStrategyTracking(
   const liveDetailKey = `strategy_detail:${connectionId}:live`
   const liveDetail = (await client.hgetall(liveDetailKey).catch(() => ({}))) as Record<string, string>
 
+  // ── Pre-derive Real 4-perspective so the UI doesn't have to ──
+  // Overall is cumulative across cycles, accumulated is the axis sum
+  // (already pre-computed by the coordinator under `stat_accumulated`,
+  // with a graceful fallback to summing `axisAccumulation` here).
+  const realOverall    = Number(prog.strategies_real_total || "0")
+  const realGeneral    = Number(prog.strategies_real_current || real.created_sets || "0")
+  const realCombined   = Number(real.sets_running_now || real.sets_with_open_positions || "0")
+  const realAccumulated = (() => {
+    const fromCoord = Number(real.stat_accumulated || "")
+    if (Number.isFinite(fromCoord) && fromCoord > 0) return fromCoord
+    let sum = 0
+    for (const axis of ["prev", "last", "cont", "pause"] as const) {
+      for (const v of Object.values(axisAccumulation[axis] || {})) sum += Number(v) || 0
+    }
+    return sum
+  })()
+
   return {
     base: {
       setsActivelyProcessing: baseActivelyProcessing,
-      setsWithOpenPositions: Number(base.sets_with_open_positions || "0"),
+      setsRunningNow: Number(base.sets_running_now || base.sets_with_open_positions || "0"),
+      setsWithOpenPositions: Number(base.sets_running_now || base.sets_with_open_positions || "0"),
       setsProgressing: Number(base.sets_progressing || base.created_sets || "0"),
       setsTotal: Number(prog.strategies_base_total || "0"),
       setsCurrent: Number(prog.strategies_base_current || base.created_sets || "0"),
@@ -299,7 +336,8 @@ export async function getStrategyTracking(
       evaluatedFromBase: Number(main.evaluated || "0"),
       setsCreated: Number(prog.strategies_main_current || main.created_sets || "0"),
       setsTotal: Number(prog.strategies_main_total || "0"),
-      setsWithOpenPositions: Number(main.sets_with_open_positions || "0"),
+      setsRunningNow: Number(main.sets_running_now || main.sets_with_open_positions || "0"),
+      setsWithOpenPositions: Number(main.sets_running_now || main.sets_with_open_positions || "0"),
       setsProgressing: Number(main.sets_progressing || main.created_sets || "0"),
       avgProfitFactor: Number(main.avg_profit_factor || "0"),
       avgDrawdownTime: Number(main.avg_drawdown_time || "0"),
@@ -308,9 +346,10 @@ export async function getStrategyTracking(
       variants: mainVariants,
     },
     real: {
-      setsCurrent: Number(prog.strategies_real_current || real.created_sets || "0"),
-      setsTotal: Number(prog.strategies_real_total || "0"),
-      setsWithOpenPositions: Number(real.sets_with_open_positions || "0"),
+      setsCurrent: realGeneral,
+      setsTotal: realOverall,
+      setsRunningNow: realCombined,
+      setsWithOpenPositions: realCombined,
       setsProgressing: Number(real.sets_progressing || real.created_sets || "0"),
       evaluatedFromMain: Number(real.evaluated || "0"),
       avgProfitFactor: Number(real.avg_profit_factor || "0"),
@@ -320,10 +359,17 @@ export async function getStrategyTracking(
       maxDrawdownTime: Number(settings.maxDrawdownTimeReal || "960"),
       axisAccumulation,
       variantsAccumulated: realVariants,
+      fourPerspective: {
+        overall:     realOverall,
+        accumulated: realAccumulated,
+        general:     realGeneral,
+        combined:    realCombined,
+      },
     },
     live: {
       setsActive: liveActive,
-      setsWithOpenPositions: Number(liveDetail.sets_with_open_positions || liveActive),
+      setsRunningNow: Number(liveDetail.sets_running_now || liveDetail.sets_with_open_positions || liveActive),
+      setsWithOpenPositions: Number(liveDetail.sets_running_now || liveDetail.sets_with_open_positions || liveActive),
       setsProgressing: Number(liveDetail.sets_progressing || "0"),
       setsTotal: Number(prog.strategies_live_total || "0"),
       avgProfitFactor: Number(prog.live_avg_profit_factor || "0"),

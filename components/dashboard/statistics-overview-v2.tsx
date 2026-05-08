@@ -994,10 +994,19 @@ export function StatisticsOverviewV2() {
 
             {/* Strategies side */}
             <div className="rounded bg-muted/30 border border-border/30 p-2">
-              <div className="flex items-center justify-between text-[9px] text-muted-foreground/80 mb-1">
-                <span className="uppercase tracking-wide font-semibold">Strategies · Active Progressing</span>
+              <div
+                className="flex items-center justify-between text-[9px] text-muted-foreground/80 mb-1"
+                title={
+                  "Strategies · Active Running. Counts only Sets currently processing — those with " +
+                  "≥1 open pseudo-position OR mid-formation this cycle. Already-progressed Sets that " +
+                  "have since closed are intentionally excluded.\n\n" +
+                  "Source: pseudo_positions:{conn}:active_config_keys (Base) and parentSetKey " +
+                  "resolution for cloned/filtered Main+Real variants."
+                }
+              >
+                <span className="uppercase tracking-wide font-semibold">Strategies · Running Now</span>
                 <span className="tabular-nums">
-                  {fmt(stats.apStrategies?.total?.sets ?? 0)} sets ·
+                  {fmt(stats.apStrategies?.total?.sets ?? 0)} running ·
                   {" "}{fmt(stats.apStrategies?.total?.trackings ?? 0)} tracked ·
                   {" "}{fmt(stats.apStrategies?.total?.positions ?? 0)} pos
                 </span>
@@ -1008,21 +1017,31 @@ export function StatisticsOverviewV2() {
                     <th className="text-left py-0.5 pr-1 font-medium">Stage</th>
                     <th
                       className="text-right py-0.5 px-1 font-medium"
-                      title="PROGRESSING SETS — distinct Sets in active calculation this cycle. Base is limit-gated (1L+1S); Main and Real calculate freely (clone & adjust Base's positions)."
+                      title={
+                        "RUNNING SETS — distinct Sets currently processing right now. A Set is " +
+                        "counted as running iff its setKey (Base) or parentSetKey (cloned/filtered " +
+                        "Main+Real variants) is in pseudo_positions:active_config_keys, i.e. it's " +
+                        "either holding ≥1 open pseudo-position or mid-formation this cycle.\n\n" +
+                        "Already-progressed Sets that have since closed are NOT counted here."
+                      }
                     >
-                      Progress
+                      Running
                     </th>
                     <th
                       className="text-right py-0.5 px-1 font-medium"
-                      title="Cumulative entries observed (trackings)"
+                      title="Cumulative entries observed (trackings) since run start"
                     >
                       Track
                     </th>
                     <th
                       className="text-right py-0.5 pl-1 font-medium"
-                      title="ACTIVE SETS WITH OPEN POSITIONS — Base holds its own pseudo-positions (capped); Main/Real hold cloned, strategically-adjusted copies of Base's positions; Live holds real exchange orders."
+                      title={
+                        "OPEN POSITIONS — Base holds its own pseudo-positions (capped); Main/Real " +
+                        "hold cloned, strategically-adjusted copies of Base's positions (no new " +
+                        "exchange exposure); Live holds real exchange orders."
+                      }
                     >
-                      Active+Pos
+                      Open Pos
                     </th>
                   </tr>
                 </thead>
