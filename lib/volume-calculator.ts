@@ -44,15 +44,18 @@ export class VolumeCalculator {
    */
   /**
    * Universal minimum notional value in USD.
-   * Every live order must have at least this value to avoid hitting
-   * exchange minimums that prevent execution. This was increased
-   * from $5 to $15 to account for 300-position mode: with a $10K
-   * balance and 0.1% cost split across 300 positions, we'd get
-   * ~$0.03/position, which is below most exchange minimums. The
-   * $15 floor ensures even in worst-case defaults, every position
-   * is executable.
+   *
+   * REVISED for the new spec where Position Limits + per-Direction caps
+   * are valid for STRATEGY BASE Sets ONLY (max 1 long + 1 short active
+   * at a time). Main and Real "calculate free" — they do NOT create new
+   * positions, only Set variants. So we no longer need the $15 floor
+   * that was sized for 300-position mode. $5 is the documented minimum
+   * across every major venue (Binance, BingX, Bybit, OKX, Bitget) and
+   * keeps live orders MINIMAL — which is what the operator wants:
+   * "ensure positions volume is minimalized ... keep enforcing minimal
+   * value." Per-pair `exchangeMinVolume` still wins when larger.
    */
-  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 15
+  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 5
 
   /**
    * Calculate position volume with risk management (pure math, no DB).
@@ -189,28 +192,28 @@ export class VolumeCalculator {
       // bundle (cleanup schedule, backup toggles) — so the operator's
       // saved leverage/cost never reached volume calculations.
       const settings = (await getAppSettings()) || {}
-      // Default position cost: 1% of balance per position.
-      // Previously 0.1%, which with 300 positions on a $10K balance
-      // meant each position got only $0.03 — below any exchange minimum.
-      // The 1% default ensures $100/position with $10K balance and
-      // 300 positions ($100 * 300 = $30K total exposure if all live
-      // simultaneously, but that's rare; typical ops have 5-10 live).
+      // Default position cost: 0.1% of balance per position (MINIMAL).
+      // Per spec: Strategy Base caps to 1 long + 1 short → max 2 active.
+      // Operator wants "positions volume is minimalized ... keep enforcing
+      // minimal value." With 0.1% cost on a $10K balance the math gives
+      // $10/position which then gets clamped UP to the universal $5 floor
+      // only if it would land below it. Using a small default keeps every
+      // live order at the smallest practical size; operators that want
+      // bigger sizing override `exchangePositionCost` explicitly.
       const positionCostPercent = parseFloat(
-        String(settings.exchangePositionCost ?? settings.positionCost ?? "1.0")
+        String(settings.exchangePositionCost ?? settings.positionCost ?? "0.1")
       )
       const positionCost = positionCostPercent / 100
 
-      // Default: 150 positions instead of 300. Balances the goal
-      // ("prevent too much capital in any one trade") with the reality
-      // ("with small defaults for cost%, volume becomes tiny"). The 50
-      // → 300 increase was intended to lower per-position sizing, but
-      // at default 0.1% cost it went TOO low. 150 is a reasonable middle
-      // ground: with 1% cost on $10K, each position gets $667 ($1M /
-      // 150), which is safe. The old 50-position default still works if
-      // the operator explicitly set it.
+      // Default: 2 (matches the Base-stage cap of 1 long + 1 short).
+      // The denominator divides budgeted exposure across the expected
+      // number of concurrent positions. With Strategy Base limited to 2
+      // (per the new spec — Main/Real calculate free and don't open
+      // positions), 2 is the correct divisor for minimal per-position
+      // sizing. Operator overrides via `positions_average` still apply.
       const positionsAverage = (() => {
-        const raw = parseFloat(String(settings.positions_average ?? "150"))
-        return Number.isFinite(raw) && raw > 0 ? raw : 150
+        const raw = parseFloat(String(settings.positions_average ?? "2"))
+        return Number.isFinite(raw) && raw > 0 ? raw : 2
       })()
 
       const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))

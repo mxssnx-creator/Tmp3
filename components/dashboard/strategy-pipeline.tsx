@@ -137,13 +137,17 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
           <CardTitle className="flex items-center gap-2 text-sm">
             <Layers className="h-4 w-4" />
             Base — Independent Sets
-            <Badge variant="secondary" className="ml-auto font-mono">
+            <Badge variant="destructive" className="ml-auto font-mono text-[10px]">
+              LIMIT-GATED
+            </Badge>
+            <Badge variant="secondary" className="font-mono">
               {data.base.setsActivelyProcessing} processing
             </Badge>
           </CardTitle>
           <p className="text-xs text-muted-foreground">
             Each Base Set has its OWN pseudo-positions (independent), one per
-            (indication_type × direction)
+            (indication_type × direction). Position Limits + per-Direction caps
+            apply HERE only (max 1 long + 1 short).
           </p>
         </CardHeader>
         <CardContent>
@@ -174,14 +178,18 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
           <CardTitle className="flex items-center gap-2 text-sm">
             <Workflow className="h-4 w-4" />
             Main — Variant Sets per Base
-            <Badge variant="secondary" className="ml-auto font-mono">
+            <Badge variant="outline" className="ml-auto font-mono text-[10px] border-emerald-500/40 text-emerald-600 dark:text-emerald-400">
+              FREE CALCULATION
+            </Badge>
+            <Badge variant="secondary" className="font-mono">
               {data.main.evaluatedFromBase} evaluated
             </Badge>
           </CardTitle>
           <p className="text-xs text-muted-foreground">
-            Each variant Set REUSES Base&apos;s pseudo-positions (no new positions
-            created). Block + DCA validate Base&apos;s complete positions through
-            different config gates. Filter: PF ≥ {data.main.minProfitFactor.toFixed(2)},
+            Variant Sets REUSE Base&apos;s pseudo-positions (no new positions
+            created). Block + DCA validate Base&apos;s COMPLETE positions through
+            different config gates. NO Position Limits / Direction caps —
+            calculated freely. Filter: PF ≥ {data.main.minProfitFactor.toFixed(2)},
             DDT ≤ {data.main.maxDrawdownTime}m
           </p>
         </CardHeader>
@@ -224,13 +232,17 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
           <CardTitle className="flex items-center gap-2 text-sm">
             <Settings2 className="h-4 w-4 text-primary" />
             Real — Position-Counts Accumulation
-            <Badge variant="default" className="ml-auto font-mono">
+            <Badge variant="outline" className="ml-auto font-mono text-[10px] border-emerald-500/40 text-emerald-600 dark:text-emerald-400">
+              FREE CALCULATION
+            </Badge>
+            <Badge variant="default" className="font-mono">
               {data.real.setsTotal} accumulated
             </Badge>
           </CardTitle>
           <p className="text-xs text-muted-foreground">
-            Multi-axis variant accumulation happens HERE (not Main). Filter:
-            PF ≥ {data.real.minProfitFactor.toFixed(2)}, DDT ≤{" "}
+            Multi-axis variant accumulation happens HERE (not Main). NO Position
+            Limits / Direction caps — calculated freely. Filter: PF ≥{" "}
+            {data.real.minProfitFactor.toFixed(2)}, DDT ≤{" "}
             {data.real.maxDrawdownTime}m
           </p>
         </CardHeader>

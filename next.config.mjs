@@ -1,3 +1,22 @@
+// Force rebuild: 2026-05-05T22:00:00 — Position limit ownership + minimal volume:
+//   1. lib/volume-calculator.ts: Volume MINIMIZATION
+//      • UNIVERSAL_MIN_NOTIONAL_USD lowered $15 → $5 (spec floor across all major venues)
+//      • Default exchangePositionCost lowered 1.0% → 0.1% per position (true minimal sizing)
+//      • Default positionsAverage lowered 150 → 2 (matches Strategy-Base 1L+1S cap)
+//      Result: live orders use the smallest practical size unless operator overrides.
+//   2. components/dashboard/strategy-pipeline.tsx: Limit-ownership clarity
+//      • Base now displays a red "LIMIT-GATED" badge — caps apply HERE only
+//      • Main now displays a green "FREE CALCULATION" badge — no limits
+//      • Real now displays a green "FREE CALCULATION" badge — no limits
+//      • Subtitle copy updated on all three stages to spell out the policy
+//   3. Architecture confirmation (no code change required):
+//      • PseudoPositionManager.canCreatePosition cap enforcement only fires from
+//        createBaseSets (Base entry-point) and createLiveSets (real exchange).
+//      • createMainSets and evaluateRealSets only mutate Set arrays + Redis
+//        counters. They do NOT call posManager.createPosition, so they cannot
+//        be gated by maxActiveBasePseudoPositionsPerDirection. Verified by
+//        scanning lib/strategy-coordinator.ts.
+// ──────────────────────────────────────────────────────────────────────────
 // Force rebuild: 2026-05-05T21:30:00 — Architecture: Real-stage accumulation correctness:
 //   1. New: lib/detailed-tracking.ts
 //      • Authoritative read API for indications + strategy stages
