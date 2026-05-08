@@ -472,6 +472,61 @@ export class InlineLocalRedis {
     this.data.ttl?.clear()
   }
 
+  /**
+   * Root-cause fix for "data still remaining after Reset DB".
+   *
+   * The previous clear-progressions route deleted keys from in-memory Maps
+   * via `client.del(...)` but never updated the snapshot file on disk.
+   * The next HTTP request triggers `loadFromDisk()` which restored all
+   * deleted keys from the stale snapshot, making the reset appear to have
+   * no effect. This method atomically deletes from memory AND overwrites
+   * the snapshot so both layers stay consistent after a reset.
+   *
+   * Deletes all keys whose prefix is NOT in `protectedPrefixes`.
+   * `forceClearPrefixes` overrides protection for runtime caches that
+   * share a protected namespace (e.g. `connection:test:*`).
+   */
+  async flushRuntimeKeys(
+    protectedPrefixes: readonly string[],
+    forceClearPrefixes: readonly string[] = [],
+  ): Promise<{ deleted: number; protected: number }> {
+    const checkProtected = (key: string): boolean => {
+      for (const fc of forceClearPrefixes) {
+        if (key.startsWith(fc)) return false
+      }
+      for (const p of protectedPrefixes) {
+        if (key.startsWith(p)) return true
+      }
+      return false
+    }
+    const allKeys = new Set<string>([
+      ...this.data.strings.keys(),
+      ...this.data.hashes.keys(),
+      ...this.data.sets.keys(),
+      ...this.data.lists.keys(),
+      ...this.data.sorted_sets.keys(),
+    ])
+    let deleted = 0
+    let protectedCount = 0
+    for (const key of allKeys) {
+      if (checkProtected(key)) {
+        protectedCount++
+      } else {
+        this.deleteKey(key)
+        deleted++
+      }
+    }
+    if (this.data.ttl) {
+      for (const key of this.data.ttl.keys()) {
+        if (!checkProtected(key)) this.data.ttl.delete(key)
+      }
+    }
+    // Immediately overwrite the snapshot so loadFromDisk() on the next
+    // cold-start or hot-reload only restores protected keys.
+    await this.saveToDisk()
+    return { deleted, protected: protectedCount }
+  }
+
   async hset(key: string, dataOrField: Record<string, string> | string, value?: string): Promise<number> {
     this.trackOperation()
     const existing = this.data.hashes.get(key) || {}
