@@ -247,18 +247,42 @@ async function incrementMetric(connectionId: string, field: string, by = 1): Pro
 async function fetchCurrentPrice(symbol: string): Promise<number> {
   try {
     const client = getRedisClient()
+
+    // 1. Primary: hgetall market_data:{symbol} hash
     const mdhash = await client.hgetall(`market_data:${symbol}`)
     const price = parseFloat(String(mdhash?.close ?? mdhash?.price ?? mdhash?.last ?? "0"))
     if (price > 0) return price
-    const raw = await client.get(`market_data:${symbol}:1m`)
-    if (raw) {
+
+    // 2. Fallback: 1m candle key
+    const raw1m = await client.get(`market_data:${symbol}:1m`)
+    if (raw1m) {
       try {
-        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw
-        return parseFloat(String(parsed?.close ?? parsed?.price ?? 0)) || 0
-      } catch {
-        /* ignore */
-      }
+        const parsed = typeof raw1m === "string" ? JSON.parse(raw1m) : raw1m
+        const p = parseFloat(String(parsed?.close ?? parsed?.price ?? parsed?.last ?? 0))
+        if (p > 0) return p
+      } catch { /* ignore */ }
     }
+
+    // 3. Fallback: ticker key (some connectors write here)
+    const rawTicker = await client.get(`ticker:${symbol}`)
+    if (rawTicker) {
+      try {
+        const parsed = typeof rawTicker === "string" ? JSON.parse(rawTicker) : rawTicker
+        const p = parseFloat(String(parsed?.last ?? parsed?.close ?? parsed?.price ?? 0))
+        if (p > 0) return p
+      } catch { /* ignore */ }
+    }
+
+    // 4. Fallback: latest candle string key
+    const rawLatest = await client.get(`market_data:${symbol}:latest`)
+    if (rawLatest) {
+      try {
+        const parsed = typeof rawLatest === "string" ? JSON.parse(rawLatest) : rawLatest
+        const p = parseFloat(String(parsed?.close ?? parsed?.price ?? parsed?.last ?? 0))
+        if (p > 0) return p
+      } catch { /* ignore */ }
+    }
+
     return 0
   } catch {
     return 0
@@ -1075,7 +1099,7 @@ export async function executeLivePosition(
   // skipped attempt for dashboard visibility.
   if (isMarginCooldownActive(connectionId)) {
     const skipped: LivePosition = {
-      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}`,
+      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
       connectionId,
       symbol: realPosition.symbol,
       direction: realPosition.direction,
@@ -1117,7 +1141,7 @@ export async function executeLivePosition(
   }
 
   const livePosition: LivePosition = {
-    id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}`,
+    id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
     connectionId,
     symbol: realPosition.symbol,
     direction: realPosition.direction,
@@ -1500,7 +1524,7 @@ export async function executeLivePosition(
     // Persist intermediate state so UI can show "placed" even during poll.
     await savePosition(livePosition)
 
-    // ── Step 6: Poll for fill confirmation ─────────────────────────────────
+    // ── Step 6: Poll for fill confirmation ───────────────────────────��─────
     const fill = await pollOrderFill(exchangeConnector, realPosition.symbol, livePosition.orderId!)
     if (fill.filled && fill.filledQty > 0) {
       livePosition.executedQuantity = fill.filledQty
