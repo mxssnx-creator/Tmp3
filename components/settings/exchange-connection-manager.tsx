@@ -382,7 +382,7 @@ function EditConnectionDialog({ connection, onSave, exchangeName }: { connection
             <Label className="font-medium">Use Testnet</Label>
             <p className="text-xs text-muted-foreground mt-1">{formData.is_testnet ? "Testnet" : "Live"}</p>
           </div>
-          <Switch checked={formData.is_testnet} onCheckedChange={(checked) => setFormData({ ...formData, is_testnet: checked })} disabled={loading} />
+          <Switch checked={formData.is_testnet === true || formData.is_testnet === "true" || formData.is_testnet === "1"} onCheckedChange={(checked) => setFormData({ ...formData, is_testnet: checked })} disabled={loading} />
         </div>
 
         <div className="border-t pt-4 space-y-3">

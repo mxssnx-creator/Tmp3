@@ -18,6 +18,10 @@ import { useExchange } from "@/lib/exchange-context"
 interface StratDetail {
   avgPosPerSet: number; createdSets: number; avgProfitFactor: number
   avgProcessingTimeMs: number; evalPct: number
+  // Optional cross-stage evaluation counters (used by the Live StratCard
+  // to show ordersFilled / ordersPlaced as a fallback when liveExecution
+  // is not yet populated).
+  passed?: number; evaluated?: number
   // Live-only extras (optional on base/main/real)
   winRate?: number; totalPnl?: number; avgPnl?: number
   openPositions?: number; volumeUsdTotal?: number
@@ -176,7 +180,7 @@ export function QuickstartComprehensiveLogDialog() {
   const [expandedLog, setExpandedLog] = useState<number | null>(null)
   const [logFilter, setLogFilter] = useState<"all" | "info" | "success" | "warning" | "error">("all")
   const logsEndRef = useRef<HTMLDivElement>(null)
-  const pollRef = useRef<NodeJS.Timeout>()
+  const pollRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined)
 
   const fetchData = useCallback(async (silent = false) => {
     if (!activeConnectionId) return

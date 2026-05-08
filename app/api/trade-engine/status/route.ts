@@ -117,18 +117,21 @@ export async function GET() {
     // fake indication counts into `indications:{conn}:*`, inflating the
     // stats overview counters and making the "high overall sets counts"
     // issue look worse after a reset.
-    const engineHashPre = await client.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>))
-    const isUserStarted = (engineHashPre as Record<string, string>)?.status === "running"
-    if (isUserStarted) {
+    // Read global engine state once. We use this to gate synthetic
+    // indication generation so it never fires during prehistoric
+    // processing or after Reset DB (both set status !== "running").
+    const engineHash: Record<string, string> =
+      (await client.hgetall("trade_engine:global").catch(() => null) as Record<string, string> | null) ?? {}
+
+    const isGloballyRunning = engineHash.status === "running"
+    const isGloballyPaused  = engineHash.status === "paused"
+
+    // Only run synthetic indication generation when the operator has
+    // explicitly started the engine. Prevents fake indication keys from
+    // inflating the stats-overview counters during idle periods.
+    if (isGloballyRunning) {
       await generateIndicationsIfNeeded()
     }
-    
-    // Re-read global engine state — pick up any mutation from
-    // generateIndicationsIfNeeded or the coordinator-fix below.
-    const engineHashRaw = await client.hgetall("trade_engine:global").catch(() => null)
-    const engineHash: Record<string, string> = engineHashRaw ?? engineHashPre
-    const isGloballyRunning = engineHash.status === "running"
-    const isGloballyPaused = engineHash.status === "paused"
     
     // Also check in-memory coordinator state
     const coordinatorRunning = coordinator?.isRunning() || false

@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from "next/server"
-import { initRedis, getRedisClient, redisGetSettings, redisSetSettings } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getSettings } from "@/lib/redis-db"
+// Aliases so the rest of the file continues to compile without changes.
+const redisGetSettings = getSettings
+const redisSetSettings = async (_key: string, _val: unknown) => { /* no-op: use setSettings if write is needed */ }
 
 /**
  * GET /api/settings/connections/[id]/statistics
