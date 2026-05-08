@@ -1075,6 +1075,20 @@ export async function GET(
       })
     )
 
+    // ── Opportunistic stale per-symbol field pruning ─────────────────
+    // After aggregation, HDEL the per-symbol bundles older than 30 min.
+    // Done after the response is computed (and fire-and-forget) so it
+    // never adds latency to /stats. Bounds hash size for long-running
+    // connections that swap symbol baskets — without pruning the hash
+    // grows by ~11 fields × every-symbol-ever-seen until the 24h TTL.
+    if (staleFieldsByKey.size > 0) {
+      void Promise.allSettled(
+        Array.from(staleFieldsByKey.entries()).map(([key, fields]) =>
+          fields.length > 0 ? client.hdel(key, ...fields).catch(() => 0) : Promise.resolve(0),
+        ),
+      )
+    }
+
     // ── LIVE STAGE DETAIL (4th tier — mirrors Real but from real exchange) ───
     // Sourced entirely from local Redis — the progression hash (counters) and
     // the closed-position archive written by the live-stage pipeline. No
