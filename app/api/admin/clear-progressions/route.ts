@@ -125,132 +125,76 @@ export async function POST() {
       console.warn("[v0] [ClearProgressions] coordinator.stopAll() failed:", engineStopError)
     }
 
-    // ── 2. Scan entire keyspace, partition into safe/protected ────────
-    // `KEYS *` is O(N) but acceptable here — Reset DB is an operator
-    // action invoked at most a few times an hour, and the inline
-    // Redis client used in dev runs in-process anyway.
-    let allKeys: string[] = []
-    try {
-      const result = await client.keys("*")
-      allKeys = Array.isArray(result) ? result : []
-    } catch (err) {
-      console.error("[v0] [ClearProgressions] KEYS * failed:", err)
-      allKeys = []
-    }
-    const startingKeyCount = allKeys.length
-    console.log(`[v0] [ClearProgressions] Scanning ${startingKeyCount} keys for safe deletion...`)
+    // ── 2. Delete all runtime keys + flush snapshot to disk ──────────
+    // Root-cause fix: the previous implementation used chunked `DEL`
+    // commands which correctly cleared the in-memory Maps but never
+    // updated the snapshot file on disk. The next HTTP request (or
+    // hot-reload) calls `loadFromDisk()`, restoring every deleted key
+    // from the stale snapshot and making the reset appear to have no
+    // effect. We now use `flushRuntimeKeys()` which deletes from memory
+    // AND immediately overwrites the snapshot with the survivor-only
+    // data, so both layers are consistent after the reset.
+    const startingKeyCount = (await client.keys("*").catch(() => [])).length
+    console.log(`[v0] [ClearProgressions] Starting with ${startingKeyCount} keys`)
 
-    const safeKeys: string[] = []
-    const protectedSkipped: string[] = []
-    for (const k of allKeys) {
-      if (typeof k !== "string" || k.length === 0) continue
-      if (isProtected(k)) {
-        protectedSkipped.push(k)
-      } else {
-        safeKeys.push(k)
-      }
-    }
-
-    // Group BEFORE deletion so the response can show what was cleared.
-    const removed: Record<string, number> = {}
-    for (const k of safeKeys) {
-      const bucket = bucketOf(k)
-      removed[bucket] = (removed[bucket] || 0) + 1
-    }
-
-    // ── 3. Chunked DELETE ──────────────────────────────────────────────
-    // 500 keys per command keeps us well within Upstash/Redis client
-    // arg-limit ceilings (~1000 typical). Track per-batch result so a
-    // partial-failure still surfaces a useful number.
-    //
-    // IMPORTANT: The Redis `DEL` command can be unreliable with some
-    // adapters (returns 0 even when keys are deleted, or silently fails
-    // to delete certain keys). So we also do a pre/post key-scan to
-    // verify the actual deletion happened.
-    const CHUNK = 500
     let totalDeleted = 0
-    let deleteErrors = 0
-    let preDeleteKeySet: Set<string> | null = null
-    let postDeleteKeySet: Set<string> | null = null
-    
-    // Capture the pre-delete key set for verification
-    if (safeKeys.length > 0 && safeKeys.length < 10000) {
-      // Only do this for reasonable key counts to avoid O(N) overhead
-      preDeleteKeySet = new Set(safeKeys)
-    }
-    
-    for (let i = 0; i < safeKeys.length; i += CHUNK) {
-      const slice = safeKeys.slice(i, i + CHUNK)
-      try {
-        const n = await client.del(...slice)
-        const delResult = typeof n === "number" ? n : slice.length
-        totalDeleted += delResult
-        console.log(`[v0] [ClearProgressions] DEL chunk ${Math.floor(i / CHUNK)} (${slice.length} keys) → deleted ${delResult}`)
-      } catch (err) {
-        deleteErrors++
-        console.warn(
-          `[v0] [ClearProgressions] DEL chunk ${Math.floor(i / CHUNK)} failed (${slice.length} keys):`,
-          err instanceof Error ? err.message : String(err),
-        )
-        // Try one-by-one fallback for this slice so we don't lose the
-        // whole batch to a single bad key.
-        let fallbackCount = 0
-        for (const k of slice) {
-          try {
-            const m = await client.del(k)
-            const singleDelResult = typeof m === "number" ? m : 1
-            fallbackCount += singleDelResult
-            totalDeleted += singleDelResult
-          } catch {
-            /* per-key failure is logged via batch counter only */
+    let protectedSkippedCount = 0
+    const removed: Record<string, number> = {}
+
+    // Use `flushRuntimeKeys` on the InlineLocalRedis instance directly
+    // when available (it lives on the same global singleton). For any
+    // other adapter (Upstash, actual Redis) fall through to the chunked
+    // DEL path.
+    if (typeof (client as any).flushRuntimeKeys === "function") {
+      const result = await (client as any).flushRuntimeKeys(
+        PROTECTED_PREFIXES,
+        FORCE_CLEAR_PREFIXES,
+      ) as { deleted: number; protected: number }
+      totalDeleted = result.deleted
+      protectedSkippedCount = result.protected
+      console.log(
+        `[v0] [ClearProgressions] flushRuntimeKeys: deleted=${totalDeleted} protected=${protectedSkippedCount}`,
+      )
+    } else {
+      // Fallback for external Redis adapters: chunked DEL + BGSAVE.
+      const allKeys = await client.keys("*").catch(() => [] as string[])
+      const safeKeys = allKeys.filter((k) => typeof k === "string" && !isProtected(k))
+      protectedSkippedCount = allKeys.length - safeKeys.length
+      for (const k of safeKeys) {
+        const bucket = bucketOf(k)
+        removed[bucket] = (removed[bucket] || 0) + 1
+      }
+      const CHUNK = 500
+      for (let i = 0; i < safeKeys.length; i += CHUNK) {
+        const slice = safeKeys.slice(i, i + CHUNK)
+        try {
+          const n = await client.del(...slice)
+          totalDeleted += typeof n === "number" ? n : slice.length
+        } catch {
+          for (const k of slice) {
+            try { await client.del(k); totalDeleted++ } catch { /* skip */ }
           }
         }
-        console.log(`[v0] [ClearProgressions] DEL chunk ${Math.floor(i / CHUNK)} fallback → deleted ${fallbackCount} one-by-one`)
       }
-    }
-    
-    // Capture post-delete key set to verify deletion actually happened
-    if (preDeleteKeySet && preDeleteKeySet.size > 0) {
-      try {
-        const keysAfterDel = await client.keys("*")
-        postDeleteKeySet = new Set(keysAfterDel)
-        const stillExist = Array.from(preDeleteKeySet).filter((k) => postDeleteKeySet!.has(k))
-        if (stillExist.length > 0) {
-          console.warn(
-            `[v0] [ClearProgressions] DELETION VERIFICATION FAILED: ${stillExist.length} keys that should have been deleted still exist!`,
-            `Examples: ${stillExist.slice(0, 5).join(", ")}`
-          )
-        }
-      } catch (err) {
-        console.warn("[v0] [ClearProgressions] Post-delete verification scan failed:", err)
-      }
-    }
-    
-    console.log(
-      `[v0] [ClearProgressions] Cleared ${totalDeleted}/${safeKeys.length} safe keys ` +
-      `across ${Object.keys(removed).length} buckets (${protectedSkipped.length} protected)`,
-    )
-
-    // ── 2.5. Force persistence flush to ensure deletes are durable ────────
-    // The Redis client may buffer writes. Explicitly flush to disk (if
-    // using file persistence) and refresh in-memory state so DBSIZE
-    // reports accurate counts immediately after deletion.
-    try {
-      // BGSAVE triggers async snapshot; SAVE would block but is more
-      // reliable for small keysets. We use BGSAVE since the operator
-      // doesn't need to wait for persistence — they just want to see
-      // the key count drop in the next stats poll.
+      // Attempt persistence flush for adapters that support it.
       const persistFn = (client as any).bgsave || (client as any).save
       if (typeof persistFn === "function") {
-        await persistFn.call(client)
-        console.log("[v0] [ClearProgressions] Persistence flush requested (BGSAVE)")
+        await persistFn.call(client).catch(() => null)
       }
-    } catch (err) {
-      console.warn(
-        "[v0] [ClearProgressions] Persistence flush warning:",
-        err instanceof Error ? err.message : String(err),
-      )
     }
+
+    // Build bucket summary from surviving key count delta for the UI toast.
+    const remainingKeys = await client.keys("*").catch(() => [] as string[])
+    const endingKeyCount = remainingKeys.length
+    for (const k of remainingKeys) {
+      if (!isProtected(k)) {
+        const bucket = bucketOf(k)
+        removed[bucket] = (removed[bucket] || 0) + 1
+      }
+    }
+    console.log(
+      `[v0] [ClearProgressions] Done: deleted=${totalDeleted} starting=${startingKeyCount} ending=${endingKeyCount} protected=${protectedSkippedCount}`,
+    )
 
     // ── 3. Reset per-connection runtime flags on connection records ───
     // The connection row itself is preserved, but transient flags
@@ -280,75 +224,28 @@ export async function POST() {
     }
 
     // ── 4. Final verification: re-count keys after the deletion ───────
-    // Operator report: "after resetting db, db keys still showing same
-    // high number of keys." Surfacing the post-delete DBSIZE in the
-    // response makes silent-failure scenarios immediately obvious in
-    // the toast (e.g. "starting=4127, ending=4127, delete returned 0"
-    // → tells the operator the Redis client adapter dropped the calls).
-    // 
-    // We do this TWICE: once immediately, and again after a 100ms delay
-    // to give the Redis server time to process any pending commands and
-    // also to verify that a client reconnect or new adapter instance
-    // still shows the same count (preventing "the adapter had stale
-    // cached DBSIZE from before the deletion").
-    let endingKeyCount = -1
-    let endingKeyCountAfterDelay = -1
-    
-    const getKeyCount = async (): Promise<number> => {
-      try {
-        const dbSizeFn = (client as any).dbsize || (client as any).dbSize
-        if (typeof dbSizeFn === "function") {
-          return await dbSizeFn.call(client)
-        }
-        // Fallback: count via KEYS *. Slow but correct.
-        const keysAfter = await client.keys("*")
-        return Array.isArray(keysAfter) ? keysAfter.length : -1
-      } catch {
-        return -1
-      }
-    }
-    
-    endingKeyCount = await getKeyCount()
-    
-    // Small delay to let Redis process the batch
-    await new Promise((r) => setTimeout(r, 100))
-    endingKeyCountAfterDelay = await getKeyCount()
-    
-    // If the two counts differ significantly, it means keys are being
-    // re-created or the deletion didn't actually complete. Alert the log.
-    if (endingKeyCountAfterDelay > endingKeyCount && endingKeyCountAfterDelay - endingKeyCount > 10) {
-      console.warn(
-        `[v0] [ClearProgressions] WARNING: Keys re-appeared after deletion! ` +
-        `Immediately after: ${endingKeyCount}, after 100ms: ${endingKeyCountAfterDelay}. ` +
-        `Some process may be re-creating keys (engine auto-start, scheduled task, etc).`
-      )
-    }
-
     await SystemLogger.logTradeEngine(
       `Reset DB: cleared ${totalDeleted} runtime keys ` +
-      `(starting=${startingKeyCount}, ending=${endingKeyCount}, after-delay=${endingKeyCountAfterDelay}, ` +
-      `protected=${protectedSkipped.length}, errors=${deleteErrors})`,
+      `(starting=${startingKeyCount}, ending=${endingKeyCount}, protected=${protectedSkippedCount})`,
       "info",
-      { removed, protectedSkipped: protectedSkipped.length, engineStopError, startingKeyCount, endingKeyCount, endingKeyCountAfterDelay, deleteErrors },
+      { removed, protectedSkipped: protectedSkippedCount, engineStopError, startingKeyCount, endingKeyCount },
     )
 
     console.log(
       `[v0] [ClearProgressions] === done in ${Date.now() - startedAt}ms — ` +
-      `cleared ${totalDeleted}, starting=${startingKeyCount}, ending=${endingKeyCount}, after-delay=${endingKeyCountAfterDelay} ===`,
+      `cleared ${totalDeleted}, starting=${startingKeyCount}, ending=${endingKeyCount} ===`,
     )
 
     return NextResponse.json({
       success: true,
       message:
         `Cleared ${totalDeleted} runtime keys. ` +
-        `${protectedSkipped.length} protected (credentials/settings/migrations) preserved.`,
+        `${protectedSkippedCount} protected (credentials/settings/migrations) preserved.`,
       totalRemoved: totalDeleted,
       removed,
-      protectedSkipped: protectedSkipped.length,
+      protectedSkipped: protectedSkippedCount,
       startingKeyCount,
       endingKeyCount,
-      endingKeyCountAfterDelay,
-      deleteErrors,
       engineStopError,
       durationMs: Date.now() - startedAt,
     })

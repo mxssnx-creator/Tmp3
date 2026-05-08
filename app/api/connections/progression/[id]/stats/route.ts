@@ -430,27 +430,46 @@ export async function GET(
     // The UI tile reads `realActivePositions.average` below. Reset DB
     // wipes the entire `progression:{id}` hash so these accumulators
     // restart cleanly per run.
+    // ── Running average of active validated Real positions ───────────────
+    // We ONLY accumulate a sample when realOpen > 0 (i.e. there are
+    // actually open real positions right now). Accumulating zero-samples
+    // during prehistoric processing — when real positions don't exist yet
+    // — would dilute the average toward zero and make the "Avg Real Pos"
+    // tile show near-zero even after many real positions have been opened.
+    //
+    // This means the average represents "mean open real positions across
+    // all polls where at least one position was open" which is the
+    // operationally useful metric (not "mean over all time including idle").
     let realActivePosAverage = 0
     let realActivePosSamples = 0
     try {
-      // Atomic increment-and-read pattern: hincrby returns the new value,
-      // so we know the sample count and cumulative sum *post-increment*.
-      // No transaction needed — the average is approximate by design
-      // (sample rate = poll rate, drift is acceptable).
       const progKey = `progression:${connectionId}`
-      const [newSumX100, newSamples] = await Promise.all([
-        client.hincrby(progKey, "real_active_pos_sum_x100", Math.round(realOpen * 100)),
-        client.hincrby(progKey, "real_active_pos_samples", 1),
-      ])
-      // Also write the current snapshot for ad-hoc inspection.
-      await client.hset(progKey, {
-        real_active_pos_current: String(realOpen),
-        real_active_pos_avg: (Number(newSamples) > 0 ? (Number(newSumX100) / 100) / Number(newSamples) : 0).toFixed(2),
-      })
-      realActivePosSamples = Number(newSamples) || 0
-      realActivePosAverage = realActivePosSamples > 0
-        ? (Number(newSumX100) / 100) / realActivePosSamples
-        : 0
+      if (realOpen > 0) {
+        // Atomic increment-and-read: hincrby returns the new value
+        // post-increment so we get a consistent sample count and sum.
+        const [newSumX100, newSamples] = await Promise.all([
+          client.hincrby(progKey, "real_active_pos_sum_x100", Math.round(realOpen * 100)),
+          client.hincrby(progKey, "real_active_pos_samples", 1),
+        ])
+        await client.hset(progKey, {
+          real_active_pos_current: String(realOpen),
+          real_active_pos_avg: (Number(newSamples) > 0 ? (Number(newSumX100) / 100) / Number(newSamples) : 0).toFixed(2),
+        })
+        realActivePosSamples = Number(newSamples) || 0
+        realActivePosAverage = realActivePosSamples > 0
+          ? (Number(newSumX100) / 100) / realActivePosSamples
+          : 0
+      } else {
+        // No open real positions right now — read the existing running
+        // average so the tile keeps showing the last meaningful value
+        // instead of going blank during idle/prehistoric periods.
+        const existing = await client.hget(progKey, "real_active_pos_avg")
+          .catch(() => null) as string | null
+        const existingSamples = await client.hget(progKey, "real_active_pos_samples")
+          .catch(() => null) as string | null
+        realActivePosAverage = parseFloat(existing || "0") || 0
+        realActivePosSamples = parseInt(existingSamples || "0", 10) || 0
+      }
     } catch { /* non-critical */ }
 
     // ── Live-stage OPEN positions + Set-relation join ────────────────
