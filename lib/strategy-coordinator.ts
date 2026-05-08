@@ -172,6 +172,18 @@ export class StrategyCoordinator {
     pruneStrategy: "hybrid",
   }
 
+  /**
+   * Per-cycle snapshot of `pseudo_positions:{conn}:active_config_keys`.
+   * Populated at the start of createBaseSets so createMainSets and
+   * evaluateRealSets can determine "running-now" without re-issuing
+   * SMEMBERS on every (symbol, stage) call.
+   *
+   * Treated as stale after 30s — if the next createBaseSets did not run
+   * for any reason (slow symbol, pause, etc.) Main/Real fall back to a
+   * fresh fetch instead of trusting old data.
+   */
+  private _activeKeysCache: { keys: Set<string>; cycleAt: number } | null = null
+
   // Profit factor thresholds per stage
   private readonly PF_BASE_MIN = 1.0    // Minimum to enter BASE set
   private readonly PF_MAIN_MIN = 1.2    // Base sets must have avgPF >= 1.2 to enter MAIN
@@ -488,6 +500,25 @@ export class StrategyCoordinator {
       const baseEntriesTotal  = baseSets.reduce((s, st) => s + (st.entryCount || 0), 0)
       const baseAvgPosPerSet  = baseSets.length > 0 ? baseEntriesTotal / baseSets.length : 0
 
+      // ── ACTIVELY-RUNNING NOW snapshot (canonical "alive" definition) ──
+      // Per operator spec the dashboard must show counts ONLY for Sets
+      // that are ACTIVELY processing — those that either:
+      //   (a) currently hold ≥ 1 open pseudo-position, or
+      //   (b) have ongoing position formation in progress this cycle.
+      // The canonical ground truth is membership in
+      // `pseudo_positions:{conn}:active_config_keys`, maintained
+      // atomically by PseudoPositionManager (added on open, removed on
+      // close). We read it once per cycle and cache on `this` so
+      // createMainSets / evaluateRealSets can reuse it without an extra
+      // SMEMBERS round-trip.
+      const activeKeys = new Set<string>(
+        (await client
+          .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
+          .catch(() => [])) as string[],
+      )
+      this._activeKeysCache = { keys: activeKeys, cycleAt: Date.now() }
+      const baseRunningNow = baseSets.filter((s) => activeKeys.has(s.setKey)).length
+
       // Fan-out all independent writes. The awaited chain used to add ~8 Redis
       // round-trips to every BASE cycle even when nothing had changed; issuing
       // them concurrently cuts that to a single bounded round-trip window.
@@ -502,19 +533,22 @@ export class StrategyCoordinator {
           evaluated:         String(baseSets.length),
           passed_sets:       "0",   // will be updated by createMainSets
           entries_total:     String(baseEntriesTotal),
-          // ── New: explicit dialog/overview metrics ─────────────────
-          //   sets_with_open_positions = Sets that actually hold ≥ 1
-          //     open pseudo-position right now (entryCount > 0 means
-          //     the Set has at least one (size × leverage × state) slot
-          //     materialized as an open pseudo-position).
-          //   sets_progressing       = Sets being calculated this cycle
-          //     (== created_sets, but emitted explicitly for the
-          //     "Progressing Sets" tile so the dashboard does not have
-          //     to alias).
-          sets_with_open_positions: String(
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────────
+          //   sets_running_now         = canonical "alive" count: Sets
+          //     whose setKey is in `active_config_keys` Redis Set right
+          //     now (open pseudo-position OR in-formation). This is the
+          //     ONLY count surfaced as "Active" on the dashboard — the
+          //     dashboard must hide already-progressed Sets that have
+          //     since closed and are no longer doing anything.
+          //   sets_with_open_positions = alias of sets_running_now for
+          //     dialog labels that prefer position-centric phrasing.
+          //   sets_progressing         = Sets in mid-calculation this
+          //     cycle (entryCount > 0 means slots are being formed).
+          sets_running_now:         String(baseRunningNow),
+          sets_with_open_positions: String(baseRunningNow),
+          sets_progressing:         String(
             baseSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
-          sets_progressing:         String(baseSets.length),
           updated_at:        String(Date.now()),
         }),
         client.expire(detailKey, 86400),
@@ -763,6 +797,26 @@ export class StrategyCoordinator {
       const mainEntriesTotal = mainSets.reduce((s, st) => s + (st.entryCount || 0), 0)
       const mainAvgPosPerSet = mainSets.length > 0 ? mainEntriesTotal / mainSets.length : 0
 
+      // ── Running-now resolution for Main (cloned/filtered Sets) ──
+      // Each Main variant Set carries `parentSetKey` pointing at the
+      // Base Set whose positions it clones and strategically adjusts.
+      // A Main Set is "running" iff its parent's setKey is in the
+      // active_config_keys snapshot — Main itself does NOT open new
+      // positions, so we don't need a separate active set for it.
+      const cache = this._activeKeysCache
+      const cacheFresh = cache && Date.now() - cache.cycleAt < 30_000
+      const activeKeys = cacheFresh
+        ? cache!.keys
+        : new Set<string>(
+            (await client
+              .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
+              .catch(() => [])) as string[],
+          )
+      const mainRunningNow = mainSets.filter((s) => {
+        const parent = s.parentSetKey || s.setKey.split("#")[0]
+        return activeKeys.has(parent)
+      }).length
+
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_main_current", String(mainSets.length)),
         client.expire(redisKey, 7 * 24 * 60 * 60),
@@ -775,16 +829,16 @@ export class StrategyCoordinator {
           passed_sets:       String(mainSets.length),
           pass_rate:         String(passRatioMain.toFixed(4)),
           entries_total:     String(mainEntriesTotal),
-          // ── New: explicit dialog/overview metrics ─────────────────
-          //   Main does NOT open new positions — it CLONES the parent
-          //   Base Set's positions and strategically adjusts them into
-          //   new relative variant Sets (Default / Trailing / Block /
-          //   DCA / Pause). Each Main Set therefore "has" cloned
-          //   positions iff its underlying entryCount > 0.
-          sets_with_open_positions: String(
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────────
+          //   Main CLONES + FILTERS Base's positions — no new exchange
+          //   positions opened. A Main Set is "running" iff its
+          //   parentSetKey is in active_config_keys (parent Base Set
+          //   actively coordinating ≥1 open pseudo-position).
+          sets_running_now:         String(mainRunningNow),
+          sets_with_open_positions: String(mainRunningNow),
+          sets_progressing:         String(
             mainSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
-          sets_progressing:         String(mainSets.length),
           updated_at:        String(Date.now()),
         }),
         client.expire(mainDetailKey, 86400),
@@ -1075,6 +1129,59 @@ export class StrategyCoordinator {
       const realEntriesTotal  = realSets.reduce((s, st) => s + (st.entryCount || 0), 0)
       const realAvgPosPerSet  = realSets.length > 0 ? realEntriesTotal / realSets.length : 0
 
+      // ── Running-now resolution for Real (axis-cloned Sets) ──
+      // Real CLONES Main's already-cloned variant Sets and adjusts
+      // them along the position-count axis. Each Real Set still
+      // ultimately traces back to a Base parentSetKey — that's our
+      // canonical "alive" check. Reuse the per-cycle activeKeys cache
+      // populated by createBaseSets; if stale, refetch.
+      const realCache = this._activeKeysCache
+      const realCacheFresh = realCache && Date.now() - realCache.cycleAt < 30_000
+      const realActiveKeys = realCacheFresh
+        ? realCache!.keys
+        : new Set<string>(
+            (await client
+              .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
+              .catch(() => [])) as string[],
+          )
+      const realRunningNow = realSets.filter((s) => {
+        const parent = s.parentSetKey || s.setKey.split("#")[0]
+        return realActiveKeys.has(parent)
+      }).length
+
+      // ── Real 4-perspective stats (Overall / Accumulated / General / Combined) ──
+      // Per operator spec: "in Strategies Real ensure correct stats..
+      // Overall, Accumulated, General, Combined."
+      //
+      //   - Overall:     cumulative Real Sets ever produced (lifetime).
+      //                  Already maintained as `strategies_real_total`
+      //                  via hincrby below.
+      //   - Accumulated: axis-window accumulation across cycles. Sum of
+      //                  the four `strategy_axis_real:{conn}:{axis}`
+      //                  hashes (prev × last × cont × pause).
+      //   - General:     per-cycle current Real Sets snapshot
+      //                  (`strategies_real_current`).
+      //   - Combined:    actively-running right now (= realRunningNow).
+      //
+      // We pre-compute the axis sum HERE so the stats route never has to
+      // do four extra HGETALLs on every dashboard refresh.
+      let realAccumulatedSum = 0
+      try {
+        const axisHashes = await Promise.all(
+          (["prev", "last", "cont", "pause"] as const).map((axis) =>
+            client
+              .hgetall(`strategy_axis_real:${this.connectionId}:${axis}`)
+              .catch(() => ({} as Record<string, string>)),
+          ),
+        )
+        for (const h of axisHashes) {
+          for (const v of Object.values(h || {})) {
+            const n = Number(v)
+            if (Number.isFinite(n)) realAccumulatedSum += n
+          }
+        }
+      } catch { /* fallback: 0 */ }
+
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),
         client.expire(redisKey, 7 * 24 * 60 * 60),
@@ -1089,16 +1196,21 @@ export class StrategyCoordinator {
           pass_rate:          String(passRatioReal.toFixed(4)),
           count_pos_eval:     String(realSets.length),
           entries_total:      String(realEntriesTotal),
-          // ── New: explicit dialog/overview metrics ─────────────────
-          //   Real does NOT open new positions either — it CLONES the
-          //   parent Main Set's already-cloned positions and strategically
-          //   adjusts them along the position-count axis (prev / last /
-          //   cont / pause). Sets with cloned positions = those whose
-          //   underlying entryCount > 0.
-          sets_with_open_positions: String(
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────────
+          //   Real CLONES + FILTERS Main's positions across the
+          //   position-count axis. A Real Set is "running" iff its
+          //   parentSetKey traces back to a Base Set actively in
+          //   active_config_keys.
+          sets_running_now:         String(realRunningNow),
+          sets_with_open_positions: String(realRunningNow),
+          sets_progressing:         String(
             realSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
-          sets_progressing:         String(realSets.length),
+          // ── 4-perspective Real stats ──────────────────────────────
+          stat_general:      String(realSets.length),         // this cycle
+          stat_combined:     String(realRunningNow),          // running now
+          stat_accumulated:  String(realAccumulatedSum),      // axis sum
+          // (Overall is pulled from `strategies_real_total` on read.)
           updated_at:         String(Date.now()),
         }),
         client.expire(realDetailKey, 86400),
@@ -1380,12 +1492,14 @@ export class StrategyCoordinator {
           evaluated:         String(realSets.length),
           passed_sets:       String(qualifying.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
-          // ── New: explicit dialog/overview metrics ─────────────────
-          //   At Live, `qualifying` IS the set of Sets with positions
-          //   sent to the exchange this cycle. Sets-with-open-positions
-          //   becomes the count of qualifying Sets (= qualifying.length)
-          //   and Sets-progressing equals `realSets.length` (the input
-          //   pool being ranked / capped this cycle).
+          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────────
+          //   Live's `qualifying` Sets ARE the executed orders. They
+          //   are by definition "running" — exchange has accepted the
+          //   order or is holding the position. `sets_progressing` is
+          //   the real-stage input pool being ranked & capped this
+          //   cycle (i.e. candidates currently progressing toward live
+          //   execution).
+          sets_running_now:         String(qualifying.length),
           sets_with_open_positions: String(qualifying.length),
           sets_progressing:         String(realSets.length),
           updated_at:        String(Date.now()),

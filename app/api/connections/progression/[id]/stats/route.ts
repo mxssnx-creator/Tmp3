@@ -961,6 +961,16 @@ export async function GET(
             ? Math.round((stagePassed / stageEvaluated) * 1000) / 10
             : 0
 
+        // ── Actively-running counts (operator spec) ──
+        // `sets_running_now` is written by strategy-coordinator using
+        // membership in the `pseudo_positions:{conn}:active_config_keys`
+        // Redis Set (Base) or parentSetKey resolution (Main/Real). It
+        // represents Sets that are CURRENTLY processing — those holding
+        // an open pseudo-position OR mid-formation this cycle. The
+        // dashboard surfaces this as the canonical "Active" count.
+        const setsRunningNow  = n(dh.sets_running_now || dh.sets_with_open_positions)
+        const setsProgressing = n(dh.sets_progressing) || createdSets
+
         stratDetail[stage] = {
           avgPosPerSet:        isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100      : 0,
           createdSets,
@@ -974,6 +984,20 @@ export async function GET(
           evaluated: stageEvaluated,
           passed: stagePassed,
           failed: Math.max(0, stageEvaluated - stagePassed),
+          setsRunningNow,
+          setsProgressing,
+          setsWithOpenPositions: setsRunningNow,
+          // Real-only 4-perspective stats (overall/accumulated/general/combined).
+          // For non-Real stages the fields are 0 — the dialog only renders
+          // the 4-tile panel when stage === "real".
+          ...(stage === "real"
+            ? {
+                statOverall:     n(progHash.strategies_real_total),
+                statAccumulated: n(dh.stat_accumulated),
+                statGeneral:     n(dh.stat_general) || createdSets,
+                statCombined:    n(dh.stat_combined) || setsRunningNow,
+              }
+            : {}),
         }
       })
     )
@@ -1340,32 +1364,52 @@ export async function GET(
           auto:           { sets: activeSetsIndByType.auto            || 0, trackings: indCounts.auto            || 0, positions: activeIndByType.auto             || 0 },
           total:          { sets: activeSetsIndTotal,                       trackings: indTotal,                       positions: activeIndTotal },
         },
-        strategies: {
-          base: { sets: activeSetsStratByStage.base || 0, trackings: stratCounts.base || 0, positions: pseudoOpen },
-          main: { sets: activeSetsStratByStage.main || 0, trackings: stratCounts.main || 0, positions: pseudoOpen },
-          real: { sets: activeSetsStratByStage.real || 0, trackings: stratCounts.real || 0, positions: realOpen },
-          live: {
-            // Live doesn't have an `_active` hash — we use
-            // `pseudoRunningSets` (distinct Sets currently feeding
-            // exchange orders) and `liveCreated - liveClosed` for
-            // open. Trackings = total live created.
-            sets:      pseudoRunningSets,
-            trackings: stratCounts.live || 0,
-            positions: Math.max(
-              0,
-              n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count),
-            ),
-          },
-          total: {
-            sets:      activeSetsStratTotal + (pseudoRunningSets > activeSetsStratTotal ? 0 : 0),
-            trackings: stratTotal,
-            // Pipeline-aware: open positions are NOT summed across
-            // stages (mirroring principle — same logical position
-            // exists at multiple stages). Use the deepest-active
-            // stage as the canonical "currently-progressing" total.
-            positions: Math.max(pseudoOpen, realOpen),
-          },
-        },
+        strategies: (() => {
+          // ── Actively-running per stage (operator spec) ─────────────
+          // Source of truth: `strategy_detail:{conn}:{stage}` ->
+          // `sets_running_now`, written by strategy-coordinator using
+          // membership in `pseudo_positions:{conn}:active_config_keys`.
+          // This is what the dashboard MUST show — already-progressed
+          // Sets that have since closed are intentionally excluded.
+          //
+          // Fallback: when the detail hash hasn't been written yet
+          // (fresh cycle, first symbol still processing), we use the
+          // (symbol, stage) presence count as a best-effort estimate.
+          const baseRun  = n(stratDetail.base?.setsRunningNow)  || activeSetsStratByStage.base || 0
+          const mainRun  = n(stratDetail.main?.setsRunningNow)  || activeSetsStratByStage.main || 0
+          const realRun  = n(stratDetail.real?.setsRunningNow)  || activeSetsStratByStage.real || 0
+          const liveRun  = n(stratDetail.live?.setsRunningNow)  || pseudoRunningSets || 0
+          // Pipeline-aware total: same logical Set exists at multiple
+          // stages (mirroring principle). The "deepest-active" count
+          // is the canonical aggregate — Live ⊂ Real ⊂ Main ⊂ Base.
+          // Surface the maximum of the four to avoid double-counting.
+          const totalRun = Math.max(baseRun, mainRun, realRun, liveRun)
+          return {
+            base: { sets: baseRun, trackings: stratCounts.base || 0, positions: pseudoOpen },
+            main: { sets: mainRun, trackings: stratCounts.main || 0, positions: pseudoOpen },
+            real: { sets: realRun, trackings: stratCounts.real || 0, positions: realOpen },
+            live: {
+              // Live's "running" = distinct Sets currently feeding
+              // exchange orders (== pseudoRunningSets when detail hash
+              // is empty).
+              sets:      liveRun,
+              trackings: stratCounts.live || 0,
+              positions: Math.max(
+                0,
+                n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count),
+              ),
+            },
+            total: {
+              sets:      totalRun,
+              trackings: stratTotal,
+              // Open positions are NOT summed across stages (mirroring
+              // principle — same logical position exists at multiple
+              // stages). Use the deepest-active stage as the canonical
+              // "currently-progressing" total.
+              positions: Math.max(pseudoOpen, realOpen),
+            },
+          }
+        })(),
       },
 
       // Per-stage strategy detail — avg positions per set, created sets, avg profit factor, avg processing time,

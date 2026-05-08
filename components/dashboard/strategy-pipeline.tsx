@@ -15,6 +15,7 @@ import {
 interface StrategyTracking {
   base: {
     setsActivelyProcessing: number
+    setsRunningNow?: number
     setsWithOpenPositions: number
     setsProgressing: number
     setsTotal: number
@@ -31,6 +32,7 @@ interface StrategyTracking {
     evaluatedFromBase: number
     setsCreated: number
     setsTotal: number
+    setsRunningNow?: number
     setsWithOpenPositions: number
     setsProgressing: number
     avgProfitFactor: number
@@ -48,6 +50,7 @@ interface StrategyTracking {
   real: {
     setsCurrent: number
     setsTotal: number
+    setsRunningNow?: number
     setsWithOpenPositions: number
     setsProgressing: number
     evaluatedFromMain: number
@@ -69,9 +72,23 @@ interface StrategyTracking {
       dca: number
       pause: number
     }
+    /**
+     * Operator's 4-perspective Real stats:
+     *   Overall  — cumulative Real Sets ever produced (lifetime)
+     *   Accumulated — axis-window accumulation across cycles
+     *   General  — this cycle's snapshot
+     *   Combined — actively running RIGHT NOW (open or in-formation)
+     */
+    fourPerspective?: {
+      overall: number
+      accumulated: number
+      general: number
+      combined: number
+    }
   }
   live: {
     setsActive: number
+    setsRunningNow?: number
     setsWithOpenPositions: number
     setsProgressing: number
     setsTotal: number
@@ -167,16 +184,16 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
           </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Metric
-              label="Active Sets w/ Open Positions"
-              value={data.base.setsWithOpenPositions}
+              label="Sets Running Now"
+              value={data.base.setsRunningNow ?? data.base.setsWithOpenPositions}
               accent="success"
-              hint="Sets currently holding ≥ 1 open pseudo-position"
+              hint="Canonical 'active' count: Sets whose setKey is in pseudo_positions:active_config_keys right now (open pseudo-position OR in-formation)."
             />
             <Metric
               label="Progressing Sets"
               value={data.base.setsProgressing}
               accent="primary"
-              hint="Sets in active calculation this cycle"
+              hint="Sets in mid-calculation this cycle (entries being formed, before open). Cloning/filtering input."
             />
           </div>
           <div className="mt-3 rounded-md border bg-muted/30 p-3">
@@ -229,16 +246,16 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
           </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Metric
-              label="Active Sets w/ Cloned Positions"
-              value={data.main.setsWithOpenPositions}
+              label="Sets Running Now"
+              value={data.main.setsRunningNow ?? data.main.setsWithOpenPositions}
               accent="success"
-              hint="Cloned from Base — Sets actually holding adjusted positions"
+              hint="Cloning/filtering of Base — Main Sets whose parent Base setKey is currently in active_config_keys. Main does not open new exchange positions."
             />
             <Metric
               label="Progressing Sets"
               value={data.main.setsProgressing}
               accent="primary"
-              hint="Sets in active calculation this cycle"
+              hint="Sets in mid-calculation this cycle (variant clones being formed)."
             />
           </div>
           <div className="mt-3">
@@ -296,18 +313,64 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
           </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Metric
-              label="Active Sets w/ Cloned Positions"
-              value={data.real.setsWithOpenPositions}
+              label="Sets Running Now"
+              value={data.real.setsRunningNow ?? data.real.setsWithOpenPositions}
               accent="success"
-              hint="Cloned from Main — Sets holding axis-adjusted positions"
+              hint="Cloning/filtering of Main — Real Sets whose parent Base setKey is currently in active_config_keys. Real does not open new exchange positions."
             />
             <Metric
               label="Progressing Sets"
               value={data.real.setsProgressing}
               accent="primary"
-              hint="Sets in active calculation this cycle"
+              hint="Sets in mid-calculation this cycle (axis-adjusted clones being formed)."
             />
           </div>
+
+          {/* ── REAL 4-PERSPECTIVE STATS PANEL (operator spec) ───────────
+              "in Strategies Real ensure correct stats..
+               Overall, Accumulated, General, Combined."
+              These four perspectives together let an operator triangulate
+              what's actually happening at the Real stage:
+                Overall     = lifetime cumulative Real Sets ever produced
+                Accumulated = axis-window accumulation (∑ prev/last/cont/pause)
+                General     = this cycle's snapshot (just-created Real Sets)
+                Combined    = actively running RIGHT NOW (open or in-formation)
+              ──────────────────────────────────────────────────────────── */}
+          {data.real.fourPerspective && (
+            <div className="mt-4 rounded-md border border-primary/30 bg-primary/[0.04] p-3">
+              <div className="mb-2 flex items-baseline justify-between">
+                <div className="text-[11px] uppercase tracking-wide text-primary/80 font-semibold">
+                  Real Stats — 4 Perspectives
+                </div>
+                <div className="text-[10px] text-muted-foreground">
+                  lifetime · axis · current · alive
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <PerspectiveTile
+                  label="Overall"
+                  value={data.real.fourPerspective.overall}
+                  hint="Cumulative Real Sets ever produced (lifetime). Includes already-progressed Sets that have since closed."
+                />
+                <PerspectiveTile
+                  label="Accumulated"
+                  value={data.real.fourPerspective.accumulated}
+                  hint="Sum of position-count axis windows across cycles (prev × last × cont × pause)."
+                />
+                <PerspectiveTile
+                  label="General"
+                  value={data.real.fourPerspective.general}
+                  hint="This cycle's Real-stage snapshot (post-PF/DDT filter, post-cap)."
+                />
+                <PerspectiveTile
+                  label="Combined"
+                  value={data.real.fourPerspective.combined}
+                  highlight
+                  hint="Actively running RIGHT NOW — Real Sets whose parent Base setKey is in pseudo_positions:active_config_keys (open or in-formation)."
+                />
+              </div>
+            </div>
+          )}
 
           {/* Position-count axis accumulation */}
           <div className="mt-4">
@@ -387,20 +450,59 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
           </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Metric
-              label="Active Sets w/ Open Positions"
-              value={data.live.setsWithOpenPositions}
+              label="Sets Running Now"
+              value={data.live.setsRunningNow ?? data.live.setsWithOpenPositions}
               accent="success"
-              hint="Sets with executed orders on the exchange"
+              hint="Sets with executed/holding orders on the exchange. These directly mirror the running pseudo-positions."
             />
             <Metric
               label="Progressing Sets"
               value={data.live.setsProgressing}
               accent="primary"
-              hint="Sets being ranked & capped for live execution"
+              hint="Real-stage Sets being ranked & capped for live execution this cycle."
             />
           </div>
         </CardContent>
       </Card>
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SUB: Real 4-Perspective tile (Overall / Accumulated / General / Combined)
+// ─────────────────────────────────────────────────────────────────────────
+function PerspectiveTile({
+  label,
+  value,
+  hint,
+  highlight,
+}: {
+  label: string
+  value: number
+  hint?: string
+  highlight?: boolean
+}) {
+  return (
+    <div
+      className={
+        "flex flex-col rounded-md border px-2.5 py-1.5 " +
+        (highlight
+          ? "border-emerald-500/50 bg-emerald-500/10"
+          : "border-border bg-card/50")
+      }
+      title={hint}
+    >
+      <div
+        className={
+          "text-[10px] uppercase tracking-wide " +
+          (highlight ? "text-emerald-700 dark:text-emerald-400 font-semibold" : "text-muted-foreground")
+        }
+      >
+        {label}
+      </div>
+      <div className="font-mono text-base tabular-nums">
+        {value.toLocaleString()}
+      </div>
     </div>
   )
 }
