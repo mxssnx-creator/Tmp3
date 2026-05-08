@@ -67,6 +67,9 @@ const PROTECTED_PREFIXES = [
   "_schema_version",
   "predefinitions:",      // Operator-defined predefined sets
   "system:base_connections_seeded", // Idempotency guard for seeder
+  "auth:",                // Auth sessions & tokens
+  "session:",             // User session data
+  "api_key:",             // Stored API keys
 ] as const
 
 // FORCE-CLEAR: prefixes that LOOK like they're protected but are pure
