@@ -502,6 +502,19 @@ export class StrategyCoordinator {
           evaluated:         String(baseSets.length),
           passed_sets:       "0",   // will be updated by createMainSets
           entries_total:     String(baseEntriesTotal),
+          // ── New: explicit dialog/overview metrics ─────────────────
+          //   sets_with_open_positions = Sets that actually hold ≥ 1
+          //     open pseudo-position right now (entryCount > 0 means
+          //     the Set has at least one (size × leverage × state) slot
+          //     materialized as an open pseudo-position).
+          //   sets_progressing       = Sets being calculated this cycle
+          //     (== created_sets, but emitted explicitly for the
+          //     "Progressing Sets" tile so the dashboard does not have
+          //     to alias).
+          sets_with_open_positions: String(
+            baseSets.filter((s) => (s.entryCount || 0) > 0).length,
+          ),
+          sets_progressing:         String(baseSets.length),
           updated_at:        String(Date.now()),
         }),
         client.expire(detailKey, 86400),
@@ -681,7 +694,7 @@ export class StrategyCoordinator {
       }
     }
 
-    // ─── VARIANT accounting ───────────────────────�����───────────────────────
+    // ─── VARIANT accounting ───────────────────────�������───────────────────────
     // Each related Main Set now carries an authoritative `variant` tag set
     // at build time, so we no longer have to heuristically classify
     // individual entries. Entries within a Set share the variant label.
@@ -762,6 +775,16 @@ export class StrategyCoordinator {
           passed_sets:       String(mainSets.length),
           pass_rate:         String(passRatioMain.toFixed(4)),
           entries_total:     String(mainEntriesTotal),
+          // ── New: explicit dialog/overview metrics ─────────────────
+          //   Main does NOT open new positions — it CLONES the parent
+          //   Base Set's positions and strategically adjusts them into
+          //   new relative variant Sets (Default / Trailing / Block /
+          //   DCA / Pause). Each Main Set therefore "has" cloned
+          //   positions iff its underlying entryCount > 0.
+          sets_with_open_positions: String(
+            mainSets.filter((s) => (s.entryCount || 0) > 0).length,
+          ),
+          sets_progressing:         String(mainSets.length),
           updated_at:        String(Date.now()),
         }),
         client.expire(mainDetailKey, 86400),
@@ -1066,6 +1089,16 @@ export class StrategyCoordinator {
           pass_rate:          String(passRatioReal.toFixed(4)),
           count_pos_eval:     String(realSets.length),
           entries_total:      String(realEntriesTotal),
+          // ── New: explicit dialog/overview metrics ─────────────────
+          //   Real does NOT open new positions either — it CLONES the
+          //   parent Main Set's already-cloned positions and strategically
+          //   adjusts them along the position-count axis (prev / last /
+          //   cont / pause). Sets with cloned positions = those whose
+          //   underlying entryCount > 0.
+          sets_with_open_positions: String(
+            realSets.filter((s) => (s.entryCount || 0) > 0).length,
+          ),
+          sets_progressing:         String(realSets.length),
           updated_at:         String(Date.now()),
         }),
         client.expire(realDetailKey, 86400),
@@ -1347,6 +1380,14 @@ export class StrategyCoordinator {
           evaluated:         String(realSets.length),
           passed_sets:       String(qualifying.length),
           pass_rate:         String(passRatioLive.toFixed(4)),
+          // ── New: explicit dialog/overview metrics ─────────────────
+          //   At Live, `qualifying` IS the set of Sets with positions
+          //   sent to the exchange this cycle. Sets-with-open-positions
+          //   becomes the count of qualifying Sets (= qualifying.length)
+          //   and Sets-progressing equals `realSets.length` (the input
+          //   pool being ranked / capped this cycle).
+          sets_with_open_positions: String(qualifying.length),
+          sets_progressing:         String(realSets.length),
           updated_at:        String(Date.now()),
         }),
         client.expire(liveDetailKey, 86400),
