@@ -110,12 +110,23 @@ export async function GET() {
     
     // Apply cache fix to all indication processors
     patchIndicationProcessorCaches(coordinator)
+
+    // Only generate synthetic indications when the engine is explicitly
+    // user-started (trade_engine:global.status === "running"). Running
+    // this during prehistoric processing or after Reset DB would write
+    // fake indication counts into `indications:{conn}:*`, inflating the
+    // stats overview counters and making the "high overall sets counts"
+    // issue look worse after a reset.
+    const engineHashPre = await client.hgetall("trade_engine:global").catch(() => ({} as Record<string, string>))
+    const isUserStarted = (engineHashPre as Record<string, string>)?.status === "running"
+    if (isUserStarted) {
+      await generateIndicationsIfNeeded()
+    }
     
-    // Generate indications using the simple generator (bypasses broken IndicationProcessor)
-    await generateIndicationsIfNeeded()
-    
-    // Read global engine state from Redis hash
-    const engineHash = await client.hgetall("trade_engine:global") || {}
+    // Re-read global engine state — pick up any mutation from
+    // generateIndicationsIfNeeded or the coordinator-fix below.
+    const engineHashRaw = await client.hgetall("trade_engine:global").catch(() => null)
+    const engineHash: Record<string, string> = engineHashRaw ?? engineHashPre
     const isGloballyRunning = engineHash.status === "running"
     const isGloballyPaused = engineHash.status === "paused"
     

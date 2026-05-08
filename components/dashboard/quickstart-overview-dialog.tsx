@@ -92,6 +92,14 @@ interface StatsResponse {
     indications?: Record<string, { sets: number; trackings: number; positions: number }>
     strategies?:  Record<string, { sets: number; trackings: number; positions: number }>
   }
+  // activeCounts carries the SUM of per-symbol counts for each stage,
+  // NOT the distinct Set count. Retained here for backward-compat reads
+  // (e.g. the windows/indications tab) but NOT used for the headline
+  // stage count in the Strategies tab — that uses activeProgressing.*.sets.
+  activeCounts?: {
+    indications?: Record<string, number>
+    strategies?: { base?: number; main?: number; real?: number; total?: number }
+  }
   metadata: { engineRunning: boolean; phase: string; progress: number; message: string; lastUpdate: string }
 }
 
@@ -333,7 +341,7 @@ export function QuickstartOverviewDialog() {
             ))}
           </TabsList>
 
-          {/* ── Overview ─────────────────────────────────────────────────── */}
+          {/* ── Overview ───────────────────────────��─────────────────────── */}
           <TabsContent value="overview" className="flex-1 overflow-y-auto p-4 space-y-3">
             {/* Historical Processing — shown FIRST, matching the engine's
                 own top-to-bottom flow: historic load → live cycles → exec.
@@ -797,9 +805,18 @@ export function QuickstartOverviewDialog() {
               mappings for high-frequency evaluation. Real strategies filter Main by highest-confidence coordination.
             </p>
 
+            {/* ── Strategy stage counts ─────────────────────────────────────
+                The `count` prop is the ACTIVE-PROCESSING SETS count — how
+                many distinct (symbol × stage) Set pairs produced qualified
+                entries on the latest engine cycle. This comes from
+                `activeProgressing.strategies.{stage}.sets`, NOT from
+                `activeCounts.strategies.{stage}` which is the SUM of per-
+                symbol strategy counts and grows to 172K+ over a run.
+                `evaluatedOf` (the eval-bar denominator) uses the same
+                `.sets` source so the ratio is sets/sets, not entries/sets. */}
             <StratSection
               label="Base"
-              count={stats?.activeCounts?.strategies?.base || 0}
+              count={stats?.activeProgressing?.strategies?.base?.sets || 0}
               evaluated={bd?.strategies.baseEvaluated || 0}
               evaluatedOf={0}
               detail={sd?.base}
@@ -809,9 +826,9 @@ export function QuickstartOverviewDialog() {
 
             <StratSection
               label="Main"
-              count={stats?.activeCounts?.strategies?.main || 0}
+              count={stats?.activeProgressing?.strategies?.main?.sets || 0}
               evaluated={bd?.strategies.mainEvaluated || 0}
-              evaluatedOf={stats?.activeCounts?.strategies?.base || 0}
+              evaluatedOf={stats?.activeProgressing?.strategies?.base?.sets || 0}
               detail={sd?.main}
               accentCls="text-yellow-600 dark:text-yellow-400"
               bgCls="bg-yellow-50/50 dark:bg-yellow-950/20 border-yellow-200/50 dark:border-yellow-800/30"
@@ -819,9 +836,9 @@ export function QuickstartOverviewDialog() {
 
             <StratSection
               label="Real"
-              count={stats?.activeCounts?.strategies?.real || 0}
+              count={stats?.activeProgressing?.strategies?.real?.sets || 0}
               evaluated={bd?.strategies.realEvaluated || 0}
-              evaluatedOf={stats?.activeCounts?.strategies?.main || 0}
+              evaluatedOf={stats?.activeProgressing?.strategies?.main?.sets || 0}
               detail={sd?.real}
               accentCls="text-green-600 dark:text-green-400"
               bgCls="bg-green-50/50 dark:bg-green-950/20 border-green-200/50 dark:border-green-800/30"
