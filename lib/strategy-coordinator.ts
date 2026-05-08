@@ -526,6 +526,11 @@ export class StrategyCoordinator {
         client.hset(redisKey, "strategies_base_current", String(baseSets.length)),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(detailKey, {
+          // ── Legacy per-cycle aggregate fields ─────────────────────────
+          // These hold THIS-symbol's values and are overwritten on every
+          // (symbol, cycle). They remain for backwards compatibility but
+          // the /stats route prefers the cross-symbol sums it computes
+          // from the `s:{symbol}:*` per-symbol fields below.
           created_sets:      String(baseSets.length),
           avg_profit_factor: String(baseAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(baseAvgDDT)),
@@ -550,6 +555,27 @@ export class StrategyCoordinator {
             baseSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
           updated_at:        String(Date.now()),
+          // ── Per-symbol fields (cross-symbol aggregation source) ──────
+          // The legacy fields above are overwritten by every symbol's
+          // cycle, leaving the dashboard with only the LAST symbol's
+          // numbers. To preserve cross-symbol totals & weighted means,
+          // we additionally write a `s:{symbol}:*` namespaced bundle
+          // per cycle. The /stats route iterates these fields, sums
+          // counters, and computes weighted means (weight = createdSets)
+          // per symbol. Stale samples (ts older than 5 min) are excluded;
+          // very old samples (ts older than 30 min) are pruned.
+          [`s:${symbol}:created`]:    String(baseSets.length),
+          [`s:${symbol}:entries`]:    String(baseEntriesTotal),
+          [`s:${symbol}:running`]:    String(baseRunningNow),
+          [`s:${symbol}:progressing`]: String(
+            baseSets.filter((s) => (s.entryCount || 0) > 0).length,
+          ),
+          [`s:${symbol}:passed`]:     "0",  // updated when Main runs
+          [`s:${symbol}:evaluated`]:  String(baseSets.length),
+          [`s:${symbol}:apf`]:        String(baseAvgPF.toFixed(4)),
+          [`s:${symbol}:addt`]:       String(Math.round(baseAvgDDT)),
+          [`s:${symbol}:apps`]:       String(baseAvgPosPerSet.toFixed(2)),
+          [`s:${symbol}:ts`]:         String(Date.now()),
         }),
         client.expire(detailKey, 86400),
         client.set(`strategies:${this.connectionId}:base:count`, String(baseSets.length)),
@@ -821,6 +847,8 @@ export class StrategyCoordinator {
         client.hset(redisKey, "strategies_main_current", String(mainSets.length)),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(mainDetailKey, {
+          // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
+          // for backwards compat; /stats prefers per-symbol sums below.
           created_sets:      String(mainSets.length),
           avg_profit_factor: String(mainAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(mainAvgDDT)),
@@ -840,11 +868,27 @@ export class StrategyCoordinator {
             mainSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
           updated_at:        String(Date.now()),
+          // Per-symbol fields — see createBaseSets for rationale.
+          [`s:${symbol}:created`]:    String(mainSets.length),
+          [`s:${symbol}:entries`]:    String(mainEntriesTotal),
+          [`s:${symbol}:running`]:    String(mainRunningNow),
+          [`s:${symbol}:progressing`]: String(
+            mainSets.filter((s) => (s.entryCount || 0) > 0).length,
+          ),
+          [`s:${symbol}:passed`]:     String(mainSets.length),
+          [`s:${symbol}:evaluated`]:  String(baseSets.length),
+          [`s:${symbol}:apf`]:        String(mainAvgPF.toFixed(4)),
+          [`s:${symbol}:addt`]:       String(Math.round(mainAvgDDT)),
+          [`s:${symbol}:apps`]:       String(mainAvgPosPerSet.toFixed(2)),
+          [`s:${symbol}:ts`]:         String(Date.now()),
         }),
         client.expire(mainDetailKey, 86400),
+        // Patch Base's per-symbol passed count so its `pass_rate` reflects
+        // Main's filter outcome for THIS symbol on the next /stats poll.
         client.hset(`strategy_detail:${this.connectionId}:base`, {
           passed_sets: String(mainSets.length),
           pass_rate:   String(passRatioMain.toFixed(4)),
+          [`s:${symbol}:passed`]: String(mainSets.length),
         }).catch(() => {}),
         client.set(`strategies:${this.connectionId}:main:count`, String(mainSets.length)),
         client.set(`strategies:${this.connectionId}:main:evaluated`, String(baseSets.length)),
@@ -1186,6 +1230,8 @@ export class StrategyCoordinator {
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(realDetailKey, {
+          // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
+          // for backwards compat; /stats prefers per-symbol sums below.
           created_sets:       String(realSets.length),
           avg_profit_factor:  String(realAvgPF.toFixed(4)),
           avg_drawdown_time:  String(Math.round(realAvgDDT)),
@@ -1207,16 +1253,34 @@ export class StrategyCoordinator {
             realSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
           // ── 4-perspective Real stats ──────────────────────────────
+          // These are connection-wide (not per-symbol) so writing them
+          // once per (symbol, cycle) is fine — every symbol computes the
+          // same `realAccumulatedSum` and the same `strategies_real_total`.
           stat_general:      String(realSets.length),         // this cycle
           stat_combined:     String(realRunningNow),          // running now
           stat_accumulated:  String(realAccumulatedSum),      // axis sum
           // (Overall is pulled from `strategies_real_total` on read.)
           updated_at:         String(Date.now()),
+          // Per-symbol fields — see createBaseSets for rationale.
+          [`s:${symbol}:created`]:    String(realSets.length),
+          [`s:${symbol}:entries`]:    String(realEntriesTotal),
+          [`s:${symbol}:running`]:    String(realRunningNow),
+          [`s:${symbol}:progressing`]: String(
+            realSets.filter((s) => (s.entryCount || 0) > 0).length,
+          ),
+          [`s:${symbol}:passed`]:     String(realSets.length),
+          [`s:${symbol}:evaluated`]:  String(mainSets.length),
+          [`s:${symbol}:apf`]:        String(realAvgPF.toFixed(4)),
+          [`s:${symbol}:addt`]:       String(Math.round(realAvgDDT)),
+          [`s:${symbol}:apps`]:       String(realAvgPosPerSet.toFixed(2)),
+          [`s:${symbol}:aper`]:       String(realAvgConf.toFixed(4)),
+          [`s:${symbol}:ts`]:         String(Date.now()),
         }),
         client.expire(realDetailKey, 86400),
         client.hset(`strategy_detail:${this.connectionId}:main`, {
           passed_sets: String(realSets.length),
           pass_rate:   String(passRatioReal.toFixed(4)),
+          [`s:${symbol}:passed`]: String(realSets.length),
         }).catch(() => {}),
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainSets.length)),
@@ -1486,6 +1550,8 @@ export class StrategyCoordinator {
         client.hset(redisKey, "strategies_live_total", String(qualifying.length)),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(liveDetailKey, {
+          // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
+          // for backwards compat; /stats prefers per-symbol sums below.
           created_sets:      String(qualifying.length),
           avg_profit_factor: String(liveAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(liveAvgDDT)),
@@ -1503,6 +1569,19 @@ export class StrategyCoordinator {
           sets_with_open_positions: String(qualifying.length),
           sets_progressing:         String(realSets.length),
           updated_at:        String(Date.now()),
+          // Per-symbol fields — see createBaseSets for rationale.
+          // Live doesn't compute avg_pos_per_set / avg_pos_eval_real;
+          // those keys are intentionally omitted from the per-symbol
+          // bundle so /stats's weighted-mean calculator skips them.
+          [`s:${symbol}:created`]:    String(qualifying.length),
+          [`s:${symbol}:entries`]:    String(qualifying.reduce((s, st) => s + (st.entryCount || 0), 0)),
+          [`s:${symbol}:running`]:    String(qualifying.length),
+          [`s:${symbol}:progressing`]: String(realSets.length),
+          [`s:${symbol}:passed`]:     String(qualifying.length),
+          [`s:${symbol}:evaluated`]:  String(realSets.length),
+          [`s:${symbol}:apf`]:        String(liveAvgPF.toFixed(4)),
+          [`s:${symbol}:addt`]:       String(Math.round(liveAvgDDT)),
+          [`s:${symbol}:ts`]:         String(Date.now()),
         }),
         client.expire(liveDetailKey, 86400),
         // `set` with EX in a single command avoids the separate expire round-trip.

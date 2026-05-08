@@ -927,19 +927,92 @@ export async function GET(
     // live only) without needing a discriminated union on every write site.
     const stratDetail: Record<string, Record<string, number>> = {}
 
+    // Track stale-symbol fields for opportunistic pruning. Without this,
+    // every symbol ever evaluated (incl. ones removed from the basket
+    // hours ago) leaves ~11 fields behind in the strategy_detail hash
+    // until the 24h key TTL — a slow memory drift across long-running
+    // connections that swap symbol baskets.
+    const staleFieldsByKey = new Map<string, string[]>()
+
     await Promise.all(
       stratDetailKeys.map(async (stage) => {
-        const dh = ((await client.hgetall(`strategy_detail:${connectionId}:${stage}`).catch(() => null)) || {}) as Record<string, string>
-        const createdSets       = n(dh.created_sets      || progHash[`strategy_${stage}_created_sets`])
-        const avgPosPerSet      = parseFloat(dh.avg_pos_per_set      || progHash[`strategy_${stage}_avg_pos_per_set`]      || "0")
-        const avgProfitFactor   = parseFloat(dh.avg_profit_factor    || progHash[`strategy_${stage}_avg_profit_factor`]    || "0")
+        const detailKey = `strategy_detail:${connectionId}:${stage}`
+        const dh = ((await client.hgetall(detailKey).catch(() => null)) || {}) as Record<string, string>
+
+        // ── Cross-symbol aggregation from per-symbol `s:{symbol}:*` fields ─
+        // Each `(symbol, cycle)` writes a `s:{symbol}:*` bundle. We sum
+        // counters and weight-mean the averages across all FRESH symbols
+        // (ts ≤ 5 min old). Symbols stale > 30 min are queued for HDEL
+        // pruning to bound the hash size.
+        const FRESH_MS = 5 * 60 * 1000
+        const PRUNE_MS = 30 * 60 * 1000
+        const nowMs = Date.now()
+        let symCreated = 0, symEntries = 0, symRunning = 0, symProgressing = 0
+        let symPassed = 0, symEvaluated = 0
+        let weightedPF = 0, weightedDDT = 0, weightedPPS = 0, weightedPER = 0
+        let weightSum = 0, freshSymbols = 0
+        const staleFields: string[] = []
+        for (const k of Object.keys(dh)) {
+          if (!k.startsWith("s:") || !k.endsWith(":ts")) continue
+          // k shape: "s:{symbol}:ts" — extract symbol between first and last colon.
+          const symbol = k.slice(2, -3)
+          const ts = Number(dh[k] || "0") || 0
+          const ageMs = nowMs - ts
+          if (ageMs > PRUNE_MS) {
+            // Collect every per-symbol field for HDEL. Cheap because
+            // these are stale samples already excluded from aggregation.
+            for (const f of ["created","entries","running","progressing","passed","evaluated","apf","addt","apps","aper","ts"]) {
+              if (`s:${symbol}:${f}` in dh) staleFields.push(`s:${symbol}:${f}`)
+            }
+            continue
+          }
+          if (ageMs > FRESH_MS) continue   // present-but-stale → exclude
+          freshSymbols += 1
+          const c = Number(dh[`s:${symbol}:created`]    || 0) || 0
+          symCreated     += c
+          symEntries     += Number(dh[`s:${symbol}:entries`]     || 0) || 0
+          symRunning     += Number(dh[`s:${symbol}:running`]     || 0) || 0
+          symProgressing += Number(dh[`s:${symbol}:progressing`] || 0) || 0
+          symPassed      += Number(dh[`s:${symbol}:passed`]      || 0) || 0
+          symEvaluated   += Number(dh[`s:${symbol}:evaluated`]   || 0) || 0
+          // Weighted means: weight = createdSets. A symbol with c=0
+          // contributes nothing — correct, an empty sample shouldn't
+          // drag the mean toward 0.
+          if (c > 0) {
+            weightSum  += c
+            weightedPF  += (Number(dh[`s:${symbol}:apf`])  || 0) * c
+            weightedDDT += (Number(dh[`s:${symbol}:addt`]) || 0) * c
+            weightedPPS += (Number(dh[`s:${symbol}:apps`]) || 0) * c
+            weightedPER += (Number(dh[`s:${symbol}:aper`]) || 0) * c
+          }
+        }
+        if (staleFields.length > 0) staleFieldsByKey.set(detailKey, staleFields)
+
+        // ── Field reads: prefer per-symbol cross-sum; fall back to legacy.
+        // The legacy fields (overwritten on every (symbol, cycle)) are
+        // wrong when N>1 symbols are processed because the LAST symbol's
+        // values are what the dashboard sees. Per-symbol fields fix that.
+        const useCross = freshSymbols > 0
+        const createdSets       = useCross
+          ? symCreated
+          : n(dh.created_sets      || progHash[`strategy_${stage}_created_sets`])
+        const avgPosPerSet      = useCross && weightSum > 0
+          ? weightedPPS / weightSum
+          : parseFloat(dh.avg_pos_per_set      || progHash[`strategy_${stage}_avg_pos_per_set`]      || "0")
+        const avgProfitFactor   = useCross && weightSum > 0
+          ? weightedPF / weightSum
+          : parseFloat(dh.avg_profit_factor    || progHash[`strategy_${stage}_avg_profit_factor`]    || "0")
         const avgProcessingMs   = parseFloat(dh.avg_processing_ms    || progHash[`strategy_${stage}_avg_processing_ms`]    || "0")
         // Average position evaluation score for Real stage (stored by strategy-coordinator)
-        const avgPosEvalReal    = parseFloat(dh.avg_pos_eval_real    || progHash[`strategy_${stage}_avg_pos_eval_real`]    || "0")
+        const avgPosEvalReal    = useCross && weightSum > 0
+          ? weightedPER / weightSum
+          : parseFloat(dh.avg_pos_eval_real    || progHash[`strategy_${stage}_avg_pos_eval_real`]    || "0")
         // Count of positions that contributed to avgPosEvalReal (only meaningful for Real stage)
         const countPosEval      = n(dh.count_pos_eval || progHash[`strategy_${stage}_count_pos_eval`])
         // Drawdown time (avg minutes from strategy sets)
-        const avgDrawdownTime   = parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
+        const avgDrawdownTime   = useCross && weightSum > 0
+          ? weightedDDT / weightSum
+          : parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
 
         // Eval percentage: main = evaluated/base, real = evaluated/main
         let evalPct = 0
