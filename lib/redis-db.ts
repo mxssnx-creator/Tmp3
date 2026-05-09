@@ -418,12 +418,44 @@ export class InlineLocalRedis {
     return this.data.strings.get(key) ?? null
   }
 
-  async set(key: string, value: string, options?: { EX?: number }): Promise<void> {
+  /**
+   * Set a string value with optional TTL and atomic-acquire semantics.
+   *
+   * Returns `"OK"` on success, `null` when `NX` was requested and the key
+   * already existed (Redis-standard). The previous `Promise<void>`
+   * signature could not represent the "not acquired" case, which made it
+   * impossible to build atomic locks on top of `client.set` —
+   * `acquireLock`, the cron sweep guard, and other check-then-act
+   * locations all silently raced because they had no way to learn
+   * whether they actually won the slot.
+   *
+   * Options:
+   *   - `EX`: TTL seconds (matches existing usage everywhere).
+   *   - `NX`: only set if the key does NOT already exist. Combined with
+   *     `EX` this is the canonical "atomic acquire-or-fail" primitive
+   *     (`SET key val NX EX ttl`). When the key is already present we
+   *     return `null` and DO NOT touch the value or refresh the TTL.
+   *   - `XX`: only set if the key DOES exist (mirror of NX, for
+   *     symmetry with the real Redis API surface).
+   */
+  async set(
+    key: string,
+    value: string,
+    options?: { EX?: number; NX?: boolean; XX?: boolean },
+  ): Promise<string | null> {
     this.trackOperation()
+    if (options?.NX || options?.XX) {
+      // Honour TTL on the existence-check too — an expired key counts
+      // as "does not exist" for NX, and as "exists" for XX.
+      const exists = !this.isExpired(key) && this.data.strings.has(key)
+      if (options.NX && exists) return null
+      if (options.XX && !exists) return null
+    }
     this.data.strings.set(key, value)
     if (options?.EX) {
       this.setKeyTTL(key, options.EX)
     }
+    return "OK"
   }
   
   async setex(key: string, seconds: number, value: string): Promise<void> {
