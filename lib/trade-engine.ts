@@ -227,6 +227,20 @@ export class GlobalTradeEngineCoordinator {
       await manager.stop()
       this.engineManagers.delete(connectionId)
 
+      // Clear the `engine_is_running` Redis flag immediately after the manager
+      // stops. This prevents the subsequent `startEngine` call from hitting its
+      // startup-lock guard ("Engine already running — skipping") when the flag
+      // survived from a previous run or was never cleaned up by the caller.
+      // Fire-and-forget — stop must not fail just because Redis is unavailable.
+      try {
+        const { getRedisClient } = await import("@/lib/redis-db")
+        const redisClient = getRedisClient()
+        await redisClient.del(`engine_is_running:${connectionId}`)
+        console.log(`[v0] ✓ Cleared engine_is_running flag for ${connectionId}`)
+      } catch (redisErr) {
+        console.warn(`[v0] [STOP LOCK] Could not clear engine_is_running flag for ${connectionId}:`, redisErr)
+      }
+
       console.log(`[v0] ✓ TradeEngine stopped for connection: ${connectionId}`)
     } finally {
       // Step 3: Remove from stop lock set (always, even on error)

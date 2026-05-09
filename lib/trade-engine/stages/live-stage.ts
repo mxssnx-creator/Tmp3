@@ -308,7 +308,12 @@ async function acquireLock(
   connectionId: string,
   symbol: string,
   direction: "long" | "short",
-  ttlSeconds = 3600
+  // Safety-expiry TTL: if closeLivePosition / reconcile fails to call releaseLock
+  // (crash, network error), the key auto-expires so the symbol+direction is not
+  // permanently locked out of new entries. For second-to-minute trades 300s
+  // (5 min) is sufficient — far shorter than the old 3600s which would block an
+  // entire hour of signals on that symbol after any failed release.
+  ttlSeconds = 300
 ): Promise<void> {
   try {
     const client = getRedisClient()
