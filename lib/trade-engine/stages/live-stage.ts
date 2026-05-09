@@ -289,36 +289,50 @@ async function fetchCurrentPrice(symbol: string): Promise<number> {
   }
 }
 
-async function hasOpenLivePosition(
+// `hasOpenLivePosition` was removed — it was a non-atomic GET-only test
+// that produced the check-then-act race in `executeLivePosition`. The
+// dedup gate is now driven by `tryAcquireLock` (atomic SET NX EX), which
+// returns the slot's ownership directly. Existence-only checks were never
+// safe for guarding new entries; if a future caller needs to peek without
+// acquiring (e.g. a UI status query), they should read the open-positions
+// index (`live:positions:{connId}`) — the lock key is now reserved for
+// mutual exclusion only.
+
+async function tryAcquireLock(
   connectionId: string,
   symbol: string,
-  direction: "long" | "short"
+  direction: "long" | "short",
+  ttlSeconds = 300,
 ): Promise<boolean> {
   try {
     const client = getRedisClient()
     const lockKey = `live:lock:${connectionId}:${symbol}:${direction}`
-    const locked = await client.get(lockKey)
-    return !!locked
+    const ok = await client.set(lockKey, String(Date.now()), { NX: true, EX: ttlSeconds })
+    return ok !== null && ok !== undefined && ok !== false
   } catch {
     return false
   }
 }
 
-async function acquireLock(
+/**
+ * Legacy non-atomic acquire — preserved for the post-fill heartbeat
+ * refresh in `closeLivePosition`'s reverse path. **Do NOT use for new
+ * call sites**; build dedup gates on `tryAcquireLock` instead.
+ *
+ * Re-stamps the lock unconditionally so a long-running entry can
+ * extend its TTL (the safety expiry would otherwise fire mid-trade if
+ * the position stays open longer than `ttlSeconds`).
+ */
+async function refreshLockTTL(
   connectionId: string,
   symbol: string,
   direction: "long" | "short",
-  // Safety-expiry TTL: if closeLivePosition / reconcile fails to call releaseLock
-  // (crash, network error), the key auto-expires so the symbol+direction is not
-  // permanently locked out of new entries. For second-to-minute trades 300s
-  // (5 min) is sufficient — far shorter than the old 3600s which would block an
-  // entire hour of signals on that symbol after any failed release.
-  ttlSeconds = 300
+  ttlSeconds = 300,
 ): Promise<void> {
   try {
     const client = getRedisClient()
     const lockKey = `live:lock:${connectionId}:${symbol}:${direction}`
-    await client.setex(lockKey, ttlSeconds, "1")
+    await client.setex(lockKey, ttlSeconds, String(Date.now()))
   } catch {
     /* non-critical */
   }
@@ -1224,37 +1238,74 @@ export async function executeLivePosition(
       { liveTrade: isLiveTradeEnabled, realPositionId: realPosition.id }
     )
 
-    // ── Coordination: accumulate instead of reject ──────────────────
-    // When a Set tries to enter on a symbol+direction that already has
-    // an open exchange position, we no longer drop the signal — we
-    // ROUTE the new volume into the existing position so the exchange
-    // exposure equals the SUM of every contributing Set's coordination-
-    // derived volume. The accumulator places an additional market
-    // order, recomputes the weighted-average entry, and re-arms SL/TP
-    // at the new effective levels. Live-trade gating still applies:
-    // if `live_trade=false` we fall through to the simulation branch
-    // below (no exchange call, just records the intent).
-    if (
-      isLiveTradeEnabled &&
-      (await hasOpenLivePosition(connectionId, realPosition.symbol, realPosition.direction))
-    ) {
-      // Resolve the actual existing position so we have its avg entry,
-      // cumulative qty, and current SL/TP order ids to merge into.
-      const existing = await findOpenLivePositionByDir(
+    // ── Atomic dedup gate (P0-4 race fix) ──────────────────────────────
+    //
+    // Spec: "Active Pseudo Position Limit for each direction Long, short
+    // maximal 1." The previous implementation was a check-then-act
+    // sequence:
+    //
+    //   if (await hasOpenLivePosition(...)) { merge-or-release-stale }
+    //   ... place order ...
+    //   await acquireLock(...)            // overwrites unconditionally
+    //
+    // — racy under any concurrency. Two ticks could both pass the
+    // `hasOpenLivePosition` check, both place exchange orders, and both
+    // belatedly stamp the lock. The exchange ended up with two
+    // duplicate positions for the same symbol+direction; reconcile then
+    // had to figure out which one to track.
+    //
+    // We now atomically `tryAcquireLock` at the very top of the
+    // live-trade branch:
+    //
+    //   • acquired → we own the slot, fresh-entry path runs. No
+    //                separate `acquireLock` call later in this function.
+    //   • not acquired → there is either an open position to merge into
+    //                    (our preferred outcome) OR an in-flight entry
+    //                    from a parallel tick that hasn't yet saved its
+    //                    position. We DEFER in the second case rather
+    //                    than racing — the 5-minute TTL guarantees a
+    //                    crashed lock self-clears, so deferred signals
+    //                    will succeed on a subsequent cycle.
+    //
+    // This is the only writer of `live:lock:{conn}:{sym}:{dir}` on the
+    // critical path, so the race window is closed at its source.
+    if (isLiveTradeEnabled) {
+      const acquired = await tryAcquireLock(
         connectionId,
         realPosition.symbol,
         realPosition.direction,
       )
-
-      if (!existing) {
-        // Lock says one is open but the index can't find it — likely a
-        // stale lock from a previous crash. Release it and let this
-        // call fall through to the normal new-position path below.
-        console.warn(
-          `${LOG_PREFIX} stale dedup lock for ${realPosition.symbol} ${realPosition.direction} — releasing and proceeding with fresh entry`,
+      if (!acquired) {
+        // Slot is held — try to merge into the existing exchange
+        // position. If we can't (in-flight entry from another tick),
+        // defer this signal cleanly.
+        const existing = await findOpenLivePositionByDir(
+          connectionId,
+          realPosition.symbol,
+          realPosition.direction,
         )
-        await releaseLock(connectionId, realPosition.symbol, realPosition.direction)
-      } else {
+
+        if (!existing) {
+          // Lock present, no position visible yet → another tick is
+          // mid-flight. DO NOT release the lock here (the previous
+          // implementation did, which let two ticks both place exchange
+          // orders). Surface a deferral and let the next cycle retry.
+          livePosition.status = "rejected"
+          livePosition.statusReason =
+            `Dedup lock held — another entry in flight for ${realPosition.symbol} ${realPosition.direction}; will retry next cycle`
+          pushStep(livePosition, "preflight", false, livePosition.statusReason)
+          await savePosition(livePosition)
+          await incrementMetric(connectionId, "live_orders_deferred_count")
+          await logProgressionEvent(
+            connectionId,
+            "live_trading",
+            "info",
+            livePosition.statusReason,
+            { symbol: realPosition.symbol, direction: realPosition.direction },
+          ).catch(() => {})
+          return livePosition
+        }
+
         // Need a price to compute additional volume + retain it for the
         // accumulator. Reuse fetchCurrentPrice with the realPosition
         // entry-price hint so we don't pay two fetches for the same tick.
@@ -1295,11 +1346,17 @@ export async function executeLivePosition(
           accPrice,
           exchangeConnector,
         )
-        // Return the (now updated) existing position. We do NOT save the
-        // throw-away `livePosition` placeholder into the open index —
-        // accumulateIntoLivePosition owns the persistence of `existing`.
+        // Refresh the existing slot's TTL — the position is still open
+        // on the exchange and we want the safety expiry pushed forward
+        // by the 300 s window. Lock value remains the original entry's
+        // timestamp (intentional — debuggers see the original entry's
+        // wall-clock, not the accumulation's).
+        await refreshLockTTL(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
         return merged
       }
+      // acquired === true: we own the slot. Continue to fresh-entry
+      // path below. The historical `await acquireLock(...)` after order
+      // placement is now redundant and has been removed (see Step 5).
     }
 
     // Short-circuit on simulation mode — still record the intent.
@@ -1329,6 +1386,11 @@ export async function executeLivePosition(
       await logProgressionEvent(connectionId, "live_trading", "error", "Live order failed — no connector", {
         symbol: realPosition.symbol,
       })
+      // Release the dedup lock we acquired at the top of this function so
+      // the next signal isn't blocked for the full 5-min TTL on a non-
+      // recoverable connector failure (operator likely didn't configure a
+      // connector — they need to be able to retry once they do).
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
       return livePosition
     }
 
@@ -1346,6 +1408,11 @@ export async function executeLivePosition(
       await logProgressionEvent(connectionId, "live_trading", "error", "Live order failed — no market price", {
         symbol: realPosition.symbol,
       })
+      // Release the dedup lock — a missing market price is a transient
+      // condition (typically a fresh symbol whose ticker hasn't streamed
+      // yet). Without releasing, the next cycle's signal would defer for
+      // 5 minutes even though the price arrives within seconds.
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
       return livePosition
     }
     livePosition.entryPrice = currentPrice
@@ -1510,6 +1577,13 @@ export async function executeLivePosition(
       } catch {
         /* logging must never throw */
       }
+      // Release the dedup lock — the order failed (rejection / API error /
+      // margin shortfall), no exchange position will exist for this slot.
+      // Without releasing, a transient failure would block the next signal
+      // for the full 5-min TTL even though the entry never opened. The
+      // margin-cooldown gate above still prevents a stampede of retries
+      // when the failure is non-recoverable (insufficient balance).
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
       return livePosition
     }
 
@@ -1517,7 +1591,15 @@ export async function executeLivePosition(
     livePosition.status = "placed"
     pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
     await incrementMetric(connectionId, "live_orders_placed_count")
-    await acquireLock(connectionId, realPosition.symbol, realPosition.direction)
+    // Lock was already acquired ATOMICALLY at the top of this function via
+    // `tryAcquireLock` (see the dedup-gate block). The legacy
+    // `await acquireLock(...)` here was redundant — it just re-stamped a
+    // lock we already owned. Keeping the order here would also paper over
+    // any future regression where the gate atomicity is removed: removing
+    // it makes the contract obvious — "fresh-entry path runs IFF we own
+    // the lock". A long-running entry's TTL is refreshed by the
+    // accumulation path (`refreshLockTTL`) and by `closeLivePosition`'s
+    // explicit `releaseLock`.
     await logProgressionEvent(connectionId, "live_trading", "info", `Entry order placed for ${realPosition.symbol}`, {
       orderId: livePosition.orderId,
       side: exchangeSide,

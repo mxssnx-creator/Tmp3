@@ -4,7 +4,7 @@
  * NOW: 100% Redis-backed, no SQL
  */
 
-import { getRedisClient, getSettings, getAppSettings, getSettingsVersionCachedSync, setSettings, createPosition as redisCreatePosition } from "@/lib/redis-db"
+import { getRedisClient, getAppSettings, getSettingsVersionCachedSync, createPosition as redisCreatePosition } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { emitPositionUpdate } from "@/lib/broadcast-helpers"
 import { StrategyConfigManager, type PseudoPosition as StrategyPseudoPosition } from "@/lib/strategy-config-manager"
@@ -679,14 +679,38 @@ export class PseudoPositionManager {
   }
 
   /**
-   * Update active positions count in engine state (Redis)
+   * Update active positions count in engine state (Redis).
+   *
+   * ── Atomic single-field write (P0-3 race fix) ─────────────────────
+   * The previous implementation was a classic read-modify-write:
+   *
+   *     const current = await getSettings(stateKey)
+   *     await setSettings(stateKey, { ...current, active_positions_count: count })
+   *
+   * — which spread the entire fetched hash back through `setSettings` →
+   * `client.hset(...)`. Field-level merge means we never wiped the hash,
+   * but ANY field that another writer (realtime heartbeat, engine
+   * startup, watchdog re-arm) updated between our read and our write
+   * would be silently overwritten with the stale value we'd read.
+   * Worst-case: heartbeat-set `last_realtime_run` flapped backwards
+   * every time createPosition / closePosition fired concurrently with a
+   * realtime tick, breaking the dashboard's "engine is alive" signal.
+   *
+   * Now: count the active positions and write JUST that one field via
+   * `client.hset(stateKey, "active_positions_count", String(count))`.
+   * No read, no spread, no race — every other field on the hash is
+   * untouched. The realtime processor's heartbeat path is unaffected
+   * (it writes its own fields with its own hset).
    */
   private async updateActivePositionsCount(): Promise<void> {
     try {
       const count = await this.getPositionCount()
       const stateKey = `trade_engine_state:${this.connectionId}`
-      const current = (await getSettings(stateKey)) || {}
-      await setSettings(stateKey, { ...current, active_positions_count: count })
+      const client = getRedisClient()
+      // Single-field hset is atomic at the Redis level; safe under any
+      // concurrency. We don't bother re-reading other fields because we
+      // don't need them — only this one is being updated.
+      await client.hset(stateKey, "active_positions_count", String(count))
     } catch (error) {
       console.error("[v0] Failed to update active positions count:", error)
     }

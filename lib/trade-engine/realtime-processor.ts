@@ -17,7 +17,7 @@
  * NOW: 100% Redis-backed, no SQL.
  */
 
-import { getSettings, setSettings, getRedisClient } from "@/lib/redis-db"
+import { getRedisClient } from "@/lib/redis-db"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { StrategyConfigManager, type PseudoPosition } from "@/lib/strategy-config-manager"
@@ -210,26 +210,34 @@ export class RealtimeProcessor {
       if (countChanged || heartbeatDue) {
         const stateKey = `trade_engine_state:${this.connectionId}`
         try {
-          if (countChanged) {
-            // Only re-fetch the state hash when we actually need to merge a
-            // new count. The heartbeat-only path uses hset to touch two
-            // fields without read-modify-write.
-            const engineState = (await getSettings(stateKey)) || {}
-            await setSettings(stateKey, {
-              ...engineState,
-              active_positions_count: count,
-              last_realtime_run: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-              realtime_processor_active: true,
-            })
-          } else {
-            const client = getRedisClient()
-            await client.hset(stateKey, {
-              last_realtime_run: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-              realtime_processor_active: "true",
-            })
+          // ── Atomic heartbeat write (P0-3 race fix) ─────────────────
+          // Both branches now use direct field-level hset — no
+          // getSettings + spread merge. Previously the `countChanged`
+          // branch did a read-modify-write that could clobber field
+          // updates from concurrent writers (PseudoPositionManager.create
+          // / close, engine startup, watchdog re-arm) between our read
+          // and our write. With Redis hash semantics the rewrite was
+          // technically a per-field merge, but the RE-WRITTEN fields
+          // came from the stale read snapshot, silently losing other
+          // writers' progress.
+          //
+          // Now: hset only the fields THIS cycle actually owns
+          // (active_positions_count, last_realtime_run, updated_at,
+          // realtime_processor_active). Every other field on the hash
+          // — symbols, prehistoric flags, started_at, etc. — is
+          // preserved untouched, regardless of who wrote it last.
+          const client = getRedisClient()
+          const fields: Record<string, string> = {
+            last_realtime_run: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            realtime_processor_active: "true",
           }
+          if (countChanged) {
+            // Only stamp the count when we know it changed — saves
+            // pointless writes on the heartbeat-only path.
+            fields.active_positions_count = String(count)
+          }
+          await client.hset(stateKey, fields)
           this.lastPositionsCount = count
           this.lastHeartbeatAt = now
         } catch (hbErr) {
