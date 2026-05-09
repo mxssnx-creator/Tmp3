@@ -465,29 +465,22 @@ export async function POST(request: Request) {
             )
             await coordinator.stopEngine(connectionId)
           }
-          // Wipe progression-accumulator fields and stale prehistoric
-          // completion markers whether or not the engine was running —
-          // both can carry forward "1/1" / running-avg values from a
-          // previous QuickStart attempt. We do NOT `del` the whole
-          // `prehistoric:{id}` hash here because the route already
-          // wrote `symbols_total: <new>` to it at Step 3 (line 391-398
-          // above); a `del` now would erase that and leave the new
-          // engine to re-init from scratch.
+
+          // CRITICAL: After stopping (or if the engine was never in-memory but
+          // Redis still holds a stale flag from a previous run / hot-reload),
+          // explicitly delete / clear the `engine_is_running:{id}` key so the
+          // subsequent `startEngine` call does NOT bail out at its startup-lock
+          // check (which returns early when the flag is "true" AND the in-memory
+          // manager reports running — a state that can linger after stopEngine
+          // completes in a different request lifecycle).
           //
-          // Cleared (per-connection only — does NOT touch
-          // `progression:{otherId}` or any global state):
-          //   * `prehistoric:{id}.is_complete / completed_at /
-          //      symbols_processed / candles_loaded /
-          //      indicators_calculated / total_duration_ms`
-          //     — the previous run's "done" markers; the new
-          //       prehistoric phase rewrites them all on success.
-          //   * `prehistoric:{id}:done` flag — re-emitted by the new
-          //     prehistoric phase.
-          //   * `progression:{id}.real_active_pos_*` — running-avg of
-          //     active Real positions; resetting prevents the new
-          //     run's tile from inheriting the old run's mean.
-          //   * `progression:{id}.prehistoric_*` — legacy mirror fields.
+          // Without this, a second QuickStart press always produced the log
+          // "[STARTUP LOCK] Engine already running — skipping" and no new
+          // progression was ever launched for that connection.
           await Promise.allSettled([
+            client.del(`engine_is_running:${connectionId}`).catch(() => 0),
+            // Wipe progression-accumulator fields and stale prehistoric
+            // completion markers (per-connection only — other connections unaffected).
             client.del(`prehistoric:${connectionId}:done`),
             client.hdel(`prehistoric:${connectionId}`,
               "is_complete",
@@ -508,6 +501,7 @@ export async function POST(request: Request) {
               "prehistoric_phase_active",
             ).catch(() => 0),
           ])
+          console.log(`${LOG_PREFIX}: Pre-start cleanup complete — engine_is_running flag cleared for ${connectionId}`)
         } catch (restartErr) {
           // Don't fail the whole quickstart on a stop/cleanup hiccup —
           // the new engine start below will still work; worst case the

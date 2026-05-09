@@ -206,22 +206,22 @@ export class StrategyCoordinator {
       description: "One Set per (indication_type × direction) — all qualifying",
     },
     main: {
-      maxDrawdownTime: 1440,  // 24 hours
+      maxDrawdownTime: 180,   // 3 hours — aligned to short-duration trade profile
       minProfitFactor: 1.2,   // Base sets with avgPF >= 1.2 → promoted to MAIN
       confidence: 0.5,        // advisory only
-      description: "Sets promoted from BASE with profitFactor >= 1.2 + DDT <= 24h",
+      description: "Sets promoted from BASE with profitFactor >= 1.2 + DDT <= 3h",
     },
     real: {
-      maxDrawdownTime: 960,   // 16 hours
+      maxDrawdownTime: 180,   // 3 hours — consistent with MAIN
       minProfitFactor: 1.4,   // Main sets with avgPF >= 1.4 → promoted to REAL
       confidence: 0.65,       // advisory only
-      description: "Sets promoted from MAIN with profitFactor >= 1.4 + DDT <= 16h",
+      description: "Sets promoted from MAIN with profitFactor >= 1.4 + DDT <= 3h",
     },
     live: {
-      maxDrawdownTime: 960,   // Match REAL stage (16 hours) — ensure valid Sets from REAL flow through to LIVE
+      maxDrawdownTime: 180,   // 3 hours — ensures REAL sets flow through to LIVE
       minProfitFactor: 1.4,   // Match REAL stage minimum so Sets can flow through
       confidence: 0.65,       // advisory only
-      description: "Best 500 Sets from REAL (PF >= 1.4 + DDT <= 16h) ready for live trading",
+      description: "Best 500 Sets from REAL (PF >= 1.4 + DDT <= 3h) ready for live trading",
     },
   }
 

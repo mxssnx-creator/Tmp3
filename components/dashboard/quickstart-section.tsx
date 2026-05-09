@@ -673,6 +673,14 @@ export function QuickstartSection() {
   // ── start / stop ���───────────────────────────────────────������─────────────────
   const handleStart = async () => {
     if (starting || isRunning) return
+
+    // Hard guard: a connection must be explicitly selected before starting.
+    // No silent fallback to a random connection — the operator must pick one.
+    if (!selectedConnectionId) {
+      addLog("Select a connection first — use the connection picker above", "warning")
+      return
+    }
+
     setStarting(true)
     setLogs([])
     addLog("Initializing connection...", "info")
@@ -681,19 +689,10 @@ export function QuickstartSection() {
       if (!connRes.ok) throw new Error("Failed to get connections")
       const data = await connRes.json()
       const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
-      const isActive = (c: any) =>
-        c.is_active_inserted === "1" || c.is_active_inserted === true ||
-        c.is_assigned === "1" || c.is_assigned === true ||
-        c.is_active === "1" || c.is_active === true ||
-        c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
 
-      // Always use the exchange-selected connection first
-      const conn =
-        conns.find(c => c.id === selectedConnectionId) ||
-        conns.find(c => isActive(c) && (c.exchange || "").toLowerCase() === (selectedExchange || "").toLowerCase()) ||
-        conns.find(c => isActive(c)) ||
-        conns[0]
-      if (!conn) throw new Error("No active connections found")
+      // Use ONLY the explicitly selected connection — no fallback.
+      const conn = conns.find(c => c.id === selectedConnectionId)
+      if (!conn) throw new Error(`Selected connection not found (id: ${selectedConnectionId}). Try refreshing.`)
       addLog(`Connected to ${conn.exchange?.toUpperCase() || "exchange"}`, "success")
       setActiveConnectionId(conn.id)
       // Seed live state from whatever the connection already says
@@ -946,7 +945,8 @@ export function QuickstartSection() {
             size="sm"
             variant={isRunning ? "destructive" : "default"}
             onClick={isRunning ? handleStop : handleStart}
-            disabled={starting || volatileSymbol.loading}
+            disabled={starting || volatileSymbol.loading || (!isRunning && !selectedConnectionId)}
+            title={!selectedConnectionId && !isRunning ? "Select a connection first" : undefined}
             className="h-7 text-xs px-2.5 gap-1"
           >
             {starting ? <Loader2 className="w-3 h-3 animate-spin" /> : isRunning ? <StopCircle className="w-3 h-3" /> : <Play className="w-3 h-3" />}
@@ -954,11 +954,13 @@ export function QuickstartSection() {
               ? "Starting..."
               : isRunning
                 ? "Stop"
-                : volatileSymbol.symbol
-                  ? symbolCount === 1
-                    ? `Start (${volatileSymbol.symbol})`
-                    : `Start (top ${symbolCount})`
-                  : "Start Engine"}
+                : !selectedConnectionId
+                  ? "Select Connection"
+                  : volatileSymbol.symbol
+                    ? symbolCount === 1
+                      ? `Start (${volatileSymbol.symbol})`
+                      : `Start (top ${symbolCount})`
+                    : "Start Engine"}
           </Button>
 
           {/* Symbol count selector — controls how many top-volatile symbols the quickstart processes. */}
