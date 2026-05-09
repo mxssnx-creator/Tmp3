@@ -475,6 +475,32 @@ export class TradeEngineManager {
             gateErr instanceof Error ? gateErr.message : String(gateErr),
           )
         }
+        // CRITICAL: Also restore the prehistoric:{id} hash completion fields.
+        // The QuickStart route wipes `is_complete`, `symbols_processed`, etc.
+        // on every new run so the UI can show fresh progress. In the cache
+        // path, the processor never re-runs to restore them, so the stats
+        // route sees `is_complete !== "1"` and `symbols_processed = 0`,
+        // causing the dashboard to display "0/N symbols" indefinitely even
+        // though historic data is fully ready. Re-stamp the canonical
+        // completion fields here so the dashboard correctly reflects the
+        // cached state.
+        try {
+          const symbols = await this.getSymbols()
+          await redisClient.hset(`prehistoric:${this.connectionId}`, {
+            is_complete: "1",
+            symbols_processed: String(symbols.length),
+            symbols_total: String(symbols.length),
+            updated_at: new Date().toISOString(),
+            data_source: "cache",
+          })
+          await redisClient.expire(`prehistoric:${this.connectionId}`, 86400)
+          console.log(`[v0] [Engine] Prehistoric cache hit — restored hash for ${symbols.length} symbols (${this.connectionId})`)
+        } catch (restoreErr) {
+          console.warn(
+            `[v0] [Engine] Failed to restore prehistoric hash on cache hit:`,
+            restoreErr instanceof Error ? restoreErr.message : String(restoreErr),
+          )
+        }
       } else {
         // Non-blocking prehistoric loading
         await this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data (background)...")
