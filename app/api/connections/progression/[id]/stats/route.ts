@@ -833,18 +833,35 @@ export async function GET(
     const activeSetsStratTotal = activeSetsStratByStage.base + activeSetsStratByStage.main + activeSetsStratByStage.real
 
     // Strategy per-stage counts
+    // NOTE on source priority:
+    //   strategies_active:{id}  hash  — per-symbol hset, aggregated to activeStratByStage above.
+    //                                    This is the CURRENT snapshot (what's alive right now).
+    //   strategies:{id}:{stage}:count  — standalone string, overwritten each cycle with the
+    //                                    LAST-PROCESSED symbol's count. Correct only for 1-symbol runs.
+    //   strategies_{stage}_total       — cumulative hincrby (grows every cycle). NEVER use as
+    //                                    current count — it inflates dramatically over many cycles.
+    // Priority: activeStratByStage (cross-symbol sum, most recent) > standalone key > cumulative hash.
     const stratTypes = ["base", "main", "real", "live"] as const
     const stratCounts: Record<string, number> = {}
     const stratEvaluated: Record<string, number> = {}
     await Promise.all(
       stratTypes.map(async (type) => {
-        const fromHash  = n(progHash[`strategies_${type}_total`])
+        // Prefer the cross-symbol sum from strategies_active hash (already computed above).
+        // For "live" there is no strategies_active entry, so fall back to the standalone key.
+        const fromActive = (type !== "live") ? (activeStratByStage[type] || 0) : 0
         const fromKey   = n(await client.get(`strategies:${connectionId}:${type}:count`).catch(() => 0))
-        stratCounts[type] = Math.max(fromHash, fromKey)
+        // NOTE: strategies_{type}_total is a cumulative hincrby (grows every cycle × symbols).
+        // It MUST NOT be used as the current count — prefer fromActive (cross-symbol live snapshot)
+        // or fromKey (last-symbol standalone, 24h TTL). Fall back to 0 when both are absent so
+        // the dashboard shows "no data yet" instead of an inflated lifetime cumulative.
+        stratCounts[type] = fromActive > 0 ? fromActive
+                          : fromKey   > 0 ? fromKey
+                          : 0
 
-        const evalFromHash = n(progHash[`strategies_${type}_evaluated`])
         const evalFromKey  = n(await client.get(`strategies:${connectionId}:${type}:evaluated`).catch(() => 0))
-        stratEvaluated[type] = Math.max(evalFromHash, evalFromKey)
+        // Standalone key is last-symbol-wins current count. Cumulative hash field
+        // (strategies_{type}_evaluated) is intentionally ignored here.
+        stratEvaluated[type] = evalFromKey
       })
     )
     // ── Pipeline-aware "total strategies" ────────────────────────────────
