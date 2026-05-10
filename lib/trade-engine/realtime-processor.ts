@@ -609,6 +609,9 @@ export class RealtimeProcessor {
           position.trailing_active = "1"
           position.trailing_anchor = String(anchor)
           position.trailing_stop_price = String(newStop)
+          // Spec §6: trailing just armed — sync to live position now
+          // so the exchange SL/TP reflects the activated stop level.
+          void this.fireSyncLiveFromPseudo(position).catch(() => {})
           return
         }
 
@@ -640,6 +643,8 @@ export class RealtimeProcessor {
           })
           position.trailing_anchor = String(newAnchor)
           position.trailing_stop_price = String(newStop)
+          // Spec §6: re-arm matching live position's exchange SL/TP.
+          void this.fireSyncLiveFromPseudo(position).catch(() => {})
         } else {
           if (currentPrice >= anchorStored - stepDistance) return
           const newAnchor = currentPrice
@@ -659,6 +664,8 @@ export class RealtimeProcessor {
           })
           position.trailing_anchor = String(newAnchor)
           position.trailing_stop_price = String(newStop)
+          // Spec §6: re-arm matching live position's exchange SL/TP.
+          void this.fireSyncLiveFromPseudo(position).catch(() => {})
         }
         return
       }
@@ -681,8 +688,54 @@ export class RealtimeProcessor {
         trailing_stop_price: String(newTrailingStop),
         updated_at: new Date().toISOString(),
       })
+
+      // ── Pseudo → Live sync hook (spec §6) ─────────────────────────
+      //
+      // Single-step path tail. Call the sync helper so any matching
+      // live position re-arms its exchange-side SL/TP at the new
+      // trailing stop. We intentionally use the percent form
+      // (`stoploss_ratio`) rather than the absolute trailing price —
+      // `recalculateAndApplySLTP` re-derives the trigger from the
+      // percent + live entry price, which is correct even when the
+      // live entry differs from the pseudo entry by fees / slippage.
+      //
+      // Fire-and-forget: `syncLiveFromPseudo` returns Promise<void>
+      // and swallows every error. Never await on the hot path.
+      void this.fireSyncLiveFromPseudo(position).catch(() => {})
     } catch (error) {
       console.error(`[v0] Failed to update trailing stop for position ${position.id}:`, error)
+    }
+  }
+
+  /**
+   * Build a connector + invoke `syncLiveFromPseudo` for the connection.
+   * Kept as a separate method so we can call it from both the
+   * multi-step and single-step trailing branches without duplicating
+   * the connector boilerplate. Best-effort; logs and swallows errors.
+   */
+  private async fireSyncLiveFromPseudo(position: any): Promise<void> {
+    try {
+      const { getConnection } = await import("@/lib/redis-db")
+      const connection = await getConnection(this.connectionId)
+      if (!connection) return
+      const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
+      const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
+      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) return
+
+      const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+      const connector = await createExchangeConnector(connection.exchange, {
+        apiKey,
+        apiSecret,
+        apiType: connection.api_type,
+        contractType: connection.contract_type,
+        isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
+      })
+
+      const { syncLiveFromPseudo } = await import("@/lib/trade-engine/stages/live-stage")
+      await syncLiveFromPseudo(this.connectionId, position, connector)
+    } catch (err) {
+      // Best-effort — never propagate.
+      console.warn(`[v0] fireSyncLiveFromPseudo error for ${position?.id}:`, err instanceof Error ? err.message : String(err))
     }
   }
 
