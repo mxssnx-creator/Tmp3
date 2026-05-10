@@ -69,6 +69,37 @@ export interface AcquireResult {
   handle?: LockHandle
   /** Populated on failure — the existing owner's encoded value (for diagnostics). */
   existingOwner?: string
+  /** True when acquisition succeeded by breaking a confirmed-stale lock. */
+  healedStaleLock?: boolean
+}
+
+/**
+ * Optional hints for self-healing acquisition.
+ *
+ *  - `selfOwnedIfAlive(epoch)` lets the caller declare "the engine for
+ *    this connection is alive in MY process; if the existing lock
+ *    matches an epoch that aligns with my running manager, treat the
+ *    lock as still mine and overwrite it with a fresh handle." This
+ *    fixes the failure mode where a dev-server restart or a Next.js
+ *    HMR cycle keeps the lock-value in Redis (data lives on globalThis)
+ *    but the in-process manager has already been re-created, so the
+ *    new process can't acquire the slot it's logically supposed to
+ *    own and ends up flapping start→bail→start.
+ *
+ *  - `staleAfterMs` causes the acquire path to force-break a lock
+ *    whose epoch is OLDER than this many ms. Defaults to 2× the lock
+ *    TTL — anything older than this CANNOT be a healthy owner because
+ *    extend would have refreshed the value (and bumped... no, the
+ *    epoch is fixed at acquire-time, so this is a conservative bound:
+ *    if the owner is alive AND extending, the value is still present,
+ *    so the only way to read an old-epoch value is if the TTL hasn't
+ *    elapsed yet. We use this as a safety net for cases where the
+ *    TTL is misconfigured high or the lock was set by a since-dead
+ *    process and is now coasting on its TTL).
+ */
+export interface AcquireOptions {
+  selfOwnedIfAlive?: boolean
+  staleAfterMs?: number
 }
 
 function key(connectionId: string): string {
@@ -114,6 +145,7 @@ export function mintOwnerToken(): string {
 export async function acquireProgressionLock(
   connectionId: string,
   ttlSec: number = LOCK_TTL_SEC,
+  opts: AcquireOptions = {},
 ): Promise<AcquireResult> {
   const client = getRedisClient()
   if (!client) {
@@ -126,6 +158,7 @@ export async function acquireProgressionLock(
     ownerToken: mintOwnerToken(),
     epoch: Date.now(),
   }
+  // ── First attempt: vanilla NX ──────────────────────────────────────
   try {
     const result = await client.set(key(connectionId), encodeValue(handle), {
       NX: true,
@@ -134,14 +167,6 @@ export async function acquireProgressionLock(
     if (result === "OK") {
       return { acquired: true, handle }
     }
-    // Acquisition failed — look up the current owner for diagnostics.
-    let existing: string | null = null
-    try {
-      existing = await client.get(key(connectionId))
-    } catch {
-      /* best effort */
-    }
-    return { acquired: false, existingOwner: existing ?? "unknown" }
   } catch (err) {
     console.warn(
       `[ProgressionLock] acquire failed for ${connectionId}:`,
@@ -149,6 +174,82 @@ export async function acquireProgressionLock(
     )
     return { acquired: false, existingOwner: "acquire-error" }
   }
+
+  // ── Contention path: decode the existing owner ─────────────────────
+  // Anything from here on is best-effort recovery. We NEVER silently
+  // steal a healthy lock — we only break it when there's solid
+  // evidence the previous owner is gone (self-owned hint OR epoch
+  // older than the staleness threshold).
+  let existingRaw: string | null = null
+  try {
+    existingRaw = await client.get(key(connectionId))
+  } catch {
+    /* best effort */
+  }
+  const existingDecoded = decodeValue(existingRaw)
+  const existingOwner = existingRaw ?? "unknown"
+
+  // ── Self-ownership recovery (Next.js HMR / dev-server restart) ─────
+  // The lock value persists across in-process module re-evaluation
+  // because the inline Redis store lives on globalThis. The NEW
+  // module's freshly-constructed manager has no record of the lock
+  // and would otherwise spin forever. When the caller passes
+  // `selfOwnedIfAlive` it is asserting "in MY process the engine for
+  // this connection is alive and intends to keep running" — so the
+  // safest action is to overwrite the lock value (NOT delete-then-NX,
+  // which would race) with a fresh handle. The new epoch immediately
+  // invalidates any zombie callbacks that might still be holding the
+  // old handle.
+  if (opts.selfOwnedIfAlive) {
+    try {
+      await client.set(key(connectionId), encodeValue(handle), { EX: ttlSec })
+      return { acquired: true, handle, healedStaleLock: true }
+    } catch (err) {
+      console.warn(
+        `[ProgressionLock] self-heal write failed for ${connectionId}:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      return { acquired: false, existingOwner }
+    }
+  }
+
+  // ── Stale-by-age recovery ──────────────────────────────────────────
+  // Default threshold: 2× LOCK_TTL_SEC. An owner that is actively
+  // extending will keep the value present; a value whose epoch is
+  // older than 2× TTL CAN only be left behind by a dead process whose
+  // TTL is still coasting (we use this as a belt-and-braces guard
+  // because TTL alone can technically reach a few seconds older than
+  // its nominal value due to round-trip latency).
+  const staleAfterMs = opts.staleAfterMs ?? (LOCK_TTL_SEC * 2 * 1000)
+  if (existingDecoded && Number.isFinite(existingDecoded.epoch)) {
+    const age = Date.now() - existingDecoded.epoch
+    if (age > staleAfterMs) {
+      try {
+        // Force-break + atomic re-acquire. We do `del` then `SET NX`
+        // rather than a single `SET` write because a parallel
+        // legitimate acquirer might be racing us and we want NX to
+        // arbitrate fairly.
+        await client.del(key(connectionId))
+        const reResult = await client.set(key(connectionId), encodeValue(handle), {
+          NX: true,
+          EX: ttlSec,
+        })
+        if (reResult === "OK") {
+          console.warn(
+            `[ProgressionLock] healed stale lock for ${connectionId} (age=${age}ms, prev_epoch=${existingDecoded.epoch})`,
+          )
+          return { acquired: true, handle, healedStaleLock: true }
+        }
+      } catch (err) {
+        console.warn(
+          `[ProgressionLock] stale-heal failed for ${connectionId}:`,
+          err instanceof Error ? err.message : String(err),
+        )
+      }
+    }
+  }
+
+  return { acquired: false, existingOwner }
 }
 
 /**

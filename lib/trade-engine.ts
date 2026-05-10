@@ -194,11 +194,20 @@ export class GlobalTradeEngineCoordinator {
       // This is the SECOND guard — the in-process `startingEngines`
       // set blocks duplicate starts within this Node worker; the
       // Redis lock blocks duplicate starts across workers, dev
-      // reloads, serverless instances, etc. If another worker
-      // already owns this connection we bail out cleanly without
-      // mutating any state. The manager constructor + Redis writes
-      // below will all be skipped.
-      const acquired = await acquireProgressionLock(connectionId)
+      // reloads, serverless instances, etc.
+      //
+      // Self-heal: if THIS process already has a running manager for
+      // the connection, the persistent lock value (data lives on
+      // globalThis so it survives module re-evaluation) was set by
+      // an earlier incarnation of OUR engine — overwrite it with a
+      // fresh handle so the new manager carries a fresh epoch.
+      // This breaks the start→bail→start flap that occurred after
+      // Next.js HMR cycles or full dev-server restarts.
+      const localManagerAlive =
+        this.engineManagers.get(connectionId)?.isEngineRunning === true
+      const acquired = await acquireProgressionLock(connectionId, undefined, {
+        selfOwnedIfAlive: localManagerAlive,
+      })
       if (!acquired.acquired || !acquired.handle) {
         console.warn(
           `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Skipping.`,
@@ -207,7 +216,7 @@ export class GlobalTradeEngineCoordinator {
       }
       lockHandle = acquired.handle
       console.log(
-        `[v0] [STARTUP LOCK] Acquired progression lock for ${connectionId} (epoch=${lockHandle.epoch})`,
+        `[v0] [STARTUP LOCK] Acquired progression lock for ${connectionId} (epoch=${lockHandle.epoch}${acquired.healedStaleLock ? ", healed stale" : ""})`,
       )
 
       // Step 4: Initialize engine if needed
@@ -978,18 +987,35 @@ export class GlobalTradeEngineCoordinator {
    */
   private stallEscalation: Map<string, number> = new Map()
 
+  /**
+   * Mutex for in-flight escalation restarts. The watchdog runs every
+   * 10 s and a full stop+restart can take longer than that, so the
+   * next tick MUST NOT fire a second escalation while the previous
+   * one is still draining. Without this guard, two concurrent
+   * restarts would each acquire-then-break the lock and produce the
+   * "doubled progression / stopping-restarting" symptom.
+   */
+  private escalatingEngines: Set<string> = new Set()
+
   private startGlobalHealthMonitoring(): void {
     if (this.healthCheckTimer) {
       // Already running — keep the existing timer.
       return
     }
     const healthCheckInterval = 10000 // 10s
-    const STALL_THRESHOLD_MS = 60_000 // 60s without heartbeat = stalled
-    // After this many CONSECUTIVE stall detections (without the
-    // heartbeat coming back) we escalate from in-place re-arm to a
-    // full stop+restart. Two means we give re-arm one full health-
-    // monitor cycle (10s) to recover before nuking the manager.
-    const ESCALATION_THRESHOLD = 2
+    // ── Stall thresholds (relaxed from earlier 60s / 2 attempts) ───
+    // Real-world Redis pauses on cold-started serverless instances
+    // can routinely sit on 30-60s; aggressive thresholds caused the
+    // watchdog to nuke healthy engines that were just about to come
+    // back. New values give the engine generous recovery room:
+    //
+    //   • 90 s without heartbeat before we even *consider* stall.
+    //   • 4 consecutive stalls (≈ 40 s extra) before we escalate from
+    //     in-place re-arm to a full stop+restart.
+    //
+    // Combined that's ~2 minutes of grace before any restart fires.
+    const STALL_THRESHOLD_MS = 90_000
+    const ESCALATION_THRESHOLD = 4
 
     console.log("[v0] Starting global trade engine health monitoring (refresh detection + stall watchdog)")
 
@@ -1071,14 +1097,38 @@ export class GlobalTradeEngineCoordinator {
                 // Redis-pipeline await, or a never-resolving await on
                 // network I/O). The ONLY safe recovery is to drop
                 // the lock, tear down the manager, and start fresh.
-                // The new generation gets a new epoch which orphans
-                // any in-flight async ops from the stuck generation
-                // (they fail `isCurrentGeneration` and drop their
-                // writes harmlessly).
+                //
+                // ── Concurrency guards ────────────────────────────────
+                //   1. Mutex: if an escalation for this connection is
+                //      already in flight, skip THIS tick. The previous
+                //      escalation will complete and the next health
+                //      check will reassess.
+                //   2. Ownership: only escalate engines we actually own
+                //      in THIS process. The local manager must be
+                //      present in our map; otherwise we're looking at
+                //      a cross-process scenario and the OTHER process
+                //      owns the recovery responsibility.
+                if (this.escalatingEngines.has(connectionId)) {
+                  console.warn(
+                    `[v0] [Watchdog] Engine ${connectionId} escalation already in-flight — skipping duplicate restart`,
+                  )
+                  // Don't clear the stall counter — let the in-flight
+                  // escalation finish and the next tick re-evaluate.
+                  continue
+                }
+                const localManager = this.engineManagers.get(connectionId)
+                if (!localManager) {
+                  console.warn(
+                    `[v0] [Watchdog] Engine ${connectionId} not in local map — skipping escalation (cross-process owner)`,
+                  )
+                  this.stallEscalation.delete(connectionId)
+                  continue
+                }
                 console.error(
                   `[v0] [Watchdog] Engine ${connectionId} STILL stalled after ${consecutiveStalls} attempts (${age}ms) — escalating to full restart`,
                 )
                 this.stallEscalation.delete(connectionId)
+                this.escalatingEngines.add(connectionId)
                 try {
                   const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
                   await logProgressionEvent(
@@ -1098,9 +1148,9 @@ export class GlobalTradeEngineCoordinator {
                 } catch {
                   /* TTL will reclaim */
                 }
-                // Stop + restart with the cached config. We run
-                // these sequentially to avoid racing the stop's
-                // cleanup against the restart's acquire.
+                // Stop + restart sequentially. The mutex above
+                // prevents this whole block from running concurrently
+                // for the same connection.
                 try {
                   await this.stopEngine(connectionId)
                 } catch (stopErr) {
@@ -1109,10 +1159,6 @@ export class GlobalTradeEngineCoordinator {
                     stopErr instanceof Error ? stopErr.message : String(stopErr),
                   )
                 }
-                // Re-load config from connection store — the
-                // original `startConfig` lived on the (now disposed)
-                // manager. Restart uses the same flow as a dashboard
-                // toggle, which is the canonical entry point.
                 try {
                   await this.startEngineFromConnectionConfig(connectionId)
                 } catch (startErr) {
@@ -1120,6 +1166,10 @@ export class GlobalTradeEngineCoordinator {
                     `[v0] [Watchdog] force restart failed for ${connectionId}:`,
                     startErr instanceof Error ? startErr.message : String(startErr),
                   )
+                } finally {
+                  // Mutex MUST always be released, even on failure,
+                  // so the next health-check tick can retry.
+                  this.escalatingEngines.delete(connectionId)
                 }
               }
             } else {
