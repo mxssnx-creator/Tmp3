@@ -74,10 +74,14 @@ export interface Settings {
   arrangementType: string
   quoteAsset: string
 
-  // Minimum Profit Factor Requirements
+  // ── Main Trade PF thresholds per stage (Base/Main/Real/Live) ─────
+  // Operator-tunable via Settings → Strategy → Main → Profit Factor
+  // Thresholds. Spec defaults 0.9/1.0/1.0/1.0 — wired into the engine
+  // by `lib/strategy-coordinator.ts:loadAppPFThresholds()`.
   baseProfitFactor: number
   mainProfitFactor: number
   realProfitFactor: number
+  liveProfitFactor: number
 
   // Risk Management
   trailingStopLoss: boolean

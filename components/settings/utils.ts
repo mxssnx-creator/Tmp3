@@ -76,10 +76,14 @@ export const initialSettings: Settings = {
   arrangementType: "marketCap24h",
   quoteAsset: "USDT",
 
-  // Minimum Profit Factor Requirements
-  baseProfitFactor: 0.6,
-  mainProfitFactor: 0.6,
-  realProfitFactor: 0.6,
+  // ── Main Trade PF thresholds per stage (spec defaults) ───────────
+  // Base 0.9 / Main 1.0 / Real 1.0 / Live 1.0 — mirrored from
+  // `app/settings/page.tsx`. Engine reads via
+  // `lib/strategy-coordinator.ts:loadAppPFThresholds()` (5s TTL).
+  baseProfitFactor: 0.9,
+  mainProfitFactor: 1.0,
+  realProfitFactor: 1.0,
+  liveProfitFactor: 1.0,
 
   // Risk Management
   trailingStopLoss: false,

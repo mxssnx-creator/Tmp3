@@ -43,24 +43,122 @@ export function StrategyTab({ settings, handleSettingChange }: StrategyTabProps)
                   <CardDescription>Configure base strategy parameters</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-6">
+                  {/*
+                   * ── Main Trade Profit Factor Thresholds ────────────────
+                   *
+                   * Spec: "Change at Main Trade PF for Base, Main, Real,
+                   * Live to 0.9 1.0 1.0 1.0 System Overall. Add to
+                   * Settings Dialog at Strategies with Sliders. Ensure
+                   * it works systemwide completely."
+                   *
+                   * Each slider tunes the minimum profit-factor gate for
+                   * one stage of the Main-Trade pipeline (Base → Main →
+                   * Real → Live). Values flow into the engine via
+                   * `lib/strategy-coordinator.ts:loadAppPFThresholds()`,
+                   * which mirrors them into:
+                   *   - `PF_BASE_MIN`  — per-indication entry filter
+                   *   - `METRICS.{base,main,real,live}.minProfitFactor`
+                   *     — Set-average promotion gates
+                   *
+                   * Cache TTL is 5s so a slider change reflects in live
+                   * gating within at most 5 seconds, no engine restart
+                   * required. Range 0.0–2.0 with 0.1 step matches the
+                   * existing Preset PF slider for UX consistency.
+                   * Defaults match the spec exactly: 0.9 / 1.0 / 1.0 / 1.0.
+                   */}
+                  <div className="space-y-2">
+                    <h3 className="text-lg font-semibold">Main Trade Profit Factor Thresholds</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Minimum profit factor required to promote Sets between
+                      Main-Trade stages. Defaults: Base 0.9, Main 1.0,
+                      Real 1.0, Live 1.0.
+                    </p>
+                  </div>
                   <div className="grid md:grid-cols-2 gap-4">
                     <div className="space-y-2">
-                      <Label>Minimum Profit Factor</Label>
+                      <Label>Base PF Threshold</Label>
                       <div className="flex items-center gap-4">
                         <Slider
-                          min={0.1}
+                          min={0.0}
                           max={2.0}
                           step={0.1}
-                          value={[settings.baseProfitFactor || 0.6]}
+                          value={[settings.baseProfitFactor ?? 0.9]}
                           onValueChange={([value]) => handleSettingChange("baseProfitFactor", value)}
                           className="flex-1"
                         />
                         <span className="text-sm font-medium w-10 text-right">
-                          {(settings.baseProfitFactor || 0.6).toFixed(1)}
+                          {(settings.baseProfitFactor ?? 0.9).toFixed(1)}
                         </span>
                       </div>
+                      <p className="text-xs text-muted-foreground">
+                        Per-indication entry filter for Base Sets.
+                      </p>
                     </div>
 
+                    <div className="space-y-2">
+                      <Label>Main PF Threshold</Label>
+                      <div className="flex items-center gap-4">
+                        <Slider
+                          min={0.0}
+                          max={2.0}
+                          step={0.1}
+                          value={[settings.mainProfitFactor ?? 1.0]}
+                          onValueChange={([value]) => handleSettingChange("mainProfitFactor", value)}
+                          className="flex-1"
+                        />
+                        <span className="text-sm font-medium w-10 text-right">
+                          {(settings.mainProfitFactor ?? 1.0).toFixed(1)}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Avg PF gate to promote Base Sets into Main.
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>Real PF Threshold</Label>
+                      <div className="flex items-center gap-4">
+                        <Slider
+                          min={0.0}
+                          max={2.0}
+                          step={0.1}
+                          value={[settings.realProfitFactor ?? 1.0]}
+                          onValueChange={([value]) => handleSettingChange("realProfitFactor", value)}
+                          className="flex-1"
+                        />
+                        <span className="text-sm font-medium w-10 text-right">
+                          {(settings.realProfitFactor ?? 1.0).toFixed(1)}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Avg PF gate to promote Main Sets into Real.
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label>Live PF Threshold</Label>
+                      <div className="flex items-center gap-4">
+                        <Slider
+                          min={0.0}
+                          max={2.0}
+                          step={0.1}
+                          value={[settings.liveProfitFactor ?? 1.0]}
+                          onValueChange={([value]) => handleSettingChange("liveProfitFactor", value)}
+                          className="flex-1"
+                        />
+                        <span className="text-sm font-medium w-10 text-right">
+                          {(settings.liveProfitFactor ?? 1.0).toFixed(1)}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Avg PF gate to promote Real Sets into Live.
+                      </p>
+                    </div>
+                  </div>
+
+                  <Separator />
+
+                  <div className="grid md:grid-cols-2 gap-4">
                     <div className="space-y-2">
                       <Label>Maximum Drawdown Time (hours)</Label>
                       <div className="flex items-center gap-4">

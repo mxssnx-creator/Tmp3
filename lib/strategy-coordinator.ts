@@ -184,11 +184,42 @@ export class StrategyCoordinator {
    */
   private _activeKeysCache: { keys: Set<string>; cycleAt: number } | null = null
 
-  // Profit factor thresholds per stage
-  private readonly PF_BASE_MIN = 1.0    // Minimum to enter BASE set
-  private readonly PF_MAIN_MIN = 1.2    // Base sets must have avgPF >= 1.2 to enter MAIN
-  private readonly PF_REAL_MIN = 1.4    // Main sets must have avgPF >= 1.4 to enter REAL
-  private readonly PF_LIVE_MIN = 1.4    // Real sets must have avgPF >= 1.4 to enter LIVE
+  // ── Profit factor thresholds per stage (system-wide defaults) ──────
+  //
+  // Spec: "Change at Main Trade PF for Base, Main, Real, Live to
+  // 0.9 1.0 1.0 1.0 System Overall. Add to Settings Dialog at
+  // Strategies with Sliders. Ensure it works systemwide completely."
+  //
+  // These are NOT `readonly` because `loadAppPFThresholds()` overrides
+  // them from the operator's settings (`baseProfitFactor`,
+  // `mainProfitFactor`, `realProfitFactor`, `liveProfitFactor`) on
+  // every cycle. The values written here are the FALLBACKS used when
+  // a setting is missing / NaN / 0 — chosen to match the new spec
+  // defaults so a fresh install gates with 0.9/1.0/1.0/1.0 even
+  // before the operator touches the sliders.
+  //
+  // Why split `PF_BASE_MIN` (per-indication entry filter at line ~440)
+  // from `METRICS.base.minProfitFactor`? Historically `PF_BASE_MIN`
+  // gated INDIVIDUAL indication entries into Base, while the METRICS
+  // values gate the AVERAGE-PF of an already-built Set into the next
+  // stage. Conceptually the operator wants ONE Base PF knob — so we
+  // load the same `baseProfitFactor` into both fields.
+  private PF_BASE_MIN = 0.9    // Minimum to enter BASE set
+  private PF_MAIN_MIN = 1.0    // Base sets must have avgPF >= 1.0 to enter MAIN
+  private PF_REAL_MIN = 1.0    // Main sets must have avgPF >= 1.0 to enter REAL
+  private PF_LIVE_MIN = 1.0    // Real sets must have avgPF >= 1.0 to enter LIVE
+
+  // ── PF threshold settings cache (per-cycle) ─────────────────────
+  // `loadAppPFThresholds()` hits Redis to pull the operator's slider
+  // values. Pulling on every symbol's flow would mean N reads per
+  // cycle for an N-symbol universe — wasteful and adds latency. The
+  // cache holds the last-load timestamp; refresh is bounded to
+  // `_pfTtlMs` so a slider change in the Settings dialog takes at
+  // most that long to flow into the engine. 5s is short enough to
+  // feel instant in the UI but long enough that a 1Hz cycle with 200
+  // symbols only does ~3 Redis reads instead of 1000.
+  private _pfThresholdsLoadedAt = 0
+  private readonly _pfTtlMs = 5_000
 
   // ── Filter axes (P0-2) ──────────────────────────────────────────────
   // Spec: *"filtering by Profitfactor Minimum, DrawdownTime Maximum"*.
@@ -198,31 +229,93 @@ export class StrategyCoordinator {
   // selector `bestEntry.confidence >= 0.85`), but it is NOT a filter
   // axis at any stage. The filter code below reads `minProfitFactor`
   // and `maxDrawdownTime` only.
-  private readonly METRICS: Record<string, EvaluationMetrics> = {
+  // NOT `readonly` — `loadAppPFThresholds()` mutates
+  // `.minProfitFactor` on each entry to keep them in sync with the
+  // operator's sliders. `maxDrawdownTime` / `confidence` / `description`
+  // stay constant (they're not part of this spec change).
+  private METRICS: Record<string, EvaluationMetrics> = {
     base: {
       maxDrawdownTime: 999999,
-      minProfitFactor: 1.0,
+      minProfitFactor: 0.9,   // spec default — operator-tunable
       confidence: 0.3,  // advisory only
       description: "One Set per (indication_type × direction) — all qualifying",
     },
     main: {
       maxDrawdownTime: 180,   // 3 hours — aligned to short-duration trade profile
-      minProfitFactor: 1.2,   // Base sets with avgPF >= 1.2 → promoted to MAIN
+      minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.5,        // advisory only
-      description: "Sets promoted from BASE with profitFactor >= 1.2 + DDT <= 3h",
+      description: "Sets promoted from BASE with profitFactor >= main-threshold + DDT <= 3h",
     },
     real: {
       maxDrawdownTime: 180,   // 3 hours — consistent with MAIN
-      minProfitFactor: 1.4,   // Main sets with avgPF >= 1.4 → promoted to REAL
+      minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.65,       // advisory only
-      description: "Sets promoted from MAIN with profitFactor >= 1.4 + DDT <= 3h",
+      description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= 3h",
     },
     live: {
       maxDrawdownTime: 180,   // 3 hours — ensures REAL sets flow through to LIVE
-      minProfitFactor: 1.4,   // Match REAL stage minimum so Sets can flow through
+      minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.65,       // advisory only
-      description: "Best 500 Sets from REAL (PF >= 1.4 + DDT <= 3h) ready for live trading",
+      description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= 3h) ready for live trading",
     },
+  }
+
+  /**
+   * Hydrate PF thresholds from operator settings.
+   *
+   * Reads `baseProfitFactor`, `mainProfitFactor`, `realProfitFactor`,
+   * `liveProfitFactor` from `getAppSettings()` and mirrors them into:
+   *   - `PF_*_MIN` (per-indication entry filter at base stage; advisory
+   *      promotion floor at later stages)
+   *   - `METRICS.{base|main|real|live}.minProfitFactor` (Set-average
+   *      gate consumed at lines 695/1117/1468)
+   *
+   * Bounds: [0.0, 5.0]. The slider UI is [0.0, 2.0] but we accept up
+   * to 5.0 to allow operators to set extreme values via API/Redis
+   * directly without truncation surprise. NaN / negative / missing
+   * values fall back to the spec defaults (0.9/1.0/1.0/1.0).
+   *
+   * Cached for `_pfTtlMs` (5s). The first call after engine start
+   * (and any 5s+ later) actually hits Redis; intermediate calls are
+   * O(1) no-ops. This is safe to call from every `executeStrategyFlow`
+   * entry — including the per-symbol calls inside the batch loop —
+   * because the TTL bounds the work.
+   */
+  private async loadAppPFThresholds(): Promise<void> {
+    const now = Date.now()
+    if (now - this._pfThresholdsLoadedAt < this._pfTtlMs) return
+    this._pfThresholdsLoadedAt = now
+    try {
+      const { getAppSettings } = await import("@/lib/redis-db")
+      const s = (await getAppSettings()) || {}
+      const clamp = (raw: unknown, fallback: number): number => {
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n < 0) return fallback
+        return Math.max(0, Math.min(5, n))
+      }
+      const basePF = clamp(s.baseProfitFactor, 0.9)
+      const mainPF = clamp(s.mainProfitFactor, 1.0)
+      const realPF = clamp(s.realProfitFactor, 1.0)
+      const livePF = clamp(s.liveProfitFactor, 1.0)
+
+      this.PF_BASE_MIN = basePF
+      this.PF_MAIN_MIN = mainPF
+      this.PF_REAL_MIN = realPF
+      this.PF_LIVE_MIN = livePF
+      this.METRICS.base.minProfitFactor = basePF
+      this.METRICS.main.minProfitFactor = mainPF
+      this.METRICS.real.minProfitFactor = realPF
+      this.METRICS.live.minProfitFactor = livePF
+    } catch (err) {
+      // Don't fail the whole flow on a settings read miss — the
+      // already-loaded values (either the defaults or the last
+      // successful load) keep gating active. Log once per failure to
+      // help diagnose without spamming.
+      console.warn(
+        `[v0] [StrategyCoordinator] loadAppPFThresholds() failed; using last-known values`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
   }
 
   constructor(connectionId: string, config?: StrategyCoordinatorConfig) {
@@ -249,6 +342,16 @@ export class StrategyCoordinator {
     const results: StrategyEvaluation[] = []
 
     try {
+      // ── Hydrate PF thresholds from operator settings ─────────────
+      // 5s TTL inside the loader bounds Redis pressure; slider changes
+      // in the Settings dialog flow into the engine within ≤5s. We
+      // call this on EVERY entry — both per-symbol and per-batch —
+      // because the TTL cap makes it cheap, and the alternative
+      // (calling it once on engine startup) would require an engine
+      // restart whenever an operator tunes the PF gates. That's not
+      // acceptable for a live-tuning interface.
+      await this.loadAppPFThresholds()
+
       // Fetch the per-cycle position coordination context once. Prehistoric
       // runs use a neutral context (no open positions, no prior outcomes) so
       // only the always-on `default` variant is produced — that matches the
