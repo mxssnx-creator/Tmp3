@@ -99,8 +99,33 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       if (enableMain) {
         const coordinator = getGlobalTradeEngineCoordinator()
         if (!coordinator.isEngineRunning(resolvedId)) {
-          engineAction = "start" // Ensure engine is started if it is unexpectedly down
-          console.log(`[v0] [Toggle] Already enabled - engine not running, starting...`)
+          // ── Re-start cool-down (anti-flap) ───────────────────────────
+          // The dashboard polls every 8 s and may hit this endpoint
+          // repeatedly while the engine is in the middle of starting.
+          // Without a cool-down, every poll would issue a new
+          // `startEngine` call — each one acquiring/releasing the
+          // progression lock and producing the "stopping/restarting"
+          // pattern visible in the UI. We remember the last restart
+          // timestamp PER CONNECTION in Redis and skip if the previous
+          // attempt was less than 15 s ago.
+          const cooldownKey = `engine_restart_cooldown:${resolvedId}`
+          const cooldownClient = getRedisClient()
+          const lastRestartRaw = await cooldownClient.get(cooldownKey).catch(() => null)
+          const lastRestartMs = Number(lastRestartRaw)
+          const RESTART_COOLDOWN_MS = 15_000
+          if (Number.isFinite(lastRestartMs) && Date.now() - lastRestartMs < RESTART_COOLDOWN_MS) {
+            console.log(
+              `[v0] [Toggle] Already enabled - engine not running but restart attempted ${Date.now() - lastRestartMs}ms ago; skipping (cool-down)`,
+            )
+          } else {
+            engineAction = "start"
+            try {
+              await cooldownClient.set(cooldownKey, String(Date.now()), { EX: 30 })
+            } catch {
+              /* best-effort */
+            }
+            console.log(`[v0] [Toggle] Already enabled - engine not running, starting...`)
+          }
         } else {
           console.log(`[v0] [Toggle] Already enabled - engine already running, no restart`)
         }

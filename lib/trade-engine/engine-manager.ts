@@ -1404,7 +1404,7 @@ export class TradeEngineManager {
             }
             writes.push(client.hincrby(redisKey, "indications_count", totalIndications))
           }
-          // ── Per-symbol error visibility ────────────────────────────────
+          // ── Per-symbol error visibility ───────────────────���────────────
           // Without this, a chronically-failing symbol (bad ticker,
           // delisted pair, persistent connector error) would have its
           // errors swallowed by the per-task `.catch` and the dashboard
@@ -2330,12 +2330,24 @@ export class TradeEngineManager {
    *
    * No-op when there's no lock handle (single-process / test mode).
    */
+  /**
+   * Tolerance for transient extend failures BEFORE we declare ownership
+   * lost and self-stop. With LOCK_EXTEND_INTERVAL_MS = 15s and
+   * LOCK_TTL_SEC = 60s we can comfortably tolerate up to 3 consecutive
+   * miss-extends (45s) before the lock would naturally expire — staying
+   * one tick under the TTL ceiling means we never accidentally stop an
+   * engine that COULD have recovered with one more retry.
+   */
+  private extendFailuresInARow = 0
+  private static readonly EXTEND_FAILURES_TOLERATED = 3
+
   private startLockExtender(): void {
     if (!this.lockHandle) return
     if (this.lockExtendTimer) {
       clearInterval(this.lockExtendTimer)
       this.lockExtendTimer = undefined
     }
+    this.extendFailuresInARow = 0
     this.lockExtendTimer = setInterval(async () => {
       if (!this.isRunning) {
         if (this.lockExtendTimer) {
@@ -2349,35 +2361,64 @@ export class TradeEngineManager {
       try {
         ok = await extendProgressionLock(this.connectionId, this.lockHandle)
       } catch (err) {
-        // Network glitches must not kill the timer — only a
-        // *confirmed* ownership loss does.
+        // ── Transient-failure path ───────────────────────────────────
+        // Network glitches, Redis pauses, and one-off serialization
+        // errors must not kill the engine. Count the miss and wait
+        // for the NEXT tick to confirm. Only escalate to a self-stop
+        // after `EXTEND_FAILURES_TOLERATED` consecutive misses, which
+        // is still well under LOCK_TTL_SEC.
+        this.extendFailuresInARow++
         console.warn(
-          `[v0] [Engine ${this.connectionId}] lock extend threw (will retry):`,
+          `[v0] [Engine ${this.connectionId}] lock extend threw (${this.extendFailuresInARow}/${TradeEngineManager.EXTEND_FAILURES_TOLERATED}):`,
           err instanceof Error ? err.message : String(err),
+        )
+        if (this.extendFailuresInARow >= TradeEngineManager.EXTEND_FAILURES_TOLERATED) {
+          console.warn(
+            `[v0] [Engine ${this.connectionId}] giving up on lock extend after ${this.extendFailuresInARow} consecutive Redis failures — stopping gracefully`,
+          )
+          this.extendFailuresInARow = 0
+          try { await this.stop() } catch { /* swallow */ }
+        }
+        return
+      }
+      if (ok) {
+        // Healthy extend — reset failure counter.
+        this.extendFailuresInARow = 0
+        return
+      }
+      // ── Definitive ownership loss ────────────────────────────────
+      // `ok === false` means the lock value no longer matches our
+      // token (someone else owns the slot, OR the TTL expired and a
+      // new acquirer wrote a fresh value on top). This is NOT a
+      // retryable error — there's no recovery path; another worker
+      // is already running with a higher epoch. Stop gracefully.
+      this.extendFailuresInARow++
+      if (this.extendFailuresInARow < TradeEngineManager.EXTEND_FAILURES_TOLERATED) {
+        console.warn(
+          `[v0] [Engine ${this.connectionId}] lock token mismatch (${this.extendFailuresInARow}/${TradeEngineManager.EXTEND_FAILURES_TOLERATED}) — will confirm on next tick before stopping`,
         )
         return
       }
-      if (!ok) {
-        console.warn(
-          `[v0] [Engine ${this.connectionId}] LOST PROGRESSION LOCK — another worker owns this connection now. Stopping gracefully to avoid result mixing.`,
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] CONFIRMED ownership loss — another generation owns this connection. Stopping gracefully to avoid result mixing.`,
+      )
+      this.extendFailuresInARow = 0
+      try {
+        await logProgressionEvent(
+          this.connectionId,
+          "ownership_lost",
+          "warning",
+          "Progression lock lost — stopping engine to prevent cross-generation result writes",
+          { epoch: this.epoch, connectionId: this.connectionId },
         )
-        try {
-          await logProgressionEvent(
-            this.connectionId,
-            "ownership_lost",
-            "warning",
-            "Progression lock lost — stopping engine to prevent cross-generation result writes",
-            { epoch: this.epoch, connectionId: this.connectionId },
-          )
-        } catch {
-          /* logging is best-effort */
-        }
-        // Self-stop. `stop()` is idempotent and clears the extender.
-        try {
-          await this.stop()
-        } catch {
-          /* swallow */
-        }
+      } catch {
+        /* logging is best-effort */
+      }
+      // Self-stop. `stop()` is idempotent and clears the extender.
+      try {
+        await this.stop()
+      } catch {
+        /* swallow */
       }
     }, LOCK_EXTEND_INTERVAL_MS)
   }
