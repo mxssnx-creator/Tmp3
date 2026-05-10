@@ -41,6 +41,15 @@ console.log(`[v0] Global Trade Engine V${COORDINATOR_VERSION} loading with cache
 
 import { TradeEngineManager, type EngineConfig } from "./trade-engine/engine-manager"
 import { getSettings, setSettings } from "./redis-db"
+import {
+  // Cross-process ownership primitive. The coordinator acquires the
+  // per-connection lock BEFORE constructing or reusing the manager;
+  // the manager extends/releases it during its lifecycle. See
+  // `lib/trade-engine/progression-lock.ts` for the full schema.
+  acquireProgressionLock,
+  forceBreakProgressionLock,
+  type LockHandle,
+} from "./trade-engine/progression-lock"
 
 // Re-export TradeEngine class and config from subdirectory for convenient imports
 export { TradeEngine, type TradeEngineConfig, TRADE_SERVICE_NAME } from "./trade-engine/trade-engine"
@@ -179,7 +188,28 @@ export class GlobalTradeEngineCoordinator {
     this.startingEngines.add(connectionId)
     console.log(`[v0] [STARTUP LOCK] Added ${connectionId} to startup lock`)
 
+    let lockHandle: LockHandle | undefined
     try {
+      // ── Step 3b: Acquire the cross-process ownership lock ──────────
+      // This is the SECOND guard — the in-process `startingEngines`
+      // set blocks duplicate starts within this Node worker; the
+      // Redis lock blocks duplicate starts across workers, dev
+      // reloads, serverless instances, etc. If another worker
+      // already owns this connection we bail out cleanly without
+      // mutating any state. The manager constructor + Redis writes
+      // below will all be skipped.
+      const acquired = await acquireProgressionLock(connectionId)
+      if (!acquired.acquired || !acquired.handle) {
+        console.warn(
+          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Skipping.`,
+        )
+        return
+      }
+      lockHandle = acquired.handle
+      console.log(
+        `[v0] [STARTUP LOCK] Acquired progression lock for ${connectionId} (epoch=${lockHandle.epoch})`,
+      )
+
       // Step 4: Initialize engine if needed
       let manager = this.engineManagers.get(connectionId)
       if (!manager) {
@@ -189,9 +219,26 @@ export class GlobalTradeEngineCoordinator {
         console.log(`[v0] [STARTUP LOCK] Reusing existing engine manager for: ${connectionId}`)
       }
 
-      // Step 5: Start the engine
-      await manager.start(config)
+      // Step 5: Start the engine — pass the lock handle so it can
+      // extend/release the slot and stamp the epoch.
+      await manager.start(config, lockHandle)
+      // Manager now owns the lock; clear our local reference so the
+      // finally-block doesn't try to break it on success.
+      lockHandle = undefined
       console.log(`[v0] [STARTUP LOCK] TradeEngine successfully started for connection: ${connectionId}`)
+    } catch (err) {
+      // On startup failure, give the lock back so a retry can succeed
+      // without waiting for the TTL to expire. We use force-break
+      // here (NOT release-with-owner) because the manager may have
+      // partially started, and we want a clean slate.
+      if (lockHandle) {
+        try {
+          await forceBreakProgressionLock(connectionId)
+        } catch {
+          /* TTL will reclaim */
+        }
+      }
+      throw err
     } finally {
       // Step 6: Remove from lock set (always, even on error)
       this.startingEngines.delete(connectionId)
@@ -246,6 +293,45 @@ export class GlobalTradeEngineCoordinator {
       // Step 3: Remove from stop lock set (always, even on error)
       this.stoppingEngines.delete(connectionId)
       console.log(`[v0] [STOP LOCK] Removed ${connectionId} from stop lock`)
+    }
+  }
+
+  /**
+   * Restart an engine using its stored connection config — used by the
+   * watchdog escalation path after a confirmed stall. Loads the same
+   * settings the normal start flow would (per-connection intervals
+   * fall back to global app settings), so the restarted engine is
+   * indistinguishable from a fresh dashboard toggle except that it
+   * carries a NEW progression epoch.
+   *
+   * Returns silently on missing connection / missing settings; the
+   * watchdog will simply retry on the next pass.
+   */
+  private async startEngineFromConnectionConfig(connectionId: string): Promise<void> {
+    try {
+      const { getAllConnections } = await import("@/lib/redis-db")
+      const { loadSettingsAsync } = await import("@/lib/settings-storage")
+      const connections = await getAllConnections()
+      const connection = connections.find((c: any) => c.id === connectionId)
+      if (!connection) {
+        console.warn(
+          `[v0] [Coordinator] restart skipped — connection ${connectionId} not found`,
+        )
+        return
+      }
+      const settings = await loadSettingsAsync()
+      const config: EngineConfig = {
+        connectionId,
+        indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
+        strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
+        realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+      }
+      await this.startEngine(connectionId, config)
+    } catch (err) {
+      console.warn(
+        `[v0] [Coordinator] startEngineFromConnectionConfig failed for ${connectionId}:`,
+        err instanceof Error ? err.message : String(err),
+      )
     }
   }
 
@@ -879,6 +965,19 @@ export class GlobalTradeEngineCoordinator {
    * prehistoric — that was the cause of the user's "no-sense
    * reassignments / restarts" complaint.
    */
+  /**
+   * Per-connection stall escalation counters. When the watchdog detects
+   * a stall it calls `manager.rearmIfStalled()` (cheap, in-place). If
+   * the engine remains stalled on the NEXT pass, we escalate: force
+   * break the progression lock (so the worker that took over later
+   * sees a fresh slot), stop the manager, and restart it from scratch
+   * with a new generation epoch. Resets to 0 once the engine reports
+   * a fresh heartbeat.
+   *
+   * Map<connectionId, consecutiveStallCount>
+   */
+  private stallEscalation: Map<string, number> = new Map()
+
   private startGlobalHealthMonitoring(): void {
     if (this.healthCheckTimer) {
       // Already running — keep the existing timer.
@@ -886,6 +985,11 @@ export class GlobalTradeEngineCoordinator {
     }
     const healthCheckInterval = 10000 // 10s
     const STALL_THRESHOLD_MS = 60_000 // 60s without heartbeat = stalled
+    // After this many CONSECUTIVE stall detections (without the
+    // heartbeat coming back) we escalate from in-place re-arm to a
+    // full stop+restart. Two means we give re-arm one full health-
+    // monitor cycle (10s) to recover before nuking the manager.
+    const ESCALATION_THRESHOLD = 2
 
     console.log("[v0] Starting global trade engine health monitoring (refresh detection + stall watchdog)")
 
@@ -928,28 +1032,102 @@ export class GlobalTradeEngineCoordinator {
             if (lastHb === 0) continue // engine started but no heartbeat yet
             const age = now - lastHb
             if (age > STALL_THRESHOLD_MS) {
-              console.warn(
-                `[v0] [Watchdog] Engine ${connectionId} stalled (last heartbeat ${age}ms ago) — re-arming in place`,
-              )
-              try {
-                const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
-                await logProgressionEvent(
-                  connectionId,
-                  "engine_stall_recovered",
-                  "warning",
-                  `Engine stalled for ${Math.round(age / 1000)}s — watchdog re-arming in place`,
-                  { ageMs: age, connectionId },
+              const consecutiveStalls = (this.stallEscalation.get(connectionId) ?? 0) + 1
+              this.stallEscalation.set(connectionId, consecutiveStalls)
+
+              if (consecutiveStalls < ESCALATION_THRESHOLD) {
+                // ── Tier 1: in-place re-arm ──────────────────────────
+                // Cheapest recovery — re-attaches missing processor
+                // timers without rebuilding the manager. Most stalls
+                // are just a dropped timer (HMR race / unhandled
+                // rejection / Redis pause) and this fixes them.
+                console.warn(
+                  `[v0] [Watchdog] Engine ${connectionId} stalled (last heartbeat ${age}ms ago, attempt ${consecutiveStalls}/${ESCALATION_THRESHOLD}) — re-arming in place`,
                 )
-              } catch {
-                // Logging is best-effort; never block recovery on it.
-              }
-              try {
-                await manager.rearmIfStalled()
-              } catch (rearmError) {
+                try {
+                  const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
+                  await logProgressionEvent(
+                    connectionId,
+                    "engine_stall_recovered",
+                    "warning",
+                    `Engine stalled for ${Math.round(age / 1000)}s — watchdog re-arming in place (attempt ${consecutiveStalls})`,
+                    { ageMs: age, connectionId, attempt: consecutiveStalls },
+                  )
+                } catch {
+                  // Logging is best-effort; never block recovery on it.
+                }
+                try {
+                  await manager.rearmIfStalled()
+                } catch (rearmError) {
+                  console.error(
+                    `[v0] [Watchdog] rearmIfStalled threw for ${connectionId}:`,
+                    rearmError instanceof Error ? rearmError.message : String(rearmError),
+                  )
+                }
+              } else {
+                // ── Tier 2: full stop + restart with new epoch ───────
+                // In-place re-arm didn't bring the heartbeat back.
+                // The engine is wedged hard (e.g. stuck inside a long
+                // Redis-pipeline await, or a never-resolving await on
+                // network I/O). The ONLY safe recovery is to drop
+                // the lock, tear down the manager, and start fresh.
+                // The new generation gets a new epoch which orphans
+                // any in-flight async ops from the stuck generation
+                // (they fail `isCurrentGeneration` and drop their
+                // writes harmlessly).
                 console.error(
-                  `[v0] [Watchdog] rearmIfStalled threw for ${connectionId}:`,
-                  rearmError instanceof Error ? rearmError.message : String(rearmError),
+                  `[v0] [Watchdog] Engine ${connectionId} STILL stalled after ${consecutiveStalls} attempts (${age}ms) — escalating to full restart`,
                 )
+                this.stallEscalation.delete(connectionId)
+                try {
+                  const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
+                  await logProgressionEvent(
+                    connectionId,
+                    "engine_force_restart",
+                    "error",
+                    `Engine wedged after ${consecutiveStalls} re-arm attempts — forcing stop+restart with new generation`,
+                    { ageMs: age, connectionId, attempts: consecutiveStalls },
+                  )
+                } catch {
+                  /* best-effort */
+                }
+                // Break the lock pre-emptively so the restart can
+                // acquire a fresh slot without waiting for the TTL.
+                try {
+                  await forceBreakProgressionLock(connectionId)
+                } catch {
+                  /* TTL will reclaim */
+                }
+                // Stop + restart with the cached config. We run
+                // these sequentially to avoid racing the stop's
+                // cleanup against the restart's acquire.
+                try {
+                  await this.stopEngine(connectionId)
+                } catch (stopErr) {
+                  console.warn(
+                    `[v0] [Watchdog] force stop threw for ${connectionId}:`,
+                    stopErr instanceof Error ? stopErr.message : String(stopErr),
+                  )
+                }
+                // Re-load config from connection store — the
+                // original `startConfig` lived on the (now disposed)
+                // manager. Restart uses the same flow as a dashboard
+                // toggle, which is the canonical entry point.
+                try {
+                  await this.startEngineFromConnectionConfig(connectionId)
+                } catch (startErr) {
+                  console.error(
+                    `[v0] [Watchdog] force restart failed for ${connectionId}:`,
+                    startErr instanceof Error ? startErr.message : String(startErr),
+                  )
+                }
+              }
+            } else {
+              // Healthy heartbeat — clear any in-flight escalation
+              // counter so a future stall starts from scratch at
+              // tier 1 instead of immediately escalating.
+              if (this.stallEscalation.has(connectionId)) {
+                this.stallEscalation.delete(connectionId)
               }
             }
           } catch (perEngineError) {

@@ -165,6 +165,18 @@ import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { engineMonitor } from "@/lib/engine-performance-monitor"
 import { ConfigSetProcessor } from "./config-set-processor"
 import { prefetchMarketDataBatch } from "./market-data-cache"
+import {
+  // ── Cross-process progression ownership (spec §"no multiple started
+  // progressions per connection, no switching"). The lock guarantees a
+  // single TradeEngineManager runs per connection across the entire
+  // deployment; the `epoch` it carries is also written to the
+  // `progression:{id}` hash so stale callbacks from a previous
+  // generation can be detected and dropped by external readers.
+  LOCK_EXTEND_INTERVAL_MS,
+  extendProgressionLock,
+  releaseProgressionLock,
+  type LockHandle,
+} from "./progression-lock"
 
 /**
  * Per-symbol fan-out concurrency cap.
@@ -336,6 +348,29 @@ export class TradeEngineManager {
    */
   private startConfig?: EngineConfig
 
+  /**
+   * ── One-progression-per-connection ownership ─────────────────────
+   *
+   * `lockHandle` is the {token, epoch} pair we acquired in the
+   * coordinator before this manager's `start()` was invoked. It is the
+   * cross-process proof that no other worker is running the same
+   * connection's engine. While the engine is running the heartbeat
+   * timer extends the lock TTL; if the extend fails (someone else
+   * stole the slot, or the lock expired due to a long pause) the
+   * heartbeat triggers a graceful self-stop so we don't continue
+   * mutating progression state we no longer own.
+   *
+   * `epoch` mirrors `lockHandle.epoch` for fast in-memory checks — any
+   * async result-write path can quickly verify "is my epoch still the
+   * live one?" by comparing `this.epoch` to a captured local value.
+   * `epoch === 0` means "not running"; the manager is freshly
+   * constructed or has been stopped.
+   */
+  private lockHandle?: LockHandle
+  private epoch = 0
+  /** Optional lock-extend timer (separate from the user-visible heartbeat). */
+  private lockExtendTimer?: NodeJS.Timeout
+
   private componentHealth: {
     indications: ComponentHealth
     strategies: ComponentHealth
@@ -366,13 +401,30 @@ export class TradeEngineManager {
   }
 
   /**
-   * Start the trade engine
+   * Start the trade engine.
+   *
+   * @param config   The engine configuration to launch with.
+   * @param lockCtx  Optional ownership handle obtained from
+   *                 `acquireProgressionLock` in the coordinator. When
+   *                 omitted the manager is running in single-process
+   *                 mode (legacy callers / unit tests) and the epoch
+   *                 is generated locally; cross-process safety is
+   *                 then NOT guaranteed and the caller is responsible
+   *                 for ensuring no other worker can race.
    */
-  async start(config: EngineConfig): Promise<void> {
+  async start(config: EngineConfig, lockCtx?: LockHandle): Promise<void> {
     if (this.isRunning || this.isStarting) {
       return
     }
     this.isStarting = true
+
+    // ── Stamp generation token BEFORE anything writes to Redis ──────
+    // Even if startup later fails, downstream readers will see a
+    // higher epoch and can correctly invalidate stale cached state.
+    // Local fallback for non-coordinator callers: a fresh epoch with
+    // no owner token (writes that need owner verification will skip).
+    this.lockHandle = lockCtx
+    this.epoch = lockCtx?.epoch ?? Date.now()
 
     // Cache config for the watchdog's in-place re-arm path. We do this
     // BEFORE any await so a fast-fail in startup still leaves a usable
@@ -407,6 +459,13 @@ export class TradeEngineManager {
             last_update: new Date().toISOString(),
             engine_started: "true",
             started_at: String(nowMs),
+            // ── Generation marker (see `progression-lock.ts`) ──────
+            // Every start writes a new epoch so external observers
+            // (dashboard, stats route, log dialog) can detect a
+            // generation flip and discard cached per-run derived
+            // state. Strictly increasing across restarts because
+            // it's epoch-ms.
+            epoch: String(this.epoch),
           })
         } else {
           // Engine restarted - preserve existing counters, only update metadata.
@@ -418,6 +477,10 @@ export class TradeEngineManager {
           const restartUpdate: Record<string, string> = {
             last_update: new Date().toISOString(),
             engine_started: "true",
+            // Refresh epoch on every restart. Counters survive (operator
+            // semantics require cumulative totals across restarts) but
+            // any per-run derived state on observers is invalidated.
+            epoch: String(this.epoch),
           }
           if (!existingProgression.started_at || !Number.isFinite(Number(existingProgression.started_at))) {
             restartUpdate.started_at = String(nowMs)
@@ -563,6 +626,15 @@ export class TradeEngineManager {
       }, 2000)
       this.startHealthMonitoring()
       this.startHeartbeat()
+      // ── Cross-process lock-extend ticker ─────────────────────────
+      // Runs only when we acquired the lock via the coordinator. Each
+      // tick refreshes the Redis TTL so a long-running engine never
+      // loses its slot, and SELF-STOPS the engine the moment the
+      // refresh fails (e.g. another worker took over after a network
+      // partition or we missed too many beats). This is the only
+      // place that gracefully tears down the engine because we
+      // discovered we no longer own it.
+      this.startLockExtender()
       
       // Phase 6: Live trading ready (isRunning was set earlier before processors started)
       this.isStarting = false
@@ -768,8 +840,37 @@ export class TradeEngineManager {
       clearInterval(this.heartbeatTimer)
       this.heartbeatTimer = undefined
     }
+    // ── Lock-extend ticker must die BEFORE we release the lock ─────
+    // Otherwise a final extend could fire concurrently with release
+    // and re-extend a key we just told Redis to drop.
+    if (this.lockExtendTimer) {
+      clearInterval(this.lockExtendTimer)
+      this.lockExtendTimer = undefined
+    }
 
     this.isRunning = false
+    // Zero the epoch immediately so any in-flight callbacks bound to
+    // this manager instance fail the `isCurrentGeneration` check and
+    // bail out instead of writing into a stopped engine's state.
+    this.epoch = 0
+
+    // ── Release the cross-process progression lock ─────────────────
+    // Compare-and-delete: never deletes a slot we no longer own.
+    // Best-effort — Redis problems must not block stop(). If we fail
+    // to release, the lock's TTL (LOCK_TTL_SEC) provides the fallback
+    // safety net and another worker can take over within at most one
+    // TTL window.
+    if (this.lockHandle) {
+      try {
+        await releaseProgressionLock(this.connectionId, this.lockHandle)
+      } catch (err) {
+        console.warn(
+          `[v0] [Engine ${this.connectionId}] release lock failed (TTL will reclaim):`,
+          err instanceof Error ? err.message : String(err),
+        )
+      }
+      this.lockHandle = undefined
+    }
 
     // Update engine state and clear running flag
     await this.updateEngineState("stopped")
@@ -2213,6 +2314,87 @@ export class TradeEngineManager {
         }
       }
     }, 10000)
+  }
+
+  /**
+   * ── Lock-extend ticker ─────────────────────────────────────────────
+   *
+   * Refreshes the cross-process progression lock at a sub-TTL cadence
+   * so the lock never expires while the engine is making progress. If
+   * the extend call returns `false` we LOST OWNERSHIP — either because
+   * the lock TTL elapsed during a long pause, OR because the watchdog
+   * forcibly broke it after a confirmed stall and another worker took
+   * over. In either case the correct response is to stop the engine
+   * gracefully so we don't continue mutating progression state that
+   * now belongs to a different generation.
+   *
+   * No-op when there's no lock handle (single-process / test mode).
+   */
+  private startLockExtender(): void {
+    if (!this.lockHandle) return
+    if (this.lockExtendTimer) {
+      clearInterval(this.lockExtendTimer)
+      this.lockExtendTimer = undefined
+    }
+    this.lockExtendTimer = setInterval(async () => {
+      if (!this.isRunning) {
+        if (this.lockExtendTimer) {
+          clearInterval(this.lockExtendTimer)
+          this.lockExtendTimer = undefined
+        }
+        return
+      }
+      if (!this.lockHandle) return
+      let ok = false
+      try {
+        ok = await extendProgressionLock(this.connectionId, this.lockHandle)
+      } catch (err) {
+        // Network glitches must not kill the timer — only a
+        // *confirmed* ownership loss does.
+        console.warn(
+          `[v0] [Engine ${this.connectionId}] lock extend threw (will retry):`,
+          err instanceof Error ? err.message : String(err),
+        )
+        return
+      }
+      if (!ok) {
+        console.warn(
+          `[v0] [Engine ${this.connectionId}] LOST PROGRESSION LOCK — another worker owns this connection now. Stopping gracefully to avoid result mixing.`,
+        )
+        try {
+          await logProgressionEvent(
+            this.connectionId,
+            "ownership_lost",
+            "warning",
+            "Progression lock lost — stopping engine to prevent cross-generation result writes",
+            { epoch: this.epoch, connectionId: this.connectionId },
+          )
+        } catch {
+          /* logging is best-effort */
+        }
+        // Self-stop. `stop()` is idempotent and clears the extender.
+        try {
+          await this.stop()
+        } catch {
+          /* swallow */
+        }
+      }
+    }, LOCK_EXTEND_INTERVAL_MS)
+  }
+
+  /**
+   * Quick in-memory ownership/epoch guard used by external write paths
+   * (e.g. progression counters, indication metric writes) to drop
+   * stale callbacks that resolve after a generation flip. Cheap:
+   * compares two integers, no I/O.
+   */
+  isCurrentGeneration(expectedEpoch: number): boolean {
+    return this.isRunning && this.epoch > 0 && this.epoch === expectedEpoch
+  }
+
+  /** Current generation epoch (0 when stopped). */
+  get currentEpoch(): number {
+    return this.epoch
   }
 
   /**
