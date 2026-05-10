@@ -2786,6 +2786,81 @@ export async function recalculateAndApplySLTP(
   }
 }
 
+/**
+ * ── syncLiveFromPseudo (spec §6) ─────────────────────────────────────
+ *
+ * Copy SL/TP percentages from a pseudo (strategy-side virtual) position
+ * onto matching live (exchange-side real) positions on the same
+ * symbol + direction, then re-arm the exchange protection orders so
+ * the new levels are actually enforced.
+ *
+ * Operator: "pseudo pos updates with trailing, steps etc is working
+ * completely correct and live pos are correctly synchron". That's the
+ * target — this helper closes the gap between strategy-side trailing
+ * and exchange-side SL/TP by piping percent updates through to
+ * `recalculateAndApplySLTP`, which already does
+ * cancel-old → place-new → persist + audit.
+ *
+ * Inputs:
+ *   - `pseudoPos.symbol` (string, required) and `pseudoPos.side`
+ *     ("long" | "short") — match key against live positions.
+ *   - `pseudoPos.stoploss_ratio` / `pseudoPos.takeprofit_factor`
+ *     (ratio form, e.g. 0.02 = 2%) OR `pseudoPos.stopLoss` /
+ *     `pseudoPos.takeProfit` (percent form). Auto-detected by
+ *     magnitude — anything < 1 is treated as ratio and multiplied by
+ *     100, anything ≥ 1 is treated as already-percent.
+ *
+ * Idempotent: if percentages unchanged `recalculateAndApplySLTP`
+ * no-ops on the diff. Per-position errors are swallowed.
+ *
+ * Caller contract: fire-and-forget. Returns `Promise<void>` and never
+ * throws past this boundary — the realtime hot path must NEVER await
+ * on exchange round-trips.
+ */
+export async function syncLiveFromPseudo(
+  connectionId: string,
+  pseudoPos: any,
+  exchangeConnector: any,
+): Promise<void> {
+  try {
+    const symbol = String(pseudoPos?.symbol || "").toUpperCase()
+    const side: "long" | "short" = pseudoPos?.side === "short" ? "short" : "long"
+    if (!symbol) return
+
+    const rawSL = Number(pseudoPos?.stoploss_ratio ?? pseudoPos?.stopLoss ?? NaN)
+    const rawTP = Number(pseudoPos?.takeprofit_factor ?? pseudoPos?.takeProfit ?? NaN)
+    if (!Number.isFinite(rawSL) && !Number.isFinite(rawTP)) return
+
+    // Ratio (< 1) → percent; already-percent (≥ 1) → keep as-is.
+    const slPct = Number.isFinite(rawSL) ? (Math.abs(rawSL) < 1 ? rawSL * 100 : rawSL) : undefined
+    const tpPct = Number.isFinite(rawTP) ? (Math.abs(rawTP) < 1 ? rawTP * 100 : rawTP) : undefined
+
+    const livePositions = await getLivePositions(connectionId)
+    const matches = livePositions.filter((p: any) => {
+      const liveSide: "long" | "short" =
+        p.direction === "short" || p.side === "short" ? "short" : "long"
+      return String(p.symbol || "").toUpperCase() === symbol && liveSide === side && p.status !== "closed"
+    })
+    if (matches.length === 0) return
+
+    for (const livePos of matches) {
+      try {
+        await recalculateAndApplySLTP(connectionId, livePos.id, exchangeConnector, {
+          stopLossPct: slPct,
+          takeProfitPct: tpPct,
+        })
+      } catch (err) {
+        console.warn(
+          `${LOG_PREFIX} syncLiveFromPseudo: failed for ${livePos.id} (${symbol}/${side}):`,
+          err instanceof Error ? err.message : String(err),
+        )
+      }
+    }
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} syncLiveFromPseudo top-level error:`, err instanceof Error ? err.message : String(err))
+  }
+}
+
 export default {
   executeLivePosition,
   updateLivePositionFill,
@@ -2796,5 +2871,6 @@ export default {
   syncWithExchange,
   reconcileLivePositions,
   recalculateAndApplySLTP,
+  syncLiveFromPseudo,
   getClosedLivePositions,
 }
