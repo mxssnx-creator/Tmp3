@@ -78,9 +78,16 @@ interface Settings {
   arrangementType: string
   numberOfSymbolsToSelect: number
   quoteAsset: string
+  // ── Main Trade PF thresholds per stage ───────────────────────────
+  // Operator-tunable gates for Base → Main → Real → Live promotion.
+  // Spec defaults: 0.9 / 1.0 / 1.0 / 1.0. Wired into
+  // `lib/strategy-coordinator.ts` via `loadAppPFThresholds()` so a
+  // slider change in the Strategies tab flows into the live engine
+  // within 5s (TTL cap on the loader cache).
   baseProfitFactor: number
   mainProfitFactor: number
   realProfitFactor: number
+  liveProfitFactor: number
   trailingStopLoss: boolean
   maxDrawdownTimeHours: number
   mainEngineIntervalMs: number
@@ -411,10 +418,14 @@ const initialSettings: Settings = {
   // numberOfSymbolsToSelect: 12, // Moved to exchange tab default
   quoteAsset: "USDT", // Moved to exchange tab default
 
-  // Minimum Profit Factor Requirements
-  baseProfitFactor: 0.6,
-  mainProfitFactor: 0.6,
-  realProfitFactor: 0.6,
+  // ── Main Trade PF thresholds per stage (spec defaults) ───────────
+  // Base 0.9 / Main 1.0 / Real 1.0 / Live 1.0 — operator-tunable via
+  // Settings → Strategy → Main → Profit Factor Thresholds. Read by
+  // `lib/strategy-coordinator.ts` on every flow cycle (5s TTL cache).
+  baseProfitFactor: 0.9,
+  mainProfitFactor: 1.0,
+  realProfitFactor: 1.0,
+  liveProfitFactor: 1.0,
 
   // Risk Management
   trailingStopLoss: false,
