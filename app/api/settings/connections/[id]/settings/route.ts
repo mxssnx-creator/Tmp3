@@ -77,10 +77,20 @@ export async function PUT(
 
     await updateConnection(id, updated)
 
-    // Notify engine of settings change
+    // Notify engine of settings change AND fast-path apply so operators
+    // don't have to wait for the next 3 s watcher tick.
     const changedFields = detectChangedFields(connection, updated)
     if (changedFields.length > 0) {
       await notifySettingsChanged(id, changedFields, connection, updated)
+      try {
+        const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+        await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
+      } catch (applyErr) {
+        console.warn(
+          `[v0] [Settings PUT] applyPendingChangesNow failed for ${id}:`,
+          applyErr instanceof Error ? applyErr.message : String(applyErr),
+        )
+      }
     }
 
     await SystemLogger.logConnection(`Updated settings`, id, "info")
@@ -125,10 +135,19 @@ export async function PATCH(
 
     await updateConnection(id, updated)
 
-    // Notify engine of settings change
+    // Notify engine of settings change AND fast-path apply.
     const changedFields = Object.keys(settings)
     if (changedFields.length > 0) {
       await notifySettingsChanged(id, ["connection_settings"])
+      try {
+        const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+        await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
+      } catch (applyErr) {
+        console.warn(
+          `[v0] [Settings PATCH] applyPendingChangesNow failed for ${id}:`,
+          applyErr instanceof Error ? applyErr.message : String(applyErr),
+        )
+      }
     }
 
     await SystemLogger.logConnection(`Patched settings`, id, "info")

@@ -306,6 +306,68 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
+   * Public restart entry point — used by the settings-watcher when a
+   * `restart_required` change is detected. Serializes via the
+   * escalation mutex (shared with the watchdog) so we never fire two
+   * concurrent restarts for the same connection.
+   */
+  async restartEngine(connectionId: string): Promise<void> {
+    if (this.escalatingEngines.has(connectionId)) {
+      console.log(
+        `[v0] [Coordinator] restartEngine(${connectionId}) skipped — restart already in flight`,
+      )
+      return
+    }
+    this.escalatingEngines.add(connectionId)
+    try {
+      // Pre-emptively break the progression lock so the restart can
+      // acquire a fresh slot without waiting for the TTL.
+      try {
+        await forceBreakProgressionLock(connectionId)
+      } catch { /* TTL will reclaim */ }
+      try {
+        await this.stopEngine(connectionId)
+      } catch (stopErr) {
+        console.warn(
+          `[v0] [Coordinator] restartEngine stop failed for ${connectionId}:`,
+          stopErr instanceof Error ? stopErr.message : String(stopErr),
+        )
+      }
+      try {
+        await this.startEngineFromConnectionConfig(connectionId)
+      } catch (startErr) {
+        console.error(
+          `[v0] [Coordinator] restartEngine start failed for ${connectionId}:`,
+          startErr instanceof Error ? startErr.message : String(startErr),
+        )
+      }
+    } finally {
+      this.escalatingEngines.delete(connectionId)
+    }
+  }
+
+  /**
+   * Public fast-path for the API route. When connection settings are
+   * saved we immediately call this so the running manager (if any in
+   * THIS process) applies the change inline rather than waiting for
+   * its 3 s watcher tick. Cross-process scenarios still converge via
+   * the watcher polling the change counter — this is a latency
+   * optimization, not a correctness one.
+   */
+  async applyPendingChangesNow(connectionId: string): Promise<void> {
+    const manager = this.engineManagers.get(connectionId)
+    if (!manager || !manager.isEngineRunning) return
+    try {
+      await manager.applyPendingSettingsChangeNow()
+    } catch (err) {
+      console.warn(
+        `[v0] [Coordinator] applyPendingChangesNow failed for ${connectionId}:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
+  }
+
+  /**
    * Restart an engine using its stored connection config — used by the
    * watchdog escalation path after a confirmed stall. Loads the same
    * settings the normal start flow would (per-connection intervals
@@ -971,7 +1033,7 @@ export class GlobalTradeEngineCoordinator {
    * older than `STALL_THRESHOLD_MS` we call `manager.rearmIfStalled()`,
    * which re-arms only the missing processor timers in place. We do NOT
    * stop + restart the engine, do NOT rebuild the manager, do NOT replay
-   * prehistoric — that was the cause of the user's "no-sense
+   * prehistoric ��� that was the cause of the user's "no-sense
    * reassignments / restarts" complaint.
    */
   /**
