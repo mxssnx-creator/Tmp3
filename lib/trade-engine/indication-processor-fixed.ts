@@ -249,12 +249,17 @@ export class IndicationProcessor {
         }
       }
 
-      // Priority 2: full MarketData JSON with nested candles
-      const marketDataRaw = await client.get(`market_data:${symbol}:1m`)
+      // Priority 2: full MarketData JSON with nested candles.
+      // Spec §7: the loader now writes the canonical envelope under
+      // `:1s`. We try `:1s` first and fall back to `:1m` for one
+      // transition release so partial deploys don't lose data.
+      const marketDataRaw =
+        (await client.get(`market_data:${symbol}:1s`)) ??
+        (await client.get(`market_data:${symbol}:1m`))
       if (marketDataRaw) {
         const marketDataObj = JSON.parse(typeof marketDataRaw === "string" ? marketDataRaw : JSON.stringify(marketDataRaw))
         if (marketDataObj?.candles && Array.isArray(marketDataObj.candles) && marketDataObj.candles.length > 0) {
-          this.logCandleCountIfChanged(symbol, "market-data-1m", marketDataObj.candles.length)
+          this.logCandleCountIfChanged(symbol, "market-data-envelope", marketDataObj.candles.length)
           return marketDataObj.candles
         }
       }
@@ -410,7 +415,10 @@ export class IndicationProcessor {
         await loadMarketDataForEngine([symbol])
         SHARED_MARKET_DATA_CACHE.delete(symbol)
         
-        const directData = await client.get(`market_data:${symbol}:1m`)
+        // Spec §7: prefer the new :1s envelope, fall back to legacy :1m.
+        const directData =
+          (await client.get(`market_data:${symbol}:1s`)) ??
+          (await client.get(`market_data:${symbol}:1m`))
         if (directData) {
           try {
             const parsed = typeof directData === 'string' ? JSON.parse(directData) : directData
@@ -710,8 +718,11 @@ export class IndicationProcessor {
       if (!data) {
         await initRedis()
         const client = getClient()
-        // Try the full MarketData object key
-        const rawData = await client.get(`market_data:${symbol}:1m`)
+        // Spec §7: read the canonical :1s envelope first, fall back
+        // to the legacy :1m suffix while the migration is in flight.
+        const rawData =
+          (await client.get(`market_data:${symbol}:1s`)) ??
+          (await client.get(`market_data:${symbol}:1m`))
         if (rawData) {
           try {
             const parsed = JSON.parse(rawData)

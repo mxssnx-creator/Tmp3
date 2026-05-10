@@ -253,11 +253,15 @@ async function fetchCurrentPrice(symbol: string): Promise<number> {
     const price = parseFloat(String(mdhash?.close ?? mdhash?.price ?? mdhash?.last ?? "0"))
     if (price > 0) return price
 
-    // 2. Fallback: 1m candle key
-    const raw1m = await client.get(`market_data:${symbol}:1m`)
-    if (raw1m) {
+    // 2. Fallback: candle envelope. Spec §7 — the loader now writes
+    //    `:1s` exclusively, but old runs may still have `:1m` data
+    //    in Redis. Try the new key first, then the legacy one.
+    const envelopeRaw =
+      (await client.get(`market_data:${symbol}:1s`)) ??
+      (await client.get(`market_data:${symbol}:1m`))
+    if (envelopeRaw) {
       try {
-        const parsed = typeof raw1m === "string" ? JSON.parse(raw1m) : raw1m
+        const parsed = typeof envelopeRaw === "string" ? JSON.parse(envelopeRaw) : envelopeRaw
         const p = parseFloat(String(parsed?.close ?? parsed?.price ?? parsed?.last ?? 0))
         if (p > 0) return p
       } catch { /* ignore */ }

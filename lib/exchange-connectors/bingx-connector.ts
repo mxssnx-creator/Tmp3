@@ -1191,6 +1191,15 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       this.log(`Fetching OHLCV for ${symbol} (${timeframe}, ${limit} candles)`)
 
+      // ── 1s timeframe (spec §7): aggregate trades ──────────────────
+      if (timeframe === "1s") {
+        const endMs = Date.now()
+        const startMs = endMs - (Math.max(1, Math.min(86_400, limit)) * 1000)
+        const aggregated = await this.getOHLCV1s(symbol, startMs, endMs)
+        if (aggregated && aggregated.length > 0) return aggregated
+        return null
+      }
+
       const baseUrl = this.getBaseUrl()
       const apiType = this.credentials.apiType || "perpetual_futures"
       
@@ -1255,6 +1264,49 @@ export class BingXConnector extends BaseExchangeConnector {
     } catch {
       // Silently return null - OHLCV errors are expected when API returns HTML error pages
       // Will retry on next cycle
+      return null
+    }
+  }
+
+  /**
+   * ── 1-second OHLCV (spec §7) ──────────────────────────────────────
+   *
+   * Aggregates from BingX trade history. Spot uses
+   * `/openApi/spot/v1/market/trades`, swap uses
+   * `/openApi/swap/v2/quote/trades`. Both cap at ~500 trades and
+   * return newest-first. Coverage is best-effort.
+   */
+  async getOHLCV1s(
+    symbol: string,
+    startMs: number,
+    endMs: number,
+  ): Promise<Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }> | null> {
+    try {
+      const baseUrl = this.getBaseUrl()
+      const apiType = this.credentials.apiType || "perpetual_futures"
+      let bingxSymbol = symbol
+      if (apiType !== "spot" && !symbol.includes("-")) {
+        bingxSymbol = symbol.replace("USDT", "-USDT").replace("USDC", "-USDC")
+      }
+      const endpoint = apiType === "spot"
+        ? `/openApi/spot/v1/market/trades?symbol=${bingxSymbol}&limit=500`
+        : `/openApi/swap/v2/quote/trades?symbol=${bingxSymbol}&limit=500`
+      const resp = await this.rateLimitedFetch(`${baseUrl}${endpoint}`, {
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      if (!resp.ok) return null
+      const data = await resp.json()
+      const rows = Array.isArray(data?.data) ? data.data : []
+      if (rows.length === 0) return []
+      const { aggregateTradesTo1sOHLCV } = await import("./aggregate-1s")
+      const trades = rows.map((r: any) => ({
+        // BingX uses `time` (spot) or `T` (swap) as timestamp; price `price`/`p`; qty `qty`/`q`/`quoteQty`.
+        timestamp: Number(r.time ?? r.T ?? r.timestamp),
+        price: Number(r.price ?? r.p),
+        quantity: Number(r.qty ?? r.q ?? r.quoteQty ?? 0),
+      }))
+      return aggregateTradesTo1sOHLCV(trades, startMs, endMs)
+    } catch {
       return null
     }
   }

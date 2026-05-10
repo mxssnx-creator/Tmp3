@@ -513,6 +513,15 @@ export class PionexConnector extends BaseExchangeConnector {
     try {
       this.log(`Fetching OHLCV for ${symbol} (${timeframe}, ${limit} candles)`)
 
+      // ── 1s timeframe (spec §7): aggregate trades ──────────────────
+      if (timeframe === "1s") {
+        const endMs = Date.now()
+        const startMs = endMs - (Math.max(1, Math.min(86_400, limit)) * 1000)
+        const aggregated = await this.getOHLCV1s(symbol, startMs, endMs)
+        if (aggregated && aggregated.length > 0) return aggregated
+        return null
+      }
+
       const baseUrl = this.getBaseUrl()
       const timestamp = Date.now().toString()
       const method = "GET"
@@ -557,6 +566,36 @@ export class PionexConnector extends BaseExchangeConnector {
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch OHLCV: ${errorMsg}`)
+      return null
+    }
+  }
+
+  /**
+   * ── 1-second OHLCV (spec §7) ──────────────────────────────────────
+   * Aggregates from Pionex `/api/v1/market/trades`. Public endpoint
+   * is unsigned. Returns up to ~500 trades.
+   */
+  async getOHLCV1s(
+    symbol: string,
+    startMs: number,
+    endMs: number,
+  ): Promise<Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }> | null> {
+    try {
+      const baseUrl = this.getBaseUrl()
+      const url = `${baseUrl}/api/v1/market/trades?symbol=${symbol}&limit=500`
+      const resp = await this.rateLimitedFetch(url)
+      if (!resp.ok) return null
+      const data = await resp.json()
+      const rows = Array.isArray(data?.data) ? data.data : []
+      if (rows.length === 0) return []
+      const { aggregateTradesTo1sOHLCV } = await import("./aggregate-1s")
+      const trades = rows.map((r: any) => ({
+        timestamp: Number(r.time ?? r.timestamp),
+        price: Number(r.price ?? r.p),
+        quantity: Number(r.size ?? r.qty ?? r.volume ?? 0),
+      }))
+      return aggregateTradesTo1sOHLCV(trades, startMs, endMs)
+    } catch {
       return null
     }
   }

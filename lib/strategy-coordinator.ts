@@ -1704,7 +1704,10 @@ export class StrategyCoordinator {
       const _mdhash = await _priceClient.hgetall(`market_data:${symbol}`)
       _cachedMarketPrice = parseFloat(String(_mdhash?.close ?? _mdhash?.price ?? _mdhash?.last ?? "0"))
       if (!_cachedMarketPrice || isNaN(_cachedMarketPrice)) {
-        const _mdraw = await _priceClient.get(`market_data:${symbol}:1m`)
+        // Spec §7: prefer the canonical :1s envelope, fall back to :1m.
+        const _mdraw =
+          (await _priceClient.get(`market_data:${symbol}:1s`)) ??
+          (await _priceClient.get(`market_data:${symbol}:1m`))
         if (_mdraw) {
           const _mdobj = typeof _mdraw === "string" ? JSON.parse(_mdraw) : _mdraw
           const _candles = _mdobj?.candles
@@ -1881,7 +1884,10 @@ export class StrategyCoordinator {
             const mdhash = await client.hgetall(`market_data:${symbol}`)
             entryPrice = parseFloat(String(mdhash?.close ?? mdhash?.price ?? mdhash?.last ?? "0"))
             if (!entryPrice || isNaN(entryPrice)) {
-              const mdraw = await client.get(`market_data:${symbol}:1m`)
+              // Spec §7: read :1s first; fall back to :1m for legacy data.
+              const mdraw =
+                (await client.get(`market_data:${symbol}:1s`)) ??
+                (await client.get(`market_data:${symbol}:1m`))
               if (mdraw) {
                 const mdobj = typeof mdraw === "string" ? JSON.parse(mdraw) : mdraw
                 const candles = mdobj?.candles
