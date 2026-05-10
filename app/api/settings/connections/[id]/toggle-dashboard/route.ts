@@ -99,28 +99,31 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       if (enableMain) {
         const coordinator = getGlobalTradeEngineCoordinator()
         if (!coordinator.isEngineRunning(resolvedId)) {
-          // ── Re-start cool-down (anti-flap) ───────────────────────────
-          // The dashboard polls every 8 s and may hit this endpoint
-          // repeatedly while the engine is in the middle of starting.
-          // Without a cool-down, every poll would issue a new
-          // `startEngine` call — each one acquiring/releasing the
-          // progression lock and producing the "stopping/restarting"
-          // pattern visible in the UI. We remember the last restart
-          // timestamp PER CONNECTION in Redis and skip if the previous
-          // attempt was less than 15 s ago.
+          // ── Minimal anti-burst guard (2 s) ───────────────────────────
+          // The hard anti-flap guarantees already live in the coordinator
+          // (`startingEngines` mutex + progression-lock self-heal), which
+          // make a second `startEngine` during an in-flight start a safe
+          // no-op. This tiny 2 s window is purely cosmetic: it absorbs
+          // rapid-fire polls from the dashboard (every ~8 s) and any
+          // accidental double-click on the toggle so we don't spam
+          // `startEngine` from MULTIPLE requests in the SAME tick. A
+          // genuine user toggle to enable/disable goes through the
+          // `needsUpdate` branch above and is NEVER throttled.
           const cooldownKey = `engine_restart_cooldown:${resolvedId}`
           const cooldownClient = getRedisClient()
           const lastRestartRaw = await cooldownClient.get(cooldownKey).catch(() => null)
           const lastRestartMs = Number(lastRestartRaw)
-          const RESTART_COOLDOWN_MS = 15_000
+          const RESTART_COOLDOWN_MS = 2_000
           if (Number.isFinite(lastRestartMs) && Date.now() - lastRestartMs < RESTART_COOLDOWN_MS) {
             console.log(
-              `[v0] [Toggle] Already enabled - engine not running but restart attempted ${Date.now() - lastRestartMs}ms ago; skipping (cool-down)`,
+              `[v0] [Toggle] Already enabled - engine not running but restart attempted ${Date.now() - lastRestartMs}ms ago; skipping (burst guard)`,
             )
           } else {
             engineAction = "start"
             try {
-              await cooldownClient.set(cooldownKey, String(Date.now()), { EX: 30 })
+              // Short TTL so the key self-cleans well before the next
+              // legitimate restart could fire.
+              await cooldownClient.set(cooldownKey, String(Date.now()), { EX: 5 })
             } catch {
               /* best-effort */
             }
