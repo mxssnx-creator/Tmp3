@@ -1,11 +1,29 @@
 /**
  * Market Data Loader
  * Populates Redis with REAL OHLCV data from exchanges for trading engine
- * 
- * KEY ARCHITECTURE:
- *   market_data:{symbol}:1m       → JSON string, full MarketData object with 250 candles (used by engine loader)
- *   market_data:{symbol}:candles  → JSON string, raw candles array (used by indication processor for history)
- *   market_data:{symbol}          → Redis hash, single latest candle (used by getMarketData() in redis-db)
+ *
+ * ── KEY ARCHITECTURE (post spec §7 migration) ──────────────────────
+ *
+ *   market_data:{symbol}:1s       → JSON envelope, MarketData with 1s
+ *                                   OHLCV buckets (default 1-day window,
+ *                                   up to 86,400 buckets). Authoritative
+ *                                   prehistoric source. Replaces the
+ *                                   legacy `:1m` envelope which is no
+ *                                   longer populated.
+ *   market_data:{symbol}:candles  → JSON string, raw candles array
+ *                                   (mirrors the 1s array; used by the
+ *                                   indication processor for history
+ *                                   access without parsing the envelope).
+ *   market_data:{symbol}          → Redis hash, single latest candle
+ *                                   (used by getMarketData() in
+ *                                   redis-db for ticker snapshots).
+ *
+ * Why we changed timeframe everywhere:
+ *   The operator spec explicitly says "Interval / Timeframe has to be
+ *   1s as in Settings, change everywhere for Main Engine ... actually
+ *   1 day." All callers now pass timeframe="1s" and the connector
+ *   either uses native 1s klines (Binance spot) or aggregates from
+ *   public-trade endpoints (see lib/exchange-connectors/aggregate-1s.ts).
  */
 
 import { getClient, initRedis, getAllConnections } from "@/lib/redis-db"
@@ -39,19 +57,25 @@ export function generateSyntheticCandles(
 ): MarketDataCandle[] {
   const candles: MarketDataCandle[] = []
   const now = Date.now()
-  const candleInterval = 60000 // 1 minute in ms
+  // Spec §7: timeframe is 1s, so synthetic samples step at 1-second
+  // intervals (was 1 minute). Magnitude of per-bar drift is scaled
+  // down 60× below so the price walk doesn't look insane.
+  const candleInterval = 1000 // 1 second in ms
 
   let lastClose = basePrice
 
   for (let i = candleCount; i > 0; i--) {
     const timestamp = now - i * candleInterval
     
-    // Generate realistic price movement (±0.5% per candle)
-    const change = (Math.random() - 0.5) * lastClose * 0.01
+    // Generate realistic per-second price movement. At 1s resolution
+    // a ±0.5% drift per bar would integrate to crazy intraday swings,
+    // so we scale to ~±0.008% / bar — roughly 0.5% per minute on a
+    // random walk basis, matching the previous behaviour at 1m.
+    const change = (Math.random() - 0.5) * lastClose * 0.000167
     const open = lastClose
-    const close = Math.max(lastClose * 0.8, lastClose + change) // Prevent crashes
-    const high = Math.max(open, close) * (1 + Math.random() * 0.005)
-    const low = Math.min(open, close) * (1 - Math.random() * 0.005)
+    const close = Math.max(lastClose * 0.8, lastClose + change)
+    const high = Math.max(open, close) * (1 + Math.random() * 0.0001)
+    const low = Math.min(open, close) * (1 - Math.random() * 0.0001)
     const volume = Math.random() * 1000000
 
     candles.push({
@@ -157,61 +181,67 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
     let realDataCount = 0
     let syntheticCount = 0
 
-    console.log(`[v0] [MarketData] Loading market data for ${targetSymbols.length} symbols...`)
-    console.log(`[v0] [MarketData] Will try to fetch REAL data from exchanges first...`)
+    console.log(`[v0] [MarketData] Loading 1s market data for ${targetSymbols.length} symbols (1-day window)...`)
+    console.log(`[v0] [MarketData] Will try to fetch REAL 1s intervals from exchanges first...`)
+
+    // ── Window: 1 day at 1s timeframe (spec §7) ─────────────────────
+    // 86,400 buckets per symbol. Real connectors will return what
+    // their public endpoints allow — Binance spot delivers the full
+    // window via paginated 1s klines; other connectors return their
+    // best-effort coverage from recent-trades aggregation.
+    const ONE_DAY_SECONDS = 86_400
 
     for (const symbol of targetSymbols) {
       try {
-        // Try to fetch real data first
-        const realData = await fetchRealMarketData(symbol, "1m", 250)
-        
+        // Try to fetch real 1s data first.
+        const realData = await fetchRealMarketData(symbol, "1s", ONE_DAY_SECONDS)
+
         let candles: MarketDataCandle[]
         let source: string
-        
+
         if (realData && realData.candles.length > 0) {
           candles = realData.candles
           source = realData.source
           realDataCount++
         } else {
-          // Fall back to synthetic data
+          // Fall back to synthetic 1s data — same shape so downstream
+          // doesn't care. We don't generate 86k synthetic buckets; a
+          // 250-bucket sample is enough for cold-boot decoration
+          // before real data arrives via the engine's own loader.
           const basePrice = basePrices[symbol] || 100
           candles = generateSyntheticCandles(symbol, basePrice, 250)
           source = "synthetic"
           syntheticCount++
-          console.log(`[v0] [MarketData] ⚠ Using synthetic data for ${symbol} (exchange fetch failed)`)
+          console.log(`[v0] [MarketData] ⚠ Using synthetic data for ${symbol} (exchange 1s fetch failed)`)
         }
 
         const marketData: MarketData = {
           symbol,
-          timeframe: "1m",
+          timeframe: "1s",
           candles,
           lastUpdated: new Date().toISOString(),
           source,
         }
 
-        const key = `market_data:${symbol}:1m`
+        // Authoritative key under the new :1s suffix.
+        const key = `market_data:${symbol}:1s`
         const jsonData = JSON.stringify(marketData)
-        console.log(`[v0] [MarketData] STORING to key=${key}, dataLength=${jsonData.length}`)
         await client.set(key, jsonData)
         await client.expire(key, 86400) // 24 hour TTL
-        
-        // Verify storage worked by reading back immediately
-        const verifyRead = await client.get(key)
-        console.log(`[v0] [MarketData] VERIFY READ: ${verifyRead ? 'SUCCESS (' + verifyRead.length + ' chars)' : 'FAILED - NULL'}`)
 
-        // Store raw candles array for indication processor historical access
+        // Store raw candles array for indication processor historical access.
         const candlesKey = `market_data:${symbol}:candles`
         await client.set(candlesKey, JSON.stringify(candles))
         await client.expire(candlesKey, 86400)
 
-        // CRITICAL: Also write latest candle to hash format so getMarketData() works
+        // Also write latest bucket to hash format so getMarketData() works.
         const latestCandle = candles[candles.length - 1]
         if (latestCandle) {
           const hashKey = `market_data:${symbol}`
           const flatHash: Record<string, string> = {
             symbol,
             exchange: source,
-            interval: "1m",
+            interval: "1s",
             price: String(latestCandle.close),
             open: String(latestCandle.open),
             high: String(latestCandle.high),
@@ -219,6 +249,8 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
             close: String(latestCandle.close),
             volume: String(latestCandle.volume),
             timestamp: new Date(latestCandle.timestamp).toISOString(),
+            // `candles_count` field name preserved so downstream readers
+            // don't need a migration; it now counts 1s INTERVALS.
             candles_count: String(candles.length),
             data_source: source,
           }
@@ -228,11 +260,10 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
           }
           await client.hmset(hashKey, ...flatArgs)
           await client.expire(hashKey, 86400)
-          console.log(`[v0] [MarketData] ✓ Stored hash ${hashKey} (${flatArgs.length / 2} fields)`)
-          
+
           const priceStr = latestCandle.close.toFixed(2)
           const sourceLabel = source === "synthetic" ? "(synthetic)" : `(real: ${source})`
-          console.log(`[v0] [MarketData] ✓ ${symbol}: $${priceStr} ${sourceLabel}`)
+          console.log(`[v0] [MarketData] ✓ ${symbol}: $${priceStr} ${sourceLabel} (${candles.length} intervals)`)
         }
 
         loaded++
@@ -263,18 +294,21 @@ export async function updateMarketDataForSymbol(symbol: string, connectionId?: s
     let candles: MarketDataCandle[] | null = null
     let source = "synthetic"
 
+    // Spec §7: same window as the bulk loader — 1s × 1 day.
+    const ONE_DAY_SECONDS = 86_400
+
     if (connectionId) {
       const connections = await getAllConnections()
       const conn = connections.find((c: any) => c.id === connectionId)
       if (conn) {
-        const result = await fetchRealMarketData(symbol, "1m", 250)
+        const result = await fetchRealMarketData(symbol, "1s", ONE_DAY_SECONDS)
         if (result) {
           candles = result.candles
           source = result.source
         }
       }
     } else {
-      const result = await fetchRealMarketData(symbol, "1m", 250)
+      const result = await fetchRealMarketData(symbol, "1s", ONE_DAY_SECONDS)
       if (result) {
         candles = result.candles
         source = result.source
@@ -283,8 +317,10 @@ export async function updateMarketDataForSymbol(symbol: string, connectionId?: s
 
     // If no real data, use existing or generate synthetic
     if (!candles || candles.length === 0) {
-      // Try to get existing data
-      const existing = await client.get(`market_data:${symbol}:1m`)
+      // Try to get existing data — :1s is now authoritative; fall back
+      // to the legacy :1m envelope for one release so partial upgrades
+      // don't lose data.
+      const existing = (await client.get(`market_data:${symbol}:1s`)) ?? (await client.get(`market_data:${symbol}:1m`))
       if (existing) {
         const existingData: MarketData = JSON.parse(existing)
         candles = existingData.candles
@@ -298,13 +334,13 @@ export async function updateMarketDataForSymbol(symbol: string, connectionId?: s
 
     const marketData: MarketData = {
       symbol,
-      timeframe: "1m",
+      timeframe: "1s",
       candles,
       lastUpdated: new Date().toISOString(),
       source,
     }
 
-    const key = `market_data:${symbol}:1m`
+    const key = `market_data:${symbol}:1s`
     await client.set(key, JSON.stringify(marketData))
     await client.expire(key, 86400)
 
@@ -320,7 +356,7 @@ export async function updateMarketDataForSymbol(symbol: string, connectionId?: s
       const flatHash: Record<string, string> = {
         symbol,
         exchange: source,
-        interval: "1m",
+        interval: "1s",
         price: String(latestCandle.close),
         open: String(latestCandle.open),
         high: String(latestCandle.high),

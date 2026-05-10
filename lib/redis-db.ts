@@ -1558,9 +1558,22 @@ export async function bumpSettingsVersion(): Promise<number> {
 // ========== Market Data Operations ==========
 
 export async function getMarketData(symbol: string, interval: string): Promise<any | null> {
+  // ── Spec §7 migration: 1s is the canonical timeframe ─────────────
+  //
+  // The market-data loader was migrated to write only the `:1s`
+  // envelope, but dozens of legacy callsites still pass `"1m"`
+  // (default in older code paths). Rather than churn every caller
+  // we transparently fall back to `:1s` whenever the requested
+  // interval is absent. The envelope shape is identical so consumers
+  // can't tell the difference; only the `timeframe` field reports
+  // "1s" instead of "1m", which all known readers ignore.
   await initRedis()
   const client = getClient()
-  const data = await client.get(`market_data:${symbol}:${interval}`)
+  const primary = await client.get(`market_data:${symbol}:${interval}`)
+  let data = primary
+  if (!data && interval !== "1s") {
+    data = await client.get(`market_data:${symbol}:1s`)
+  }
   if (!data) return null
   try {
     return JSON.parse(data)

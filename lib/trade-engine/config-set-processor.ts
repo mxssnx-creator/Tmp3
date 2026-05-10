@@ -217,8 +217,15 @@ export class ConfigSetProcessor {
           candles = JSON.parse(candlesRaw)
         }
 
+        // ── Fallback read switched from `:1m` → `:1s` (spec §7.3) ───
+        //
+        // The market-data loader was migrated to 1-second timeframe so
+        // the legacy `:1m` suffix is no longer populated on fresh
+        // deployments. The canonical `:candles` snapshot above is
+        // still tried first; the `:1s` JSON envelope is the
+        // authoritative fallback.
         if (!candles || candles.length === 0) {
-          const marketDataRaw = await client.get(`market_data:${symbol}:1m`)
+          const marketDataRaw = await client.get(`market_data:${symbol}:1s`)
           if (marketDataRaw) {
             const marketDataObj = JSON.parse(marketDataRaw)
             if (marketDataObj?.candles) {

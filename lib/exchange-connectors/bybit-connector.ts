@@ -783,6 +783,21 @@ export class BybitConnector extends BaseExchangeConnector {
   > {
     // Public endpoint — no signature required.
     try {
+      // ── 1s timeframe (spec §7): aggregate from recent-trades ───
+      // Bybit V5 has no native sub-1m klines. We aggregate from
+      // /v5/market/recent-trade. The public endpoint returns the
+      // most recent 1000 trades, so we can't truly reach 24h on a
+      // high-volume pair — we return what we can, and the
+      // prehistoric `processed_intervals` set will simply mark the
+      // covered buckets. Better partial 1s than fake 1m.
+      if (timeframe === "1s") {
+        const endMs = Date.now()
+        const startMs = endMs - (Math.max(1, Math.min(86_400, limit)) * 1000)
+        const aggregated = await this.getOHLCV1s(symbol, startMs, endMs)
+        if (aggregated && aggregated.length > 0) return aggregated
+        return null
+      }
+
       const baseUrl = this.getBaseUrl()
       const category = this.getTradingCategory()
       const intervalMap: Record<string, string> = {
@@ -823,6 +838,47 @@ export class BybitConnector extends BaseExchangeConnector {
         .reverse()
 
       return candles
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * ── 1-second OHLCV (spec §7) ──────────────────────────────────────
+   *
+   * Aggregates from `/v5/market/recent-trade`. Bybit returns trades
+   * newest-first and caps at 1000 per page. There is no `endTime`
+   * cursor on the public endpoint so we cannot truly paginate
+   * backward in time — we accept that limitation and return whatever
+   * coverage we can build within the 1000-trade window.
+   *
+   * For lower-volume pairs the 1000 trades may span hours. For
+   * high-volume pairs (BTCUSDT) it might cover only a few minutes.
+   * Either way it's more honest 1s data than fake 1m candles.
+   */
+  async getOHLCV1s(
+    symbol: string,
+    startMs: number,
+    endMs: number,
+  ): Promise<
+    Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }> | null
+  > {
+    try {
+      const baseUrl = this.getBaseUrl()
+      const category = this.getTradingCategory()
+      const { aggregateTradesTo1sOHLCV } = await import("./aggregate-1s")
+      const url = `${baseUrl}/v5/market/recent-trade?category=${category}&symbol=${encodeURIComponent(symbol)}&limit=1000`
+      const resp = await this.rateLimitedFetch(url)
+      if (!resp.ok) return null
+      const data = await resp.json()
+      const rows = data?.result?.list as Array<{ time: string; price: string; size: string }> | undefined
+      if (!Array.isArray(rows) || rows.length === 0) return []
+      const trades = rows.map((r) => ({
+        timestamp: Number(r.time),
+        price: Number(r.price),
+        quantity: Number(r.size),
+      }))
+      return aggregateTradesTo1sOHLCV(trades, startMs, endMs)
     } catch {
       return null
     }
