@@ -307,8 +307,13 @@ async function tryAcquireLock(
   try {
     const client = getRedisClient()
     const lockKey = `live:lock:${connectionId}:${symbol}:${direction}`
+    // `client.set` with NX returns `"OK"` on success or `null` when the
+    // key already existed (Redis-standard). The `!= null` check covers
+    // both `null` and `undefined` (some adapters return undefined on
+    // pipeline failures); any other value (i.e. the truthy "OK"
+    // response) means we acquired the slot.
     const ok = await client.set(lockKey, String(Date.now()), { NX: true, EX: ttlSeconds })
-    return ok !== null && ok !== undefined && ok !== false
+    return ok != null
   } catch {
     return false
   }
@@ -422,10 +427,32 @@ async function accumulateIntoLivePosition(
 
   try {
     // ── 1. Compute additional volume (always honors min) ───────────────
+    //
+    // Accumulation is a LIVE-execution path — it places real exchange
+    // orders to merge into an existing position. Per spec, this MUST
+    // calculate "indeed volume" using the per-engine ratio. We resolve
+    // the trade mode from the connection's flags exactly the same way
+    // `executeLivePosition` does (Preset iff is_preset_trade=true AND
+    // is_live_trade=false, otherwise Main). A failure to load the
+    // connection here falls back to "main" which is the conservative
+    // default — Preset's factor is often the more aggressive one and
+    // we don't want a transient Redis blip to silently up-size the
+    // accumulated order.
+    let accTradeMode: "main" | "preset" = "main"
+    try {
+      const { getConnection: _getConn } = await import("@/lib/redis-db")
+      const { isTruthyFlag } = await import("@/lib/connection-state-utils")
+      const accConn = (await _getConn(connectionId)) || {}
+      if (isTruthyFlag(accConn.is_preset_trade) && !isTruthyFlag(accConn.is_live_trade)) {
+        accTradeMode = "preset"
+      }
+    } catch { /* fall back to "main" — see comment above */ }
+
     const volumeResult = await VolumeCalculator.calculateVolumeForConnection(
       connectionId,
       symbol,
       currentPrice,
+      { tradeMode: accTradeMode },
     ).catch((err) => {
       console.error(`${LOG_PREFIX} accumulate volume calc error:`, err)
       return null
@@ -1425,10 +1452,31 @@ export async function executeLivePosition(
     // synthesize a fallback at the universal $5-notional floor and
     // continue. This keeps the operator's signal flow uninterrupted
     // and matches the documented behavior of `VolumeCalculator`.
+    //
+    // ── Trade-mode resolution for the engine volume factor ────────
+    // The live-stage IS the live-execution path by definition — it
+    // MUST tell `VolumeCalculator` which engine is asking for sizing so
+    // the per-engine multiplier (Main vs. Preset) is applied. We reuse
+    // the already-loaded `connSettings` to derive the mode without a
+    // second Redis round-trip:
+    //   - Preset engine: `is_preset_trade=true` AND `is_live_trade=false`
+    //   - Main   engine: otherwise (the conservative default — when
+    //                    both flags happen to be true during a UI
+    //                    toggle transition we don't want to silently
+    //                    apply Preset's typically-more-aggressive
+    //                    multiplier).
+    // Strategy / pseudo-position callers (in pseudo-position-manager)
+    // do NOT pass `tradeMode` — they remain ratio-only per spec.
+    const liveTradeMode: "main" | "preset" =
+      isTruthyFlag(connSettings.is_preset_trade) && !isTruthyFlag(connSettings.is_live_trade)
+        ? "preset"
+        : "main"
+
     const volumeResult = await VolumeCalculator.calculateVolumeForConnection(
       connectionId,
       realPosition.symbol,
-      currentPrice
+      currentPrice,
+      { tradeMode: liveTradeMode },
     ).catch(err => {
       console.error(`${LOG_PREFIX} volume calc error:`, err)
       return null
