@@ -150,11 +150,23 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
 
     await updateConnection(id, updatedConnection)
 
-    // Notify running engines about the change
+    // Notify running engines about the change AND fast-path apply it
+    // in-process so operators see the new behavior on the very next
+    // engine cycle instead of waiting up to one watcher tick (~3s).
     const changedFields = detectChangedFields(connection, updatedConnection)
     if (changedFields.length > 0) {
       const changeEvent = await notifySettingsChanged(id, changedFields, connection, updatedConnection)
       console.log(`[v0] Connection patched: ${id}, change type: ${changeEvent.changeType}, fields: [${changedFields.join(",")}]`)
+      try {
+        const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+        await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
+      } catch (applyErr) {
+        // Non-fatal — the watcher will pick it up within 3s.
+        console.warn(
+          `[v0] [PATCH] applyPendingChangesNow failed for ${id} (watcher will retry):`,
+          applyErr instanceof Error ? applyErr.message : String(applyErr),
+        )
+      }
     }
 
     await SystemLogger.logConnection(`Connection patched successfully`, id, "info")
@@ -218,11 +230,21 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
 
     await updateConnection(id, updatedConnection)
 
-    // Notify running engines about the change
+    // Notify running engines about the change AND fast-path apply it
+    // in-process (see PATCH above for rationale).
     const changedFields = detectChangedFields(connection, updatedConnection)
     if (changedFields.length > 0) {
       const changeEvent = await notifySettingsChanged(id, changedFields, connection, updatedConnection)
       console.log(`[v0] Connection updated: ${id}, change type: ${changeEvent.changeType}, fields: [${changedFields.join(",")}]`)
+      try {
+        const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+        await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
+      } catch (applyErr) {
+        console.warn(
+          `[v0] [PUT] applyPendingChangesNow failed for ${id} (watcher will retry):`,
+          applyErr instanceof Error ? applyErr.message : String(applyErr),
+        )
+      }
     }
 
     await SystemLogger.logConnection(`Connection updated successfully`, id, "info")

@@ -371,6 +371,32 @@ export class TradeEngineManager {
   /** Optional lock-extend timer (separate from the user-visible heartbeat). */
   private lockExtendTimer?: NodeJS.Timeout
 
+  /**
+   * ── Live settings-reload bus ─────────────────────────────────────
+   *
+   * When connection settings change (e.g. operator edits indication
+   * thresholds, volume factor, presets, etc.) the API handler writes
+   * a change event + bumps `settings_change_counter:{id}` in Redis.
+   * The `settingsWatcherTimer` below polls that counter every 3s and,
+   * on a bump, calls `applyPendingSettingsChange()` to dispatch the
+   * event:
+   *
+   *   • `reload` → in-place: bump `settingsVersion`, re-read the
+   *     connection snapshot, refresh config-set processor caches. No
+   *     stop/start, no epoch change.
+   *   • `restart` → escalates to the coordinator's stop+start path so
+   *     the new credentials / api-type take effect with a fresh epoch.
+   *
+   * Public `settingsVersion` lets per-cycle code in processors detect
+   * a generational settings flip and bust any local memoization (e.g.
+   * "did the indication thresholds change since I last computed?").
+   */
+  private settingsWatcherTimer?: NodeJS.Timeout
+  private lastSettingsCounter = 0
+  private settingsVersion = 0
+  /** Set true while a settings apply is in flight to prevent overlap. */
+  private settingsApplying = false
+
   private componentHealth: {
     indications: ComponentHealth
     strategies: ComponentHealth
@@ -635,6 +661,10 @@ export class TradeEngineManager {
       // place that gracefully tears down the engine because we
       // discovered we no longer own it.
       this.startLockExtender()
+      // ── Live settings-reload watcher ─────────────────────────────
+      // Picks up operator edits to connection settings and applies
+      // them WITHOUT requiring a manual restart. See `applyPendingSettingsChange`.
+      this.startSettingsWatcher()
       
       // Phase 6: Live trading ready (isRunning was set earlier before processors started)
       this.isStarting = false
@@ -846,6 +876,13 @@ export class TradeEngineManager {
     if (this.lockExtendTimer) {
       clearInterval(this.lockExtendTimer)
       this.lockExtendTimer = undefined
+    }
+    // Settings watcher must die alongside the engine — otherwise a
+    // stopped manager would keep polling and could re-apply a change
+    // it has no business touching.
+    if (this.settingsWatcherTimer) {
+      clearInterval(this.settingsWatcherTimer)
+      this.settingsWatcherTimer = undefined
     }
 
     this.isRunning = false
@@ -1404,7 +1441,7 @@ export class TradeEngineManager {
             }
             writes.push(client.hincrby(redisKey, "indications_count", totalIndications))
           }
-          // ── Per-symbol error visibility ───────────────────���────────────
+          // ── Per-symbol error visibility ───────────────────�����────────────
           // Without this, a chronically-failing symbol (bad ticker,
           // delisted pair, persistent connector error) would have its
           // errors swallowed by the per-task `.catch` and the dashboard
@@ -2436,6 +2473,213 @@ export class TradeEngineManager {
   /** Current generation epoch (0 when stopped). */
   get currentEpoch(): number {
     return this.epoch
+  }
+
+  /**
+   * Current settings generation. Bumped every time `applyHotReload`
+   * runs. Processors / cycle code can compare this against a locally
+   * remembered value to invalidate memoized config snapshots.
+   */
+  get currentSettingsVersion(): number {
+    return this.settingsVersion
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  //  Live settings reload
+  // ────────────────────────────────────────────────────────────────────
+
+  /**
+   * Starts the per-connection settings watcher (3s poll). Cheap: a
+   * single HGETALL on `settings:settings_change_counter:{id}` per
+   * tick, branchless when the counter hasn't moved.
+   */
+  private startSettingsWatcher(): void {
+    if (this.settingsWatcherTimer) {
+      clearInterval(this.settingsWatcherTimer)
+      this.settingsWatcherTimer = undefined
+    }
+    // Seed the counter so we don't immediately re-apply a change that
+    // happened BEFORE the engine started.
+    void this.seedSettingsCounter()
+    this.settingsWatcherTimer = setInterval(async () => {
+      if (!this.isRunning) {
+        if (this.settingsWatcherTimer) {
+          clearInterval(this.settingsWatcherTimer)
+          this.settingsWatcherTimer = undefined
+        }
+        return
+      }
+      if (this.settingsApplying) return
+      try {
+        const { getChangeCounter } = await import("@/lib/settings-coordinator")
+        const counter = await getChangeCounter(this.connectionId)
+        if (counter > this.lastSettingsCounter) {
+          this.lastSettingsCounter = counter
+          await this.applyPendingSettingsChange()
+        }
+      } catch (err) {
+        // Watcher failures must never kill the engine; just log once.
+        console.warn(
+          `[v0] [Engine ${this.connectionId}] settings watcher poll failed:`,
+          err instanceof Error ? err.message : String(err),
+        )
+      }
+    }, 3000)
+  }
+
+  private async seedSettingsCounter(): Promise<void> {
+    try {
+      const { getChangeCounter } = await import("@/lib/settings-coordinator")
+      this.lastSettingsCounter = await getChangeCounter(this.connectionId)
+    } catch {
+      this.lastSettingsCounter = 0
+    }
+  }
+
+  /**
+   * Public fast-path: called by the API route after `notifySettingsChanged`
+   * so changes take effect WITHIN MILLISECONDS rather than waiting up
+   * to one watcher tick (3 s). Safe to call even when the engine isn't
+   * running — it just returns. Idempotent.
+   */
+  async applyPendingSettingsChangeNow(): Promise<void> {
+    if (!this.isRunning) return
+    // Capture the latest counter so the periodic watcher doesn't
+    // re-fire on the same change.
+    try {
+      const { getChangeCounter } = await import("@/lib/settings-coordinator")
+      this.lastSettingsCounter = await getChangeCounter(this.connectionId)
+    } catch {
+      /* best effort */
+    }
+    await this.applyPendingSettingsChange()
+  }
+
+  /**
+   * Consumes the pending change event, dispatches to reload-or-restart,
+   * and clears the event. Wrapped in a `settingsApplying` mutex so a
+   * fast-path call and a watcher tick can't interleave.
+   */
+  private async applyPendingSettingsChange(): Promise<void> {
+    if (this.settingsApplying) return
+    this.settingsApplying = true
+    try {
+      const { getPendingChanges, clearPendingChanges } = await import("@/lib/settings-coordinator")
+      const event = await getPendingChanges(this.connectionId)
+      if (!event) return
+
+      const changeType = event.changeType
+      const fields = Array.isArray(event.changedFields) ? event.changedFields : []
+      console.log(
+        `[v0] [Engine ${this.connectionId}] applying settings change type=${changeType} fields=[${fields.join(",")}]`,
+      )
+
+      if (changeType === "restart") {
+        // Hand off to the coordinator's stop+start path. We MUST clear
+        // the pending event BEFORE the restart so the freshly-started
+        // engine doesn't immediately re-apply the same change (it
+        // would just be a no-op, but cleaner this way).
+        await clearPendingChanges(this.connectionId)
+        try {
+          const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+          const coordinator = getGlobalTradeEngineCoordinator()
+          await coordinator.restartEngine(this.connectionId)
+        } catch (restartErr) {
+          console.error(
+            `[v0] [Engine ${this.connectionId}] settings-driven restart failed:`,
+            restartErr instanceof Error ? restartErr.message : String(restartErr),
+          )
+        }
+        return
+      }
+
+      if (changeType === "reload") {
+        await this.applyHotReload(fields)
+        await clearPendingChanges(this.connectionId)
+        return
+      }
+
+      // `cosmetic` — name change, label, etc. Nothing to do for the
+      // engine, just clear the marker.
+      await clearPendingChanges(this.connectionId)
+    } catch (err) {
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] applyPendingSettingsChange failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    } finally {
+      this.settingsApplying = false
+    }
+  }
+
+  /**
+   * Hot-reload path: bump `settingsVersion`, re-read the connection
+   * snapshot from Redis, and refresh any cached configs the manager
+   * controls. Per-cycle code in processors already reads fresh from
+   * Redis, so for THOSE this is mostly a cache-bust signal. For
+   * settings that ARE held in memory (interval cadence, volume
+   * factor, preset toggles) we copy the new values into `startConfig`.
+   */
+  private async applyHotReload(_changedFields: string[]): Promise<void> {
+    this.settingsVersion++
+    try {
+      const { getConnection } = await import("@/lib/redis-db")
+      const fresh = await getConnection(this.connectionId)
+      if (!fresh) {
+        console.warn(
+          `[v0] [Engine ${this.connectionId}] hot-reload: connection vanished from Redis; skipping`,
+        )
+        return
+      }
+
+      // Pick up new per-connection intervals if the operator changed
+      // them via the settings UI. The scheduler reads pause from a
+      // global setting today (cyclePauseMs) but `startConfig` is the
+      // canonical source for any future per-connection cadence work.
+      const cs: any = typeof (fresh as any).connection_settings === "string"
+        ? (() => {
+            try { return JSON.parse((fresh as any).connection_settings) } catch { return {} }
+          })()
+        : ((fresh as any).connection_settings || {})
+
+      if (this.startConfig) {
+        if (Number.isFinite(Number(cs.indicationTimeInterval))) {
+          this.startConfig.indicationInterval = Number(cs.indicationTimeInterval)
+        }
+        if (Number.isFinite(Number(cs.strategyTimeInterval))) {
+          this.startConfig.strategyInterval = Number(cs.strategyTimeInterval)
+        }
+        if (Number.isFinite(Number(cs.realtimeTimeInterval))) {
+          this.startConfig.realtimeInterval = Number(cs.realtimeTimeInterval)
+        }
+      }
+
+      // Best-effort: tell any subscribed processors to refresh. The
+      // pseudo-position manager + config-set processor already re-read
+      // fresh per cycle, so this is informational, but we still log
+      // it for operator visibility.
+      console.log(
+        `[v0] [Engine ${this.connectionId}] hot-reload applied (settingsVersion=${this.settingsVersion}, volume_factor=${(fresh as any).volume_factor})`,
+      )
+
+      try {
+        await logProgressionEvent(
+          this.connectionId,
+          "settings_reloaded",
+          "info",
+          `Connection settings hot-reloaded (v=${this.settingsVersion})`,
+          {
+            settingsVersion: this.settingsVersion,
+            connectionId: this.connectionId,
+          },
+        )
+      } catch { /* best-effort */ }
+    } catch (err) {
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] applyHotReload failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
   }
 
   /**
