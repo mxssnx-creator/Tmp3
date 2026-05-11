@@ -437,17 +437,38 @@ export function ActiveConnectionCard({
           // strategies}.total.sets`. Falls back to the legacy
           // cumulative counters when the new field is absent (older
           // API revs).
-          indications:
-            data.activeProgressing?.indications?.total?.sets ??
-            data.realtime?.indicationsTotal ??
-            data.totalIndicationsCount ??
-            0,
-          strategies:
-            data.activeProgressing?.strategies?.total?.sets ??
-            data.realtime?.strategiesTotal ??
-            data.totalStrategyCount ??
-            0,
-          positions:        data.openPositions?.live?.open  || data.realtime?.positionsOpen || data.positionsCount || 0,
+          // For Ind./Strat. counters: prefer "alive now" (non-zero sets from
+          // activeProgressing.total.sets). Fall back to the cumulative total
+          // (`indicationsTotal`) when the active-sets hash is empty — e.g.
+          // when no per-cycle threshold crossing has been written yet, or when
+          // the indication processor hasn't qualified anything this tick. This
+          // keeps the tile non-zero so the operator can see the engine is
+          // actually processing data.
+          indications: (() => {
+            const activeNow = data.activeProgressing?.indications?.total?.sets ?? 0
+            if (activeNow > 0) return activeNow
+            return data.activeCounts?.indications?.total ??
+                   data.realtime?.indicationsTotal ??
+                   data.totalIndicationsCount ??
+                   0
+          })(),
+          strategies: (() => {
+            const activeNow = data.activeProgressing?.strategies?.total?.sets ?? 0
+            if (activeNow > 0) return activeNow
+            return data.activeCounts?.strategies?.total ??
+                   data.realtime?.strategiesTotal ??
+                   data.totalStrategyCount ??
+                   0
+          })(),
+          // Positions: prefer pseudo open (evaluation pipeline) because live
+          // exchange positions are 0 unless an order filled. This way the
+          // tile shows "5" (pseudo evaluation positions) when evaluating.
+          positions: (() => {
+            const pseudo = data.openPositions?.pseudo?.open ?? 0
+            const live   = data.openPositions?.live?.open   ?? 0
+            const rt     = data.realtime?.positionsOpen     ?? 0
+            return live > 0 ? live : pseudo > 0 ? pseudo : rt
+          })(),
         })
 
         // Also populate prehistoric stats from the same response
@@ -927,7 +948,10 @@ export function ActiveConnectionCard({
                   { label: "Cycles",    value: liveStats.indicationCycles },
                   { label: "Ind.",      value: liveStats.indications },
                   { label: "Strat.",    value: liveStats.strategies },
-                  { label: "Positions", value: liveStats.positions },
+                  {
+                    label: prehistoricStats?.liveOpenPositions > 0 ? "Live" : "Pseudo",
+                    value: liveStats.positions,
+                  },
                 ].map(({ label, value }) => (
                   <div key={label} className="flex items-center gap-1 text-[10px]">
                     <span className="text-muted-foreground">{label}</span>
@@ -965,7 +989,10 @@ export function ActiveConnectionCard({
                       { label: "Cycles",    value: liveStats.indicationCycles },
                       { label: "Ind.",      value: liveStats.indications },
                       { label: "Strat.",    value: liveStats.strategies },
-                      { label: "Positions", value: liveStats.positions },
+                      {
+                        label: prehistoricStats?.liveOpenPositions > 0 ? "Live" : "Pseudo",
+                        value: liveStats.positions,
+                      },
                     ].map(({ label, value }) => (
                       <div key={label} className="flex items-center gap-1 text-[10px]">
                         <span className="text-muted-foreground">{label}</span>
@@ -1478,7 +1505,12 @@ export function ActiveConnectionCard({
                               {prehistoricStats.livePositionsCreated}
                             </span>
                           </span>
-                          {prehistoricStats.livePositionsClosed > 0 && (
+                          {/* Only show closed count when positions were actually created in
+                              this session — avoids the reconcile-sweep artifact where the
+                              sweep detects exchange positions from a previous session as
+                              "closed" before any new position was created, producing the
+                              confusing "Positions 0 closed 6" display. */}
+                          {prehistoricStats.livePositionsClosed > 0 && prehistoricStats.livePositionsCreated > 0 && (
                             <span className="text-muted-foreground">
                               closed <span className="text-foreground font-semibold tabular-nums">
                                 {prehistoricStats.livePositionsClosed}

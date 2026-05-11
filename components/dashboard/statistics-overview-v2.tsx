@@ -640,11 +640,23 @@ export function StatisticsOverviewV2() {
           activeIndMove:      Number(d.activeCounts?.indications?.move)           || 0,
           activeIndActive:    Number(d.activeCounts?.indications?.active)         || 0,
           activeIndOptimal:   Number(d.activeCounts?.indications?.optimal)        || 0,
-          activeIndTotal:     Number(d.activeCounts?.indications?.total)          || 0,
+          // Fall back to cumulative indicationsTotal when the per-cycle
+          // active-sets count is 0 — keeps the tile non-zero while the
+          // engine is running but nothing has crossed the threshold yet.
+          activeIndTotal: (() => {
+            const active = Number(d.activeCounts?.indications?.total) || 0
+            if (active > 0) return active
+            return Number(d.realtime?.indicationsTotal) || 0
+          })(),
           activeStratBase:    Number(d.activeCounts?.strategies?.base)            || 0,
           activeStratMain:    Number(d.activeCounts?.strategies?.main)            || 0,
           activeStratReal:    Number(d.activeCounts?.strategies?.real)            || 0,
-          activeStratTotal:   Number(d.activeCounts?.strategies?.total)           || 0,
+          // Fall back to activeProgressing strategies total when activeCounts is 0.
+          activeStratTotal: (() => {
+            const active = Number(d.activeCounts?.strategies?.total) || 0
+            if (active > 0) return active
+            return Number(d.activeProgressing?.strategies?.total?.sets) || 0
+          })(),
           mainEvaluated:    mainBreakdownEval,
           mainCoordCreated,
           mainBlockDcaSets,
