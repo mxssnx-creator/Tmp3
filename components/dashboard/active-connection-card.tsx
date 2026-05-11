@@ -447,18 +447,25 @@ export function ActiveConnectionCard({
           indications: (() => {
             const activeNow = data.activeProgressing?.indications?.total?.sets ?? 0
             if (activeNow > 0) return activeNow
-            return data.activeCounts?.indications?.total ??
-                   data.realtime?.indicationsTotal ??
-                   data.totalIndicationsCount ??
-                   0
+            const activeCnt = data.activeCounts?.indications?.total ?? 0
+            if (activeCnt > 0) return activeCnt
+            const rt = data.realtime?.indicationsTotal ?? 0
+            if (rt > 0) return rt
+            const total = data.totalIndicationsCount ?? 0
+            if (total > 0) return total
+            // Final fallback: breakdown cumulative total (type-summed, most durable)
+            return data.breakdown?.indications?.total ?? 0
           })(),
           strategies: (() => {
             const activeNow = data.activeProgressing?.strategies?.total?.sets ?? 0
             if (activeNow > 0) return activeNow
-            return data.activeCounts?.strategies?.total ??
-                   data.realtime?.strategiesTotal ??
-                   data.totalStrategyCount ??
-                   0
+            const activeCnt = data.activeCounts?.strategies?.total ?? 0
+            if (activeCnt > 0) return activeCnt
+            const rt = data.realtime?.strategiesTotal ?? 0
+            if (rt > 0) return rt
+            const total = data.totalStrategyCount ?? 0
+            if (total > 0) return total
+            return data.breakdown?.strategies?.total ?? 0
           })(),
           // Positions: prefer pseudo open (evaluation pipeline) because live
           // exchange positions are 0 unless an order filled. This way the

@@ -632,14 +632,18 @@ export function StatisticsOverviewV2() {
           stratMain:        d.breakdown?.strategies?.main || 0,
           stratReal:        d.breakdown?.strategies?.real || 0,
           stratLive:        d.breakdown?.strategies?.live || liveExec.positionsCreated || 0,
-          // Active-now snapshot — written per cycle by engine writers
-          // (indication-sets-processor + strategy-coordinator). The UI
-          // shows these as the headline numbers and the cumulative
-          // counts above as smaller subtext.
-          activeIndDirection: Number(d.activeCounts?.indications?.direction)      || 0,
-          activeIndMove:      Number(d.activeCounts?.indications?.move)           || 0,
-          activeIndActive:    Number(d.activeCounts?.indications?.active)         || 0,
-          activeIndOptimal:   Number(d.activeCounts?.indications?.optimal)        || 0,
+          // Active-now snapshot — written per cycle by engine writers.
+          // Falls back to breakdown cumulative counts when activeCounts
+          // is 0 (hash expired, not yet written, or engine just started)
+          // so per-type tiles stay non-zero while the engine is running.
+          activeIndDirection: Number(d.activeCounts?.indications?.direction) ||
+                              Number(d.breakdown?.indications?.direction) || 0,
+          activeIndMove:      Number(d.activeCounts?.indications?.move) ||
+                              Number(d.breakdown?.indications?.move) || 0,
+          activeIndActive:    Number(d.activeCounts?.indications?.active) ||
+                              Number(d.breakdown?.indications?.active) || 0,
+          activeIndOptimal:   Number(d.activeCounts?.indications?.optimal) ||
+                              Number(d.breakdown?.indications?.optimal) || 0,
           // Fall back to cumulative indicationsTotal when the per-cycle
           // active-sets count is 0 — keeps the tile non-zero while the
           // engine is running but nothing has crossed the threshold yet.
