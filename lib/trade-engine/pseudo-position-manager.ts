@@ -623,6 +623,21 @@ export class PseudoPositionManager {
       this.invalidateCache()
       await this.updateActivePositionsCount()
 
+      // ── Progression counter (P3-1) ────────────────────────────────────
+      // Increment the connection-level totalTrades / successfulTrades counters
+      // so the dashboard "Test Count" tile reflects all closed pseudo positions
+      // (not just exchange-level live orders). `recordTrade` uses atomic
+      // hincrby so concurrent closes never lose a count.
+      try {
+        const { ProgressionStateManager } = await import(
+          "@/lib/progression-state-manager"
+        )
+        await ProgressionStateManager.recordTrade(this.connectionId, pnl >= 0, pnl)
+      } catch (recordErr) {
+        // Non-critical — counters will be slightly behind on failure.
+        console.warn(`[v0] [closePosition] recordTrade failed for ${positionId}:`, recordErr)
+      }
+
       // ── P1-2: Propagate close into BasePseudoPositionManager counters ──
       // Keeps Base-level win-rate / avg-profit / avg-loss / max-drawdown
       // stats up-to-date on every close so the Base → Main promotion

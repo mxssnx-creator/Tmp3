@@ -27,7 +27,13 @@ interface RedisData {
 }
 
 // Global storage for persistence across hot reloads
-const globalForRedis = globalThis as unknown as { __redis_data?: RedisData }
+const globalForRedis = globalThis as unknown as {
+  __redis_data?: RedisData
+  // In-flight guard for loadFromDisk — ensures concurrent initRedis() calls
+  // from different module scopes share a single disk-read rather than racing
+  // to overwrite each other's post-migration state.
+  __redis_load_promise?: Promise<boolean>
+}
 
 export class InlineLocalRedis {
   private data: RedisData
@@ -1073,7 +1079,18 @@ export async function initRedis(): Promise<void> {
     const wasEmpty = !globalForRedis.__redis_data
     redisInstance = new InlineLocalRedis()
     if (wasEmpty) {
-      await redisInstance.loadFromDisk().catch(() => { /* fresh start ok */ })
+      // Dedup concurrent loadFromDisk calls across module scopes. If another
+      // initRedis() already fired loadFromDisk in this process (via a
+      // concurrent route handler), wait for that promise instead of loading
+      // the snapshot a second time — the second load would overwrite
+      // post-migration writes (e.g. is_enabled_dashboard=1 from mig 021).
+      if (!globalForRedis.__redis_load_promise) {
+        globalForRedis.__redis_load_promise = redisInstance.loadFromDisk().catch(() => false)
+        globalForRedis.__redis_load_promise.finally(() => {
+          globalForRedis.__redis_load_promise = undefined
+        })
+      }
+      await globalForRedis.__redis_load_promise
     }
   }
 

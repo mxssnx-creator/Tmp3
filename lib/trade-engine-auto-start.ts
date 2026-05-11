@@ -102,6 +102,44 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
           return
         }
 
+        // ── Idempotent activation fix ───────────────────────────────────
+        // Migrations 015–017 unconditionally reset is_enabled_dashboard to "0"
+        // on every boot. A concurrent double-load of the Redis snapshot can
+        // overwrite migration 021's restoration write (which sets it back to
+        // "1"). We re-apply the write here — after the 2-second deferral that
+        // lets all concurrent snapshot loads settle — so the engine sweep
+        // always has the correct flag value regardless of load timing.
+        //
+        // Only touches connections that already have API credentials in Redis.
+        // Connections without credentials are intentionally left disabled.
+        const BASE_CONNECTION_IDS = ["bybit-x03", "bingx-x01"]
+        try {
+          const activationClient = getRedisClient()
+          for (const connId of BASE_CONNECTION_IDS) {
+            const connData = await activationClient.hgetall(`connection:${connId}`)
+            if (!connData) continue
+            const credsHash = (await activationClient.hgetall(`credentials:${connId}`)) || {}
+            const hasApiKey =
+              (connData.api_key && connData.api_key.length > 4) ||
+              (credsHash.api_key && credsHash.api_key.length > 4) ||
+              (connData.apiKey && connData.apiKey.length > 4)
+            if (!hasApiKey) continue
+            if (connData.is_enabled_dashboard === "1") continue // already correct
+            await activationClient.hset(`connection:${connId}`, {
+              is_enabled_dashboard: "1",
+              is_active_inserted: "1",
+              is_assigned: "1",
+              is_enabled: "1",
+              is_inserted: "1",
+              is_active: "1",
+            })
+            await activationClient.sadd("connections:main:enabled", connId)
+            console.log(`[v0] [AutoStart] Restored dashboard_enabled=1 for ${connId}`)
+          }
+        } catch (activErr) {
+          console.warn("[v0] [AutoStart] Failed to restore dashboard_enabled:", activErr)
+        }
+
         const connections = await getAllConnections()
         if (!Array.isArray(connections)) {
           console.warn("[v0] [AutoStart] Connections not array, skipping sweep")
