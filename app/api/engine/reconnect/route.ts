@@ -93,6 +93,57 @@ export async function POST(request: Request) {
       })
     }
 
+    // ── 3b. Live-patch VolumeCalculator to fix TDZ crash ─────────────
+    // Route handlers are compiled fresh per-request in Next.js dev mode,
+    // so this code runs from the current disk source (not the stale eval).
+    // Overwriting the prototype method here fixes all existing singleton
+    // instances because they share the same VolumeCalculator class reference.
+    try {
+      const { VolumeCalculator } = await import("@/lib/volume-calculator")
+      const { getAppSettings: _gas, getSettings: _gs } = await import("@/lib/redis-db")
+
+      ;(VolumeCalculator as any).prototype.calculateVolumeForConnection = async function(
+        connectionId: string,
+        symbol: string,
+        currentPrice: number,
+        _options: Record<string, unknown> = {},
+      ) {
+        const settings = (await _gas()) || {}
+        const positionCostPct = parseFloat(
+          String((settings as any).exchangePositionCost ?? (settings as any).positionCost ?? "0.1")
+        )
+        const positionCost = positionCostPct / 100
+        const posAvg = (() => {
+          const r = parseFloat(String((settings as any).positions_average ?? "2"))
+          return Number.isFinite(r) && r > 0 ? r : 2
+        })()
+        const levPct = parseFloat(String((settings as any).leveragePercentage ?? "100"))
+        const useMax =
+          (settings as any).useMaximalLeverage === true ||
+          (settings as any).useMaximalLeverage === "true"
+        const rawLev = useMax ? 125 : Math.round(125 * (levPct / 100))
+        const { accountBalance, maxLeverage } =
+          await VolumeCalculator.resolveBalanceAndLeverage(connectionId, rawLev)
+        const tp = await _gs(`trading_pair:${symbol}`)
+        const exMin = (tp as any)?.min_order_size
+          ? parseFloat((tp as any).min_order_size)
+          : undefined
+        return VolumeCalculator.calculatePositionVolume({
+          positionCost,
+          positionsAverage: posAvg,
+          accountBalance,
+          currentPrice,
+          leverage: maxLeverage,
+          exchangeMinVolume: exMin,
+        })
+      }
+      log.push("VolumeCalculator.calculateVolumeForConnection live-patched (TDZ fix applied)")
+    } catch (patchErr) {
+      log.push(
+        `VolumeCalculator patch failed: ${patchErr instanceof Error ? patchErr.message : String(patchErr)}`
+      )
+    }
+
     // ── 4. Start any missing engines ──────────────────────────────────
     let startedCount = 0
     try {
