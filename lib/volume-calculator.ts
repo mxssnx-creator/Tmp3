@@ -377,20 +377,14 @@ export class VolumeCalculator {
       const useMaxLeverage = settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
       const rawLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
 
-      // ── Fetch account balance FIRST (needed for leverage cap below) ──
-      // Declaration must come before the balance-cap block to avoid the
-      // `let` temporal dead zone (TDZ). Previously `accountBalance` was
-      // declared on line 407 but used on line 391, causing:
-      //   ReferenceError: Cannot access 'accountBalance' before initialization
-      let accountBalance = 10000 // Default fallback
-
-      try {
-        // Try to get cached balance from Redis
-        const cachedBalance = await getSettings(`connection_balance:${connectionId}`)
-        if (cachedBalance?.balance) {
-          accountBalance = parseFloat(String(cachedBalance.balance))
-        } else {
-          // Try to fetch from exchange via connector
+      // Fetch account balance then apply leverage safety cap.
+      // Using an async IIFE + const avoids any TDZ risk from let ordering.
+      const accountBalance = await (async (): Promise<number> => {
+        try {
+          const cachedBalance = await getSettings(`connection_balance:${connectionId}`)
+          if (cachedBalance?.balance) {
+            return parseFloat(String(cachedBalance.balance))
+          }
           const connection = await getConnection(connectionId)
           if (connection?.api_key && connection?.api_secret
             && !connection.api_key.includes("PLACEHOLDER")
@@ -403,30 +397,27 @@ export class VolumeCalculator {
               contractType: connection.contract_type,
               isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
             })
-
             const balanceResult = await connector.getBalance()
             if (balanceResult?.balance) {
-              accountBalance = balanceResult.balance
-              // Cache the balance in Redis
               await setSettings(`connection_balance:${connectionId}`, {
-                balance: accountBalance,
+                balance: balanceResult.balance,
                 updated_at: new Date().toISOString(),
               })
+              return balanceResult.balance
             }
           }
+        } catch (balanceError) {
+          console.warn("[v0] Failed to fetch account balance, using default:", balanceError)
         }
-      } catch (balanceError) {
-        console.warn("[v0] Failed to fetch account balance, using default:", balanceError)
-      }
+        return 10000
+      })()
 
       // ── Balance-based leverage safety cap ───────────────────────────
-      // Cap effective leverage so margin per position stays above the
-      // exchange floor. Thresholds keep margin ≥ ~$0.50/pos:
-      //   ≤$50  → 10x  |  ≤$200 → 20x  |  ≤$500 → 50x  |  >$500 → 125x
-      let balanceCap = 125
-      if (accountBalance <= 50) balanceCap = 10
-      else if (accountBalance <= 200) balanceCap = 20
-      else if (accountBalance <= 500) balanceCap = 50
+      //   ≤$50 → 10x  |  ≤$200 → 20x  |  ≤$500 → 50x  |  >$500 → 125x
+      const balanceCap = accountBalance <= 50 ? 10
+        : accountBalance <= 200 ? 20
+        : accountBalance <= 500 ? 50
+        : 125
       const maxLeverage = Math.min(rawLeverage, balanceCap)
 
       // ── Exchange minimum order size from Redis trading-pair metadata ─
