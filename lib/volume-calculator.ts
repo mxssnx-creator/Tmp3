@@ -1,5 +1,5 @@
 /**
- * Volume Calculator
+ * Volume Calculator (TDZ fix: accountBalance declared before balanceCap block)
  * Calculates position volume based on base volume factor, leverage, and risk management
  * Calculates position volume ONLY at Exchange level when actual orders are executed
  * This calculator is ONLY used by ExchangePositionManager
