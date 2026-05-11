@@ -375,7 +375,23 @@ export class VolumeCalculator {
       // strict `=== true` check is now safe (the old
       // `=== "true"` string compare would always miss).
       const useMaxLeverage = settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
-      const maxLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
+      const rawLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
+
+      // ── Balance-based leverage safety cap ───────────────────────────
+      // High leverage on low-balance accounts produces BingX code 101204
+      // (Insufficient margin) even for small notional positions, because
+      // the exchange enforces a minimum initial-margin ratio per position.
+      // Cap the effective leverage so the margin per position stays above
+      // the exchange's floor. Thresholds chosen to keep margin ≥ ~$0.50/pos:
+      //   ≤ $50  → 10x  (margin ratio 10%; keeps min position affordable)
+      //   ≤ $200 → 20x
+      //   ≤ $500 → 50x
+      //   >$500  → up to 125x (full user setting respected)
+      let balanceCap = 125
+      if (accountBalance <= 50) balanceCap = 10
+      else if (accountBalance <= 200) balanceCap = 20
+      else if (accountBalance <= 500) balanceCap = 50
+      const maxLeverage = Math.min(rawLeverage, balanceCap)
 
       // Get exchange min volume from Redis trading pair data. When the
       // metadata is missing or zero we leave `exchangeMinVolume`

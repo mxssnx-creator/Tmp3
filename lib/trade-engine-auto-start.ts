@@ -60,60 +60,49 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
 }
 
   /**
-   * One-shot startup synchronization (no longer interval-driven).
+   * Persistent self-healing monitor.
    *
-   * Per spec ("Disable intervaled connection reassignments. Do use only
-   * on Startup."): we now run a SINGLE assignment pass on cold start
-   * and do not poll for connection changes thereafter.
+   * Replaces the former one-shot `setTimeout`. Runs an initial sweep
+   * 2 seconds after init (to let migrations settle) then repeats every
+   * 30 seconds. On each tick it:
+   *   1. Checks that the global engine is running.
+   *   2. Re-applies `is_enabled_dashboard="1"` for base connections that
+   *      were accidentally zeroed out (migration race, clear-progressions
+   *      partial run, accidental toggle, etc.).
+   *   3. Calls `coordinator.startMissingEngines()` to restart any enabled
+   *      connection whose engine is not currently running.
    *
-   * After this initial sweep, engines are added or removed only by:
-   *   1. The dashboard toggle (`/api/settings/connections/[id]/toggle-dashboard`)
-   *      which directly calls `coordinator.toggleEngine()`.
-   *   2. Explicit Start/Stop buttons in the global engine controls.
-   *   3. The next cold-start of the serverless function (Vercel) — at
-   *      which point this same one-shot sweep runs again.
-   *
-   * Why an interval was wrong here: in serverless / Vercel the
-   * interval timers don't survive hibernation anyway, AND every wake
-   * was creating unnecessary reassignment churn that the operator
-   * didn't ask for. The cold-start one-shot is the natural fit:
-   * Vercel serverless functions get a fresh init on every cold boot,
-   * so engines self-recover without us polling.
+   * This makes the system self-healing: any accidental disable is
+   * corrected within 30 seconds without a full cold-boot. The interval
+   * does NOT reassign connections the operator deliberately stopped via
+   * the dashboard — `isConnectionMainProcessing()` still gates that.
    */
   function startConnectionMonitoring(): void {
     if (autoStartTimer) {
       return
     }
 
-    // 2-second deferred startup sweep. The deferral lets ensureBaseConnections
-    // finish its bootstrap write (`trade_engine:global.status = "running"`)
-    // before we read the flag, which prevents the very first cold-boot from
-    // bailing out with "Global engine not running".
-    autoStartTimer = setTimeout(async () => {
+    const BASE_CONNECTION_IDS = ["bybit-x03", "bingx-x01"]
+
+    async function runHealingSweep(isStartup: boolean): Promise<void> {
       try {
         await initRedis()
         const monClient = getRedisClient()
         const monGlobalState = await monClient.hgetall("trade_engine:global")
         if (monGlobalState?.status !== "running") {
-          console.log(
-            "[v0] [AutoStart] One-shot sweep skipped: global engine not running. " +
-            "Engines will be started by explicit user toggle.",
-          )
+          if (isStartup) {
+            console.log(
+              "[v0] [AutoStart] Startup sweep skipped: global engine not running. " +
+              "Engines will be started by explicit user toggle.",
+            )
+          }
           return
         }
 
-        // ── Idempotent activation fix ───────────────────────────────────
-        // Migrations 015–017 unconditionally reset is_enabled_dashboard to "0"
-        // on every boot. A concurrent double-load of the Redis snapshot can
-        // overwrite migration 021's restoration write (which sets it back to
-        // "1"). We re-apply the write here — after the 2-second deferral that
-        // lets all concurrent snapshot loads settle — so the engine sweep
-        // always has the correct flag value regardless of load timing.
-        //
-        // No API-key guard here: the predefined base connections are always
-        // enabled at the connection level. Whether they actually trade is
-        // gated by hasConnectionCredentials() later in the coordinator sweep.
-        const BASE_CONNECTION_IDS = ["bybit-x03", "bingx-x01"]
+        // ── Idempotent base-connection activation ───────────────────
+        // Migrations 015–017 unconditionally reset is_enabled_dashboard to
+        // "0" on every boot. Re-apply the correct value before the engine
+        // sweep so the coordinator always sees the right flag.
         try {
           const activationClient = getRedisClient()
           for (const connId of BASE_CONNECTION_IDS) {
@@ -129,7 +118,7 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
               is_active: "1",
             })
             await activationClient.sadd("connections:main:enabled", connId)
-            console.log(`[v0] [AutoStart] Restored dashboard_enabled=1 for ${connId}`)
+            console.log(`[v0] [AutoStart] Self-heal: restored dashboard_enabled=1 for ${connId}`)
           }
         } catch (activErr) {
           console.warn("[v0] [AutoStart] Failed to restore dashboard_enabled:", activErr)
@@ -150,53 +139,64 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
           return hasAnyCredentials || isPredefined || isTestnet
         })
 
-        // Settings load is best-effort; engines that need it consult Redis
-        // on each tick anyway, so a stale snapshot here is harmless.
+        // Settings load is best-effort; engines consult Redis on each tick.
         try { await loadSettingsAsync() } catch { /* non-critical */ }
 
         try {
           const coordinator = getGlobalTradeEngineCoordinator()
           const startedCount = await coordinator.startMissingEngines(connectionsThatShouldBeRunning)
-          console.log(
-            `[v0] [AutoStart] One-shot sweep complete: ${startedCount} engines started ` +
-            `(${connectionsThatShouldBeRunning.length} connections eligible)`,
-          )
+          if (startedCount > 0 || isStartup) {
+            console.log(
+              `[v0] [AutoStart] Healing sweep: ${startedCount} engines started ` +
+              `(${connectionsThatShouldBeRunning.length} connections eligible)`,
+            )
+          }
         } catch (startError) {
           console.warn("[v0] [AutoStart] Failed to start missing engines:", startError)
         }
       } catch (error) {
         if (error instanceof Error && error.message.includes("Redis credentials")) {
-          console.warn("[v0] [AutoStart] Redis not configured - skipping startup sweep")
+          console.warn("[v0] [AutoStart] Redis not configured - skipping healing sweep")
         } else {
           console.warn(
-            "[v0] [AutoStart] Error during startup sweep:",
+            "[v0] [AutoStart] Error during healing sweep:",
             error instanceof Error ? error.message : String(error),
           )
         }
-      } finally {
-        // Drop the handle so a subsequent restart of monitoring (e.g.
-        // operator-triggered) is allowed to re-arm. The one-shot has
-        // fulfilled its purpose by now.
-        autoStartTimer = null
       }
+    }
+
+    // 2-second deferred initial sweep lets ensureBaseConnections finish
+    // its bootstrap write before we read the flag.
+    const startupDelay = setTimeout(async () => {
+      await runHealingSweep(true)
+
+      // After startup sweep, arm the persistent interval.
+      const intervalHandle = setInterval(async () => {
+        await runHealingSweep(false)
+      }, 30_000) // 30 seconds
+
+      intervalHandle.unref?.()
+      // Overwrite the module-level timer ref with the interval handle so
+      // stopConnectionMonitoring() correctly cancels it.
+      autoStartTimer = intervalHandle
     }, 2000)
 
-    autoStartTimer.unref?.()
+    startupDelay.unref?.()
+    // Point the module-level ref at the startup delay initially.
+    autoStartTimer = startupDelay
   }
 
 /**
- * Cancel the pending one-shot startup sweep.
+ * Cancel the self-healing monitor.
  *
- * After the sweep fires (~2s after init) the timer self-clears and
- * this becomes a no-op. Useful only when the engine is being shut
- * down before the sweep had a chance to run.
+ * Clears both the startup delay (if still pending) and the repeating
+ * interval (if already armed). Safe to call multiple times.
  */
 export function stopConnectionMonitoring(): void {
   if (autoStartTimer) {
-    // setTimeout handle works with both clearTimeout and clearInterval
-    // in Node, but use clearTimeout for clarity now that this is a
-    // one-shot (was setInterval pre-2026-05-03).
-    clearTimeout(autoStartTimer)
+    clearTimeout(autoStartTimer)   // works for both setTimeout and setInterval
+    clearInterval(autoStartTimer)
     autoStartTimer = null
   }
 }

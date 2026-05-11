@@ -500,9 +500,11 @@ async function accumulateIntoLivePosition(
       )
       await savePosition(existing)
       await incrementMetric(connectionId, "live_orders_failed_count")
-      // Same cooldown trigger as the primary entry-order path —
-      // accumulation orders also count toward the margin-error gate.
-      if (isNonRecoverableExchangeError(orderResult)) {
+      // Distinguish circuit-breaker (109400) from genuine margin failures.
+      // Circuit-breaker gates the symbol only; margin errors gate the connection.
+      if (isCircuitBreakerError(orderResult)) {
+        recordCircuitBreaker(symbol)
+      } else if (isNonRecoverableExchangeError(orderResult)) {
         recordMarginError(connectionId)
       }
       await logProgressionEvent(
@@ -765,28 +767,91 @@ async function retry<T>(
 // on the next cycle re-attempts the order, generating a continuous
 // stream of failed exchange API calls (~20/sec at observed cadence).
 //
-// We track the last margin-error timestamp PER CONNECTION in this
-// module-level Map and short-circuit `executeLivePosition` for
-// `MARGIN_ERROR_COOLDOWN_MS` after a hit. The skipped attempt is logged
-// once per cycle and recorded as a `warning` progression event so the
-// operator sees it in the dashboard.
+// Exponential backoff: each consecutive failure doubles the cooldown
+// (60s → 120s → 240s → 300s cap). This prevents the re-arm loop where
+// a 60s cooldown expires, the next attempt fails again (same root cause),
+// and immediately re-arms for another 60s — making recovery appear stuck.
+// After the operator tops up, the next successful order resets the counter.
 //
-// 60 s is the sweet spot: long enough to stop the API flood, short
-// enough that the system resumes promptly after a top-up. Operators
-// typically deposit and refresh within that window.
-const MARGIN_ERROR_COOLDOWN_MS = 60_000
-const marginErrorCooldownByConnection: Map<string, number> = new Map()
+// A `clearMarginCooldown(connectionId)` export allows the /api/engine/reconnect
+// endpoint to forcibly release a stuck cooldown.
+//
+// NOTE: Exchange circuit-breaker errors (BingX code 109400 — "API orders
+// temporarily disabled due to market volatility") are NOT margin errors.
+// They have their own per-symbol gate (`circuitBreakerBySymbol`) with a
+// 5-minute TTL and do NOT increment the margin failure counter.
+const MARGIN_COOLDOWN_STEPS_MS = [60_000, 120_000, 240_000, 300_000]
+const MARGIN_COOLDOWN_MAX_MS = 300_000
+
+interface MarginCooldownEntry {
+  lastErrorAt: number
+  consecutiveFailures: number
+}
+const marginErrorCooldownByConnection: Map<string, MarginCooldownEntry> = new Map()
 
 function isMarginCooldownActive(connectionId: string): boolean {
-  const ts = marginErrorCooldownByConnection.get(connectionId)
-  if (!ts) return false
-  if (Date.now() - ts < MARGIN_ERROR_COOLDOWN_MS) return true
+  const entry = marginErrorCooldownByConnection.get(connectionId)
+  if (!entry) return false
+  const stepIdx = Math.min(entry.consecutiveFailures - 1, MARGIN_COOLDOWN_STEPS_MS.length - 1)
+  const cooldownMs = MARGIN_COOLDOWN_STEPS_MS[stepIdx] ?? MARGIN_COOLDOWN_MAX_MS
+  if (Date.now() - entry.lastErrorAt < cooldownMs) return true
+  // Cooldown expired — clear so the next attempt runs fresh.
   marginErrorCooldownByConnection.delete(connectionId)
   return false
 }
 
 function recordMarginError(connectionId: string): void {
-  marginErrorCooldownByConnection.set(connectionId, Date.now())
+  const existing = marginErrorCooldownByConnection.get(connectionId)
+  marginErrorCooldownByConnection.set(connectionId, {
+    lastErrorAt: Date.now(),
+    consecutiveFailures: (existing?.consecutiveFailures ?? 0) + 1,
+  })
+}
+
+/** Exported so the /api/engine/reconnect endpoint can forcibly clear a stuck cooldown. */
+export function clearMarginCooldown(connectionId: string): void {
+  marginErrorCooldownByConnection.delete(connectionId)
+  console.log(`${LOG_PREFIX} Margin cooldown cleared for ${connectionId}`)
+}
+
+// ── Per-symbol exchange circuit-breaker gate ──────────────────────────
+// BingX code 109400 means the exchange has TEMPORARILY disabled API
+// trading for that symbol due to extreme volatility. This is NOT a
+// margin/balance issue — the account is fine, the exchange re-enables
+// trading automatically (typically within 1–5 minutes). We skip the
+// symbol for 5 minutes then resume WITHOUT touching the margin counter,
+// preventing one volatile symbol from blocking all orders on the connection.
+const CIRCUIT_BREAKER_COOLDOWN_MS = 5 * 60_000 // 5 minutes
+const circuitBreakerBySymbol: Map<string, number> = new Map()
+
+function isCircuitBreakerActive(symbol: string): boolean {
+  const ts = circuitBreakerBySymbol.get(symbol)
+  if (!ts) return false
+  if (Date.now() - ts < CIRCUIT_BREAKER_COOLDOWN_MS) return true
+  circuitBreakerBySymbol.delete(symbol)
+  return false
+}
+
+function recordCircuitBreaker(symbol: string): void {
+  circuitBreakerBySymbol.set(symbol, Date.now())
+}
+
+function isCircuitBreakerError(payload: unknown): boolean {
+  if (!payload) return false
+  let text = ""
+  if (typeof payload === "string") text = payload
+  else if (payload instanceof Error) text = payload.message
+  else if (typeof payload === "object") {
+    const obj = payload as Record<string, unknown>
+    text = String(obj.error ?? obj.message ?? "")
+  } else {
+    text = String(payload)
+  }
+  return (
+    /\bcode\s*=?\s*109400\b/.test(text) ||
+    /api orders? (?:are )?temporarily disabled/i.test(text) ||
+    /large market fluctuations/i.test(text)
+  )
 }
 
 /**
@@ -1156,19 +1221,63 @@ export async function executeLivePosition(
   await initRedis()
   const client = getRedisClient()
 
+  // ── Exchange circuit-breaker gate (per-symbol) ───────────────────────
+  // BingX code 109400 — "API orders temporarily disabled due to market
+  // volatility" — affects a specific symbol for ~1-5 minutes. Skip it
+  // silently rather than counting it as a margin/balance failure.
+  if (isCircuitBreakerActive(realPosition.symbol)) {
+    const cbSkipped: LivePosition = {
+      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      connectionId,
+      symbol: realPosition.symbol,
+      direction: realPosition.direction,
+      realPositionId: realPosition.id,
+      quantity: realPosition.quantity,
+      executedQuantity: 0,
+      remainingQuantity: realPosition.quantity,
+      entryPrice: realPosition.entryPrice,
+      averageExecutionPrice: 0,
+      volumeUsd: 0,
+      leverage: realPosition.leverage,
+      marginType: "cross",
+      stopLoss: realPosition.stopLoss,
+      takeProfit: realPosition.takeProfit,
+      assignedStopLoss: realPosition.stopLoss,
+      assignedTakeProfit: realPosition.takeProfit,
+      status: "rejected",
+      statusReason: `Skipped — exchange circuit breaker active for ${realPosition.symbol} (market volatility, resumes in <5min)`,
+      fills: [],
+      progression: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      setKey: realPosition.setKey,
+      parentSetKey: realPosition.parentSetKey,
+      setVariant: realPosition.setVariant,
+      axisWindows: realPosition.axisWindows,
+      accumulatedSetKeys: realPosition.setKey ? [realPosition.setKey] : [],
+    }
+    pushStep(cbSkipped, "preflight", false, cbSkipped.statusReason)
+    logProgressionEvent(connectionId, "live_trading", "warning", cbSkipped.statusReason!, {
+      symbol: realPosition.symbol,
+      direction: realPosition.direction,
+    }).catch(() => {})
+    return cbSkipped
+  }
+
   // ── Non-recoverable-error cooldown gate ──
   //
-  // If we hit `code=101204` (Insufficient margin) within the last
-  // MARGIN_ERROR_COOLDOWN_MS, skip this attempt entirely and return a
-  // synthetic "rejected" LivePosition. This prevents every Set evaluation
-  // in a no-balance state from spamming the BingX API with hopeless
-  // orders that just slow the event loop.
+  // If we hit `code=101204` (Insufficient margin) within the exponential
+  // backoff window (60s → 120s → 240s → 300s), skip this attempt and return
+  // a synthetic "rejected" LivePosition. Prevents API flood on no-balance.
   //
-  // Rationale: the operator must top up — there is no engine-side fix.
   // The skip is silent at console level after the first occurrence so
-  // logs stay readable; the progression event still records it once per
-  // skipped attempt for dashboard visibility.
+  // logs stay readable; the progression event still records it for the
+  // dashboard. Operator tops up → next successful order resets counter.
   if (isMarginCooldownActive(connectionId)) {
+    const entry = marginErrorCooldownByConnection.get(connectionId)
+    const failures = entry?.consecutiveFailures ?? 1
+    const stepIdx = Math.min(failures - 1, MARGIN_COOLDOWN_STEPS_MS.length - 1)
+    const cooldownSec = Math.round((MARGIN_COOLDOWN_STEPS_MS[stepIdx] ?? MARGIN_COOLDOWN_MAX_MS) / 1000)
     const skipped: LivePosition = {
       id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
       connectionId,
@@ -1191,7 +1300,7 @@ export async function executeLivePosition(
       assignedTakeProfit: realPosition.takeProfit,
       status: "rejected",
       statusReason:
-        "Skipped — connection in margin-error cooldown (top up exchange balance to resume live trading)",
+        `Skipped — margin-error cooldown active (attempt ${failures}, cooldown=${cooldownSec}s). Top up exchange balance to resume.`,
       fills: [],
       progression: [],
       createdAt: Date.now(),
@@ -1207,6 +1316,8 @@ export async function executeLivePosition(
     logProgressionEvent(connectionId, "live_trading", "warning", skipped.statusReason!, {
       symbol: realPosition.symbol,
       direction: realPosition.direction,
+      consecutiveFailures: failures,
+      cooldownSec,
     }).catch(() => {})
     return skipped
   }
@@ -1597,7 +1708,7 @@ export async function executeLivePosition(
     // that don't care about the options object simply ignore the 6th arg.
     // BingX's one-way-mode accounts auto-retry without positionSide if the
     // exchange rejects it (code 80014), so this is safe for both modes.
-    const orderResult: any = await retry(
+    let orderResult: any = await retry(
       () => exchangeConnector.placeOrder(
         realPosition.symbol,
         exchangeSide,
@@ -1612,20 +1723,82 @@ export async function executeLivePosition(
       "placeOrder"
     )
 
+    // ── Leverage auto-reduce on 101204 (Insufficient margin) ─────────
+    // When the exchange rejects with "Insufficient margin" the account
+    // likely does not have enough funds at the current leverage. Halve
+    // the leverage and retry ONCE — this is often enough to get the
+    // minimum margin requirement below the available balance.
+    if (!orderResult?.success && isNonRecoverableExchangeError(orderResult)) {
+      const reducedLev = Math.max(1, Math.floor(livePosition.leverage / 2))
+      if (reducedLev < livePosition.leverage) {
+        console.warn(
+          `${LOG_PREFIX} 101204 on ${realPosition.symbol} — retrying with halved leverage ` +
+          `${livePosition.leverage}x → ${reducedLev}x`,
+        )
+        try {
+          if (typeof exchangeConnector.setLeverage === "function") {
+            await exchangeConnector.setLeverage(realPosition.symbol, reducedLev)
+          }
+        } catch { /* non-critical; the order might still succeed */ }
+
+        const retryResult: any = await retry(
+          () => exchangeConnector.placeOrder(
+            realPosition.symbol,
+            exchangeSide,
+            computedVolume,
+            undefined,
+            "market",
+            { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+          ),
+          (r: any) => !!r?.success && !!(r.orderId || r.id),
+          "placeOrder-reducedLev",
+          1 // single retry attempt — we already tried 3× above
+        )
+
+        if (retryResult?.success && (retryResult.orderId || retryResult.id)) {
+          // Succeeded with reduced leverage — update livePosition and continue.
+          livePosition.leverage = reducedLev
+          orderResult = retryResult
+          console.log(
+            `${LOG_PREFIX} Entry succeeded after leverage reduction to ${reducedLev}x for ${realPosition.symbol}`,
+          )
+        } else {
+          // Still failing — record margin error and give up.
+          recordMarginError(connectionId)
+          orderResult = retryResult ?? orderResult
+        }
+      } else {
+        // Leverage already at 1x — cannot reduce further.
+        recordMarginError(connectionId)
+      }
+    }
+
+    // ── Exchange circuit-breaker (109400) detection ───────────────────
+    // Code 109400 = exchange temporarily halted API trading for this
+    // symbol due to volatility. This is NOT a margin issue — record a
+    // per-symbol circuit-breaker and let the connection continue placing
+    // orders on other symbols without triggering the margin cooldown.
+    if (!orderResult?.success && isCircuitBreakerError(orderResult)) {
+      recordCircuitBreaker(realPosition.symbol)
+      livePosition.status = "error"
+      livePosition.statusReason = `Exchange circuit breaker active for ${realPosition.symbol} — retrying in <5min`
+      pushStep(livePosition, "place_order", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_failed_count")
+      await logProgressionEvent(connectionId, "live_trading", "warning", livePosition.statusReason, {
+        symbol: realPosition.symbol,
+        error: orderResult?.error,
+      })
+      await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+      return livePosition
+    }
+
     if (!orderResult?.success || !(orderResult.orderId || orderResult.id)) {
       livePosition.status = "error"
       livePosition.statusReason = `Entry order failed: ${orderResult?.error || "unknown"}`
       pushStep(livePosition, "place_order", false, livePosition.statusReason)
       await savePosition(livePosition)
       await incrementMetric(connectionId, "live_orders_failed_count")
-
-      // Arm the per-connection cooldown when the failure was a
-      // non-recoverable margin/balance error. This stops the engine
-      // from re-attempting on every subsequent cycle and lets the
-      // operator top up without the API getting hammered.
-      if (isNonRecoverableExchangeError(orderResult)) {
-        recordMarginError(connectionId)
-      }
 
       // Per-connection progression log (for the UI Progression panel).
       await logProgressionEvent(connectionId, "live_trading", "error", `Entry order failed for ${realPosition.symbol}`, {
@@ -1664,6 +1837,9 @@ export async function executeLivePosition(
     livePosition.status = "placed"
     pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
     await incrementMetric(connectionId, "live_orders_placed_count")
+    // Successful placement — reset the margin error consecutive-failure counter
+    // so the backoff resets to the shortest cooldown on the next failure.
+    marginErrorCooldownByConnection.delete(connectionId)
     // Lock was already acquired ATOMICALLY at the top of this function via
     // `tryAcquireLock` (see the dedup-gate block). The legacy
     // `await acquireLock(...)` here was redundant — it just re-stamped a
@@ -2054,7 +2230,7 @@ export async function closeLivePosition(
     const wasAlreadyClosed = await client.get(movedMarker).catch(() => null)
     await savePosition(position)
 
-    // ── 5. Release dedup lock + counters + audit log ───────────────���──
+    // ── 5. Release dedup lock + counters + audit log ──────────────�����──
     await releaseLock(connectionId, position.symbol, position.direction)
     if (!wasAlreadyClosed) {
       await incrementMetric(connectionId, "live_positions_closed_count")
