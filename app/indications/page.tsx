@@ -198,7 +198,7 @@ export default function IndicationsPage() {
 
   if (isLoading) {
     return (
-     <div className="flex items-center justify-center min-h-screen">
+     <div className="flex flex-1 items-center justify-center">
          <div className="text-center">
            <div className="animate-spin rounded-full h-8 w-8 border border-slate-400 border-t-cyan-600 mx-auto mb-4"></div>
            <p className="text-muted-foreground">Loading indications...</p>

@@ -447,7 +447,7 @@ export function ActiveConnectionCard({
             data.realtime?.strategiesTotal ??
             data.totalStrategyCount ??
             0,
-          positions:        data.realtime?.positionsOpen     || data.positionsCount        || 0,
+          positions:        data.openPositions?.live?.open  || data.realtime?.positionsOpen || data.positionsCount || 0,
         })
 
         // Also populate prehistoric stats from the same response
@@ -505,7 +505,7 @@ export function ActiveConnectionCard({
           liveOrdersAccumulated: data?.liveExecution?.ordersAccumulated || 0,
           livePositionsCreated:  data?.liveExecution?.positionsCreated || 0,
           livePositionsClosed:   data?.liveExecution?.positionsClosed  || 0,
-          livePositionsOpen:     data?.liveExecution?.positionsOpen    || 0,
+          livePositionsOpen:     data?.openPositions?.live?.open || data?.liveExecution?.positionsOpen || 0,
           liveWins:              data?.liveExecution?.wins             || 0,
           // USDT figures shown on the card represent the **used balance
           // (margin)** committed to live exchange positions, NOT the

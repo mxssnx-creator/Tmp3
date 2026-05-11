@@ -7,8 +7,8 @@ export const metadata = {
 
 export default function TestPage() {
   return (
-    <div className='min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900'>
-      <div className='container mx-auto py-6'>
+    <div className='flex flex-col flex-1 overflow-auto'>
+      <div className='p-6'>
         <div className='mb-6'>
           <h1 className='text-3xl font-bold'>Autotest & Debug Dashboard</h1>
           <p className='text-muted-foreground mt-2'>

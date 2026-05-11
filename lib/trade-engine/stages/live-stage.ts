@@ -801,30 +801,51 @@ async function pollOrderFill(
 ): Promise<{ filled: boolean; filledQty: number; filledPrice: number; status: string }> {
   const deadline = Date.now() + timeoutMs
   let lastStatus = "pending"
+  let pollCount = 0
   while (Date.now() < deadline) {
     try {
+      pollCount++
       const order = await connector.getOrder(symbol, orderId)
+      console.log(`[v0] [pollOrderFill] poll #${pollCount}: ${JSON.stringify(order)}`)
+      
       if (order) {
-        lastStatus = order.status
-        if (order.status === "filled") {
+        lastStatus = order.status || order.orderStatus || "unknown"
+        
+        // Check for filled status (case-insensitive, handle various format: "filled", "FILLED", "Filled")
+        const statusLower = String(lastStatus).toLowerCase().trim()
+        const isFilled = statusLower === "filled" || statusLower === "filled" || order.status === "FILLED"
+        
+        // Check for executed quantity/amount
+        const filledQty = order.filledQty || order.executedQty || order.cumQty || 0
+        const filledPrice = order.filledPrice || order.avgPrice || 0
+        
+        console.log(`[v0] [pollOrderFill] status=${statusLower}, filledQty=${filledQty}, filledPrice=${filledPrice}, isFilled=${isFilled}`)
+        
+        if (isFilled && filledQty > 0) {
+          console.log(`[v0] [pollOrderFill] ✓ Order filled: ${orderId}`)
           return {
             filled: true,
-            filledQty: order.filledQty || 0,
-            filledPrice: order.filledPrice || 0,
+            filledQty: filledQty,
+            filledPrice: filledPrice || 0,
             status: "filled",
           }
         }
-        if (order.status === "cancelled") {
+        if (statusLower === "cancelled" || statusLower === "canceled") {
+          console.log(`[v0] [pollOrderFill] ✗ Order cancelled: ${orderId}`)
           return { filled: false, filledQty: 0, filledPrice: 0, status: "cancelled" }
         }
+      } else {
+        console.log(`[v0] [pollOrderFill] poll #${pollCount}: no order data returned`)
       }
     } catch (err) {
-      console.warn(`${LOG_PREFIX} poll error:`, err)
+      console.warn(`${LOG_PREFIX} poll error:`, err instanceof Error ? err.message : String(err))
     }
     await new Promise(r => setTimeout(r, intervalMs))
   }
+  console.log(`[v0] [pollOrderFill] Timeout after ${pollCount} polls, lastStatus=${lastStatus}`)
   return { filled: false, filledQty: 0, filledPrice: 0, status: lastStatus }
 }
+
 
 /**
  * Cancel an SL/TP order on the exchange. Tolerates "order not found" and
@@ -2428,7 +2449,7 @@ export async function reconcileLivePositions(
           }
           pos.updatedAt = Date.now()
 
-          // ── SL/TP self-healing ──────────────────────────────────────
+          // ── SL/TP self-healing ───────���──────────────────────────────
           // Every reconcile cycle (driven by the cron) we verify the
           // protection orders match the desired levels derived from the
           // position's current stopLoss / takeProfit percentages and

@@ -237,8 +237,8 @@ export default function AlertsPage() {
 
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-background to-muted/20">
-        <div className="container mx-auto p-6">
+      <div className="flex flex-col flex-1 overflow-auto">
+        <div className="p-6">
           <div className="text-center py-12">
             <div className="text-muted-foreground">Loading alerts...</div>
           </div>
@@ -248,8 +248,8 @@ export default function AlertsPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-background to-muted/20">
-      <div className="container mx-auto p-6 space-y-6">
+    <div className="flex flex-col flex-1 overflow-auto">
+      <div className="p-6 space-y-6">
         {!hasRealConnections && (
           <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4">
             <div className="flex items-center gap-2">
