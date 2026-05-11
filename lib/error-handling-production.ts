@@ -129,7 +129,9 @@ export class ProductionErrorHandler {
       process.exit(exitCode)
     }, 10000)
 
-    shutdownTimeout.unref() // Don't block process exit
+    // Do NOT call shutdownTimeout.unref() — we need the event loop to stay
+    // alive long enough for emergencyCloseAllPositions() to complete. The 10s
+    // hard-kill above is our backstop.
 
     // Attempt graceful cleanup — close all open live positions on the exchange
     // before the process dies. This is the last-resort safety net to prevent

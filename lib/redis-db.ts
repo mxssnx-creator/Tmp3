@@ -2287,10 +2287,24 @@ export async function getEnabledConnections(): Promise<any[]> {
 
 export async function getAssignedAndEnabledConnections(): Promise<any[]> {
   const allConnections = await getAllConnections()
-  return allConnections.filter(conn => 
-    (isEnabledFlag(conn.is_active_inserted) || isEnabledFlag(conn.is_assigned)) &&
-    (isEnabledFlag(conn.is_enabled) || isEnabledFlag(conn.enabled))
-  )
+  return allConnections.filter(conn => {
+    // A connection is eligible for the engine when it is both:
+    // 1. Assigned/inserted into the active panel  
+    // 2. Enabled — either the base is_enabled flag OR the dashboard toggle
+    //    (is_enabled_dashboard). The dashboard toggle is what migration 021
+    //    and the quickstart route write, so checking it here means the engine
+    //    starts as soon as the user enables a connection via the UI or runs
+    //    quickstart — no extra Redis flag writes needed.
+    const isAssigned =
+      isEnabledFlag(conn.is_active_inserted) ||
+      isEnabledFlag(conn.is_assigned) ||
+      isEnabledFlag(conn.is_dashboard_inserted)
+    const isEnabled =
+      isEnabledFlag(conn.is_enabled) ||
+      isEnabledFlag(conn.enabled) ||
+      isEnabledFlag(conn.is_enabled_dashboard)
+    return isAssigned && isEnabled
+  })
 }
 
 export async function getConnectionsByExchange(exchange: string): Promise<any[]> {
