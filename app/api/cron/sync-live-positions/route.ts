@@ -80,13 +80,21 @@ export async function GET() {
         settings?.live_trade === "true" ||
         settings?.live_trade === "1" ||
         (conn as any).live_trade === true ||
-        // Quickstart sets is_live_trade on the connection object, not in
-        // connection:settings — check both locations so the cron fires.
+        // Quickstart sets is_live_trade on the connection object directly.
         (conn as any).is_live_trade === "1" ||
         (conn as any).is_live_trade === true ||
         settings?.is_live_trade === "1"
 
-      if (!isLiveTrade) {
+      // Even when isLiveTrade is false, reconcile any connection that has
+      // open positions tracked in Redis. This catches positions left over
+      // from a previous quickstart run whose snapshot was restored but
+      // the is_live_trade flag was not — the orders are still open on the
+      // exchange and must be closed.
+      const hasOpenPositions = !isLiveTrade
+        ? (await client.llen(`live:positions:${connId}`).catch(() => 0)) > 0
+        : false
+
+      if (!isLiveTrade && !hasOpenPositions) {
         summary.connectionsSkipped++
         continue
       }

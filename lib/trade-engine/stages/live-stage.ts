@@ -1471,7 +1471,7 @@ export async function executeLivePosition(
     pushStep(livePosition, "price_fetch", true, `price=${currentPrice}`)
 
     // ── Step 3: Volume calculation ─────────────────────────────────────────
-    // POLICY: minimum volume is ALWAYS enforced — we never reject a live
+    // POLICY: minimum volume is ALWAYS enforced �� we never reject a live
     // order for "qty too small". If the calculator returns null or a
     // non-positive quantity (e.g. balance fetch failed, NaN math) we
     // synthesize a fallback at the universal $5-notional floor and
@@ -2054,7 +2054,7 @@ export async function closeLivePosition(
     const wasAlreadyClosed = await client.get(movedMarker).catch(() => null)
     await savePosition(position)
 
-    // ── 5. Release dedup lock + counters + audit log ───────────────��──
+    // ── 5. Release dedup lock + counters + audit log ───────────────���──
     await releaseLock(connectionId, position.symbol, position.direction)
     if (!wasAlreadyClosed) {
       await incrementMetric(connectionId, "live_positions_closed_count")
@@ -2381,6 +2381,72 @@ async function checkAndForceCloseOnSltpCross(
  * Reconciliation reuses the existing `closeLivePosition` and
  * `executeLivePosition` paths — no new exchange-call surface.
  */
+
+/**
+ * Orphan-close all open positions for a connection that have exceeded the
+ * max hold time, writing `orphan_no_connector` or `orphan_exchange_error`
+ * as the close reason. Called when the exchange connector is unavailable or
+ * `getPositions()` throws, so positions are never left open in Redis
+ * indefinitely even when the exchange cannot be reached.
+ *
+ * @param connectionId  Redis connection ID
+ * @param connector     Exchange connector (null when unavailable)
+ * @param summary       Mutable reconcile summary to increment counters
+ */
+async function orphanCloseExpiredPositions(
+  connectionId: string,
+  connector: any,
+  summary: { reconciled: number; closed: number; errors: number; updated: number },
+): Promise<void> {
+  const MAX_HOLD_TIME_MS = Number(process.env.MAX_POSITION_HOLD_MS ?? 4 * 60 * 60 * 1000)
+  if (MAX_HOLD_TIME_MS <= 0) return
+
+  try {
+    const allOpen = await getLivePositions(connectionId)
+    const expired = allOpen.filter((p) => {
+      if (p.status !== "open" && p.status !== "filled" && p.status !== "partially_filled") return false
+      if ((p.executedQuantity ?? 0) <= 0) return false
+      const openedAt = p.createdAt || p.updatedAt || 0
+      return openedAt > 0 && Date.now() - openedAt > MAX_HOLD_TIME_MS
+    })
+
+    for (const pos of expired) {
+      summary.reconciled++
+      const heldMin = Math.round((Date.now() - (pos.createdAt || pos.updatedAt || 0)) / 60000)
+      const exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || pos.entryPrice
+      const reason = connector ? "orphan_exchange_error" : "orphan_no_connector"
+
+      console.warn(
+        `${LOG_PREFIX} [orphan-close] ${pos.symbol} held ${heldMin}min, connector=${connector ? "error" : "missing"} — marking closed`,
+      )
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "warning",
+        `Orphan-close ${pos.symbol} (held ${heldMin}min, ${reason})`,
+        { positionId: pos.id, heldMin, exitPrice, reason },
+      )
+
+      // Best-effort cancel protection orders first (connector may be partially working)
+      if (connector) {
+        const cancels: Promise<any>[] = []
+        if (pos.stopLossOrderId) cancels.push(cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss").catch(() => {}))
+        if (pos.takeProfitOrderId) cancels.push(cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit").catch(() => {}))
+        if (cancels.length) await Promise.all(cancels).catch(() => {})
+      }
+
+      await closeLivePosition(connectionId, pos.id, exitPrice, connector, reason).catch((err) => {
+        console.warn(`${LOG_PREFIX} [orphan-close] closeLivePosition failed for ${pos.id}:`, err instanceof Error ? err.message : String(err))
+        summary.errors++
+      })
+      summary.closed++
+    }
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} [orphan-close] sweep error:`, err instanceof Error ? err.message : String(err))
+    summary.errors++
+  }
+}
+
 export async function reconcileLivePositions(
   connectionId: string,
   exchangeConnector: any,
@@ -2396,6 +2462,12 @@ export async function reconcileLivePositions(
   const summary = { reconciled: 0, updated: 0, closed: 0, errors: 0 }
 
   if (!exchangeConnector || typeof exchangeConnector.getPositions !== "function") {
+    // No connector — we cannot reach the exchange to confirm position state.
+    // Run the orphan-close sweep so positions that have been sitting open
+    // past the max hold time are at least marked closed in Redis. The
+    // close reason "orphan_no_connector" distinguishes them from normal
+    // closes in the audit trail.
+    await orphanCloseExpiredPositions(connectionId, null, summary)
     return summary
   }
 
@@ -2415,6 +2487,9 @@ export async function reconcileLivePositions(
       exchangePositions = (await exchangeConnector.getPositions().catch(() => [])) || []
     } catch (err) {
       console.warn(`${LOG_PREFIX} reconcile getPositions failed:`, err instanceof Error ? err.message : String(err))
+      // Exchange unreachable — still run the orphan-close sweep so positions
+      // that exceeded max hold time are not stranded open in Redis indefinitely.
+      await orphanCloseExpiredPositions(connectionId, exchangeConnector, summary)
       return summary
     }
 
