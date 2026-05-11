@@ -35,7 +35,11 @@ export class InlineLocalRedis {
   constructor() {
     // Use global storage for persistence across hot reloads
     if (!globalForRedis.__redis_data) {
-      // Initialize with defaults
+      // Initialize with defaults. Do NOT fire loadFromDisk() here — initRedis()
+      // awaits it explicitly after construction when wasEmpty=true. Firing a
+      // background load here races with initRedis() and overwrites migration
+      // writes (ensureBaseConnections / migration 021) because the unawaited
+      // Promise settles AFTER migrations have already set is_enabled_dashboard=1.
       globalForRedis.__redis_data = {
         strings: new Map(),
         hashes: new Map(),
@@ -49,11 +53,6 @@ export class InlineLocalRedis {
           operationsPerSecond: 0,
         },
       }
-      
-      // Try to load from disk snapshot if available
-      this.loadFromDisk().catch(() => {
-        // Ignore load errors - start with empty database
-      });
     }
     
     // Ensure ttl map exists for older data structures
@@ -1064,18 +1063,16 @@ export async function initRedis(): Promise<void> {
   if (isConnected) return
 
   if (!redisInstance) {
-    // Track whether the global data store was freshly created (empty) so
-    // we know whether to load from disk. If globalForRedis.__redis_data
-    // already exists, the in-memory store is populated from a previous
-    // module evaluation (hot-reload) — reloading the snapshot at this point
-    // would OVERWRITE any migration writes that already ran in this process.
+    // Capture emptiness BEFORE construction. The constructor now only
+    // initialises the in-memory Maps without loading from disk, so after
+    // `new InlineLocalRedis()` the data structure exists but is empty.
+    // wasEmpty=true  → first boot, load the snapshot now (awaited, ordered before migrations)
+    // wasEmpty=false → hot-reload; data is already in globalForRedis.__redis_data
+    //                  from the previous module instance — do NOT reload the
+    //                  snapshot or it overwrites post-migration state.
     const wasEmpty = !globalForRedis.__redis_data
     redisInstance = new InlineLocalRedis()
     if (wasEmpty) {
-      // Restore from disk snapshot before any caller reads keys. Only do
-      // this when the store was genuinely empty; subsequent module reloads
-      // must not re-apply the snapshot (it contains pre-migration state and
-      // would clobber is_enabled_dashboard writes from migration 021+).
       await redisInstance.loadFromDisk().catch(() => { /* fresh start ok */ })
     }
   }

@@ -15,7 +15,17 @@ export async function GET() {
     await initRedis()
 
     const connections = await getAllConnections()
-    const activeConnections = connections.filter((c: any) => c.is_enabled === "1" && c.is_inserted === "1")
+
+    // Mirror the same eligibility logic as getAssignedAndEnabledConnections()
+    // so this surface never disagrees with the coordinator. Previously this
+    // filtered only on is_enabled + is_inserted, missing connections enabled
+    // via is_enabled_dashboard (quickstart / UI toggle path).
+    const _isOn = (v: unknown) => v === true || v === 1 || v === "1" || v === "true"
+    const activeConnections = connections.filter((c: any) => {
+      const assigned = _isOn(c.is_active_inserted) || _isOn(c.is_assigned) || _isOn(c.is_dashboard_inserted)
+      const enabled  = _isOn(c.is_enabled) || _isOn(c.enabled) || _isOn(c.is_enabled_dashboard)
+      return assigned && enabled
+    })
 
     // Get engine state for first active connection.
     //
@@ -33,7 +43,12 @@ export async function GET() {
     // "engine not running" recommendations. We now read the counters
     // from `progression:` first and fall back to `trade_engine_state` so
     // the response stays correct on legacy data.
-    const connectionId = activeConnections[0]?.id || "unknown"
+    // Fall back to any connection that has engine state if activeConnections
+    // is still empty (e.g. snapshot restored without re-running quickstart).
+    const connectionId =
+      activeConnections[0]?.id ||
+      connections.find((c: any) => c.is_enabled_dashboard === "1" || c.is_assigned === "1")?.id ||
+      "unknown"
     const engineState = (await getSettings(`trade_engine_state:${connectionId}`)) || {}
     const progression = (await getSettings(`progression:${connectionId}`)) || {}
 
