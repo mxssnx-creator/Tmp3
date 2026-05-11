@@ -1,3 +1,4 @@
+// Plain `crypto` — Edge build aliases this to `false` via `next.config.mjs`.
 import * as crypto from "crypto"
 import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-connector"
 import { safeParseResponse } from "@/lib/safe-response-parser"
@@ -604,6 +605,15 @@ export class OrangeXConnector extends BaseExchangeConnector {
   async getOHLCV(symbol: string, timeframe = "1m", limit = 250): Promise<Array<{timestamp: number; open: number; high: number; low: number; close: number; volume: number}> | null> {
     try {
       this.log(`Fetching OHLCV for ${symbol} (${timeframe}, ${limit} candles)`)
+      // ── 1s timeframe (spec §7) ──
+      if (timeframe === "1s") {
+        const endMs = Date.now()
+        const startMs = endMs - (Math.max(1, Math.min(86_400, limit)) * 1000)
+        const aggregated = await this.getOHLCV1s(symbol, startMs, endMs)
+        if (aggregated && aggregated.length > 0) return aggregated
+        return null
+      }
+
       const baseUrl = this.getBaseUrl()
 
       // Convert timeframe to OrangeX interval format
@@ -639,6 +649,34 @@ export class OrangeXConnector extends BaseExchangeConnector {
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch OHLCV: ${errorMsg}`)
+      return null
+    }
+  }
+
+  /** ── 1-second OHLCV via aggregated trades (spec §7) ──────────── */
+  async getOHLCV1s(
+    symbol: string,
+    startMs: number,
+    endMs: number,
+  ): Promise<Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }> | null> {
+    try {
+      const baseUrl = this.getBaseUrl()
+      const url = `${baseUrl}/v1/market/trades?symbol=${symbol}&limit=500`
+      const resp = await this.rateLimitedFetch(url, {
+        headers: { "X-CH-APIKEY": this.credentials.apiKey },
+      })
+      if (!resp.ok) return null
+      const data = await resp.json().catch(() => null)
+      const rows = Array.isArray(data?.data) ? data.data : []
+      if (rows.length === 0) return []
+      const { aggregateTradesTo1sOHLCV } = await import("./aggregate-1s")
+      const trades = rows.map((r: any) => ({
+        timestamp: Number(r.time ?? r.timestamp ?? r.t),
+        price: Number(r.price ?? r.p),
+        quantity: Number(r.qty ?? r.q ?? r.size ?? 0),
+      }))
+      return aggregateTradesTo1sOHLCV(trades, startMs, endMs)
+    } catch {
       return null
     }
   }

@@ -26,7 +26,7 @@ async function getCachedMarketData(symbol: string): Promise<any> {
   
   try {
     await initRedis()
-    const rawData = await getMarketData(symbol)
+    const rawData = await getMarketData(symbol, "1m")
     if (!rawData) return null
     
     const latest = Array.isArray(rawData) ? rawData[0] : rawData

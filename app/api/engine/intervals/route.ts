@@ -10,10 +10,20 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     
     await initRedis()
     
-    // Get engine state for this connection
-    const engState = await getSettings(`trade_engine_state:${id}`)
-    const engHealth = await getSettings(`trade_engine_health:${id}`)
-    
+    // Canonical sources (see audit plan item 5):
+    //   • last_*_run        → trade_engine_state:{id}  (heartbeat)
+    //   • *_cycle_count     → progression:{id}         (atomic hincrby)
+    //
+    // Reading cycle counts from `trade_engine_state` alone lagged the
+    // authoritative counters and made this surface look stuck after a
+    // watchdog re-arm. We now resolve cycle counters from the
+    // `progression:` hash first and fall back to the engine-state
+    // snapshot for legacy data.
+    const [engState, progression] = await Promise.all([
+      getSettings(`trade_engine_state:${id}`),
+      getSettings(`progression:${id}`),
+    ])
+
     // Extract interval/timing metrics from engine state
     const lastIndicationRun = (engState as any)?.last_indication_run || 0
     const lastStrategyRun = (engState as any)?.last_strategy_run || 0
@@ -22,19 +32,26 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // Determine if intervals are "running" (ran within last 30 seconds)
     const indicationRunning = (now - lastIndicationRun) < 30000
     const strategyRunning = (now - lastStrategyRun) < 30000
-    
+
+    const indicationCycleCount =
+      Number((progression as any)?.indication_cycle_count) ||
+      Number((engState as any)?.indication_cycle_count) || 0
+    const strategyCycleCount =
+      Number((progression as any)?.strategy_cycle_count) ||
+      Number((engState as any)?.strategy_cycle_count) || 0
+
     return NextResponse.json({
       connectionId: id,
       intervals: {
         indication: {
           running: indicationRunning,
           lastRun: lastIndicationRun,
-          cycleCount: (engState as any)?.indication_cycle_count || 0,
+          cycleCount: indicationCycleCount,
         },
         strategy: {
           running: strategyRunning,
           lastRun: lastStrategyRun,
-          cycleCount: (engState as any)?.strategy_cycle_count || 0,
+          cycleCount: strategyCycleCount,
         },
       },
       timestamp: new Date().toISOString(),

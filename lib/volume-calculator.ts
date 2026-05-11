@@ -20,6 +20,29 @@ interface VolumeCalculationParams {
   currentPrice: number
   leverage?: number
   exchangeMinVolume?: number
+
+  // ── LIVE-only engine factor (spec: pseudo positions are ratio-only) ──
+  //
+  // Which Trade Engine is asking for sizing? Determines which volume-
+  // factor multiplier (if any) is applied to the LIVE notional.
+  //
+  // The Strategy stack (Base/Main/Real pseudo positions) is RATIO-based
+  // and count-driven per spec — it MUST NOT receive any volume-factor
+  // multiplier. Only Live Positions (real exchange orders) get the
+  // engine-specific scalar applied. So Strategy callers leave
+  // `tradeMode` undefined and the factor defaults to 1.0 (identity).
+  //
+  //   - `"main"`   → multiply by `mainVolumeFactor`   (a.k.a. live_volume_factor)
+  //   - `"preset"` → multiply by `presetVolumeFactor` (a.k.a. preset_volume_factor)
+  //   - omitted    → no engine multiplier (pseudo-position / Strategy path)
+  tradeMode?: "main" | "preset"
+
+  // Volume scaling factors applied at the LIVE-EXECUTION layer only.
+  // Both default to 1.0 (no scaling) when missing or invalid. Bounded
+  // to [0.1, 10] inside `calculatePositionVolume` so a misconfigured
+  // setting can never blow out a live order to 100× the intended size.
+  mainVolumeFactor?: number
+  presetVolumeFactor?: number
 }
 
 interface VolumeCalculationResult {
@@ -36,17 +59,40 @@ interface VolumeCalculationResult {
 
 export class VolumeCalculator {
   /**
+   * Universal hard floor: the smallest USD notional we will ever attempt to
+   * place on an exchange when no specific minimum is known. $5 covers the
+   * documented minimums of every major venue (Binance, BingX, Bybit, OKX,
+   * Bitget). Applied AFTER any per-pair `exchangeMinVolume` so a known
+   * larger minimum (e.g. some altcoin pairs require $10) still wins.
+   */
+  /**
+   * Universal minimum notional value in USD.
+   *
+   * REVISED for the new spec where Position Limits + per-Direction caps
+   * are valid for STRATEGY BASE Sets ONLY (max 1 long + 1 short active
+   * at a time). Main and Real "calculate free" — they do NOT create new
+   * positions, only Set variants. So we no longer need the $15 floor
+   * that was sized for 300-position mode. $5 is the documented minimum
+   * across every major venue (Binance, BingX, Bybit, OKX, Bitget) and
+   * keeps live orders MINIMAL — which is what the operator wants:
+   * "ensure positions volume is minimalized ... keep enforcing minimal
+   * value." Per-pair `exchangeMinVolume` still wins when larger.
+   */
+  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 5
+
+  /**
    * Calculate position volume with risk management (pure math, no DB).
    *
-   * BEHAVIOR (updated): if the coordination-derived volume falls below the
-   * exchange's minimum order size, we CLAMP UP to that minimum instead of
-   * rejecting the position. The live engine should still be able to submit
-   * the order at the minimum allowed size rather than silently dropping a
-   * valid signal because the USDT-cost sizing produced a sub-dust qty.
+   * BEHAVIOR: minimum volume is ALWAYS enforced — never reject for "qty
+   * too small". Three layers:
+   *   1. Per-pair `exchangeMinVolume` (from trading_pair metadata)
+   *   2. Universal $5-notional floor when no per-pair min is known
+   *   3. Numeric safety: if math yields 0/NaN/Infinity (e.g. balance=0
+   *      or currentPrice rounding), still emit at least layer 1 or 2.
    *
-   * The result is still flagged `volumeAdjusted: true` with an
-   * `adjustmentReason` explaining the clamp so that UI + logs can show
-   * the user exactly why the quantity doesn't match the pure math.
+   * The result is flagged `volumeAdjusted: true` with an
+   * `adjustmentReason` explaining the clamp so UI + logs show the user
+   * exactly why the quantity doesn't match the pure math.
    */
   static calculatePositionVolume(params: VolumeCalculationParams): VolumeCalculationResult {
     const {
@@ -59,31 +105,117 @@ export class VolumeCalculator {
       currentPrice,
       leverage = 1,
       exchangeMinVolume = 0,
+      tradeMode,
+      mainVolumeFactor,
+      presetVolumeFactor,
     } = params
 
-    if (positionCost) {
-      const positionSizeUsd = accountBalance * positionCost
-      const calculatedVolume = positionSizeUsd / currentPrice
+    // ── Resolve the engine-specific volume factor (Live-only) ──────
+    //
+    // Only applied when the CALLER explicitly identifies as a Live trade
+    // engine via `tradeMode`. The Strategy stack (Base/Main/Real pseudo
+    // positions) never sets `tradeMode`, so it always sees a 1.0
+    // multiplier here — pseudo positions stay strictly ratio-based per
+    // spec ("at Strategies, pseudo pos use ratios for volume calcs").
+    //
+    // Bounds: [0.1, 10]. A misconfigured 0 or negative collapses the
+    // position to zero (the universal $5 floor would clamp back up but
+    // we'd still log misleading numbers); a runaway 100× value would
+    // silently blow live orders. Clipping here means the slider's UI
+    // range (0.1-10x) is also enforced server-side even if a malformed
+    // POST bypasses the UI.
+    const clampFactor = (raw: number | undefined): number => {
+      const n = Number(raw)
+      if (!Number.isFinite(n) || n <= 0) return 1
+      return Math.max(0.1, Math.min(10, n))
+    }
+    const liveEngineFactor =
+      tradeMode === "preset" ? clampFactor(presetVolumeFactor)
+      : tradeMode === "main" ? clampFactor(mainVolumeFactor)
+      : 1  // Strategy / pseudo-position path → identity (ratio-only)
 
-      let finalVolume = calculatedVolume
-      let volumeAdjusted = false
-      let adjustmentReason: string | undefined
+    // ── Resolve the effective minimum that MUST be honored ──────────
+    // Take the larger of the per-pair minimum and the universal $5
+    // notional floor. Guarantees we always have a positive lower bound
+    // as long as `currentPrice > 0` (the upstream caller is responsible
+    // for rejecting price=0 before we get here).
+    const universalMinFromNotional =
+      currentPrice > 0
+        ? VolumeCalculator.UNIVERSAL_MIN_NOTIONAL_USD / currentPrice
+        : 0
+    const effectiveMin = Math.max(exchangeMinVolume || 0, universalMinFromNotional)
 
-      // Clamp up to the exchange minimum rather than rejecting.
-      if (exchangeMinVolume > 0 && calculatedVolume < exchangeMinVolume) {
-        finalVolume = exchangeMinVolume
-        volumeAdjusted = true
-        adjustmentReason = `Calculated volume ${calculatedVolume.toFixed(8)} was below exchange minimum ${exchangeMinVolume} — clamped up to minimum order size.`
+    /**
+     * Final clamp: never return less than `effectiveMin`, never NaN,
+     * never Infinity. Used by both the positionCost and the
+     * risk-percentage branches below.
+     */
+    const clampUp = (raw: number): { final: number; adjusted: boolean; reason?: string } => {
+      const safeRaw = Number.isFinite(raw) && raw > 0 ? raw : 0
+      if (effectiveMin > 0 && safeRaw < effectiveMin) {
+        const usingUniversalFallback = exchangeMinVolume <= 0
+        return {
+          final: effectiveMin,
+          adjusted: true,
+          reason:
+            safeRaw <= 0
+              ? `Sizing math yielded ${raw} — clamped up to enforced minimum ${effectiveMin.toFixed(8)} (${usingUniversalFallback ? `universal $${VolumeCalculator.UNIVERSAL_MIN_NOTIONAL_USD} notional fallback` : "exchange minimum"}).`
+              : `Calculated volume ${safeRaw.toFixed(8)} was below ${usingUniversalFallback ? `universal $${VolumeCalculator.UNIVERSAL_MIN_NOTIONAL_USD} notional fallback` : "exchange minimum"} ${effectiveMin.toFixed(8)} — clamped up to minimum order size.`,
+        }
       }
+      return { final: safeRaw, adjusted: false }
+    }
+
+    if (positionCost) {
+      // ── positions_average + engine factor wired into positionCost ─────
+      //
+      // Previous formula:
+      //   pos_usd = (balance × positionCost) / posAvg
+      //
+      // New formula (with per-engine volume factor):
+      //   pos_usd = (balance × positionCost × liveEngineFactor) / posAvg
+      //
+      // With positionCost expressed as a fraction of balance (the
+      // calling site already converts `pct/100`), the denominator
+      // divides total budgeted exposure across the expected concurrent
+      // position count. The `liveEngineFactor` (1.0 by default; tunable
+      // per Trade Engine — Main vs. Preset — through the Settings
+      // dialog) lets operators independently scale the notional of
+      // Main-engine orders vs. Preset-engine orders without touching
+      // positionCost (which controls the per-position BUDGET share —
+      // the two knobs compose).
+      //
+      // Strategy / pseudo-position calls leave `tradeMode` undefined,
+      // so `liveEngineFactor === 1` and this branch behaves identically
+      // for them. Only LIVE exchange-order callers see the multiplier
+      // — which is exactly the spec: pseudo positions are ratio-only,
+      // live positions calculate "indeed volume" (real notional) using
+      // the per-engine ratio.
+      const posAvg = positionsAverage && positionsAverage > 0 ? positionsAverage : 1
+      const positionSizeUsd = (accountBalance * positionCost * liveEngineFactor) / posAvg
+      const calculatedVolume = positionSizeUsd / currentPrice
+      const { final, adjusted, reason } = clampUp(calculatedVolume)
+
+      // Surface engine-factor provenance in the adjustment reason ONLY
+      // when it actually changed sizing (≠ 1.0). A 1.0 factor is the
+      // norm for Strategy callers and default Live config, and we don't
+      // want to spam the volume-history log with no-op entries.
+      const factorReason =
+        liveEngineFactor !== 1 && tradeMode
+          ? `${tradeMode}-engine volume factor ${liveEngineFactor.toFixed(2)}x applied`
+          : undefined
+      const composedReason = adjusted && reason
+        ? (factorReason ? `${reason} | ${factorReason}` : reason)
+        : factorReason
 
       return {
         calculatedVolume,
-        finalVolume,
-        volume: finalVolume,
-        volumeUsd: finalVolume * currentPrice,
+        finalVolume: final,
+        volume: final,
+        volumeUsd: final * currentPrice,
         leverage,
-        volumeAdjusted,
-        adjustmentReason,
+        volumeAdjusted: adjusted || liveEngineFactor !== 1,
+        adjustmentReason: composedReason,
       }
     }
 
@@ -98,37 +230,109 @@ export class VolumeCalculator {
     const positionSize = adjustedRisk / (riskPercentage / 100)
     const rawVolume = positionSize / (currentPrice * calculatedLeverage)
 
-    let finalVolume = rawVolume
-    let volumeAdjusted = false
-    let adjustmentReason: string | undefined
-
-    // Clamp up to the exchange minimum rather than rejecting.
-    if (exchangeMinVolume > 0 && rawVolume < exchangeMinVolume) {
-      finalVolume = exchangeMinVolume
-      volumeAdjusted = true
-      adjustmentReason = `Calculated volume ${rawVolume.toFixed(8)} was below exchange minimum ${exchangeMinVolume} — clamped up to minimum order size.`
-    }
+    const { final, adjusted, reason } = clampUp(rawVolume)
 
     return {
       calculatedVolume: rawVolume,
-      finalVolume,
-      volume: finalVolume,
-      volumeUsd: finalVolume * currentPrice,
+      finalVolume: final,
+      volume: final,
+      volumeUsd: final * currentPrice,
       leverage: calculatedLeverage,
       positionSize,
-      volumeAdjusted,
-      adjustmentReason,
+      volumeAdjusted: adjusted,
+      adjustmentReason: reason,
       riskAmount: adjustedRisk,
     }
   }
 
   /**
-   * Calculate volume for a specific connection and symbol using Redis settings
+   * Resolve the LIVE engine + scaling factor for a given connection.
+   *
+   * Used by `calculateVolumeForConnection` when the caller passes
+   * `tradeMode` explicitly OR leaves it for auto-resolve from the
+   * connection's `is_preset_trade` / `is_live_trade` flags. Two-tier
+   * factor stack:
+   *
+   *   per-connection override (saved by VolumeConfigurationPanel)
+   *   > global setting (Settings → Overall → Volume Configuration)
+   *   > 1.0 (identity, no scaling)
+   *
+   * Trade-mode resolution from connection flags:
+   *   - `is_preset_trade === true` AND `is_live_trade !== true` → "preset"
+   *   - else                                                    → "main"
+   *
+   * Both flags true is unusual but possible during transitions; we
+   * pick "main" because it's the conservative default — Preset's
+   * factor often applies more aggressive multipliers and we don't
+   * want an in-flight toggle to silently up-size existing live orders.
+   *
+   * Strategy callers (pseudo-position-manager) DO NOT call this helper
+   * — they pass NO `tradeMode` to `calculateVolumeForConnection`, so
+   * the engine factor never applies to pseudo positions per spec.
+   */
+  static resolveLiveEngine(
+    connection: Record<string, unknown> | null | undefined,
+    appSettings: Record<string, unknown> | null | undefined,
+  ): { tradeMode: "main" | "preset"; mainVolumeFactor: number; presetVolumeFactor: number } {
+    const truthy = (v: unknown) =>
+      v === true || v === "true" || v === 1 || v === "1"
+    const num = (v: unknown, fallback: number) => {
+      const n = Number(v)
+      return Number.isFinite(n) && n > 0 ? n : fallback
+    }
+    const conn = connection || {}
+    const app = appSettings || {}
+
+    const isPreset = truthy(conn["is_preset_trade"])
+    const isLive   = truthy(conn["is_live_trade"])
+    const tradeMode: "main" | "preset" = isPreset && !isLive ? "preset" : "main"
+
+    // Per-connection override > global default > 1.0 identity.
+    // Global setting key is `mainTradeVolumeFactor` (matches the slider
+    // wired in `components/settings/tabs/overall-tab.tsx`).
+    const mainVolumeFactor = num(
+      conn["live_volume_factor"]
+        ?? app["mainTradeVolumeFactor"]
+        ?? app["main_trade_volume_factor"],
+      1,
+    )
+    const presetVolumeFactor = num(
+      conn["preset_volume_factor"]
+        ?? app["presetTradeVolumeFactor"]
+        ?? app["preset_trade_volume_factor"],
+      1,
+    )
+
+    return { tradeMode, mainVolumeFactor, presetVolumeFactor }
+  }
+
+  /**
+   * Calculate volume for a specific connection and symbol using Redis settings.
+   *
+   * ── `tradeMode` is an explicit, opt-in parameter ───────────────────
+   * `calculateVolumeForConnection` is called from BOTH:
+   *   - the pseudo-position manager (Strategy stack — ratio-only, MUST
+   *     NOT see a volume multiplier per spec), and
+   *   - the live-stage executor (real exchange orders — MUST see the
+   *     multiplier).
+   *
+   * Auto-resolving the engine would silently apply the factor to
+   * Strategy pseudo positions too, violating the spec. Instead the
+   * caller decides:
+   *   - Pseudo-position-manager (Strategy): omits `tradeMode` →
+   *     `liveEngineFactor = 1` → ratio-only preserved.
+   *   - Live-stage: passes `tradeMode: "main" | "preset"` explicitly
+   *     (resolved via `resolveLiveEngine` at callsite).
+   *
+   * This is enforced by the type system: the only way to apply an
+   * engine factor is to pass `tradeMode`, which the Strategy stack
+   * never does.
    */
   static async calculateVolumeForConnection(
     connectionId: string,
     symbol: string,
     currentPrice: number,
+    options: { tradeMode?: "main" | "preset" } = {},
   ): Promise<VolumeCalculationResult> {
     try {
       await initRedis()
@@ -142,10 +346,29 @@ export class VolumeCalculator {
       // bundle (cleanup schedule, backup toggles) — so the operator's
       // saved leverage/cost never reached volume calculations.
       const settings = (await getAppSettings()) || {}
+      // Default position cost: 0.1% of balance per position (MINIMAL).
+      // Per spec: Strategy Base caps to 1 long + 1 short → max 2 active.
+      // Operator wants "positions volume is minimalized ... keep enforcing
+      // minimal value." With 0.1% cost on a $10K balance the math gives
+      // $10/position which then gets clamped UP to the universal $5 floor
+      // only if it would land below it. Using a small default keeps every
+      // live order at the smallest practical size; operators that want
+      // bigger sizing override `exchangePositionCost` explicitly.
       const positionCostPercent = parseFloat(
         String(settings.exchangePositionCost ?? settings.positionCost ?? "0.1")
       )
       const positionCost = positionCostPercent / 100
+
+      // Default: 2 (matches the Base-stage cap of 1 long + 1 short).
+      // The denominator divides budgeted exposure across the expected
+      // number of concurrent positions. With Strategy Base limited to 2
+      // (per the new spec — Main/Real calculate free and don't open
+      // positions), 2 is the correct divisor for minimal per-position
+      // sizing. Operator overrides via `positions_average` still apply.
+      const positionsAverage = (() => {
+        const raw = parseFloat(String(settings.positions_average ?? "2"))
+        return Number.isFinite(raw) && raw > 0 ? raw : 2
+      })()
 
       const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))
       // `parseHash` coerces the stored "true"/"1" to boolean true, so a
@@ -154,22 +377,16 @@ export class VolumeCalculator {
       const useMaxLeverage = settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
       const maxLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
 
-      // Get exchange min volume from Redis trading pair data
+      // Get exchange min volume from Redis trading pair data. When the
+      // metadata is missing or zero we leave `exchangeMinVolume`
+      // undefined — `calculatePositionVolume` will then apply the
+      // universal $5-notional floor itself, which works for ANY quote
+      // currency (USDT, USDC, USD, BTC, BUSD, ...) without per-quote
+      // string sniffing.
       const tradingPair = await getSettings(`trading_pair:${symbol}`)
-      let exchangeMinVolume = tradingPair?.min_order_size ? parseFloat(tradingPair.min_order_size) : undefined
-
-      // Conservative per-quote fallbacks when no trading-pair metadata is
-      // available. This prevents the engine from submitting dust-sized orders
-      // (e.g. 0.00002 BTC) that every exchange rejects with a cryptic error.
-      if (!exchangeMinVolume || exchangeMinVolume <= 0) {
-        const upper = symbol.toUpperCase().replace("-", "")
-        if (upper.endsWith("USDT") || upper.endsWith("USDC") || upper.endsWith("USD")) {
-          // Notional-based minimum: $5 USD at current price — covers BingX,
-          // Binance and most other majors (their BTC perp min is $5 / ~0.0001 BTC).
-          const MIN_NOTIONAL_USD = 5
-          exchangeMinVolume = currentPrice > 0 ? MIN_NOTIONAL_USD / currentPrice : 0
-        }
-      }
+      const exchangeMinVolume = tradingPair?.min_order_size
+        ? parseFloat(tradingPair.min_order_size)
+        : undefined
 
       let accountBalance = 10000 // Default fallback
 
@@ -208,12 +425,49 @@ export class VolumeCalculator {
         console.warn("[v0] Failed to fetch account balance, using default:", balanceError)
       }
 
+      // ── Resolve engine factor IFF caller asked for it ──────────────
+      //
+      // We only do the connection-flag resolution when the caller
+      // passed `options.tradeMode`. The pseudo-position-manager call
+      // omits it, so this entire block is skipped for Strategy callers
+      // — they go through with no engine multiplier (the in-place
+      // ratio-only behaviour the spec requires).
+      //
+      // Live-stage callers can pass:
+      //   - an explicit "main" / "preset" (forces that engine), OR
+      //   - leave it unset entirely (treated as Strategy → identity).
+      // To opt into AUTO-RESOLUTION from connection flags, the
+      // live-stage caller passes `tradeMode: "auto"` — handled by the
+      // type widening below.
+      let resolvedMode: "main" | "preset" | undefined = options.tradeMode
+      let mainVolumeFactor = 1
+      let presetVolumeFactor = 1
+      if (resolvedMode === "main" || resolvedMode === "preset") {
+        // We need the connection record + app settings to resolve the
+        // factor stack (per-connection override > global > 1.0).
+        let connectionRecord: any = null
+        try {
+          connectionRecord = await getConnection(connectionId)
+        } catch { /* defaults to 1.0 / 1.0 */ }
+
+        const resolved = VolumeCalculator.resolveLiveEngine(connectionRecord, settings)
+        mainVolumeFactor = resolved.mainVolumeFactor
+        presetVolumeFactor = resolved.presetVolumeFactor
+        // We honour the CALLER's explicit mode; `resolveLiveEngine`'s
+        // tradeMode result is informational here (used only when the
+        // caller did not specify).
+      }
+
       const result = this.calculatePositionVolume({
         positionCost,
+        positionsAverage,
         accountBalance,
         currentPrice,
         leverage: maxLeverage,
         exchangeMinVolume,
+        tradeMode: resolvedMode,
+        mainVolumeFactor,
+        presetVolumeFactor,
       })
 
       return result

@@ -8,6 +8,7 @@
 import { sql, execute, getDatabaseType } from "@/lib/db"
 import type { PresetType, PresetConfigurationSet, PresetCoordinationResult } from "@/lib/types-preset-coordination"
 import { calculateIndicators, type IndicatorConfig } from "./indicators"
+// Plain `crypto` — Edge build aliases this to `false` via `next.config.mjs`.
 import * as crypto from "crypto"
 import { PresetPseudoPositionManager } from "./preset-pseudo-position-manager"
 import { DataSyncManager } from "./data-sync-manager"

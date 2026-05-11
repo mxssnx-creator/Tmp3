@@ -51,12 +51,20 @@ function pick(...values: unknown[]): number {
  * Response shape:
  * {
  *   historic: { symbolsProcessed, symbolsTotal, candlesLoaded, indicatorsCalculated,
- *               cyclesCompleted, isComplete, progressPercent }
+ *               cyclesCompleted, isComplete, progressPercent,
+ *               processing: { indicationChurnCycles, strategyChurnCycles } }
  *   realtime: { indicationCycles, strategyCycles, realtimeCycles, indicationsTotal,
- *               strategiesTotal, positionsOpen, isActive, successRate, avgCycleTimeMs }
+ *               strategiesTotal, positionsOpen, isActive, successRate, avgCycleTimeMs,
+ *               cycleCounters: {                            // per-processor cumulative
+ *                 indication, indicationLive,               // (every tick / live only)
+ *                 strategy, strategyLive,
+ *                 realtime, realtimeLive
+ *               },
+ *               framesProcessed                              // cross-processor tick total
+ *                                                            // — independent of 250 cap }
  *               ↑ strategiesTotal = Real-stage output (NOT sum of stages)
  *   breakdown: {
- *     indications: { direction, move, active, optimal, auto, total }
+ *     indications: { direction, move, active, activeAdvanced, optimal, auto, total }
  *     strategies:  { base, main, real, live, total,
  *                    baseEvaluated, mainEvaluated, realEvaluated }
  *                    ↑ `total` = Real-stage count only, per pipeline rule above
@@ -86,6 +94,7 @@ export async function GET(
       engineState,
       engineProgression,
       prehistoricSymbolCount,
+      axisWindowsHashRaw,
     ] = await Promise.all([
       client.hgetall(`progression:${connectionId}`).catch(() => null),
       client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
@@ -93,11 +102,17 @@ export async function GET(
       getSettings(`trade_engine_state:${connectionId}`).catch(() => ({})),
       getSettings(`engine_progression:${connectionId}`).catch(() => ({})),
       client.scard(`prehistoric:${connectionId}:symbols`).catch(() => 0),
+      // Per-axis-window cumulative counters written by createMainSets in
+      // strategy-coordinator.ts. Hash fields are `${axis}_${N}_sets` /
+      // `${axis}_${N}_pos` for axis ∈ {prev, last, cont, pause} and the
+      // step-1 windows documented in StrategySet.axisWindows.
+      client.hgetall(`axis_windows:${connectionId}`).catch(() => null),
     ])
 
     const progHash: Record<string, string>       = progHashRaw       || {}
     const prehistoricHash: Record<string, string> = prehistoricHashRaw || {}
     const realtimeHash: Record<string, string>   = realtimeHashRaw   || {}
+    const axisWindowsHash: Record<string, string> = axisWindowsHashRaw || {}
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
@@ -184,14 +199,25 @@ export async function GET(
     )
     const liveIndicationCycles = n(progHash.indication_live_cycle_count)
     const liveStrategyCycles   = n(progHash.strategy_live_cycle_count)
+    const liveRealtimeCycles   = n(progHash.realtime_live_cycle_count)
 
     const realtimeIndicationCycles = liveIndicationCycles || churnIndicationCycles
     const realtimeStrategyCycles   = liveStrategyCycles   || churnStrategyCycles
+    // realtimeCycles = total realtime ticks (churn). This is now actually
+    // populated because EngineManager.startRealtimeProcessor writes
+    // `realtime_cycle_count` on every tick via hincrby (previously this key
+    // was never written, so this counter was permanently 0).
     const realtimeCycles = pick(
       n(progHash.realtime_cycle_count),
       n(realtimeHash.cycle_count),
       n(es.realtime_cycle_count)
     )
+
+    // Cross-processor cumulative tick counter — sum of every tick across
+    // indication + strategy + realtime processors since the engine started.
+    // INDEPENDENT of the per-Set 250-entry DB cap. This is the "Frames /
+    // Total Ticks" metric on the dashboard.
+    const framesProcessed = n(progHash.frames_processed)
 
     // Cycle time average from realtime hash
     const realtimeCycleTimeSum = n(realtimeHash.cycle_time_sum_ms)
@@ -382,6 +408,67 @@ export async function GET(
             }
           } catch { /* skip malformed */ }
         }
+      }
+    } catch { /* non-critical */ }
+
+    // ── Running-avg of active validated Real positions ────────────────
+    // The dashboard "Avg Real Pos" tile previously sourced its value from
+    // `stageReal.avgPosPerSet` = entriesCount / createdSets. That ratio
+    // is mathematically bounded by the per-set 250-entry DB capacity:
+    // each Set holds at most 250 entries, so `entries/sets ≤ 250`. The
+    // operator wants the average count of CURRENTLY-ACTIVE validated
+    // Real positions, which has no such cap (it's bounded only by the
+    // 500-key safety ceiling on the realOpen scan above and is realistic
+    // many-hundreds-deep).
+    //
+    // We accumulate a true running average across stats fetches into the
+    // `progression:{connectionId}` hash:
+    //   * real_active_pos_sum_x100   — Σ(realOpen) × 100 (precision-preserving)
+    //   * real_active_pos_samples    — # of /stats fetches contributing
+    //   * real_active_pos_current    — last-observed snapshot for debug
+    //
+    // The UI tile reads `realActivePositions.average` below. Reset DB
+    // wipes the entire `progression:{id}` hash so these accumulators
+    // restart cleanly per run.
+    // ── Running average of active validated Real positions ───────────────
+    // We ONLY accumulate a sample when realOpen > 0 (i.e. there are
+    // actually open real positions right now). Accumulating zero-samples
+    // during prehistoric processing — when real positions don't exist yet
+    // — would dilute the average toward zero and make the "Avg Real Pos"
+    // tile show near-zero even after many real positions have been opened.
+    //
+    // This means the average represents "mean open real positions across
+    // all polls where at least one position was open" which is the
+    // operationally useful metric (not "mean over all time including idle").
+    let realActivePosAverage = 0
+    let realActivePosSamples = 0
+    try {
+      const progKey = `progression:${connectionId}`
+      if (realOpen > 0) {
+        // Atomic increment-and-read: hincrby returns the new value
+        // post-increment so we get a consistent sample count and sum.
+        const [newSumX100, newSamples] = await Promise.all([
+          client.hincrby(progKey, "real_active_pos_sum_x100", Math.round(realOpen * 100)),
+          client.hincrby(progKey, "real_active_pos_samples", 1),
+        ])
+        await client.hset(progKey, {
+          real_active_pos_current: String(realOpen),
+          real_active_pos_avg: (Number(newSamples) > 0 ? (Number(newSumX100) / 100) / Number(newSamples) : 0).toFixed(2),
+        })
+        realActivePosSamples = Number(newSamples) || 0
+        realActivePosAverage = realActivePosSamples > 0
+          ? (Number(newSumX100) / 100) / realActivePosSamples
+          : 0
+      } else {
+        // No open real positions right now — read the existing running
+        // average so the tile keeps showing the last meaningful value
+        // instead of going blank during idle/prehistoric periods.
+        const existing = await client.hget(progKey, "real_active_pos_avg")
+          .catch(() => null) as string | null
+        const existingSamples = await client.hget(progKey, "real_active_pos_samples")
+          .catch(() => null) as string | null
+        realActivePosAverage = parseFloat(existing || "0") || 0
+        realActivePosSamples = parseInt(existingSamples || "0", 10) || 0
       }
     } catch { /* non-critical */ }
 
@@ -649,7 +736,13 @@ export async function GET(
     //   2. standalone key:   indications:{connId}:{type}:count  (also by statistics-tracker incr)
     // We read both and take the higher.
 
-    const indTypes = ["direction", "move", "active", "optimal", "auto"] as const
+    // Indication types tracked. MUST stay in sync with `DEFAULT_LIMITS`
+    // in `lib/indication-sets-processor.ts`. Each type has:
+    //   - its own per-Set 250-entry pool (per config)
+    //   - its own cumulative counter `indications_{type}_count` on progression:{id}
+    //   - its own per-cycle increment via hincrby in EngineManager.startIndicationProcessor
+    // `auto` is a synthetic legacy alias retained for back-compat with old runs.
+    const indTypes = ["direction", "move", "active", "active_advanced", "optimal", "auto"] as const
     const indCounts: Record<string, number> = {}
     await Promise.all(
       indTypes.map(async (type) => {
@@ -661,19 +754,114 @@ export async function GET(
     )
     const indTotal = Object.values(indCounts).reduce((s, v) => s + v, 0) || indicationsTotal
 
+    // ── ACTIVE-NOW aggregation: indications + strategies ───────────────
+    // The cumulative `indCounts` / `stratCounts` above answer "how many
+    // were ever created since the run started". The dashboard Overview
+    // also needs "how many are alive RIGHT NOW" — i.e. passing their
+    // thresholds on the latest cycle. The engine writes per-cycle
+    // overwrites into:
+    //
+    //   indications_active:{connId} hash (fields: "{symbol}:{type}")
+    //   strategies_active:{connId}  hash (fields: "{symbol}:{stage}")
+    //
+    // We hgetall both, then aggregate by type / stage. If the engine
+    // never wrote (e.g. fresh run, no symbols yet) the hashes are empty
+    // and all activeCounts come back zero — exactly the right "nothing
+    // alive" semantic for the UI.
+    const activeIndByType: Record<string, number> = {
+      direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
+    }
+    const activeStratByStage: Record<string, number> = {
+      base: 0, main: 0, real: 0,
+    }
+    // ── DISTINCT-SETS-PROGRESSING tally (per type / per stage) ────────
+    // The cumulative `indCounts.*` and `stratCounts.*` count the total
+    // *entries* ever produced by every Set since run start. The
+    // dashboard also needs a "how many distinct Sets are currently
+    // alive RIGHT NOW" view — i.e. per (symbol × type) or
+    // (symbol × stage) pairs whose latest cycle reported a non-zero
+    // qualified count. We count distinct hash fields with `value > 0`
+    // because each field encodes a unique "{symbol}:{type|stage}" pair
+    // — exactly the cardinality of "active progressing Sets" the
+    // operator asked for. Zero-valued fields (engine wrote a row but
+    // nothing qualified that cycle) are excluded so the number tracks
+    // currently-progressing pools, not all-ever-touched pools.
+    const activeSetsIndByType: Record<string, number> = {
+      direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
+    }
+    const activeSetsStratByStage: Record<string, number> = {
+      base: 0, main: 0, real: 0,
+    }
+    try {
+      const [indActiveHash, stratActiveHash] = await Promise.all([
+        client.hgetall(`indications_active:${connectionId}`).catch(() => null),
+        client.hgetall(`strategies_active:${connectionId}`).catch(() => null),
+      ])
+      if (indActiveHash && typeof indActiveHash === "object") {
+        for (const [field, val] of Object.entries(indActiveHash)) {
+          // field shape: "{symbol}:{type}" — split on the LAST colon so
+          // symbols containing colons (none today, but future-proof) survive.
+          const idx = field.lastIndexOf(":")
+          if (idx <= 0) continue
+          const type = field.slice(idx + 1)
+          const numVal = n(val)
+          if (type in activeIndByType) {
+            activeIndByType[type] += numVal
+            // Each non-zero (symbol×type) field == one Set actively
+            // producing qualified entries this cycle. Cardinality is
+            // the operator-asked "Active Progressing Sets" count.
+            if (numVal > 0) activeSetsIndByType[type] += 1
+          }
+        }
+      }
+      if (stratActiveHash && typeof stratActiveHash === "object") {
+        for (const [field, val] of Object.entries(stratActiveHash)) {
+          const idx = field.lastIndexOf(":")
+          if (idx <= 0) continue
+          const stage = field.slice(idx + 1)
+          const numVal = n(val)
+          if (stage in activeStratByStage) {
+            activeStratByStage[stage] += numVal
+            if (numVal > 0) activeSetsStratByStage[stage] += 1
+          }
+        }
+      }
+    } catch { /* non-critical: dashboard falls back to cumulative */ }
+    const activeIndTotal = Object.values(activeIndByType).reduce((s, v) => s + v, 0)
+    const activeStratTotal = activeStratByStage.base + activeStratByStage.main + activeStratByStage.real
+    const activeSetsIndTotal   = Object.values(activeSetsIndByType).reduce((s, v) => s + v, 0)
+    const activeSetsStratTotal = activeSetsStratByStage.base + activeSetsStratByStage.main + activeSetsStratByStage.real
+
     // Strategy per-stage counts
+    // NOTE on source priority:
+    //   strategies_active:{id}  hash  — per-symbol hset, aggregated to activeStratByStage above.
+    //                                    This is the CURRENT snapshot (what's alive right now).
+    //   strategies:{id}:{stage}:count  — standalone string, overwritten each cycle with the
+    //                                    LAST-PROCESSED symbol's count. Correct only for 1-symbol runs.
+    //   strategies_{stage}_total       — cumulative hincrby (grows every cycle). NEVER use as
+    //                                    current count — it inflates dramatically over many cycles.
+    // Priority: activeStratByStage (cross-symbol sum, most recent) > standalone key > cumulative hash.
     const stratTypes = ["base", "main", "real", "live"] as const
     const stratCounts: Record<string, number> = {}
     const stratEvaluated: Record<string, number> = {}
     await Promise.all(
       stratTypes.map(async (type) => {
-        const fromHash  = n(progHash[`strategies_${type}_total`])
+        // Prefer the cross-symbol sum from strategies_active hash (already computed above).
+        // For "live" there is no strategies_active entry, so fall back to the standalone key.
+        const fromActive = (type !== "live") ? (activeStratByStage[type] || 0) : 0
         const fromKey   = n(await client.get(`strategies:${connectionId}:${type}:count`).catch(() => 0))
-        stratCounts[type] = Math.max(fromHash, fromKey)
+        // NOTE: strategies_{type}_total is a cumulative hincrby (grows every cycle × symbols).
+        // It MUST NOT be used as the current count — prefer fromActive (cross-symbol live snapshot)
+        // or fromKey (last-symbol standalone, 24h TTL). Fall back to 0 when both are absent so
+        // the dashboard shows "no data yet" instead of an inflated lifetime cumulative.
+        stratCounts[type] = fromActive > 0 ? fromActive
+                          : fromKey   > 0 ? fromKey
+                          : 0
 
-        const evalFromHash = n(progHash[`strategies_${type}_evaluated`])
         const evalFromKey  = n(await client.get(`strategies:${connectionId}:${type}:evaluated`).catch(() => 0))
-        stratEvaluated[type] = Math.max(evalFromHash, evalFromKey)
+        // Standalone key is last-symbol-wins current count. Cumulative hash field
+        // (strategies_{type}_evaluated) is intentionally ignored here.
+        stratEvaluated[type] = evalFromKey
       })
     )
     // ── Pipeline-aware "total strategies" ────────────────────────────────
@@ -699,7 +887,13 @@ export async function GET(
     //
     // We surface these alongside the stage-level detail so the dashboard can
     // show "Avg PF / Avg DDT per variant" over the lifetime of the run.
-    const variantKeys = ["default", "trailing", "block", "dca"] as const
+    // ── PAUSE VARIANT ────────────────────────────────────────────────
+    // The Real stage and StrategyCoordinator both write a 5th variant
+    // bucket — `pause` — for entries placed under the global pause-axis
+    // ratio config. The previous `variantKeys` list dropped this row so
+    // the dashboard quietly missed the count. Adding it here surfaces
+    // those entries in `strategyVariants.pause` of the response.
+    const variantKeys = ["default", "trailing", "block", "dca", "pause"] as const
     const variantDetail: Record<string, Record<string, number>> = {}
     await Promise.all(
       variantKeys.map(async (variant) => {
@@ -769,19 +963,92 @@ export async function GET(
     // live only) without needing a discriminated union on every write site.
     const stratDetail: Record<string, Record<string, number>> = {}
 
+    // Track stale-symbol fields for opportunistic pruning. Without this,
+    // every symbol ever evaluated (incl. ones removed from the basket
+    // hours ago) leaves ~11 fields behind in the strategy_detail hash
+    // until the 24h key TTL — a slow memory drift across long-running
+    // connections that swap symbol baskets.
+    const staleFieldsByKey = new Map<string, string[]>()
+
     await Promise.all(
       stratDetailKeys.map(async (stage) => {
-        const dh = ((await client.hgetall(`strategy_detail:${connectionId}:${stage}`).catch(() => null)) || {}) as Record<string, string>
-        const createdSets       = n(dh.created_sets      || progHash[`strategy_${stage}_created_sets`])
-        const avgPosPerSet      = parseFloat(dh.avg_pos_per_set      || progHash[`strategy_${stage}_avg_pos_per_set`]      || "0")
-        const avgProfitFactor   = parseFloat(dh.avg_profit_factor    || progHash[`strategy_${stage}_avg_profit_factor`]    || "0")
+        const detailKey = `strategy_detail:${connectionId}:${stage}`
+        const dh = ((await client.hgetall(detailKey).catch(() => null)) || {}) as Record<string, string>
+
+        // ── Cross-symbol aggregation from per-symbol `s:{symbol}:*` fields ─
+        // Each `(symbol, cycle)` writes a `s:{symbol}:*` bundle. We sum
+        // counters and weight-mean the averages across all FRESH symbols
+        // (ts ≤ 5 min old). Symbols stale > 30 min are queued for HDEL
+        // pruning to bound the hash size.
+        const FRESH_MS = 5 * 60 * 1000
+        const PRUNE_MS = 30 * 60 * 1000
+        const nowMs = Date.now()
+        let symCreated = 0, symEntries = 0, symRunning = 0, symProgressing = 0
+        let symPassed = 0, symEvaluated = 0
+        let weightedPF = 0, weightedDDT = 0, weightedPPS = 0, weightedPER = 0
+        let weightSum = 0, freshSymbols = 0
+        const staleFields: string[] = []
+        for (const k of Object.keys(dh)) {
+          if (!k.startsWith("s:") || !k.endsWith(":ts")) continue
+          // k shape: "s:{symbol}:ts" — extract symbol between first and last colon.
+          const symbol = k.slice(2, -3)
+          const ts = Number(dh[k] || "0") || 0
+          const ageMs = nowMs - ts
+          if (ageMs > PRUNE_MS) {
+            // Collect every per-symbol field for HDEL. Cheap because
+            // these are stale samples already excluded from aggregation.
+            for (const f of ["created","entries","running","progressing","passed","evaluated","apf","addt","apps","aper","ts"]) {
+              if (`s:${symbol}:${f}` in dh) staleFields.push(`s:${symbol}:${f}`)
+            }
+            continue
+          }
+          if (ageMs > FRESH_MS) continue   // present-but-stale → exclude
+          freshSymbols += 1
+          const c = Number(dh[`s:${symbol}:created`]    || 0) || 0
+          symCreated     += c
+          symEntries     += Number(dh[`s:${symbol}:entries`]     || 0) || 0
+          symRunning     += Number(dh[`s:${symbol}:running`]     || 0) || 0
+          symProgressing += Number(dh[`s:${symbol}:progressing`] || 0) || 0
+          symPassed      += Number(dh[`s:${symbol}:passed`]      || 0) || 0
+          symEvaluated   += Number(dh[`s:${symbol}:evaluated`]   || 0) || 0
+          // Weighted means: weight = createdSets. A symbol with c=0
+          // contributes nothing — correct, an empty sample shouldn't
+          // drag the mean toward 0.
+          if (c > 0) {
+            weightSum  += c
+            weightedPF  += (Number(dh[`s:${symbol}:apf`])  || 0) * c
+            weightedDDT += (Number(dh[`s:${symbol}:addt`]) || 0) * c
+            weightedPPS += (Number(dh[`s:${symbol}:apps`]) || 0) * c
+            weightedPER += (Number(dh[`s:${symbol}:aper`]) || 0) * c
+          }
+        }
+        if (staleFields.length > 0) staleFieldsByKey.set(detailKey, staleFields)
+
+        // ── Field reads: prefer per-symbol cross-sum; fall back to legacy.
+        // The legacy fields (overwritten on every (symbol, cycle)) are
+        // wrong when N>1 symbols are processed because the LAST symbol's
+        // values are what the dashboard sees. Per-symbol fields fix that.
+        const useCross = freshSymbols > 0
+        const createdSets       = useCross
+          ? symCreated
+          : n(dh.created_sets      || progHash[`strategy_${stage}_created_sets`])
+        const avgPosPerSet      = useCross && weightSum > 0
+          ? weightedPPS / weightSum
+          : parseFloat(dh.avg_pos_per_set      || progHash[`strategy_${stage}_avg_pos_per_set`]      || "0")
+        const avgProfitFactor   = useCross && weightSum > 0
+          ? weightedPF / weightSum
+          : parseFloat(dh.avg_profit_factor    || progHash[`strategy_${stage}_avg_profit_factor`]    || "0")
         const avgProcessingMs   = parseFloat(dh.avg_processing_ms    || progHash[`strategy_${stage}_avg_processing_ms`]    || "0")
         // Average position evaluation score for Real stage (stored by strategy-coordinator)
-        const avgPosEvalReal    = parseFloat(dh.avg_pos_eval_real    || progHash[`strategy_${stage}_avg_pos_eval_real`]    || "0")
+        const avgPosEvalReal    = useCross && weightSum > 0
+          ? weightedPER / weightSum
+          : parseFloat(dh.avg_pos_eval_real    || progHash[`strategy_${stage}_avg_pos_eval_real`]    || "0")
         // Count of positions that contributed to avgPosEvalReal (only meaningful for Real stage)
         const countPosEval      = n(dh.count_pos_eval || progHash[`strategy_${stage}_count_pos_eval`])
         // Drawdown time (avg minutes from strategy sets)
-        const avgDrawdownTime   = parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
+        const avgDrawdownTime   = useCross && weightSum > 0
+          ? weightedDDT / weightSum
+          : parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
 
         // Eval percentage: main = evaluated/base, real = evaluated/main
         let evalPct = 0
@@ -803,6 +1070,16 @@ export async function GET(
             ? Math.round((stagePassed / stageEvaluated) * 1000) / 10
             : 0
 
+        // ── Actively-running counts (operator spec) ──
+        // `sets_running_now` is written by strategy-coordinator using
+        // membership in the `pseudo_positions:{conn}:active_config_keys`
+        // Redis Set (Base) or parentSetKey resolution (Main/Real). It
+        // represents Sets that are CURRENTLY processing — those holding
+        // an open pseudo-position OR mid-formation this cycle. The
+        // dashboard surfaces this as the canonical "Active" count.
+        const setsRunningNow  = n(dh.sets_running_now || dh.sets_with_open_positions)
+        const setsProgressing = n(dh.sets_progressing) || createdSets
+
         stratDetail[stage] = {
           avgPosPerSet:        isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100      : 0,
           createdSets,
@@ -816,9 +1093,37 @@ export async function GET(
           evaluated: stageEvaluated,
           passed: stagePassed,
           failed: Math.max(0, stageEvaluated - stagePassed),
+          setsRunningNow,
+          setsProgressing,
+          setsWithOpenPositions: setsRunningNow,
+          // Real-only 4-perspective stats (overall/accumulated/general/combined).
+          // For non-Real stages the fields are 0 — the dialog only renders
+          // the 4-tile panel when stage === "real".
+          ...(stage === "real"
+            ? {
+                statOverall:     n(progHash.strategies_real_total),
+                statAccumulated: n(dh.stat_accumulated),
+                statGeneral:     n(dh.stat_general) || createdSets,
+                statCombined:    n(dh.stat_combined) || setsRunningNow,
+              }
+            : {}),
         }
       })
     )
+
+    // ── Opportunistic stale per-symbol field pruning ─────────────────
+    // After aggregation, HDEL the per-symbol bundles older than 30 min.
+    // Done after the response is computed (and fire-and-forget) so it
+    // never adds latency to /stats. Bounds hash size for long-running
+    // connections that swap symbol baskets — without pruning the hash
+    // grows by ~11 fields × every-symbol-ever-seen until the 24h TTL.
+    if (staleFieldsByKey.size > 0) {
+      void Promise.allSettled(
+        Array.from(staleFieldsByKey.entries()).map(([key, fields]) =>
+          fields.length > 0 ? client.hdel(key, ...fields).catch(() => 0) : Promise.resolve(0),
+        ),
+      )
+    }
 
     // ── LIVE STAGE DETAIL (4th tier — mirrors Real but from real exchange) ───
     // Sourced entirely from local Redis — the progression hash (counters) and
@@ -915,6 +1220,14 @@ export async function GET(
       missingIntervalsLoaded:  n(prehistoricHash.missing_intervals)   || n(progHash.prehistoric_missing_loaded),
       currentSymbol:           prehistoricHash.current_symbol         || progHash.prehistoric_current_symbol || "",
       isComplete:              prehistoricHash.is_complete === "1",
+      // Aggregate profit factor across every closed prehistoric position
+      // — written by `ConfigSetProcessor` after each prehistoric run
+      // (`historic_avg_profit_factor` field on the `prehistoric:{id}`
+      // hash). Surfaced here so the dashboard tile + Overall Summary can
+      // render it without computing PF client-side. 0 when no closed
+      // positions yet, so the UI can render "—" for empty states.
+      historicAvgProfitFactor: parseFloat(prehistoricHash.historic_avg_profit_factor || "0") || 0,
+      historicAvgProfitFactorCount: n(prehistoricHash.historic_avg_profit_factor_count),
     }
 
     // ── WINDOW DATA (last 5min / 60min) ──────────────────────────────────────
@@ -982,6 +1295,27 @@ export async function GET(
         framesMissingLoaded:    n(prehistoricMeta.missingIntervalsLoaded),
         timeframeSeconds:       n(prehistoricMeta.timeframeSeconds) || 1,
 
+        // ── Historic profit factor + executed positions ────────────────
+        // Two operator-requested overview metrics that previously lived
+        // only inside the per-stage `strategyDetail` block (PF) or the
+        // `liveExecution` block (positions created/closed). Surfaced
+        // alongside the prehistoric counters so the QuickStart card and
+        // the Overall Summary can render them without re-deriving from
+        // multiple fields.
+        //
+        //   * `avgProfitFactor` — historic-wide PF (all closed
+        //     prehistoric positions, sum(+pct) / |sum(-pct)|, capped at
+        //     9.999). 0 ⇒ no closed positions yet.
+        //   * `avgProfitFactorCount` — sample count behind the average.
+        //   * `executedPositions` — cumulative live exchange positions
+        //     created since engine start (`live_positions_created_count`).
+        //     This is the canonical "Executed Positions" metric the spec
+        //     refers to: every Real→Live promotion that resulted in an
+        //     actual exchange order.
+        avgProfitFactor:        Math.round(prehistoricMeta.historicAvgProfitFactor * 1000) / 1000,
+        avgProfitFactorCount:   prehistoricMeta.historicAvgProfitFactorCount,
+        executedPositions:      n(progHash.live_positions_created_count),
+
         // Prehistoric-processing churn counters — tick every time the engine spins
         // through its evaluation loop, incl. idle/warmup ticks. Kept here so the UI
         // can hide them from the primary live-progression display while still
@@ -997,6 +1331,36 @@ export async function GET(
         indicationCycles: realtimeIndicationCycles,
         strategyCycles:   realtimeStrategyCycles,
         realtimeCycles,
+        // ── Per-processor cycle counters (cumulative, hincrby-backed) ──
+        // Each processor maintains TWO independent counters:
+        //   *_cycle_count       — every tick (incl. idle/empty/gated)
+        //   *_live_cycle_count  — only ticks that produced actual work
+        // The dashboard surfaces both so the operator can spot imbalances
+        // (e.g. realtime ticking but never doing live work = no positions).
+        cycleCounters: {
+          indication:       churnIndicationCycles,
+          indicationLive:   liveIndicationCycles,
+          strategy:         churnStrategyCycles,
+          strategyLive:     liveStrategyCycles,
+          realtime:         realtimeCycles,
+          realtimeLive:     liveRealtimeCycles,
+        },
+        // ── Pseudo-position mark-to-market visibility ────────────────
+        // Cumulative counters written by RealtimeProcessor.processRealtimeUpdates
+        // on every tick that touched ≥1 open pseudo-position. Lets the
+        // dashboard prove the "open positions are recalculated INDEPENDENT
+        // of indication/strategy" invariant — independent of indication/
+        // strategy cycle counters above.
+        pseudoPositionUpdates: {
+          totalUpdates:     n(progHash.pseudo_positions_updated_count),
+          updateCycles:     n(progHash.pseudo_positions_update_cycles),
+          lastUpdateAt:     progHash.pseudo_positions_last_update_at || null,
+          lastBatchSize:    n(progHash.pseudo_positions_last_count),
+        },
+        // Cross-processor cumulative tick total — independent of the
+        // per-Set 250-entry DB cap. Counts every loop tick across all
+        // three processors since the engine started.
+        framesProcessed,
         indicationsTotal,
         strategiesTotal,
         positionsOpen,
@@ -1029,13 +1393,18 @@ export async function GET(
       },
 
       breakdown: {
+        // EVERY indication type tracked by `IndicationSetsProcessor` is
+        // surfaced here — `active_advanced` was previously silently
+        // dropped from this response despite the engine generating it.
+        // Each value is the cumulative count since run start.
         indications: {
-          direction: indCounts.direction || 0,
-          move:      indCounts.move      || 0,
-          active:    indCounts.active    || 0,
-          optimal:   indCounts.optimal   || 0,
-          auto:      indCounts.auto      || 0,
-          total:     indTotal,
+          direction:      indCounts.direction      || 0,
+          move:           indCounts.move           || 0,
+          active:         indCounts.active         || 0,
+          activeAdvanced: indCounts.active_advanced || 0,
+          optimal:        indCounts.optimal        || 0,
+          auto:           indCounts.auto           || 0,
+          total:          indTotal,
         },
         strategies: {
           base: stratCounts.base || 0,
@@ -1047,6 +1416,123 @@ export async function GET(
           mainEvaluated: stratEvaluated.main || 0,
           realEvaluated: stratEvaluated.real || 0,
         },
+      },
+
+      // ── CURRENTLY-ACTIVE counts (per cycle, not cumulative) ───────────
+      // The Overview surfaces these as the headline numbers because the
+      // operator wants to see what's alive RIGHT NOW — not "how many
+      // were ever created since boot". Engine writers overwrite the
+      // backing hashes once per cycle so these values track live state.
+      // See engine writers in:
+      //   - lib/indication-sets-processor.ts → indications_active:{id}
+      //   - lib/strategy-coordinator.ts      → strategies_active:{id}
+      activeCounts: {
+        indications: {
+          direction:      activeIndByType.direction        || 0,
+          move:           activeIndByType.move             || 0,
+          active:         activeIndByType.active           || 0,
+          activeAdvanced: activeIndByType.active_advanced  || 0,
+          optimal:        activeIndByType.optimal          || 0,
+          auto:           activeIndByType.auto             || 0,
+          total:          activeIndTotal,
+        },
+        strategies: {
+          base:  activeStratByStage.base  || 0,
+          main:  activeStratByStage.main  || 0,
+          real:  activeStratByStage.real  || 0,
+          total: activeStratTotal,
+        },
+      },
+
+      // ── ACTIVE PROGRESSING (sets / trackings / positions) ───────────
+      // Per spec: "count for Indications and Strategies Active
+      // Progressing Sets, trackings .. active positions."
+      //
+      // Three orthogonal axes, computed per indication-type and per
+      // strategy-stage:
+      //
+      //   1. `sets`      — distinct (symbol × type/stage) pairs whose
+      //                    latest cycle reported a non-zero qualified
+      //                    count. This is the cardinality of Sets
+      //                    currently producing entries.
+      //   2. `trackings` — cumulative entries that have ever been
+      //                    written to those Sets. Mirrors the
+      //                    `breakdown` totals so the operator sees
+      //                    "how much tracked data has been observed".
+      //   3. `positions` — open positions held by that
+      //                    type/stage. For Strategies the canonical
+      //                    mapping is:
+      //                       base → pseudoOpen   (mark-to-market)
+      //                       main → pseudoOpen   (Main is a Set
+      //                                            evaluation stage,
+      //                                            shares the pseudo
+      //                                            ledger; surfaced for
+      //                                            symmetry, identical
+      //                                            value to base)
+      //                       real → realOpen     (Real-stage promotions)
+      //                       live → liveOpen     (exchange orders)
+      //                    For Indications `positions` is the count
+      //                    of currently-qualified indications (one
+      //                    per slot held).
+      //
+      // All three are read from already-collected variables — zero
+      // additional Redis calls.
+      activeProgressing: {
+        indications: {
+          direction:      { sets: activeSetsIndByType.direction       || 0, trackings: indCounts.direction       || 0, positions: activeIndByType.direction        || 0 },
+          move:           { sets: activeSetsIndByType.move            || 0, trackings: indCounts.move            || 0, positions: activeIndByType.move             || 0 },
+          active:         { sets: activeSetsIndByType.active          || 0, trackings: indCounts.active          || 0, positions: activeIndByType.active           || 0 },
+          activeAdvanced: { sets: activeSetsIndByType.active_advanced || 0, trackings: indCounts.active_advanced || 0, positions: activeIndByType.active_advanced  || 0 },
+          optimal:        { sets: activeSetsIndByType.optimal         || 0, trackings: indCounts.optimal         || 0, positions: activeIndByType.optimal          || 0 },
+          auto:           { sets: activeSetsIndByType.auto            || 0, trackings: indCounts.auto            || 0, positions: activeIndByType.auto             || 0 },
+          total:          { sets: activeSetsIndTotal,                       trackings: indTotal,                       positions: activeIndTotal },
+        },
+        strategies: (() => {
+          // ── Actively-running per stage (operator spec) ─────────────
+          // Source of truth: `strategy_detail:{conn}:{stage}` ->
+          // `sets_running_now`, written by strategy-coordinator using
+          // membership in `pseudo_positions:{conn}:active_config_keys`.
+          // This is what the dashboard MUST show — already-progressed
+          // Sets that have since closed are intentionally excluded.
+          //
+          // Fallback: when the detail hash hasn't been written yet
+          // (fresh cycle, first symbol still processing), we use the
+          // (symbol, stage) presence count as a best-effort estimate.
+          const baseRun  = n(stratDetail.base?.setsRunningNow)  || activeSetsStratByStage.base || 0
+          const mainRun  = n(stratDetail.main?.setsRunningNow)  || activeSetsStratByStage.main || 0
+          const realRun  = n(stratDetail.real?.setsRunningNow)  || activeSetsStratByStage.real || 0
+          const liveRun  = n(stratDetail.live?.setsRunningNow)  || pseudoRunningSets || 0
+          // Pipeline-aware total: same logical Set exists at multiple
+          // stages (mirroring principle). The "deepest-active" count
+          // is the canonical aggregate — Live ⊂ Real ⊂ Main ⊂ Base.
+          // Surface the maximum of the four to avoid double-counting.
+          const totalRun = Math.max(baseRun, mainRun, realRun, liveRun)
+          return {
+            base: { sets: baseRun, trackings: stratCounts.base || 0, positions: pseudoOpen },
+            main: { sets: mainRun, trackings: stratCounts.main || 0, positions: pseudoOpen },
+            real: { sets: realRun, trackings: stratCounts.real || 0, positions: realOpen },
+            live: {
+              // Live's "running" = distinct Sets currently feeding
+              // exchange orders (== pseudoRunningSets when detail hash
+              // is empty).
+              sets:      liveRun,
+              trackings: stratCounts.live || 0,
+              positions: Math.max(
+                0,
+                n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count),
+              ),
+            },
+            total: {
+              sets:      totalRun,
+              trackings: stratTotal,
+              // Open positions are NOT summed across stages (mirroring
+              // principle — same logical position exists at multiple
+              // stages). Use the deepest-active stage as the canonical
+              // "currently-progressing" total.
+              positions: Math.max(pseudoOpen, realOpen),
+            },
+          }
+        })(),
       },
 
       // Per-stage strategy detail — avg positions per set, created sets, avg profit factor, avg processing time,
@@ -1092,6 +1578,33 @@ export async function GET(
         const totalReused  = n(progHash.strategies_main_related_reused)
         const totalCycles  = n(progHash.strategies_main_cycles)
         const reuseDenom   = totalCreated + totalReused
+
+        // ── Build per-axis-window arrays from `axis_windows:{id}` ─────────
+        //
+        // Spec mapping:
+        //   prev  : N ∈ 0..12 (closed lookback window)
+        //   last  : N ∈ 0..4  (last-N wins/losses magnitude)
+        //   cont  : N ∈ 0..8  (open continuous positions)
+        //   pause : N ∈ 0..8  (last-N validation window)
+        //
+        // For each axis we emit an array of `{ window, sets, pos }` so the
+        // dashboard can render a compact 0..N strip without re-deriving
+        // positional offsets. `sets` = cumulative Sets that landed under
+        // window N; `pos` = total entries (≈ "position configurations")
+        // those Sets carried. 0-bucket is included so consumers can show
+        // "axis was inactive N times" without special-casing the absence.
+        const buildAxis = (axis: "prev" | "last" | "cont" | "pause", maxN: number) => {
+          const out: Array<{ window: number; sets: number; pos: number }> = []
+          for (let i = 0; i <= maxN; i++) {
+            out.push({
+              window: i,
+              sets: n(axisWindowsHash[`${axis}_${i}_sets`]),
+              pos:  n(axisWindowsHash[`${axis}_${i}_pos`]),
+            })
+          }
+          return out
+        }
+
         return {
           activeVariants:       activeVariantsStr.split(",").filter(Boolean),
           activeVariantCount:   n(progHash.strategies_main_active_variant_count),
@@ -1108,6 +1621,17 @@ export async function GET(
             prevLosses:  n(progHash.strategies_main_ctx_prev_losses),
             prevTotal:   n(progHash.strategies_main_ctx_prev_total),
             updatedAt:   n(progHash.strategies_main_ctx_updated_at),
+          },
+          // ── Per-axis Position-Count windows (cumulative across run) ─────
+          // Spec: *"step 1 previous 1-12; Last (of previous) 1-4;
+          // continuous 1-8 and Pause 1-8"*. Each axis emits its full 0..N
+          // bucket strip, suitable for a compact "axis summary" UI row.
+          axisWindows: {
+            prev:   buildAxis("prev",  12),
+            last:   buildAxis("last",  4),
+            cont:   buildAxis("cont",  8),
+            pause:  buildAxis("pause", 8),
+            updatedAt: n(axisWindowsHash.updated_at),
           },
         }
       })(),
@@ -1154,6 +1678,26 @@ export async function GET(
         )
         const liveVolumeUsd = n(progHash.live_volume_usd_total)
         const liveVolumeUsdR = Math.round(liveVolumeUsd * 100) / 100
+        // Used-balance (margin) cumulative counter — incremented in
+        // lock-step with `live_volume_usd_total` by live-stage.ts at both
+        // creation and accumulation points. This is the canonical "USDT
+        // used balance" surface the UI should prefer over the leveraged
+        // notional figure (per the operator's spec). Falls back to the
+        // current portfolio aggregate when the cumulative counter is
+        // empty (legacy connection that started before margin tracking).
+        // Prefer the new cent-precision counter so sub-dollar margins
+        // (a $5 fill at 125x leverage = $0.04 margin) survive integer
+        // truncation. Falls back to the legacy dollar counter, then
+        // to the open-portfolio aggregate.
+        const liveMarginCents = n(progHash.live_margin_cents_total)
+        const liveMarginUsdR = liveMarginCents > 0
+          ? Math.round(liveMarginCents) / 100
+          : (() => {
+              const dollars = n(progHash.live_margin_usd_total)
+              return dollars > 0
+                ? Math.round(dollars * 100) / 100
+                : Math.round(liveAggTotalMarginUsd * 100) / 100
+            })()
 
         // Full Exchange Position Details per live position. Contains
         // everything the operator needs to evaluate trade health
@@ -1213,10 +1757,26 @@ export async function GET(
           },
           real: {
             open:         realOpen,                  // count only
+            // Running average of currently-active validated Real
+            // positions, accumulated across all /stats fetches for this
+            // connection. UNBOUNDED — does not share the per-set 250
+            // entry cap. See "Running-avg of active validated Real
+            // positions" block above for the storage layout. Resets
+            // when ResetDB clears `progression:{id}`.
+            activeAvg:    Math.round(realActivePosAverage * 100) / 100,
+            activeSamples: realActivePosSamples,
           },
           live: {
             open:         liveOpen,                  // count
-            volumeUsd:    liveVolumeUsdR,            // exchange USD exposure (only real figure)
+            volumeUsd:    liveVolumeUsdR,            // exchange USD notional (qty × price, leveraged exposure)
+            // Used-balance / margin USDT — the value of the *capital
+            // committed* to live exchange positions, NOT the leveraged
+            // notional. This is what the dashboard should display under
+            // "USDT" labels per operator spec. Equals the cumulative
+            // sum of (notional / leverage) across every live fill +
+            // accumulation, with a fallback to the live portfolio
+            // aggregate when no historical counter exists.
+            marginUsd:    liveMarginUsdR,
             openScanned:  liveOpenScanned,
             positions:    liveMirroring,
             resolution: {
@@ -1259,6 +1819,14 @@ export async function GET(
         ordersFailed:     n(progHash.live_orders_failed_count),
         ordersRejected:   n(progHash.live_orders_rejected_count),
         ordersSimulated:  n(progHash.live_orders_simulated_count),
+        // Accumulated entries (extra fills merged into an existing
+        // exchange position because multiple Real-stage Set signals
+        // for the same symbol+direction landed on a still-open live
+        // position). This is the canonical "Pos Accumulated" metric
+        // the user wants surfaced at Real → Live: it's how many
+        // upstream Set signals were absorbed without spawning new
+        // exchange orders, keeping the live exposure consolidated.
+        ordersAccumulated: n(progHash.live_orders_accumulated_count),
         // Positions
         positionsCreated: n(progHash.live_positions_created_count),
         positionsClosed:  n(progHash.live_positions_closed_count),
@@ -1267,8 +1835,28 @@ export async function GET(
           n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)
         ),
         wins:             n(progHash.live_wins_count),
-        // Volume
+        // Volume — leveraged notional (cumulative qty × price across all fills)
         volumeUsdTotal:   n(progHash.live_volume_usd_total),
+        // Used-balance margin (cumulative notional/leverage). This is
+        // the canonical "USDT" figure the dashboard should display:
+        // the actual capital committed, not the leveraged exposure.
+        //
+        // PRIORITY ORDER:
+        //   1. `live_margin_cents_total` — cent-precision counter
+        //      (added 2026-05-03). Survives the rounding that wiped out
+        //      sub-dollar margins (e.g. $5 notional / 125x = $0.04
+        //      margin) on the legacy dollar counter.
+        //   2. `live_margin_usd_total` — legacy dollar counter, still
+        //      written in lock-step for backward-compat dashboards.
+        //   3. Current open-portfolio margin aggregate, for connections
+        //      that started before either counter existed.
+        marginUsdTotal:   (() => {
+          const cents = n(progHash.live_margin_cents_total)
+          if (cents > 0) return Math.round(cents) / 100
+          const dollars = n(progHash.live_margin_usd_total)
+          if (dollars > 0) return dollars
+          return Math.round(liveAggTotalMarginUsd * 100) / 100
+        })(),
         // Derived
         fillRate: (() => {
           const placed = n(progHash.live_orders_placed_count)

@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server"
-import { initRedis, getSettings, setSettings, getConnection } from "@/lib/redis-db"
+import { initRedis, getSettings, setSettings, getConnection, getRedisClient } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors"
 
 export const runtime = "nodejs"
@@ -54,12 +54,16 @@ export async function GET(request: NextRequest) {
           }
         } else {
           // Fallback to real price fetch without credentials if possible
-          const connector = await createExchangeConnector(exchange, { isTestnet: false })
+          const connector = await createExchangeConnector(exchange, 
+            { apiKey: "", apiSecret: "", apiPassphrase: "", isTestnet: false, apiType: "spot" } as any
+          )
           marketData = await connector.getTicker(symbol)
         }
 
         // Cache for 3 seconds for real data
-        await setSettings(cacheKey, JSON.stringify(marketData), { EX: 3 })
+        const client = getRedisClient()
+        await client.set(cacheKey, JSON.stringify(marketData))
+        await client.expire(cacheKey, 3)
       } catch (fetchError) {
         console.warn("[Market Data] Failed to fetch real data, using fallback:", fetchError)
         // Fallback - still generate but don't use random values, use static base prices

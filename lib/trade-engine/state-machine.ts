@@ -11,7 +11,12 @@
 import { createExchangeConnector } from "@/lib/exchange-connectors"
 import { positionTracker, LivePosition, OrderRecord } from "@/lib/positions/position-tracker"
 import { indicatorCalculator, PriceData } from "@/lib/indicators/calculator"
-import { redisDb } from "@/lib/redis-db"
+import { getRedisClient } from "@/lib/redis-db"
+// shim: existing code uses redisDb.set; map to InlineLocalRedis instance.
+const redisDb = {
+  set: (key: string, val: string, opts?: { ex?: number }) =>
+    opts?.ex ? getRedisClient().setex(key, opts.ex, val) : getRedisClient().set(key, val),
+}
 
 export interface TradeEngineConfig {
   connectionId: string

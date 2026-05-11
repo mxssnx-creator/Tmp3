@@ -34,6 +34,27 @@ export interface Settings {
   baseRatioMax: number
   trailingOption: boolean
 
+  /**
+   * Multi-step trailing for Base Strategies.
+   *
+   * Spec: each enabled (start, stop) combo spawns one INDEPENDENT Base Set
+   * per (indication_type × direction), so the engine evaluates the full
+   * configuration matrix in parallel. Operator can prune the matrix in
+   * Settings → Strategy → Trailing.
+   *
+   * Units: ratios where 0.1 ≡ 10% (decimal of price change).
+   *   trailingStart  ∈ {0.3, 0.6, 0.9, 1.2, 1.5}    (activation gain)
+   *   trailingStop   ∈ {0.1, 0.2, 0.3, 0.4, 0.5}    (trail distance)
+   *   trailingStep   = trailingStop / 2              (derived; ratchet
+   *                                                   minimum increment)
+   *
+   * `strategyBaseTrailingVariants` is a list of "start:stop" tokens
+   * (e.g. "0.3:0.1") — one entry per ENABLED combo. Empty array means
+   * multi-trailing is effectively off even with the master toggle on.
+   */
+  strategyBaseTrailingEnabled: boolean
+  strategyBaseTrailingVariants: string[]
+
   // Main Strategy
   previousPositionsCount: number
   lastStateCount: number
@@ -53,10 +74,14 @@ export interface Settings {
   arrangementType: string
   quoteAsset: string
 
-  // Minimum Profit Factor Requirements
+  // ── Main Trade PF thresholds per stage (Base/Main/Real/Live) ─────
+  // Operator-tunable via Settings → Strategy → Main → Profit Factor
+  // Thresholds. Spec defaults 0.9/1.0/1.0/1.0 — wired into the engine
+  // by `lib/strategy-coordinator.ts:loadAppPFThresholds()`.
   baseProfitFactor: number
   mainProfitFactor: number
   realProfitFactor: number
+  liveProfitFactor: number
 
   // Risk Management
   trailingStopLoss: boolean
@@ -84,6 +109,15 @@ export interface Settings {
    * *"Active Pseudo Position Limit for each direction Long,short maximal 1"*.
    */
   maxActiveBasePseudoPositionsPerDirection: number
+
+  /**
+   * Hard ceiling on the number of post-filter, post-PF-sort REAL Sets
+   * that propagate to Live evaluation each cycle. Default 12000 — set
+   * high enough that the cap rarely binds in normal operation, yet
+   * still bounds growth when the funnel widens. Operator-tunable via
+   * Settings → System.
+   */
+  maxRealSets: number
 
   // System Configuration
   autoRestartOnErrors: boolean

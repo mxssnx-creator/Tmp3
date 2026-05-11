@@ -8,7 +8,7 @@
 
 import { IndicationConfigManager, IndicationResult, IndicationConfig } from "@/lib/indication-config-manager"
 import { StrategyConfigManager, PseudoPosition, StrategyConfig } from "@/lib/strategy-config-manager"
-import { getRedisClient, initRedis, getSettings } from "@/lib/redis-db"
+import { getRedisClient, initRedis, getSettings, setSettings } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
@@ -36,10 +36,44 @@ export class ConfigSetProcessor {
   private indicationManager: IndicationConfigManager
   private strategyManager: StrategyConfigManager
 
+  // Per-Set DB capacity used to clip the per-config indication-result and
+  // strategy-position arrays returned from each calculation pass. This
+  // value MUST track the operator-controlled `setCompactionFloor`
+  // setting (Settings → System → Set Compaction → Compaction Floor) so
+  // the per-pass slice does not artificially mask actual processed
+  // counts in the dashboard.
+  //
+  // Read once at the start of each `processPrehistoricData` run (cheap,
+  // already async) into `runtimeSetEntryCap`. Default 250 matches the
+  // historical hard-coded value, so behaviour is unchanged for fresh
+  // installs that haven't tuned the setting.
+  private runtimeSetEntryCap: number = 250
+
   constructor(connectionId: string) {
     this.connectionId = connectionId
     this.indicationManager = new IndicationConfigManager(connectionId)
     this.strategyManager = new StrategyConfigManager(connectionId)
+  }
+
+  /**
+   * Resolve the per-Set entry cap from settings (`setCompactionFloor`).
+   * Honours the same value the operator configured in Settings → System
+   * → Set Compaction. Returns 250 (the legacy default) when the
+   * setting is missing or invalid so behaviour is preserved.
+   *
+   * NOTE: this is called once per `processPrehistoricData` run. Per-call
+   * lookup avoids stale closures on long-lived process instances.
+   */
+  private async resolveSetEntryCap(): Promise<number> {
+    try {
+      const settingsRaw = await getSettings("global_settings").catch(() => null)
+      const settings: any = settingsRaw && typeof settingsRaw === "object" ? settingsRaw : {}
+      const fromSettings = Number(settings.setCompactionFloor)
+      if (Number.isFinite(fromSettings) && fromSettings >= 50 && fromSettings <= 100_000) {
+        return Math.floor(fromSettings)
+      }
+    } catch { /* non-critical */ }
+    return 250
   }
 
   /**
@@ -119,6 +153,17 @@ export class ConfigSetProcessor {
     await initRedis()
     const client = getRedisClient()
 
+    // Resolve the per-Set entry cap once for this whole run. Honours the
+    // operator-controlled `setCompactionFloor` setting so the dashboard
+    // counts (`indications_count`, `strategies_base_total`, the per-Set
+    // DB lengths) reflect the actual configured ceiling instead of the
+    // historical hard-coded 250.
+    this.runtimeSetEntryCap = await this.resolveSetEntryCap()
+    console.log(
+      `[v0] [ConfigSetProcessor] per-Set entry cap = ${this.runtimeSetEntryCap} ` +
+      `(from setCompactionFloor)`
+    )
+
     // Mutable aggregates updated from parallel workers — guard with a lightweight
     // local function since JS is single-threaded inside the event loop there's
     // no true race, but this keeps the reads/writes explicit.
@@ -172,8 +217,15 @@ export class ConfigSetProcessor {
           candles = JSON.parse(candlesRaw)
         }
 
+        // ── Fallback read switched from `:1m` → `:1s` (spec §7.3) ───
+        //
+        // The market-data loader was migrated to 1-second timeframe so
+        // the legacy `:1m` suffix is no longer populated on fresh
+        // deployments. The canonical `:candles` snapshot above is
+        // still tried first; the `:1s` JSON envelope is the
+        // authoritative fallback.
         if (!candles || candles.length === 0) {
-          const marketDataRaw = await client.get(`market_data:${symbol}:1m`)
+          const marketDataRaw = await client.get(`market_data:${symbol}:1s`)
           if (marketDataRaw) {
             const marketDataObj = JSON.parse(marketDataRaw)
             if (marketDataObj?.candles) {
@@ -283,10 +335,16 @@ export class ConfigSetProcessor {
         totalStrategyPositions += strategyPositions
 
         // Fan-out the counter writes & completion marker.
+        // NOTE: Track prehistoric stats separately so they don't bleed into
+        // realtime counts. The `indications_count` and `strategies_count` are
+        // realtime-authoritative (written by engine-manager). Prehistoric phase
+        // writes to separate `prehistoric_indications_total` and
+        // `prehistoric_strategies_total` keys. This prevents the "jumped counters"
+        // effect when transitioning from setup to live trading.
         await Promise.all([
           progressWrite,
-          client.hincrby(progressKey, "indications_count", indicationResults),
-          client.hincrby(progressKey, "strategies_base_total", strategyPositions),
+          client.hincrby(progressKey, "prehistoric_indications_total", indicationResults),
+          client.hincrby(progressKey, "prehistoric_strategies_total", strategyPositions),
           client.expire(progressKey, 7 * 24 * 60 * 60),
           client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol),
           client.expire(`prehistoric:${this.connectionId}:symbols`, 86400),
@@ -306,6 +364,29 @@ export class ConfigSetProcessor {
           // distinguishes "prehistoric done" from "never ran".
           ProgressionStateManager.incrementPrehistoricCycle(this.connectionId, symbol).catch(() => { /* non-critical */ }),
         ]).catch(() => { /* non-critical */ })
+
+        // ── Live phase progression update (per-symbol cadence) ─────────
+        // Push the actual percent + sub_progress (X/Y symbols) into
+        // `engine_progression:{id}` so the dashboard progress bar
+        // advances in real time as parallel workers tick off symbols.
+        // The phase percent maps the prehistoric work onto the
+        // 15 → 95 range (live_trading @ 100 is set by the engine boot
+        // path's post-prehistoric handler). Fire-and-forget — a stuck
+        // Redis write should never delay the next symbol.
+        try {
+          const total = Math.max(1, symbols.length)
+          const pct = Math.min(95, 15 + Math.round((symbolsProcessed / total) * 80))
+          void setSettings(`engine_progression:${this.connectionId}`, {
+            phase: "prehistoric_data",
+            progress: pct,
+            detail: `Prehistoric calc filling sets — ${symbolsProcessed}/${total} symbols processed`,
+            sub_current: symbolsProcessed,
+            sub_total: total,
+            sub_item: symbol,
+            connection_id: this.connectionId,
+            updated_at: new Date().toISOString(),
+          }).catch(() => { /* non-critical */ })
+        } catch { /* non-critical */ }
 
         const tSymMs = Date.now() - tSymStart
         console.log(
@@ -378,6 +459,158 @@ export class ConfigSetProcessor {
       errors: result.errors,
       durationMs: result.duration,
     })
+
+    // ── Aggregate per-stage avg profit factor from prehistoric positions ──
+    //
+    // The realtime strategy-coordinator writes
+    // `strategy_detail:{connId}:{base|main|real}.avg_profit_factor` once it
+    // starts running. During pure prehistoric processing those keys stay
+    // empty, so the dashboard's Base/Main/Real PF tiles read 0/— even
+    // though we just generated thousands of historic positions with full
+    // PnL data. Spec ask: "Show / Add also Average Profitfactors for
+    // Strategies Base, Main, Real (for Historic Processing Info / Stats)."
+    //
+    // We compute one aggregate PF over all prehistoric position results
+    // and mirror it into the three stage hashes. Per-stage tiering does
+    // not exist in the prehistoric data model (StrategyConfig has no
+    // tier field), so the same aggregate is written across all three;
+    // once the realtime strategy-coordinator runs, its tier-specific
+    // writes naturally overwrite these prehistoric placeholders. We use
+    // SETNX-style logic via plain HSET because callers downstream
+    // already accept the field whenever it is present.
+    //
+    // PF = sum(positive results %) / |sum(negative results %)|.
+    // Capped at 9.999 so a no-loss prehistoric run renders cleanly.
+    try {
+      let posSum = 0
+      let negAbsSum = 0
+      let resultCount = 0
+      const tStart = Date.now()
+      // Cap concurrency on the hot prehistoric path — for very large
+      // strategy config counts we don't want to fan out an unbounded
+      // number of LRANGE commands at once.
+      const PF_SCAN_CONCURRENCY = 16
+      const queue = strategyConfigs.slice()
+      const workers: Promise<void>[] = []
+      for (let w = 0; w < Math.min(PF_SCAN_CONCURRENCY, queue.length); w++) {
+        workers.push((async () => {
+          while (true) {
+            const cfg = queue.shift()
+            if (!cfg) return
+            try {
+              const setKey = `strategy:${this.connectionId}:config:${cfg.id}:positions`
+              const entries = (await client.lrange(setKey, 0, StrategyConfigManager.MAX_POSITIONS - 1)) || []
+              for (const entry of entries) {
+                if (!entry) continue
+                // ── Closed-only gate (spec: "Main Sets / Pos Coord ones must
+                //    evaluate previous CLOSED pseudo positions, not opened ones") ──
+                //
+                // Entries are produced via `StrategyConfigManager.serializeSetEntry`,
+                // which writes a POSITIONAL "|"-delimited tuple:
+                //   entry_time|symbol|entry_price|take_profit|stop_loss|
+                //   status|result|exit_time|exit_price
+                //
+                // The previous parser tried two branches that never matched
+                // real production rows:
+                //   (1) `JSON.parse` — only legacy payloads use that
+                //   (2) regex `\bresult=…` — assumed key=value pairs that
+                //       this serializer does NOT produce
+                // The result was `resultCount` permanently 0 — and worse,
+                // had parsing succeeded the aggregate would have summed
+                // OPEN positions because the prehistoric fill path appends
+                // `status:"open"` rows alongside `status:"closed"` ones.
+                //
+                // Now: parse with the canonical `StrategyConfigManager.parseEntry`
+                // helper (already used by `getLatestPosition` / `getStats`),
+                // then hard-gate on `status === "closed"`. Floating
+                // mark-to-market PnL on still-open prehistoric trades is
+                // excluded from the aggregate that mirrors into
+                //   strategy_detail:{base|main|real}.avg_profit_factor
+                //   progression:{id}.strategy_{base|main|real}_avg_profit_factor
+                //   prehistoric:{id}.historic_avg_profit_factor
+                // — all of which feed the Main-stage position-factor
+                // coordination layer.
+                const parsed = StrategyConfigManager.parseEntry(String(entry))
+                if (!parsed) continue
+                if (parsed.status !== "closed") continue
+                const resultPct = Number(parsed.result)
+                if (!Number.isFinite(resultPct)) continue
+                if (resultPct > 0) posSum += resultPct
+                else if (resultPct < 0) negAbsSum += Math.abs(resultPct)
+                resultCount++
+              }
+            } catch (err) {
+              console.warn(
+                `[v0] [ConfigSetProcessor] PF scan failed for ${cfg.id}:`,
+                err instanceof Error ? err.message : String(err),
+              )
+            }
+          }
+        })())
+      }
+      await Promise.all(workers)
+
+      // Compute PF only when we actually saw closed positions on both
+      // sides, otherwise the value is meaningless and we leave the field
+      // alone (downstream realtime writers will populate it later).
+      if (resultCount > 0 && (posSum > 0 || negAbsSum > 0)) {
+        const rawPF = negAbsSum > 0 ? posSum / negAbsSum : 9.999 // all-wins ceiling
+        const aggregatePF = Math.min(9.999, Math.max(0, rawPF))
+        const pfStr = aggregatePF.toFixed(4)
+        const stageWrites: Promise<any>[] = []
+        for (const stage of ["base", "main", "real"] as const) {
+          const stageKey = `strategy_detail:${this.connectionId}:${stage}`
+          stageWrites.push(
+            client.hset(stageKey, {
+              avg_profit_factor: pfStr,
+              // Mark provenance so anyone debugging the dashboard can tell
+              // this PF was synthesised from prehistoric positions and not
+              // from realtime strategy-coordinator. Cleared on the first
+              // realtime write because that flow doesn't set this field.
+              avg_profit_factor_source: "prehistoric_aggregate",
+              avg_profit_factor_count: String(resultCount),
+              avg_profit_factor_calc_at: new Date().toISOString(),
+            }),
+          )
+          stageWrites.push(client.expire(stageKey, 86400))
+          // Also mirror into the canonical progression hash so the
+          // legacy fallback chain in the /stats route can find it
+          // even if the per-stage detail hash is unreadable for any
+          // reason. Stage-specific keys avoid clobbering the
+          // realtime writer's own writes.
+          stageWrites.push(
+            client.hset(`progression:${this.connectionId}`, {
+              [`strategy_${stage}_avg_profit_factor`]: pfStr,
+            }),
+          )
+        }
+        // Single overall key for the dashboard's "Historic PF" surface.
+        stageWrites.push(
+          client.hset(`prehistoric:${this.connectionId}`, {
+            historic_avg_profit_factor: pfStr,
+            historic_avg_profit_factor_count: String(resultCount),
+            historic_avg_profit_factor_at: new Date().toISOString(),
+          }),
+        )
+        await Promise.all(stageWrites)
+        console.log(
+          `[v0] [ConfigSetProcessor] Historic PF aggregated: ${pfStr} ` +
+          `(across ${resultCount} positions, +${posSum.toFixed(2)}% / ` +
+          `-${negAbsSum.toFixed(2)}%, ${Date.now() - tStart}ms)`,
+        )
+      } else {
+        console.log(
+          `[v0] [ConfigSetProcessor] Historic PF skipped — no closed positions ` +
+          `(scan ${Date.now() - tStart}ms)`,
+        )
+      }
+    } catch (err) {
+      // Aggregate PF is a UX nicety — never fail the prehistoric run.
+      console.warn(
+        `[v0] [ConfigSetProcessor] Historic PF aggregation failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
 
     // Flip `prehistoric_phase_active` to "false" and refresh last_update.
     // Downstream readers (verify-engine API, progression stats API, the
@@ -535,7 +768,11 @@ export class ConfigSetProcessor {
       }
     }
 
-    return results.slice(0, 250)
+    // Honour the operator-configured per-Set entry cap (default 250 to
+    // preserve legacy behaviour). Slicing per-config keeps Set size bounded
+    // and the displayed totals in the dashboard now reflect the configured
+    // ceiling rather than a hard-coded magic number.
+    return results.slice(0, this.runtimeSetEntryCap)
   }
 
   /**
@@ -658,7 +895,11 @@ export class ConfigSetProcessor {
       })
     }
 
-    return positions.slice(0, 250)
+    // Honour the operator-configured per-Set entry cap (see
+    // `resolveSetEntryCap`). Default 250 — bumping the Set Compaction
+    // Floor in Settings → System raises this ceiling for every prehistoric
+    // strategy pass without code changes.
+    return positions.slice(0, this.runtimeSetEntryCap)
   }
 
   /**

@@ -100,7 +100,7 @@ async function getMarketDataForSymbol(symbol: string, client: any): Promise<{
  * Fetch real price from BingX public API as fallback for market data
  */
 async function fetchLivePriceFromExchange(symbol: string): Promise<{
-  close: number; open: number; high: number; low: number
+  close: number; open: number; high: number; low: number; volume: number
 } | null> {
   try {
     // BingX public ticker endpoint — no auth required
@@ -117,8 +117,9 @@ async function fetchLivePriceFromExchange(symbol: string): Promise<{
         return {
           close,
           open:  parseFloat(ticker.openPrice || String(close)),
-          high:  parseFloat(ticker.highPrice  || String(close * 1.01)),
+          high:  parseFloat(ticker.highPrice  || String(close)),
           low:   parseFloat(ticker.lowPrice   || String(close * 0.99)),
+          volume: parseFloat(ticker.quoteAssetVolume || ticker.volume || "0"),
         }
       }
     }
@@ -141,6 +142,7 @@ async function fetchLivePriceFromExchange(symbol: string): Promise<{
           open:  parseFloat(data.openPrice || String(close)),
           high:  parseFloat(data.highPrice  || String(close * 1.01)),
           low:   parseFloat(data.lowPrice   || String(close * 0.99)),
+          volume: parseFloat(data.quoteAssetVolume || data.volume || "0"),
         }
       }
     }
@@ -280,7 +282,10 @@ async function generateIndicationsForConnection(
     }
 
     result.indications = indications.length
-    await client.hincrby(progKey, "indications_count", indications.length)
+    // NOTE: Do NOT increment indications_count or strategies_count here.
+    // These counters are authoritative in engine-manager during the realtime cycle.
+    // The cron route is a secondary/utility generator and writing to the same counters
+    // creates race conditions and jumped counts. All stats are canonical from realtime.
     await client.hincrby(progKey, "indication_cycle_count", 1)
 
     // ── Strategy generation (proportional to indications that fired) ──────────
@@ -297,13 +302,9 @@ async function generateIndicationsForConnection(
     await client.hincrby(progKey, "strategies_base_total", baseGenerated)
     await client.hincrby(progKey, "strategies_main_total", mainGenerated)
     await client.hincrby(progKey, "strategies_real_total", realGenerated)
-    // `strategies_count` is the canonical "total strategies" for the UI.
-    // Base → Main → Real is a CASCADE FILTER pipeline — the same logical
-    // strategy flows through each stage — so summing the three stages would
-    // triple-count every strategy. The correct semantic is the FINAL-stage
-    // output (Real), which equals the number of strategies that survived
-    // both filter passes and are eligible for live promotion.
-    await client.hincrby(progKey, "strategies_count", realGenerated)
+    // NOTE: Do NOT increment strategies_count here.
+    // The canonical strategies_count is written by engine-manager during realtime cycle.
+    // This is a utility/analysis endpoint and should not mutate canonical counters.
     await client.hincrby(progKey, "strategy_cycle_count", 1)
 
     // Also write flat counter keys for backward compat
@@ -358,7 +359,7 @@ async function generateIndicationsForConnection(
       }).catch(() => {}),
       client.expire(`strategy_detail:${connectionId}:main`, ttlDay).catch(() => {}),
 
-      // Real stage detail — includes avgPosEvalReal
+      // Real stage detail ��� includes avgPosEvalReal
       client.hset(`strategy_detail:${connectionId}:real`, {
         created_sets: String(realGenerated),
         avg_profit_factor: String(realPF.toFixed(4)),

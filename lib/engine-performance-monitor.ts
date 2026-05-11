@@ -11,10 +11,22 @@ export interface CycleMetrics {
   endTime: number
   durationMs: number
   symbolsProcessed: number
-  indicationsGenerated: number
-  strategiesEvaluated: number
+  // `indicationsGenerated` is the total indications produced this
+  // cycle; only relevant for the indications processor's metric calls
+  // — strategy/realtime metric calls leave it undefined.
+  indicationsGenerated?: number
+  strategiesEvaluated?: number
+  // Strategies that completed evaluation AND signalled "ready to enter
+  // live trading" (passed all filters). Tracked separately from
+  // strategiesEvaluated so the dashboard can show the "live-ready"
+  // conversion rate without re-deriving it from indication counts.
+  strategiesLiveReady?: number
+  // Cumulative running total across all strategy cycles since engine
+  // start — useful for time-series charts that aren't aligned to a
+  // particular cycle.
+  totalCumulativeStrategies?: number
   errors: number
-  timestamp: string
+  timestamp?: string
 }
 
 export interface ProcessorMetrics {
@@ -107,9 +119,12 @@ class EnginePerformanceMonitor {
     // Calculate cycles per minute
     const now = Date.now()
     const lastMinute = now - 60000
-    const recentCycles = (await client.lrange(cycleKey, 0, this.MAX_HISTORY))
+    const recentCycles = (await client.lrange(cycleKey, 0, this.MAX_HISTORY as number))
       .map((c: string) => JSON.parse(c))
-      .filter((c: CycleMetrics) => new Date(c.timestamp).getTime() > lastMinute)
+      .filter((c: CycleMetrics) => {
+        if (!c.timestamp || typeof c.timestamp !== 'string') return false
+        return new Date(c.timestamp).getTime() > lastMinute
+      })
       .length
 
     const flatHash: Record<string, string> = {

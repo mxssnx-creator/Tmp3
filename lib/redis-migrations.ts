@@ -774,8 +774,16 @@ const BASE_CONNECTION_CONFIG: Array<{
   credentialId: BaseConnectionId
   autoActive: boolean
 }> = [
-  { id: "bybit-x03", name: "Bybit Base", exchange: "bybit", credentialId: "bybit-x03", autoActive: false },
-  { id: "bingx-x01", name: "BingX Base", exchange: "bingx", credentialId: "bingx-x01", autoActive: false },
+  // Spec ask: "assign Main Connections bybit and bingx ON Startup."
+  // Bybit-X03 and BingX-X01 are the canonical primary live-trading
+  // connections — they are auto-inserted into the Active panel AND the
+  // dashboard toggle is defaulted ON during *first* creation. Any
+  // existing operator override (e.g. user explicitly disabled the
+  // dashboard toggle) is preserved by the existing `(existing?.is_*) || …`
+  // fallback chain in `ensureBaseConnections` below — autoActive only
+  // affects the initial-create defaults, never overwrites prior state.
+  { id: "bybit-x03", name: "Bybit Base", exchange: "bybit", credentialId: "bybit-x03", autoActive: true },
+  { id: "bingx-x01", name: "BingX Base", exchange: "bingx", credentialId: "bingx-x01", autoActive: true },
   { id: "pionex-x01", name: "Pionex Base", exchange: "pionex", credentialId: "pionex-x01", autoActive: false },
   { id: "orangex-x01", name: "OrangeX Base", exchange: "orangex", credentialId: "orangex-x01", autoActive: false },
 ]
@@ -794,7 +802,36 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     }
   }
 
+  // ── Honour operator-issued tombstones ────────────────────────────
+  // The DELETE endpoint (`app/api/settings/connections/[id]/route.ts`)
+  // adds deleted connection IDs to the `connections:tombstoned` Set so
+  // we don't immediately resurrect them on the next migration sweep
+  // (which historically ran every cold start and silently un-did the
+  // operator's delete). Read the set once up-front so we don't query
+  // Redis per-config inside the loop below.
+  const tombstonedIds = new Set<string>()
+  try {
+    const tombs = await client.smembers("connections:tombstoned")
+    if (Array.isArray(tombs)) {
+      for (const id of tombs) {
+        if (typeof id === "string" && id.length > 0) tombstonedIds.add(id)
+      }
+    }
+  } catch {
+    // Non-critical: a missing/corrupt set just means we treat it as empty.
+  }
+
   for (const cfg of BASE_CONNECTION_CONFIG) {
+    if (tombstonedIds.has(cfg.id)) {
+      // Operator explicitly deleted this base connection — don't
+      // recreate it. Logged at INFO so the cold-start log makes the
+      // skip visible.
+      console.log(
+        `[v0] [Migrations] Skipping tombstoned base connection ${cfg.id} ` +
+        `(deleted by operator; will not be auto-recreated)`,
+      )
+      continue
+    }
     const now = new Date().toISOString()
     const existing = await client.hgetall(`connection:${cfg.id}`)
     const hasExisting = existing && Object.keys(existing).length > 0
@@ -802,42 +839,154 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     const { apiKey, apiSecret } = getBaseConnectionCredentials(cfg.credentialId)
     const hasRealCredentials = apiKey.length > 10 && apiSecret.length > 10
 
-    const updateData: Record<string, string> = {
-      id: cfg.id,
-      name: (existing?.name as string) || cfg.name,
-      exchange: (existing?.exchange as string) || cfg.exchange,
-      is_predefined: "0",
-      is_inserted: (existing?.is_inserted as string) || "1",
-      is_dashboard_inserted: (existing?.is_dashboard_inserted as string) || "1",
-      is_active_inserted: cfg.autoActive ? "1" : ((existing?.is_active_inserted as string) || "0"),
-      // Base connections are enabled in Settings by default.
-      is_enabled: (existing?.is_enabled as string) || "1",
-      // Dashboard (Main) connections are OFF by default until user enables them.
-      is_enabled_dashboard: (existing?.is_enabled_dashboard as string) || "0",
-      is_active: (existing?.is_active as string) || "0",
-      connection_method: (existing?.connection_method as string) || "library",
-      connection_library: (existing?.connection_library as string) || "native",
-      api_type: (existing?.api_type as string) || "perpetual_futures",
-      updated_at: now,
-      created_at: (existing?.created_at as string) || now,
+    // ── OPERATOR-STATE PRESERVATION CONTRACT ──────────────────────────
+    // Bug being fixed (operator report): "after removing main connections,
+    // it's getting re-added by some procedure".
+    //
+    // Root cause: previous version unconditionally set
+    //   is_active_inserted: cfg.autoActive ? "1" : ...
+    // for autoActive base connections (bybit-x03, bingx-x01). Every
+    // cold-start (or any code path that calls `initRedis` followed by
+    // `runMigrations` — which is essentially every Vercel function
+    // invocation) re-flipped the flag back to "1", undoing the
+    // operator's explicit DELETE on `/api/settings/connections/[id]/active`.
+    //
+    // Same class of bug applies to is_inserted, is_dashboard_inserted,
+    // is_enabled, is_enabled_dashboard, is_active — the previous code
+    // used `(existing || default)` patterns which mostly worked for
+    // string "0" (truthy in JS), but the autoActive override branch did
+    // not, AND the structural fields (api_type, connection_method, etc)
+    // could clobber operator-chosen values via the `||` fallback.
+    //
+    // New contract for EXISTING connections:
+    //   * STRUCTURAL fields  → kept as-is (id, name, exchange,
+    //                          api_type, connection_method, etc).
+    //                          Migrations 015-018 are the canonical
+    //                          place for one-time structural rewrites;
+    //                          this ensure-pass is a SAFETY NET, not a
+    //                          schema enforcer.
+    //   * OPERATOR FLAG fields (is_inserted, is_active_inserted,
+    //                          is_dashboard_inserted, is_enabled,
+    //                          is_enabled_dashboard, is_active) →
+    //                          NEVER touched. The operator's last
+    //                          choice via the dashboard wins.
+    //   * CREDENTIALS         → injected from env when available, even
+    //                          on existing rows (so credential rotation
+    //                          via env var works without re-saving).
+    //   * `updated_at`        → bumped only when credentials actually
+    //                          changed, so we don't generate spurious
+    //                          dashboard "connection updated" toasts on
+    //                          every cold-start.
+    //
+    // For BRAND-NEW connections (no existing row in Redis): seed every
+    // field with the canonical defaults — that's the only time we get
+    // to choose. The `autoActive` hint controls the initial insertion +
+    // dashboard-enable defaults so a fresh DB still surfaces Bybit/BingX
+    // ready to go.
+
+    if (!hasExisting) {
+      // First-time seed. Apply full canonical defaults.
+      const seedData: Record<string, string> = {
+        id: cfg.id,
+        name: cfg.name,
+        exchange: cfg.exchange,
+        is_predefined: "0",
+        is_inserted: "1",
+        is_dashboard_inserted: cfg.autoActive ? "1" : "0",
+        is_active_inserted: cfg.autoActive ? "1" : "0",
+        is_enabled: "1",
+        is_enabled_dashboard: cfg.autoActive ? "1" : "0",
+        is_active: cfg.autoActive ? "1" : "0",
+        connection_method: "library",
+        connection_library: "native",
+        api_type: "perpetual_futures",
+        api_key: hasRealCredentials ? apiKey : "",
+        api_secret: hasRealCredentials ? apiSecret : "",
+        created_at: now,
+        updated_at: now,
+      }
+      await client.hset(`connection:${cfg.id}`, seedData)
+      await client.sadd("connections", cfg.id)
+      if (hasRealCredentials) credentialsInjected++
+      createdOrUpdated++
+      continue
     }
+
+    // Existing connection: PRESERVE every operator-controlled field.
+    // The only values we touch are:
+    //   1. Credentials (rotate from env when available).
+    //   2. The connection-set membership (in case a manual SREM ever
+    //      desyncs the index from the hash — defensive only).
+    const updates: Record<string, string> = {}
+    let didChange = false
 
     if (hasRealCredentials) {
-      updateData.api_key = apiKey
-      updateData.api_secret = apiSecret
-      credentialsInjected++
-    } else if (!hasExisting) {
-      updateData.api_key = ""
-      updateData.api_secret = ""
-    } else {
-      // Preserve previously stored credentials if env vars are not present.
-      updateData.api_key = (existing?.api_key as string) || ""
-      updateData.api_secret = (existing?.api_secret as string) || ""
+      const existingApiKey = (existing.api_key as string) || ""
+      const existingApiSecret = (existing.api_secret as string) || ""
+      if (existingApiKey !== apiKey || existingApiSecret !== apiSecret) {
+        updates.api_key = apiKey
+        updates.api_secret = apiSecret
+        updates.updated_at = now
+        didChange = true
+        credentialsInjected++
+      }
     }
 
-    await client.hset(`connection:${cfg.id}`, updateData)
+    if (Object.keys(updates).length > 0) {
+      await client.hset(`connection:${cfg.id}`, updates)
+    }
+    // Always re-assert index membership; HSET above doesn't manage it.
     await client.sadd("connections", cfg.id)
-    createdOrUpdated++
+
+    if (didChange) createdOrUpdated++
+  }
+
+  // ── Bootstrap the global engine status ────────────────────────────
+  // The auto-start monitor in `lib/trade-engine-auto-start.ts` only
+  // attempts to start missing connection engines when
+  // `trade_engine:global.status === "running"`. On a brand-new DB this
+  // hash is empty, so even the autoActive=true connections above would
+  // never have their engines spun up until an operator clicked "Start"
+  // in the UI. That is exactly the symptom reported in production:
+  // "Low Counts, Low DB Activity, No really processings".
+  //
+  // We bootstrap the hash to `running` ONLY when:
+  //   - at least one autoActive base connection is configured, AND
+  //   - the hash is currently empty OR carries no `status` field.
+  //
+  // We never overwrite an existing `status` (incl. `stopped`,
+  // `paused`, `error`) — those represent explicit operator state and
+  // must be preserved across reloads. This keeps the user's "Stop"
+  // button authoritative while solving the cold-boot dead-on-arrival
+  // problem.
+  const hasAutoActive = BASE_CONNECTION_CONFIG.some((c) => c.autoActive)
+  if (hasAutoActive) {
+    try {
+      const globalState = await client.hgetall("trade_engine:global")
+      const hasStatus =
+        globalState && typeof (globalState as any).status === "string" &&
+        (globalState as any).status.length > 0
+      if (!hasStatus) {
+        const nowIso = new Date().toISOString()
+        await client.hset("trade_engine:global", {
+          status: "running",
+          started_at: nowIso,
+          bootstrapped_at: nowIso,
+          bootstrapped_by: "ensureBaseConnections",
+        })
+        console.log(
+          `[v0] [Migrations] Bootstrapped trade_engine:global status=running ` +
+          `(autoActive base connections detected)`,
+        )
+      }
+    } catch (err) {
+      // Non-critical: the auto-start monitor will retry on the next
+      // tick and the operator can also press Start in the UI.
+      console.warn(
+        `[v0] [Migrations] Failed to bootstrap global engine status:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
   }
 
   return { createdOrUpdated, credentialsInjected }

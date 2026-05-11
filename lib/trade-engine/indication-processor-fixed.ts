@@ -179,6 +179,15 @@ export class IndicationProcessor {
   private settingsCache: { data: any; timestamp: number } | null = SHARED_SETTINGS_CACHE
   private readonly CACHE_TTL = SHARED_CACHE_TTL
 
+  /**
+   * Per-symbol last-logged candle count. Keyed by `${symbol}:${source}` so
+   * priority-1 (`candles-array`) and priority-2 (`market-data-1m`) sources
+   * are throttled independently. Only the FIRST log per (symbol,source) and
+   * subsequent CHANGES to the candle count emit; steady-state ticks are
+   * silent.  See `getHistoricalCandles` for context.
+   */
+  private lastLoggedCandleCount: Map<string, number> = new Map()
+
   constructor(connectionId: string) {
     this.connectionId = connectionId
     // CRITICAL: Force assignment to shared cache in case class field initialization failed
@@ -189,6 +198,26 @@ export class IndicationProcessor {
     if (!this.settingsCache) {
       this.settingsCache = SHARED_SETTINGS_CACHE
     }
+  }
+
+  /**
+   * Throttled logger for the per-tick candle-source diagnostic. Emits only
+   * when the candle count for `(symbol, source)` differs from the last
+   * value seen — eliminates the steady-state stdout flood that was
+   * starving the Node event loop and making the dashboard unresponsive.
+   */
+  private logCandleCountIfChanged(symbol: string, source: string, count: number): void {
+    const key = `${symbol}:${source}`
+    const prev = this.lastLoggedCandleCount.get(key)
+    if (prev === count) return
+    this.lastLoggedCandleCount.set(key, count)
+    const label =
+      source === "candles-array"
+        ? `Using candles array for ${symbol}: ${count} candles`
+        : source === "market-data-1m"
+          ? `Using market_data:1m candles for ${symbol}: ${count} candles`
+          : `${source} for ${symbol}: ${count} candles`
+    console.log(`[v0] [PrehistoricIndication] ${label}`)
   }
 
   /**
@@ -207,17 +236,30 @@ export class IndicationProcessor {
       if (candlesRaw) {
         const candles = JSON.parse(typeof candlesRaw === "string" ? candlesRaw : JSON.stringify(candlesRaw))
         if (Array.isArray(candles) && candles.length > 0) {
-          console.log(`[v0] [PrehistoricIndication] Using candles array for ${symbol}: ${candles.length} candles`)
+          // ── Log throttling (event-loop hygiene) ──
+          // This fires on EVERY prehistoric tick at the realtime cadence
+          // (~20 calls/sec under typical settings), and the previous
+          // unconditional `console.log` was producing ~80 stdout writes/sec
+          // PER SYMBOL across the four log lines in the cycle, starving the
+          // event loop and making the dashboard appear to hang. The candle
+          // count is effectively constant between fetches, so we only log
+          // when the count actually changes for this symbol.
+          this.logCandleCountIfChanged(symbol, "candles-array", candles.length)
           return candles
         }
       }
 
-      // Priority 2: full MarketData JSON with nested candles
-      const marketDataRaw = await client.get(`market_data:${symbol}:1m`)
+      // Priority 2: full MarketData JSON with nested candles.
+      // Spec §7: the loader now writes the canonical envelope under
+      // `:1s`. We try `:1s` first and fall back to `:1m` for one
+      // transition release so partial deploys don't lose data.
+      const marketDataRaw =
+        (await client.get(`market_data:${symbol}:1s`)) ??
+        (await client.get(`market_data:${symbol}:1m`))
       if (marketDataRaw) {
         const marketDataObj = JSON.parse(typeof marketDataRaw === "string" ? marketDataRaw : JSON.stringify(marketDataRaw))
         if (marketDataObj?.candles && Array.isArray(marketDataObj.candles) && marketDataObj.candles.length > 0) {
-          console.log(`[v0] [PrehistoricIndication] Using market_data:1m candles for ${symbol}: ${marketDataObj.candles.length} candles`)
+          this.logCandleCountIfChanged(symbol, "market-data-envelope", marketDataObj.candles.length)
           return marketDataObj.candles
         }
       }
@@ -320,7 +362,7 @@ export class IndicationProcessor {
         }
         
         for (const ind of prehistoricIndications) {
-          await saveIndication(`${this.connectionId}:${symbol}:prehistoric`, ind)
+          await saveIndication({ ...ind, connection_id: `${this.connectionId}:${symbol}:prehistoric` })
         }
         console.log(`[v0] [PrehistoricIndication] ✓ Saved ${prehistoricIndications.length} indication types to Redis for ${symbol}`)
       } catch (saveErr) {
@@ -373,7 +415,10 @@ export class IndicationProcessor {
         await loadMarketDataForEngine([symbol])
         SHARED_MARKET_DATA_CACHE.delete(symbol)
         
-        const directData = await client.get(`market_data:${symbol}:1m`)
+        // Spec §7: prefer the new :1s envelope, fall back to legacy :1m.
+        const directData =
+          (await client.get(`market_data:${symbol}:1s`)) ??
+          (await client.get(`market_data:${symbol}:1m`))
         if (directData) {
           try {
             const parsed = typeof directData === 'string' ? JSON.parse(directData) : directData
@@ -673,8 +718,11 @@ export class IndicationProcessor {
       if (!data) {
         await initRedis()
         const client = getClient()
-        // Try the full MarketData object key
-        const rawData = await client.get(`market_data:${symbol}:1m`)
+        // Spec §7: read the canonical :1s envelope first, fall back
+        // to the legacy :1m suffix while the migration is in flight.
+        const rawData =
+          (await client.get(`market_data:${symbol}:1s`)) ??
+          (await client.get(`market_data:${symbol}:1m`))
         if (rawData) {
           try {
             const parsed = JSON.parse(rawData)

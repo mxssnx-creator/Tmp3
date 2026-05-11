@@ -137,23 +137,80 @@ export function OverallTab({
               <div className="settings-section">
                 <h3 className="text-xl font-bold text-foreground">Volume Configuration</h3>
                 <p className="settings-description mt-2">
-                  Configure volume factors and position calculation settings
+                  Trade-engine volume factors and position calculation settings.
+                  Strategy / pseudo positions are RATIO-based (count-driven, no
+                  volume); only Live Positions on real exchange orders use these
+                  factors as a notional multiplier — Main and Preset engines are
+                  scaled independently.
                 </p>
 
                 <div className="grid md:grid-cols-2 gap-6">
+                  {/*
+                   * ── Trade-Engine Volume Factors ─────────────────────────
+                   *
+                   * Per spec: "at Strategies, pseudo pos use ratios for
+                   * volume calcs; for Live Positions calculate indeed volume
+                   * with specific ratios. At settings dialog remove volume
+                   * slider for Strategies — use sliders for Trade Engines:
+                   * Main, Preset."
+                   *
+                   * The previous single `base_volume_factor` slider was
+                   * applied universally and conflated Strategy ratios with
+                   * Live notional — it was misleading and is therefore gone.
+                   * These two replace it: each sets the GLOBAL default
+                   * volume multiplier for one Trade Engine, and the dashboard
+                   * connection card may override on a per-connection basis.
+                   *
+                   * Wired into `lib/volume-calculator.ts` via
+                   * `VolumeCalculator.resolveLiveEngine` → applied ONLY in
+                   * the live-execution `positionCost` branch (Strategy
+                   * pseudo-position calls leave `tradeMode` undefined, so
+                   * they always see a 1.0 multiplier).
+                   */}
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <Label>Base Volume Factor</Label>
-                      <span className="text-sm font-medium">{settings.base_volume_factor || 1}</span>
+                      <Label>Main Trade Engine Volume Factor</Label>
+                      <span className="text-sm font-medium">
+                        {(settings.mainTradeVolumeFactor ?? 1).toFixed(1)}x
+                      </span>
                     </div>
                     <Slider
-                      min={0.5}
+                      min={0.1}
                       max={10}
-                      step={0.5}
-                      value={[settings.base_volume_factor || 1]}
-                      onValueChange={([value]) => handleSettingChange("base_volume_factor", value)}
+                      step={0.1}
+                      value={[settings.mainTradeVolumeFactor ?? 1]}
+                      onValueChange={([value]) =>
+                        handleSettingChange("mainTradeVolumeFactor", value)
+                      }
                     />
-                    <p className="text-xs text-muted-foreground">Position volume multiplier (0.5-10)</p>
+                    <p className="text-xs text-muted-foreground">
+                      Live notional multiplier for the Main Trade Engine
+                      (default 1.0x). Overridable per-connection from the
+                      dashboard. Range 0.1–10x.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Preset Trade Engine Volume Factor</Label>
+                      <span className="text-sm font-medium">
+                        {(settings.presetTradeVolumeFactor ?? 1).toFixed(1)}x
+                      </span>
+                    </div>
+                    <Slider
+                      min={0.1}
+                      max={10}
+                      step={0.1}
+                      value={[settings.presetTradeVolumeFactor ?? 1]}
+                      onValueChange={([value]) =>
+                        handleSettingChange("presetTradeVolumeFactor", value)
+                      }
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Live notional multiplier for the Preset Trade Engine
+                      (default 1.0x). Overridable per-connection from the
+                      dashboard. Range 0.1–10x.
+                    </p>
                   </div>
 
                   <div className="space-y-2">
@@ -179,13 +236,13 @@ export function OverallTab({
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <Label>Positions Average</Label>
-                      <span className="text-sm font-medium">{settings.positions_average || 50}</span>
+                      <span className="text-sm font-medium">{settings.positions_average || 300}</span>
                     </div>
                     <Slider
                       min={20}
                       max={300}
                       step={10}
-                      value={[settings.positions_average || 50]}
+                      value={[settings.positions_average || 300]}
                       onValueChange={([value]) => handleSettingChange("positions_average", value)}
                     />
                     <p className="text-xs text-muted-foreground">

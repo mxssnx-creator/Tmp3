@@ -721,9 +721,9 @@ function LogisticsContent() {
   const [livePos,      setLivePos]      = useState<LivePosition[]>([])
   const [lastRefresh,  setLastRefresh]  = useState<Date | null>(null)
   const [refreshing,   setRefreshing]   = useState(false)
-  const pollRef = useRef<ReturnType<typeof setInterval>>()
+  const pollRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined)
 
-  const loadAll = useCallback(async (silent = false) => {
+  const loadAll = useCallback(async (silent: boolean = false) => {
     if (!silent) setRefreshing(true)
     try {
       const [statsRes, queueRes, livePosRes] = await Promise.allSettled([

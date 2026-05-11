@@ -6,7 +6,13 @@
  * Supports: RSI, MACD, Bollinger Bands, EMA, ATR, Momentum, Divergence
  */
 
-import { redisDb } from "@/lib/redis-db"
+import { getRedisClient } from "@/lib/redis-db"
+// shim: existing code uses redisDb.set/get; map to InlineLocalRedis instance.
+const redisDb = {
+  get: (key: string) => getRedisClient().get(key),
+  set: (key: string, val: string, opts?: { ex?: number }) =>
+    opts?.ex ? getRedisClient().setex(key, opts.ex, val) : getRedisClient().set(key, val),
+}
 
 export interface IndicatorResult {
   indicator: string

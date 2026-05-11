@@ -1,3 +1,6 @@
+// Plain `crypto` — Edge build is satisfied by the `crypto: false` alias
+// in `next.config.mjs` (runtime guard in `instrumentation.ts` ensures
+// the stub is never executed at request time).
 import * as crypto from "crypto"
 import {
   BaseExchangeConnector,
@@ -287,6 +290,127 @@ export class BybitConnector extends BaseExchangeConnector {
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to place order: ${errorMsg}`)
+      return { success: false, error: errorMsg }
+    }
+  }
+
+  /**
+   * Bybit-native conditional order via `/v5/order/create`.
+   *
+   * Bybit folds stop-orders into the regular create endpoint by adding
+   * `triggerPrice` and `triggerDirection` (1 = trigger when last price
+   * RISES through the level, 2 = when it FALLS). Combined with
+   * `orderType: "Market"` and `reduceOnly: true` this yields a real
+   * stop-loss / take-profit on the linear perp. Spot accounts have no
+   * v5 conditional family — fall back to the base limit-as-trigger
+   * implementation.
+   *
+   * Trigger direction matrix (the four cases that cover SL+TP × long+short):
+   *
+   *   long  TP  → close=sell, trigger when price RISES   (triggerDirection=1)
+   *   long  SL  → close=sell, trigger when price FALLS   (triggerDirection=2)
+   *   short TP  → close=buy,  trigger when price FALLS   (triggerDirection=2)
+   *   short SL  → close=buy,  trigger when price RISES   (triggerDirection=1)
+   *
+   * Note we treat the *position* side (derived from `closeSide`) plus
+   * `kind` as the source of truth — easier to reason about than trying
+   * to derive it from `closeSide` alone.
+   */
+  override async placeStopOrder(
+    symbol: string,
+    closeSide: "buy" | "sell",
+    quantity: number,
+    triggerPrice: number,
+    kind: "stop_loss" | "take_profit",
+    options: PlaceOrderOptions = {},
+  ): Promise<{ success: boolean; orderId?: string; error?: string }> {
+    try {
+      const category = this.getTradingCategory()
+      if (category !== "linear") {
+        // Spot — no native trigger order family; fall back to legacy implementation.
+        return super.placeStopOrder(symbol, closeSide, quantity, triggerPrice, kind, options)
+      }
+
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        return { success: false, error: `Invalid quantity: ${quantity}` }
+      }
+      if (!Number.isFinite(triggerPrice) || triggerPrice <= 0) {
+        return { success: false, error: `Invalid trigger price: ${triggerPrice}` }
+      }
+
+      const roundedQty = Math.round(quantity * 1e8) / 1e8
+      const qtyStr = roundedQty.toFixed(8).replace(/\.?0+$/, "")
+      const trigRounded = Math.round(triggerPrice * 1e8) / 1e8
+      const trigStr = trigRounded.toFixed(8).replace(/\.?0+$/, "")
+
+      const hedgeMode = options.hedgeMode === true
+      const positionSide: "LONG" | "SHORT" = options.positionSide
+        ?? (closeSide === "sell" ? "LONG" : "SHORT")
+
+      // See JSDoc for the full direction matrix.
+      const isLong = positionSide === "LONG"
+      let triggerDirection: 1 | 2
+      if (kind === "take_profit") {
+        triggerDirection = isLong ? 1 : 2
+      } else {
+        triggerDirection = isLong ? 2 : 1
+      }
+
+      const body: Record<string, any> = {
+        category,
+        symbol,
+        side: closeSide === "buy" ? "Buy" : "Sell",
+        orderType: "Market",
+        qty: qtyStr,
+        timeInForce: "IOC",
+        triggerPrice: trigStr,
+        triggerDirection,
+        // LastPrice trigger matches Bybit's UI default and avoids
+        // mark-vs-last drift confusion. Could be exposed if needed.
+        triggerBy: "LastPrice",
+        reduceOnly: options.reduceOnly !== false,
+      }
+      if (options.clientOrderId) body.orderLinkId = options.clientOrderId
+      // positionIdx: 0 = one-way, 1 = hedge LONG, 2 = hedge SHORT.
+      body.positionIdx = hedgeMode ? (isLong ? 1 : 2) : 0
+
+      this.log(
+        `Placing ${kind === "take_profit" ? "TP" : "SL"}-Market ${closeSide} ${qtyStr} ${symbol} ` +
+          `@ trig=${trigStr} dir=${triggerDirection} idx=${body.positionIdx}`,
+      )
+
+      const { data } = await this.signedRequestV5<any>({
+        method: "POST",
+        path: "/v5/order/create",
+        body,
+      })
+
+      if (data?.retCode !== 0) {
+        // Same idx-mismatch retry as `placeOrder`.
+        if (String(data?.retCode) === "10001") {
+          this.log("Retrying stop order with flipped position mode (idx mismatch)")
+          body.positionIdx = body.positionIdx === 0 ? (isLong ? 1 : 2) : 0
+          const retry = await this.signedRequestV5<any>({
+            method: "POST",
+            path: "/v5/order/create",
+            body,
+          })
+          if (retry.data?.retCode === 0) {
+            const retryId = retry.data.result?.orderId
+            this.log(`✓ Stop order placed on retry: ${retryId}`)
+            return { success: true, orderId: retryId }
+          }
+          throw new Error(`Bybit stop order error: ${retry.data?.retMsg || "Unknown"}`)
+        }
+        throw new Error(`Bybit stop order error: ${data?.retMsg || "Unknown"}`)
+      }
+
+      const orderId = data.result?.orderId
+      this.log(`✓ Stop order placed: ${orderId} @ ${trigStr}`)
+      return { success: true, orderId }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to place stop order: ${errorMsg}`)
       return { success: false, error: errorMsg }
     }
   }
@@ -659,6 +783,21 @@ export class BybitConnector extends BaseExchangeConnector {
   > {
     // Public endpoint — no signature required.
     try {
+      // ── 1s timeframe (spec §7): aggregate from recent-trades ───
+      // Bybit V5 has no native sub-1m klines. We aggregate from
+      // /v5/market/recent-trade. The public endpoint returns the
+      // most recent 1000 trades, so we can't truly reach 24h on a
+      // high-volume pair — we return what we can, and the
+      // prehistoric `processed_intervals` set will simply mark the
+      // covered buckets. Better partial 1s than fake 1m.
+      if (timeframe === "1s") {
+        const endMs = Date.now()
+        const startMs = endMs - (Math.max(1, Math.min(86_400, limit)) * 1000)
+        const aggregated = await this.getOHLCV1s(symbol, startMs, endMs)
+        if (aggregated && aggregated.length > 0) return aggregated
+        return null
+      }
+
       const baseUrl = this.getBaseUrl()
       const category = this.getTradingCategory()
       const intervalMap: Record<string, string> = {
@@ -699,6 +838,47 @@ export class BybitConnector extends BaseExchangeConnector {
         .reverse()
 
       return candles
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * ── 1-second OHLCV (spec §7) ──────────────────────────────────────
+   *
+   * Aggregates from `/v5/market/recent-trade`. Bybit returns trades
+   * newest-first and caps at 1000 per page. There is no `endTime`
+   * cursor on the public endpoint so we cannot truly paginate
+   * backward in time — we accept that limitation and return whatever
+   * coverage we can build within the 1000-trade window.
+   *
+   * For lower-volume pairs the 1000 trades may span hours. For
+   * high-volume pairs (BTCUSDT) it might cover only a few minutes.
+   * Either way it's more honest 1s data than fake 1m candles.
+   */
+  async getOHLCV1s(
+    symbol: string,
+    startMs: number,
+    endMs: number,
+  ): Promise<
+    Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }> | null
+  > {
+    try {
+      const baseUrl = this.getBaseUrl()
+      const category = this.getTradingCategory()
+      const { aggregateTradesTo1sOHLCV } = await import("./aggregate-1s")
+      const url = `${baseUrl}/v5/market/recent-trade?category=${category}&symbol=${encodeURIComponent(symbol)}&limit=1000`
+      const resp = await this.rateLimitedFetch(url)
+      if (!resp.ok) return null
+      const data = await resp.json()
+      const rows = data?.result?.list as Array<{ time: string; price: string; size: string }> | undefined
+      if (!Array.isArray(rows) || rows.length === 0) return []
+      const trades = rows.map((r) => ({
+        timestamp: Number(r.time),
+        price: Number(r.price),
+        quantity: Number(r.size),
+      }))
+      return aggregateTradesTo1sOHLCV(trades, startMs, endMs)
     } catch {
       return null
     }

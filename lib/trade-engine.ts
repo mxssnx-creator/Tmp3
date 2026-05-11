@@ -1,29 +1,55 @@
 /**
  * Global Trade Engine Coordinator V4.0
  * @version 4.0.0 - Force engine restart on version change to fix stale closures
+ *
+ * NOTE: The legacy `indication-processor-patch` side-effect import was
+ * removed — it monkey-patched cache initialisation that the underlying
+ * class now handles natively (instance fields backed by module-level
+ * shared singletons in `indication-processor-fixed` v5.0.1+). The patch
+ * file itself is preserved as a no-op stub for backward compatibility
+ * with any external imports of its named exports.
  */
 
-// CRITICAL: Import patch FIRST to fix cache initialization issues in stale webpack bundles
-import "./trade-engine/indication-processor-patch"
+const COORDINATOR_VERSION = "4.2.0"
 
-const COORDINATOR_VERSION = "4.1.0"
-
-// Force clear stale engine instances on version change
-const coordGlobal = globalThis as unknown as { 
+// STABILITY: NEVER stop or clear live engines on version change.
+//
+// Previously this block tore down the global coordinator singleton every
+// time the module was reloaded (HMR, serverless cold-warm, redeploy). That
+// caused the symptom the user described: "GlobalTradeCoordinator
+// automatically stopping / Trade Engines restarting / no-sense
+// reassignments". The coordinator is supposed to be a long-lived overall
+// state holder; replacing it on every module reload is exactly the wrong
+// behaviour.
+//
+// We now record the running version for diagnostics only — no destructive
+// cleanup. The singleton on `globalThis.__tradeEngineCoordinator` is
+// preserved across reloads.
+const coordGlobal = globalThis as unknown as {
   __coordinator_version?: string
   __global_coordinator?: unknown
 }
-
-if (coordGlobal.__coordinator_version !== COORDINATOR_VERSION) {
-  console.log(`[v0] Coordinator version changed from ${coordGlobal.__coordinator_version} to ${COORDINATOR_VERSION}, clearing stale engines...`)
-  coordGlobal.__global_coordinator = undefined
-  coordGlobal.__coordinator_version = COORDINATOR_VERSION
+if (coordGlobal.__coordinator_version && coordGlobal.__coordinator_version !== COORDINATOR_VERSION) {
+  console.log(
+    `[v0] Coordinator version ${coordGlobal.__coordinator_version} -> ${COORDINATOR_VERSION} ` +
+      `(keeping live coordinator and engines)`,
+  )
 }
+coordGlobal.__coordinator_version = COORDINATOR_VERSION
 
 console.log(`[v0] Global Trade Engine V${COORDINATOR_VERSION} loading with cache patch...`)
 
 import { TradeEngineManager, type EngineConfig } from "./trade-engine/engine-manager"
 import { getSettings, setSettings } from "./redis-db"
+import {
+  // Cross-process ownership primitive. The coordinator acquires the
+  // per-connection lock BEFORE constructing or reusing the manager;
+  // the manager extends/releases it during its lifecycle. See
+  // `lib/trade-engine/progression-lock.ts` for the full schema.
+  acquireProgressionLock,
+  forceBreakProgressionLock,
+  type LockHandle,
+} from "./trade-engine/progression-lock"
 
 // Re-export TradeEngine class and config from subdirectory for convenient imports
 export { TradeEngine, type TradeEngineConfig, TRADE_SERVICE_NAME } from "./trade-engine/trade-engine"
@@ -84,6 +110,17 @@ export class GlobalTradeEngineCoordinator {
 
   constructor() {
     console.log("[v0] GlobalTradeEngineCoordinator initialized with advanced coordination")
+    // The coordinator is a long-lived overall state holder. Its background
+    // monitors must run as long as the singleton exists — not gated behind
+    // `startAll()` (which the user may never call when engines are toggled
+    // individually from the dashboard). Both methods are idempotent w.r.t.
+    // their internal `*Timer` fields, so calling them again later is safe.
+    try { this.startGlobalHealthMonitoring() } catch (e) {
+      console.warn("[v0] [Coordinator] health monitor init failed:", e)
+    }
+    try { this.startCoordinationMetricsTracking() } catch (e) {
+      console.warn("[v0] [Coordinator] metrics tracker init failed:", e)
+    }
   }
 
   /**
@@ -118,6 +155,10 @@ export class GlobalTradeEngineCoordinator {
    * PHASE 1 FIX: Added startup lock to prevent duplicate engines
    */
   async startEngine(connectionId: string, config: EngineConfig): Promise<void> {
+    // Self-heal background timers on every public entry-point — see
+    // `ensureBackgroundTimers` doc-block. No-op if already armed.
+    this.ensureBackgroundTimers()
+
     // Step 1: Check if already starting
     if (this.startingEngines.has(connectionId)) {
       console.log(`[v0] [STARTUP LOCK] Engine already starting for ${connectionId}, skipping duplicate start request`)
@@ -147,7 +188,37 @@ export class GlobalTradeEngineCoordinator {
     this.startingEngines.add(connectionId)
     console.log(`[v0] [STARTUP LOCK] Added ${connectionId} to startup lock`)
 
+    let lockHandle: LockHandle | undefined
     try {
+      // ── Step 3b: Acquire the cross-process ownership lock ──────────
+      // This is the SECOND guard — the in-process `startingEngines`
+      // set blocks duplicate starts within this Node worker; the
+      // Redis lock blocks duplicate starts across workers, dev
+      // reloads, serverless instances, etc.
+      //
+      // Self-heal: if THIS process already has a running manager for
+      // the connection, the persistent lock value (data lives on
+      // globalThis so it survives module re-evaluation) was set by
+      // an earlier incarnation of OUR engine — overwrite it with a
+      // fresh handle so the new manager carries a fresh epoch.
+      // This breaks the start→bail→start flap that occurred after
+      // Next.js HMR cycles or full dev-server restarts.
+      const localManagerAlive =
+        this.engineManagers.get(connectionId)?.isEngineRunning === true
+      const acquired = await acquireProgressionLock(connectionId, undefined, {
+        selfOwnedIfAlive: localManagerAlive,
+      })
+      if (!acquired.acquired || !acquired.handle) {
+        console.warn(
+          `[v0] [STARTUP LOCK] Cannot start engine ${connectionId} — owned by another worker (${acquired.existingOwner ?? "unknown"}). Skipping.`,
+        )
+        return
+      }
+      lockHandle = acquired.handle
+      console.log(
+        `[v0] [STARTUP LOCK] Acquired progression lock for ${connectionId} (epoch=${lockHandle.epoch}${acquired.healedStaleLock ? ", healed stale" : ""})`,
+      )
+
       // Step 4: Initialize engine if needed
       let manager = this.engineManagers.get(connectionId)
       if (!manager) {
@@ -157,9 +228,26 @@ export class GlobalTradeEngineCoordinator {
         console.log(`[v0] [STARTUP LOCK] Reusing existing engine manager for: ${connectionId}`)
       }
 
-      // Step 5: Start the engine
-      await manager.start(config)
+      // Step 5: Start the engine — pass the lock handle so it can
+      // extend/release the slot and stamp the epoch.
+      await manager.start(config, lockHandle)
+      // Manager now owns the lock; clear our local reference so the
+      // finally-block doesn't try to break it on success.
+      lockHandle = undefined
       console.log(`[v0] [STARTUP LOCK] TradeEngine successfully started for connection: ${connectionId}`)
+    } catch (err) {
+      // On startup failure, give the lock back so a retry can succeed
+      // without waiting for the TTL to expire. We use force-break
+      // here (NOT release-with-owner) because the manager may have
+      // partially started, and we want a clean slate.
+      if (lockHandle) {
+        try {
+          await forceBreakProgressionLock(connectionId)
+        } catch {
+          /* TTL will reclaim */
+        }
+      }
+      throw err
     } finally {
       // Step 6: Remove from lock set (always, even on error)
       this.startingEngines.delete(connectionId)
@@ -195,11 +283,126 @@ export class GlobalTradeEngineCoordinator {
       await manager.stop()
       this.engineManagers.delete(connectionId)
 
+      // Clear the `engine_is_running` Redis flag immediately after the manager
+      // stops. This prevents the subsequent `startEngine` call from hitting its
+      // startup-lock guard ("Engine already running — skipping") when the flag
+      // survived from a previous run or was never cleaned up by the caller.
+      // Fire-and-forget — stop must not fail just because Redis is unavailable.
+      try {
+        const { getRedisClient } = await import("@/lib/redis-db")
+        const redisClient = getRedisClient()
+        await redisClient.del(`engine_is_running:${connectionId}`)
+        console.log(`[v0] ✓ Cleared engine_is_running flag for ${connectionId}`)
+      } catch (redisErr) {
+        console.warn(`[v0] [STOP LOCK] Could not clear engine_is_running flag for ${connectionId}:`, redisErr)
+      }
+
       console.log(`[v0] ✓ TradeEngine stopped for connection: ${connectionId}`)
     } finally {
       // Step 3: Remove from stop lock set (always, even on error)
       this.stoppingEngines.delete(connectionId)
       console.log(`[v0] [STOP LOCK] Removed ${connectionId} from stop lock`)
+    }
+  }
+
+  /**
+   * Public restart entry point — used by the settings-watcher when a
+   * `restart_required` change is detected. Serializes via the
+   * escalation mutex (shared with the watchdog) so we never fire two
+   * concurrent restarts for the same connection.
+   */
+  async restartEngine(connectionId: string): Promise<void> {
+    if (this.escalatingEngines.has(connectionId)) {
+      console.log(
+        `[v0] [Coordinator] restartEngine(${connectionId}) skipped — restart already in flight`,
+      )
+      return
+    }
+    this.escalatingEngines.add(connectionId)
+    try {
+      // Pre-emptively break the progression lock so the restart can
+      // acquire a fresh slot without waiting for the TTL.
+      try {
+        await forceBreakProgressionLock(connectionId)
+      } catch { /* TTL will reclaim */ }
+      try {
+        await this.stopEngine(connectionId)
+      } catch (stopErr) {
+        console.warn(
+          `[v0] [Coordinator] restartEngine stop failed for ${connectionId}:`,
+          stopErr instanceof Error ? stopErr.message : String(stopErr),
+        )
+      }
+      try {
+        await this.startEngineFromConnectionConfig(connectionId)
+      } catch (startErr) {
+        console.error(
+          `[v0] [Coordinator] restartEngine start failed for ${connectionId}:`,
+          startErr instanceof Error ? startErr.message : String(startErr),
+        )
+      }
+    } finally {
+      this.escalatingEngines.delete(connectionId)
+    }
+  }
+
+  /**
+   * Public fast-path for the API route. When connection settings are
+   * saved we immediately call this so the running manager (if any in
+   * THIS process) applies the change inline rather than waiting for
+   * its 3 s watcher tick. Cross-process scenarios still converge via
+   * the watcher polling the change counter — this is a latency
+   * optimization, not a correctness one.
+   */
+  async applyPendingChangesNow(connectionId: string): Promise<void> {
+    const manager = this.engineManagers.get(connectionId)
+    if (!manager || !manager.isEngineRunning) return
+    try {
+      await manager.applyPendingSettingsChangeNow()
+    } catch (err) {
+      console.warn(
+        `[v0] [Coordinator] applyPendingChangesNow failed for ${connectionId}:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
+  }
+
+  /**
+   * Restart an engine using its stored connection config — used by the
+   * watchdog escalation path after a confirmed stall. Loads the same
+   * settings the normal start flow would (per-connection intervals
+   * fall back to global app settings), so the restarted engine is
+   * indistinguishable from a fresh dashboard toggle except that it
+   * carries a NEW progression epoch.
+   *
+   * Returns silently on missing connection / missing settings; the
+   * watchdog will simply retry on the next pass.
+   */
+  private async startEngineFromConnectionConfig(connectionId: string): Promise<void> {
+    try {
+      const { getAllConnections } = await import("@/lib/redis-db")
+      const { loadSettingsAsync } = await import("@/lib/settings-storage")
+      const connections = await getAllConnections()
+      const connection = connections.find((c: any) => c.id === connectionId)
+      if (!connection) {
+        console.warn(
+          `[v0] [Coordinator] restart skipped — connection ${connectionId} not found`,
+        )
+        return
+      }
+      const settings = await loadSettingsAsync()
+      const config: EngineConfig = {
+        connectionId,
+        indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
+        strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
+        realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 3,
+      }
+      await this.startEngine(connectionId, config)
+    } catch (err) {
+      console.warn(
+        `[v0] [Coordinator] startEngineFromConnectionConfig failed for ${connectionId}:`,
+        err instanceof Error ? err.message : String(err),
+      )
     }
   }
 
@@ -330,13 +533,92 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
+   * Idempotent background-timer self-heal.
+   *
+   * STABILITY: HMR / module-reload events historically fired in
+   * production (e.g. when a settings save bounced a route handler) and
+   * were observed to leave the coordinator singleton alive but with
+   * `healthCheckTimer` / `coordinationMetricsTimer` cleared. The
+   * watchdog re-arm and refresh-request handling are *exactly* the
+   * mechanisms that keep engines processing; losing them silently is
+   * the worst-case stability failure.
+   *
+   * This method is called from every public coordinator entry-point
+   * (`startMissingEngines`, `refreshEngines`, `startEngine`,
+   * `getAllEnginesStatus`, `pause`, `resume`, …) so the very next
+   * caller after such an event re-arms both timers. The constructor
+   * already calls them once; the underlying `startGlobal*` helpers are
+   * themselves idempotent (they early-return when the timer field is
+   * already set), so calling this on every entry-point is essentially
+   * free in steady state.
+   */
+  ensureBackgroundTimers(): void {
+    try {
+      this.startGlobalHealthMonitoring()
+    } catch (e) {
+      console.warn("[v0] [Coordinator] ensureBackgroundTimers: health monitor restart failed:", e)
+    }
+    try {
+      this.startCoordinationMetricsTracking()
+    } catch (e) {
+      console.warn("[v0] [Coordinator] ensureBackgroundTimers: metrics tracker restart failed:", e)
+    }
+  }
+
+  /**
+   * Drop "zombie" engine-manager entries — Map slots whose manager is
+   * not actually running and whose creation predates `staleAgeMs`. We
+   * see these accumulate when an engine fails to fully initialise
+   * (e.g. credentials were revoked) and the failure path leaves a
+   * not-running manager in the Map. They prevent `startMissingEngines`
+   * from ever retrying that connection because the connectionId
+   * appears "owned".
+   *
+   * Safe to call any time — a manager that *is* running is never
+   * pruned.
+   */
+  private pruneZombieManagers(staleAgeMs = 30_000): number {
+    let pruned = 0
+    const now = Date.now()
+    for (const [connectionId, mgr] of this.engineManagers.entries()) {
+      if (mgr.isEngineRunning) continue
+      // `createdAt` is set on TradeEngineManager construction; if it's
+      // missing (older instances) we treat the entry as immediately
+      // prunable, which is the conservative behaviour — a not-running
+      // manager has no semantics worth preserving.
+      const createdAt = (mgr as any).createdAt as number | undefined
+      const ageMs = createdAt ? now - createdAt : Number.POSITIVE_INFINITY
+      if (ageMs >= staleAgeMs) {
+        this.engineManagers.delete(connectionId)
+        pruned++
+        console.log(
+          `[v0] [Coordinator] Pruned zombie manager for ${connectionId} (age=${
+            Number.isFinite(ageMs) ? `${ageMs}ms` : "unknown"
+          }, isEngineRunning=false)`,
+        )
+      }
+    }
+    return pruned
+  }
+
+  /**
    * Start engines for connections that should be running but don't have engines
    * Does NOT stop engines - leaves that to explicit user actions via dashboard toggles
    */
   async startMissingEngines(connections: any[]): Promise<number> {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
-      
+
+      // Self-heal: make sure the watchdog and metrics tracker are armed
+      // before we start any new engines (otherwise any stalls on
+      // freshly-started engines wouldn't be recovered).
+      this.ensureBackgroundTimers()
+
+      // Prune dead Map entries before computing `runningIds` so a
+      // failed-init manager doesn't shadow a connection that should
+      // legitimately be (re-)started.
+      this.pruneZombieManagers()
+
       const { initRedis, getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
       
@@ -418,7 +700,13 @@ export class GlobalTradeEngineCoordinator {
   async refreshEngines(): Promise<void> {
     try {
       console.log("[v0] [Coordinator] === REFRESH ENGINES START (START ONLY) ===")
-      
+
+      // Self-heal background timers + drop dead Map slots before we
+      // reconcile so a zombie manager doesn't shadow a connection that
+      // legitimately needs (re-)starting.
+      this.ensureBackgroundTimers()
+      this.pruneZombieManagers()
+
       const { initRedis, getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
       
@@ -641,9 +929,15 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
-   * Get status of all engines
+   * Get status of all engines.
+   *
+   * Status reads are by far the most frequent coordinator entry-point
+   * (the dashboard polls every few seconds). We piggyback the background
+   * timer self-heal here so even a system that's never explicitly
+   * "started" but is being observed will keep its watchdog armed.
    */
   async getAllEnginesStatus(): Promise<Record<string, any>> {
+    this.ensureBackgroundTimers()
     const status: Record<string, any> = {}
 
     for (const [connectionId, manager] of this.engineManagers.entries()) {
@@ -731,57 +1025,251 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
-   * Start global health monitoring with connection refresh detection
+   * Start global health monitoring with connection refresh detection +
+   * per-engine stall watchdog.
+   *
+   * Watchdog: every 10s we read each running engine's
+   * `last_processor_heartbeat` from `trade_engine_state:{id}`. If it's
+   * older than `STALL_THRESHOLD_MS` we call `manager.rearmIfStalled()`,
+   * which re-arms only the missing processor timers in place. We do NOT
+   * stop + restart the engine, do NOT rebuild the manager, do NOT replay
+   * prehistoric ��� that was the cause of the user's "no-sense
+   * reassignments / restarts" complaint.
    */
-  private startGlobalHealthMonitoring(): void {
-    const healthCheckInterval = 10000 // Check every 10 seconds for faster response
+  /**
+   * Per-connection stall escalation counters. When the watchdog detects
+   * a stall it calls `manager.rearmIfStalled()` (cheap, in-place). If
+   * the engine remains stalled on the NEXT pass, we escalate: force
+   * break the progression lock (so the worker that took over later
+   * sees a fresh slot), stop the manager, and restart it from scratch
+   * with a new generation epoch. Resets to 0 once the engine reports
+   * a fresh heartbeat.
+   *
+   * Map<connectionId, consecutiveStallCount>
+   */
+  private stallEscalation: Map<string, number> = new Map()
 
-    console.log("[v0] Starting global trade engine health monitoring with refresh detection")
+  /**
+   * Mutex for in-flight escalation restarts. The watchdog runs every
+   * 10 s and a full stop+restart can take longer than that, so the
+   * next tick MUST NOT fire a second escalation while the previous
+   * one is still draining. Without this guard, two concurrent
+   * restarts would each acquire-then-break the lock and produce the
+   * "doubled progression / stopping-restarting" symptom.
+   */
+  private escalatingEngines: Set<string> = new Set()
+
+  private startGlobalHealthMonitoring(): void {
+    if (this.healthCheckTimer) {
+      // Already running — keep the existing timer.
+      return
+    }
+    const healthCheckInterval = 10000 // 10s
+    // ── Stall thresholds (relaxed from earlier 60s / 2 attempts) ───
+    // Real-world Redis pauses on cold-started serverless instances
+    // can routinely sit on 30-60s; aggressive thresholds caused the
+    // watchdog to nuke healthy engines that were just about to come
+    // back. New values give the engine generous recovery room:
+    //
+    //   • 90 s without heartbeat before we even *consider* stall.
+    //   • 4 consecutive stalls (≈ 40 s extra) before we escalate from
+    //     in-place re-arm to a full stop+restart.
+    //
+    // Combined that's ~2 minutes of grace before any restart fires.
+    const STALL_THRESHOLD_MS = 90_000
+    const ESCALATION_THRESHOLD = 4
+
+    console.log("[v0] Starting global trade engine health monitoring (refresh detection + stall watchdog)")
 
     this.healthCheckTimer = setInterval(async () => {
       try {
-        // Check for refresh requests from toggle-dashboard
+        // -- 1. Refresh-request handling ----------------------------------
         const refreshRequest = await getSettings("engine_coordinator:refresh_requested")
-        
         if (refreshRequest && refreshRequest.timestamp) {
           const requestTime = new Date(refreshRequest.timestamp).getTime()
           const now = Date.now()
-          
-          // Process refresh requests within the last 30 seconds
           if (now - requestTime < 30000) {
             console.log(`[v0] [Coordinator] Refresh requested for ${refreshRequest.connectionId}: ${refreshRequest.action}`)
-            
-            // Clear the request to prevent duplicate processing
             await setSettings("engine_coordinator:refresh_requested", {
               timestamp: null,
               connectionId: null,
               action: null,
               processed_at: new Date().toISOString(),
             })
-            
-            // Trigger engine refresh
             await this.refreshEngines()
           }
         }
-        
+
+        // -- 2. Per-engine stall watchdog (in-place re-arm) ---------------
+        //
+        // Always run, even when `isGloballyRunning` is false — individual
+        // engines can be running via dashboard toggle without the global
+        // run-all flag being set.
+        const now = Date.now()
+        for (const [connectionId, manager] of this.engineManagers.entries()) {
+          if (!manager.isEngineRunning) continue
+          try {
+            const state = (await getSettings(`trade_engine_state:${connectionId}`)) || {}
+            // Prefer the unified processor heartbeat; fall back to
+            // last_indication_run for engines that haven't been upgraded
+            // yet (heartbeat key is added in this same change-set).
+            const lastHb =
+              Number(state.last_processor_heartbeat) ||
+              (state.last_processor_heartbeat ? new Date(state.last_processor_heartbeat).getTime() : 0) ||
+              (state.last_indication_run ? new Date(state.last_indication_run).getTime() : 0)
+            if (lastHb === 0) continue // engine started but no heartbeat yet
+            const age = now - lastHb
+            if (age > STALL_THRESHOLD_MS) {
+              const consecutiveStalls = (this.stallEscalation.get(connectionId) ?? 0) + 1
+              this.stallEscalation.set(connectionId, consecutiveStalls)
+
+              if (consecutiveStalls < ESCALATION_THRESHOLD) {
+                // ── Tier 1: in-place re-arm ──────────────────────────
+                // Cheapest recovery — re-attaches missing processor
+                // timers without rebuilding the manager. Most stalls
+                // are just a dropped timer (HMR race / unhandled
+                // rejection / Redis pause) and this fixes them.
+                console.warn(
+                  `[v0] [Watchdog] Engine ${connectionId} stalled (last heartbeat ${age}ms ago, attempt ${consecutiveStalls}/${ESCALATION_THRESHOLD}) — re-arming in place`,
+                )
+                try {
+                  const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
+                  await logProgressionEvent(
+                    connectionId,
+                    "engine_stall_recovered",
+                    "warning",
+                    `Engine stalled for ${Math.round(age / 1000)}s — watchdog re-arming in place (attempt ${consecutiveStalls})`,
+                    { ageMs: age, connectionId, attempt: consecutiveStalls },
+                  )
+                } catch {
+                  // Logging is best-effort; never block recovery on it.
+                }
+                try {
+                  await manager.rearmIfStalled()
+                } catch (rearmError) {
+                  console.error(
+                    `[v0] [Watchdog] rearmIfStalled threw for ${connectionId}:`,
+                    rearmError instanceof Error ? rearmError.message : String(rearmError),
+                  )
+                }
+              } else {
+                // ── Tier 2: full stop + restart with new epoch ───────
+                // In-place re-arm didn't bring the heartbeat back.
+                // The engine is wedged hard (e.g. stuck inside a long
+                // Redis-pipeline await, or a never-resolving await on
+                // network I/O). The ONLY safe recovery is to drop
+                // the lock, tear down the manager, and start fresh.
+                //
+                // ── Concurrency guards ────────────────────────────────
+                //   1. Mutex: if an escalation for this connection is
+                //      already in flight, skip THIS tick. The previous
+                //      escalation will complete and the next health
+                //      check will reassess.
+                //   2. Ownership: only escalate engines we actually own
+                //      in THIS process. The local manager must be
+                //      present in our map; otherwise we're looking at
+                //      a cross-process scenario and the OTHER process
+                //      owns the recovery responsibility.
+                if (this.escalatingEngines.has(connectionId)) {
+                  console.warn(
+                    `[v0] [Watchdog] Engine ${connectionId} escalation already in-flight — skipping duplicate restart`,
+                  )
+                  // Don't clear the stall counter — let the in-flight
+                  // escalation finish and the next tick re-evaluate.
+                  continue
+                }
+                const localManager = this.engineManagers.get(connectionId)
+                if (!localManager) {
+                  console.warn(
+                    `[v0] [Watchdog] Engine ${connectionId} not in local map — skipping escalation (cross-process owner)`,
+                  )
+                  this.stallEscalation.delete(connectionId)
+                  continue
+                }
+                console.error(
+                  `[v0] [Watchdog] Engine ${connectionId} STILL stalled after ${consecutiveStalls} attempts (${age}ms) — escalating to full restart`,
+                )
+                this.stallEscalation.delete(connectionId)
+                this.escalatingEngines.add(connectionId)
+                try {
+                  const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
+                  await logProgressionEvent(
+                    connectionId,
+                    "engine_force_restart",
+                    "error",
+                    `Engine wedged after ${consecutiveStalls} re-arm attempts — forcing stop+restart with new generation`,
+                    { ageMs: age, connectionId, attempts: consecutiveStalls },
+                  )
+                } catch {
+                  /* best-effort */
+                }
+                // Break the lock pre-emptively so the restart can
+                // acquire a fresh slot without waiting for the TTL.
+                try {
+                  await forceBreakProgressionLock(connectionId)
+                } catch {
+                  /* TTL will reclaim */
+                }
+                // Stop + restart sequentially. The mutex above
+                // prevents this whole block from running concurrently
+                // for the same connection.
+                try {
+                  await this.stopEngine(connectionId)
+                } catch (stopErr) {
+                  console.warn(
+                    `[v0] [Watchdog] force stop threw for ${connectionId}:`,
+                    stopErr instanceof Error ? stopErr.message : String(stopErr),
+                  )
+                }
+                try {
+                  await this.startEngineFromConnectionConfig(connectionId)
+                } catch (startErr) {
+                  console.error(
+                    `[v0] [Watchdog] force restart failed for ${connectionId}:`,
+                    startErr instanceof Error ? startErr.message : String(startErr),
+                  )
+                } finally {
+                  // Mutex MUST always be released, even on failure,
+                  // so the next health-check tick can retry.
+                  this.escalatingEngines.delete(connectionId)
+                }
+              }
+            } else {
+              // Healthy heartbeat — clear any in-flight escalation
+              // counter so a future stall starts from scratch at
+              // tier 1 instead of immediately escalating.
+              if (this.stallEscalation.has(connectionId)) {
+                this.stallEscalation.delete(connectionId)
+              }
+            }
+          } catch (perEngineError) {
+            // One bad engine read must not break the whole monitor.
+            console.warn(
+              `[v0] [Watchdog] Read error for ${connectionId}:`,
+              perEngineError instanceof Error ? perEngineError.message : String(perEngineError),
+            )
+          }
+        }
+
+        // -- 3. Aggregate health ------------------------------------------
         if (!this.isGloballyRunning) return
-
         const health = await this.getGlobalHealth()
-
         if (health.overall !== "healthy") {
           console.warn(`[v0] Global trade engine health: ${health.overall}`)
         }
-
-        // Log unhealthy connections
         for (const [connectionId, component] of Object.entries(health.components)) {
           if (component.status !== "healthy") {
             console.warn(`[v0] Connection ${connectionId} is ${component.status}`)
           }
         }
       } catch (error) {
+        // The monitor itself must NEVER throw out — that would silently
+        // kill the timer. Catch everything and continue on the next tick.
         console.error("[v0] Global health monitoring error:", error)
       }
     }, healthCheckInterval)
+    // Don't keep the process alive solely for this monitor.
+    if (typeof this.healthCheckTimer.unref === "function") this.healthCheckTimer.unref()
   }
 
   /**
@@ -807,7 +1295,10 @@ export class GlobalTradeEngineCoordinator {
 
   private startCoordinationMetricsTracking(): void {
     if (this.coordinationMetricsTimer) {
-      clearInterval(this.coordinationMetricsTimer)
+      // Idempotent: don't replace an already-armed timer. (Previous
+      // behaviour cleared and re-armed, which on rapid re-init could leak
+      // listeners through the inner `getAllEnginesStatus` import chain.)
+      return
     }
     const metricsInterval = 60000 // Update every 60 seconds
 
@@ -843,6 +1334,8 @@ export class GlobalTradeEngineCoordinator {
         console.error("[v0] Coordination metrics tracking error:", error)
       }
     }, metricsInterval)
+    // Don't keep the process alive solely for this metrics timer.
+    if (typeof this.coordinationMetricsTimer.unref === "function") this.coordinationMetricsTimer.unref()
   }
 
   /**
@@ -855,7 +1348,18 @@ export class GlobalTradeEngineCoordinator {
 
 /**
  * The global trade engine coordinator singleton instance
- * V5: Aggressive timer cleanup - also clear timers from engine-manager.ts
+ *
+ * STABILITY: This module used to "aggressively clean up" on version-change
+ * by clearing every registered engine timer AND calling `manager.stop()` on
+ * every running engine AND clearing the singleton. That ran on every HMR
+ * reload, every serverless warm-restart, and every redeploy — which is
+ * exactly what produced the "engines auto-restart for no reason / no-sense
+ * reassignments / GlobalTradeCoordinator stops itself" symptom.
+ *
+ * The coordinator is supposed to be a SOLID overall state holder. We now
+ * only log a soft diagnostic on version change and preserve every live
+ * engine across module reloads. Real cleanup remains the job of explicit
+ * `coordinator.stopEngine()` / `coordinator.stopAll()` calls.
  */
 const engineGlobalThis = globalThis as unknown as {
   __tradeEngineCoordinator?: GlobalTradeEngineCoordinator
@@ -863,45 +1367,16 @@ const engineGlobalThis = globalThis as unknown as {
   __engine_timers?: Set<ReturnType<typeof setInterval>>
 }
 
-const TRADE_ENGINE_VERSION = "5.1.0"
+const TRADE_ENGINE_VERSION = "5.2.0"
 
-// V5: Aggressive cleanup - clear ALL registered engine timers on version change
-if (engineGlobalThis.__tradeEngineVersion !== TRADE_ENGINE_VERSION) {
-  console.log(`[v0] Trade Engine version changed ${engineGlobalThis.__tradeEngineVersion} -> ${TRADE_ENGINE_VERSION}, aggressive cleanup...`)
-  
-  // Clear timers registered by engine-manager.ts
-  if (engineGlobalThis.__engine_timers) {
-    console.log(`[v0] Clearing ${engineGlobalThis.__engine_timers.size} registered engine timers...`)
-    for (const timer of engineGlobalThis.__engine_timers) {
-      try {
-        clearInterval(timer)
-      } catch {}
-    }
-    engineGlobalThis.__engine_timers.clear()
-  }
-  
-  // Stop old coordinator's engines
-  if (engineGlobalThis.__tradeEngineCoordinator) {
-    try {
-      const oldCoord = engineGlobalThis.__tradeEngineCoordinator
-      // @ts-expect-error - accessing private member for cleanup
-      if (oldCoord.engineManagers) {
-        // @ts-expect-error - accessing private member for cleanup
-        for (const manager of oldCoord.engineManagers.values()) {
-          try {
-            manager.stop().catch(() => {})
-          } catch {}
-        }
-        // @ts-expect-error - accessing private member for cleanup
-        oldCoord.engineManagers.clear()
-      }
-    } catch {
-      // Ignore cleanup errors
-    }
-    engineGlobalThis.__tradeEngineCoordinator = undefined
-  }
+if (engineGlobalThis.__tradeEngineVersion && engineGlobalThis.__tradeEngineVersion !== TRADE_ENGINE_VERSION) {
+  // Soft diagnostic only. NO timer clear, NO manager.stop(), NO singleton reset.
+  console.log(
+    `[v0] Trade Engine version ${engineGlobalThis.__tradeEngineVersion} -> ${TRADE_ENGINE_VERSION} ` +
+      `(keeping ${engineGlobalThis.__engine_timers?.size ?? 0} live timers and ` +
+      `${engineGlobalThis.__tradeEngineCoordinator ? "existing" : "no"} coordinator)`,
+  )
 }
-
 engineGlobalThis.__tradeEngineVersion = TRADE_ENGINE_VERSION
 let globalCoordinator: GlobalTradeEngineCoordinator | null = engineGlobalThis.__tradeEngineCoordinator || null
 

@@ -70,10 +70,265 @@ export class InlineLocalRedis {
     this.startPersistence();
   }
 
-  async loadFromDisk(): Promise<boolean> { return false }
-  async startPersistence(): Promise<boolean> { return false }
-  async saveToDisk(): Promise<boolean> { return false }
-  saveToDiskSync(): boolean { return false }
+  // ──────────────────────────────────────────────────────────────────────
+  // Disk persistence (snapshot-based, single instance)
+  // ──────────────────────────────────────────────────────────────────────
+  //
+  // The "local Redis" is in-memory only, so without a snapshot every
+  // deploy / container restart / serverless cold-start wipes EVERYTHING:
+  // connections, settings, progression counters, prehistoric flags.
+  //
+  // This implementation does the simplest thing that survives a restart on
+  // a single warm instance:
+  //   • saveToDisk():       JSON-serialise data, write atomically (tmp + rename)
+  //   • saveToDiskSync():   same, blocking — used in SIGTERM/SIGINT/beforeExit
+  //   • loadFromDisk():     read + restore Maps/Sets; rename corrupt file aside
+  //   • startPersistence(): once-per-process 5-min interval + signal handlers
+  //
+  // Notes:
+  //   • Defaults to `<cwd>/.v0-data/redis-snapshot.json`, falls back to
+  //     `/tmp/v0-redis-snapshot.json` if the cwd path is not writable
+  //     (Vercel serverless restricts writes outside `/tmp`).
+  //   • This is NOT cross-instance durable. Vercel `/tmp` is per warm
+  //     instance; a fresh cold instance starts empty and rebuilds via
+  //     migrations. Swap the body of save/load for Vercel Blob to gain
+  //     cross-instance durability without changing this surface.
+  //   • Browser builds: every entry point exits early via the `process`
+  //     guard so client bundles never pull in `node:fs`. We use dynamic
+  //     `await import("node:fs/promises")` to keep the file's "no static
+  //     fs/path imports" contract (see header comment).
+  //
+  // Failure-mode philosophy: the in-memory store keeps working regardless
+  // of disk failures — the only observable effect of a broken disk is a
+  // single rate-limited warning per minute and no cross-restart recovery.
+
+  private static persistenceTickStarted = false
+  private static signalsAttached = false
+  private static lastSaveErrorWarn = 0
+
+  /** Resolve snapshot path; honours `V0_REDIS_SNAPSHOT_PATH` env override. */
+  private async resolveSnapshotPath(): Promise<{ dir: string; file: string } | null> {
+    if (typeof process === "undefined" || !process.versions?.node) return null
+    try {
+      // Bare specifier (no `node:` URI scheme) — Webpack 5's bundler can
+      // analyse this and Node's resolver maps it to the built-in. The
+      // `node:path` form triggers `UnhandledSchemeError` on the Edge
+      // build because Webpack's scheme handler doesn't recognise it.
+      // Bare imports are aliased to `false` for the Edge runtime in
+      // `next.config.mjs`, which short-circuits the load (the runtime
+      // guard above already returns `null` before this line ever runs).
+      const path = await import("path")
+      const explicit = process.env.V0_REDIS_SNAPSHOT_PATH
+      if (explicit) {
+        return { dir: path.dirname(explicit), file: explicit }
+      }
+      // Prefer cwd/.v0-data; fall back to /tmp in restricted environments.
+      const primary = path.join(process.cwd(), ".v0-data", "redis-snapshot.json")
+      return { dir: path.dirname(primary), file: primary }
+    } catch {
+      return null
+    }
+  }
+
+  /** Fallback: write to `/tmp` when the primary path is read-only. */
+  private async tmpFallbackPath(): Promise<{ dir: string; file: string } | null> {
+    if (typeof process === "undefined" || !process.versions?.node) return null
+    try {
+      // Bare specifier — see comment in `resolveSnapshotPath`.
+      const path = await import("path")
+      return { dir: "/tmp", file: path.join("/tmp", "v0-redis-snapshot.json") }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Build a JSON-safe snapshot of the in-memory data. We can't JSON-stringify
+   * Maps and Sets directly, so we materialise them as arrays of entries.
+   * Format is versioned (`v: 1`) so future shape changes can migrate cleanly.
+   */
+  private buildSnapshot(): string {
+    const d = this.data
+    return JSON.stringify({
+      v: 1,
+      savedAt: Date.now(),
+      strings: Array.from(d.strings.entries()),
+      hashes: Array.from(d.hashes.entries()),
+      sets: Array.from(d.sets.entries()).map(([k, s]) => [k, Array.from(s)]),
+      lists: Array.from(d.lists.entries()),
+      sorted_sets: Array.from(d.sorted_sets.entries()),
+      ttl: Array.from(d.ttl.entries()),
+    })
+  }
+
+  /** Restore Maps/Sets from a parsed snapshot. Tolerant of partial files. */
+  private applySnapshot(parsed: any): boolean {
+    if (!parsed || typeof parsed !== "object") return false
+    const d = this.data
+    try {
+      if (Array.isArray(parsed.strings))
+        d.strings = new Map(parsed.strings)
+      if (Array.isArray(parsed.hashes))
+        d.hashes = new Map(parsed.hashes)
+      if (Array.isArray(parsed.sets))
+        d.sets = new Map(parsed.sets.map(([k, s]: [string, string[]]) => [k, new Set(s)]))
+      if (Array.isArray(parsed.lists))
+        d.lists = new Map(parsed.lists)
+      if (Array.isArray(parsed.sorted_sets))
+        d.sorted_sets = new Map(parsed.sorted_sets)
+      if (Array.isArray(parsed.ttl))
+        d.ttl = new Map(parsed.ttl)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** Single rate-limited warning per minute so a broken disk doesn't spam logs. */
+  private warnRateLimited(msg: string, err: unknown): void {
+    const now = Date.now()
+    if (now - InlineLocalRedis.lastSaveErrorWarn < 60_000) return
+    InlineLocalRedis.lastSaveErrorWarn = now
+    const detail = err instanceof Error ? err.message : String(err)
+    console.warn(`[v0] [Redis Persistence] ${msg}: ${detail}`)
+  }
+
+  async loadFromDisk(): Promise<boolean> {
+    const target = await this.resolveSnapshotPath()
+    if (!target) return false
+    // Bare specifier — see comment in `resolveSnapshotPath`. Type alias
+    // also drops the `node:` prefix so the bundler doesn't analyse it.
+    let fs: typeof import("fs/promises")
+    try {
+      fs = await import("fs/promises")
+    } catch {
+      return false
+    }
+    // Try primary path, then `/tmp` fallback.
+    const candidates = [target, await this.tmpFallbackPath()].filter(Boolean) as Array<{ file: string }>
+    for (const c of candidates) {
+      try {
+        const raw = await fs.readFile(c.file, "utf8")
+        const parsed = JSON.parse(raw)
+        if (this.applySnapshot(parsed)) {
+          const keys =
+            this.data.strings.size + this.data.hashes.size + this.data.sets.size +
+            this.data.lists.size + this.data.sorted_sets.size
+          console.log(`[v0] [Redis Persistence] Restored ${keys} keys from ${c.file}`)
+          return true
+        }
+        // Parsed but didn't fit — quarantine and continue.
+        try { await fs.rename(c.file, `${c.file}.corrupt-${Date.now()}`) } catch {}
+      } catch (err: any) {
+        if (err?.code === "ENOENT") continue // no snapshot yet
+        if (err instanceof SyntaxError) {
+          // Corrupt JSON — move it aside so we don't keep failing.
+          try { await fs.rename(c.file, `${c.file}.corrupt-${Date.now()}`) } catch {}
+          continue
+        }
+        // Other I/O error — try fallback.
+        continue
+      }
+    }
+    return false
+  }
+
+  async saveToDisk(): Promise<boolean> {
+    const primary = await this.resolveSnapshotPath()
+    if (!primary) return false
+    // Bare specifier — see comment in `resolveSnapshotPath`.
+    let fs: typeof import("fs/promises")
+    try {
+      fs = await import("fs/promises")
+    } catch {
+      return false
+    }
+    const json = this.buildSnapshot()
+    // Try primary then `/tmp` fallback so a read-only cwd doesn't lose data.
+    const candidates = [primary, await this.tmpFallbackPath()].filter(Boolean) as Array<{ dir: string; file: string }>
+    for (const c of candidates) {
+      try {
+        await fs.mkdir(c.dir, { recursive: true })
+        const tmpPath = `${c.file}.tmp`
+        await fs.writeFile(tmpPath, json, "utf8")
+        // Atomic on POSIX — readers either see old or new, never partial.
+        await fs.rename(tmpPath, c.file)
+        return true
+      } catch (err) {
+        // Try next fallback. Only warn after we've exhausted everything.
+        if (c === candidates[candidates.length - 1]) {
+          this.warnRateLimited(`save failed (${c.file})`, err)
+        }
+        continue
+      }
+    }
+    return false
+  }
+
+  /** Synchronous variant for SIGTERM / SIGINT / beforeExit handlers. */
+  saveToDiskSync(): boolean {
+    if (typeof process === "undefined" || !process.versions?.node) return false
+    // Type aliases use bare specifiers so TypeScript's emitted .d.ts
+    // (and any incremental compile cache) don't carry `node:` URIs that
+    // could re-enter the bundler graph.
+    let fsSync: typeof import("fs"), pathMod: typeof import("path")
+    try {
+      // require() is fine here because this method only ever runs in Node.
+      // We use dynamic require via Function to bypass static-bundler analysis.
+      const dynamicRequire = Function("m", "return require(m)") as (m: string) => any
+      // Bare specifiers — Node maps these to the built-ins identically
+      // to the `node:` URI form. Avoiding the URI form here keeps the
+      // request strings out of any chunk the bundler might still scan
+      // (defence in depth — `Function(...)` already hides them).
+      fsSync = dynamicRequire("fs")
+      pathMod = dynamicRequire("path")
+    } catch {
+      return false
+    }
+    const explicit = process.env.V0_REDIS_SNAPSHOT_PATH
+    const primaryFile = explicit || pathMod.join(process.cwd(), ".v0-data", "redis-snapshot.json")
+    const tmpFile = pathMod.join("/tmp", "v0-redis-snapshot.json")
+    const json = this.buildSnapshot()
+    for (const file of [primaryFile, tmpFile]) {
+      try {
+        const dir = pathMod.dirname(file)
+        fsSync.mkdirSync(dir, { recursive: true })
+        const tmp = `${file}.tmp`
+        fsSync.writeFileSync(tmp, json, "utf8")
+        fsSync.renameSync(tmp, file)
+        return true
+      } catch {
+        continue
+      }
+    }
+    return false
+  }
+
+  async startPersistence(): Promise<boolean> {
+    if (typeof process === "undefined" || !process.versions?.node) return false
+    if (InlineLocalRedis.persistenceTickStarted) return true
+    InlineLocalRedis.persistenceTickStarted = true
+
+    // 5-minute snapshot tick. unref() so this timer never holds the
+    // process open during a graceful exit.
+    const FIVE_MIN_MS = 5 * 60 * 1000
+    const t = setInterval(() => {
+      this.saveToDisk().catch(() => { /* warned inside saveToDisk */ })
+    }, FIVE_MIN_MS)
+    if (typeof t.unref === "function") t.unref()
+
+    // Flush-on-exit handlers (idempotent).
+    if (!InlineLocalRedis.signalsAttached) {
+      InlineLocalRedis.signalsAttached = true
+      const flush = () => { try { this.saveToDiskSync() } catch {} }
+      // setMaxListeners is a NodeEventEmitter API; guard for ts safety.
+      try { (process as any).setMaxListeners?.(50) } catch {}
+      process.on("SIGTERM", flush)
+      process.on("SIGINT", flush)
+      process.on("beforeExit", flush)
+    }
+    return true
+  }
   
   private startTTLCleanup(): void {
     // DISABLED: Automatic TTL cleanup causing all data to be deleted every 60 seconds
@@ -163,12 +418,44 @@ export class InlineLocalRedis {
     return this.data.strings.get(key) ?? null
   }
 
-  async set(key: string, value: string, options?: { EX?: number }): Promise<void> {
+  /**
+   * Set a string value with optional TTL and atomic-acquire semantics.
+   *
+   * Returns `"OK"` on success, `null` when `NX` was requested and the key
+   * already existed (Redis-standard). The previous `Promise<void>`
+   * signature could not represent the "not acquired" case, which made it
+   * impossible to build atomic locks on top of `client.set` —
+   * `acquireLock`, the cron sweep guard, and other check-then-act
+   * locations all silently raced because they had no way to learn
+   * whether they actually won the slot.
+   *
+   * Options:
+   *   - `EX`: TTL seconds (matches existing usage everywhere).
+   *   - `NX`: only set if the key does NOT already exist. Combined with
+   *     `EX` this is the canonical "atomic acquire-or-fail" primitive
+   *     (`SET key val NX EX ttl`). When the key is already present we
+   *     return `null` and DO NOT touch the value or refresh the TTL.
+   *   - `XX`: only set if the key DOES exist (mirror of NX, for
+   *     symmetry with the real Redis API surface).
+   */
+  async set(
+    key: string,
+    value: string,
+    options?: { EX?: number; NX?: boolean; XX?: boolean },
+  ): Promise<string | null> {
     this.trackOperation()
+    if (options?.NX || options?.XX) {
+      // Honour TTL on the existence-check too — an expired key counts
+      // as "does not exist" for NX, and as "exists" for XX.
+      const exists = !this.isExpired(key) && this.data.strings.has(key)
+      if (options.NX && exists) return null
+      if (options.XX && !exists) return null
+    }
     this.data.strings.set(key, value)
     if (options?.EX) {
       this.setKeyTTL(key, options.EX)
     }
+    return "OK"
   }
   
   async setex(key: string, seconds: number, value: string): Promise<void> {
@@ -215,6 +502,80 @@ export class InlineLocalRedis {
     this.data.lists.clear()
     this.data.sorted_sets.clear()
     this.data.ttl?.clear()
+  }
+
+  /**
+   * Root-cause fix for "data still remaining after Reset DB".
+   *
+   * The previous clear-progressions route deleted keys from in-memory Maps
+   * via `client.del(...)` but never updated the snapshot file on disk.
+   * The next HTTP request triggers `loadFromDisk()` which restored all
+   * deleted keys from the stale snapshot, making the reset appear to have
+   * no effect. This method atomically deletes from memory AND overwrites
+   * the snapshot so both layers stay consistent after a reset.
+   *
+   * Deletes all keys whose prefix is NOT in `protectedPrefixes`.
+   * `forceClearPrefixes` overrides protection for runtime caches that
+   * share a protected namespace (e.g. `connection:test:*`).
+   */
+  async flushRuntimeKeys(
+    protectedPrefixes: readonly string[],
+    forceClearPrefixes: readonly string[] = [],
+  ): Promise<{ deleted: number; protected: number; buckets: Record<string, number> }> {
+    const checkProtected = (key: string): boolean => {
+      for (const fc of forceClearPrefixes) {
+        if (key.startsWith(fc)) return false
+      }
+      for (const p of protectedPrefixes) {
+        if (key.startsWith(p)) return true
+      }
+      return false
+    }
+    const bucketOf = (key: string): string => {
+      const idx = key.indexOf(":")
+      return idx > 0 ? key.slice(0, idx) + ":*" : key
+    }
+    const allKeys = new Set<string>([
+      ...this.data.strings.keys(),
+      ...this.data.hashes.keys(),
+      ...this.data.sets.keys(),
+      ...this.data.lists.keys(),
+      ...this.data.sorted_sets.keys(),
+    ])
+    let deleted = 0
+    let protectedCount = 0
+    // Build bucket summary BEFORE deletion so the response reflects what
+    // was actually removed — not what survived.
+    const buckets: Record<string, number> = {}
+    for (const key of allKeys) {
+      if (checkProtected(key)) {
+        protectedCount++
+      } else {
+        const b = bucketOf(key)
+        buckets[b] = (buckets[b] || 0) + 1
+        this.deleteKey(key)
+        deleted++
+      }
+    }
+    if (this.data.ttl) {
+      for (const key of this.data.ttl.keys()) {
+        if (!checkProtected(key)) this.data.ttl.delete(key)
+      }
+    }
+    // Immediately overwrite the snapshot so loadFromDisk() on the next
+    // cold-start or hot-reload only restores protected keys. Without this
+    // step, a hot-reload or cold-start resurrects the deleted runtime data.
+    await this.saveToDisk()
+    return { deleted, protected: protectedCount, buckets }
+  }
+
+  /**
+   * Flush the in-memory state to disk without any deletions.
+   * Call this after any batch of writes that MUST be durable before the
+   * next request (e.g. after connection-flag resets in clear-progressions).
+   */
+  async persistNow(): Promise<boolean> {
+    return this.saveToDisk()
   }
 
   async hset(key: string, dataOrField: Record<string, string> | string, value?: string): Promise<number> {
@@ -515,6 +876,39 @@ export class InlineLocalRedis {
     return before - remaining.length
   }
 
+  /** Return members in ascending score order between indices start and stop (inclusive). */
+  async zrange(key: string, start: number, stop: number): Promise<string[]> {
+    if (this.isExpired(key)) return []
+    const set = this.data.sorted_sets.get(key) || []
+    const sorted = [...set].sort((a, b) => a.score - b.score)
+    const end = stop < 0 ? sorted.length + stop + 1 : stop + 1
+    return sorted.slice(start < 0 ? Math.max(0, sorted.length + start) : start, end).map(e => e.member)
+  }
+
+  /** Return members in descending score order between indices start and stop (inclusive). */
+  async zrevrange(key: string, start: number, stop: number): Promise<string[]> {
+    if (this.isExpired(key)) return []
+    const set = this.data.sorted_sets.get(key) || []
+    const sorted = [...set].sort((a, b) => b.score - a.score)
+    const end = stop < 0 ? sorted.length + stop + 1 : stop + 1
+    return sorted.slice(start < 0 ? Math.max(0, sorted.length + start) : start, end).map(e => e.member)
+  }
+
+  /** Return the score of a member in a sorted set. */
+  async zscore(key: string, member: string): Promise<string | null> {
+    if (this.isExpired(key)) return null
+    const set = this.data.sorted_sets.get(key)
+    if (!set) return null
+    const entry = set.find(e => e.member === member)
+    return entry !== undefined ? String(entry.score) : null
+  }
+
+  /** Return the cardinality (number of members) of a sorted set. */
+  async zcard(key: string): Promise<number> {
+    if (this.isExpired(key)) return 0
+    return (this.data.sorted_sets.get(key) || []).length
+  }
+
   async trackDatabaseOperation(limit: number): Promise<{ current: number; limit: number; exceeded: boolean }> {
     const globalTracker = globalThis as unknown as { __db_ops_tracker?: { timestamp: number; count: number } }
     const now = Date.now()
@@ -671,7 +1065,10 @@ export async function initRedis(): Promise<void> {
 
   if (!redisInstance) {
     redisInstance = new InlineLocalRedis()
-    await redisInstance.load()
+    // Restore from disk snapshot before any caller reads keys. The
+    // constructor also kicks off a background load, but awaiting here
+    // guarantees migrations + readers see hydrated state on first tick.
+    await redisInstance.loadFromDisk().catch(() => { /* fresh start ok */ })
   }
 
   isConnected = true
@@ -1161,9 +1558,22 @@ export async function bumpSettingsVersion(): Promise<number> {
 // ========== Market Data Operations ==========
 
 export async function getMarketData(symbol: string, interval: string): Promise<any | null> {
+  // ── Spec §7 migration: 1s is the canonical timeframe ─────────────
+  //
+  // The market-data loader was migrated to write only the `:1s`
+  // envelope, but dozens of legacy callsites still pass `"1m"`
+  // (default in older code paths). Rather than churn every caller
+  // we transparently fall back to `:1s` whenever the requested
+  // interval is absent. The envelope shape is identical so consumers
+  // can't tell the difference; only the `timeframe` field reports
+  // "1s" instead of "1m", which all known readers ignore.
   await initRedis()
   const client = getClient()
-  const data = await client.get(`market_data:${symbol}:${interval}`)
+  const primary = await client.get(`market_data:${symbol}:${interval}`)
+  let data = primary
+  if (!data && interval !== "1s") {
+    data = await client.get(`market_data:${symbol}:1s`)
+  }
   if (!data) return null
   try {
     return JSON.parse(data)

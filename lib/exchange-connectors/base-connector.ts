@@ -249,6 +249,44 @@ export abstract class BaseExchangeConnector {
     options?: PlaceOrderOptions
   ): Promise<{ success: boolean; orderId?: string; error?: string }>
 
+  /**
+   * Place a CONDITIONAL (stop / take-profit) order.
+   *
+   * Why it exists: a regular LIMIT order placed at the trigger price is
+   * NOT a stop-loss. For SL on a long it's a sell-limit *below* market —
+   * which most exchanges reject as an aggressive reduce-only, or worse,
+   * fill instantly at the current bid. The result is no actual exchange
+   * protection at all. A real SL/TP on perp exchanges is a separate
+   * conditional order family (BingX `STOP_MARKET` / `TAKE_PROFIT_MARKET`,
+   * Bybit `triggerPrice` + `triggerDirection`, etc.).
+   *
+   * The default implementation here delegates to `placeOrder` with a
+   * limit at the trigger price — which is the legacy behaviour, kept as
+   * a fallback so connectors without native conditional-order support
+   * continue to compile and operate without code changes. Connectors
+   * that DO support conditional orders MUST override this method.
+   *
+   * @param closeSide       Order side that CLOSES the position
+   *                        (sell for a long, buy for a short).
+   * @param triggerPrice    Absolute price at which the conditional order
+   *                        becomes a market order on the exchange.
+   * @param kind            "stop_loss" or "take_profit" — connectors
+   *                        use this to pick the correct trigger
+   *                        direction and / or order type.
+   */
+  async placeStopOrder(
+    symbol: string,
+    closeSide: "buy" | "sell",
+    quantity: number,
+    triggerPrice: number,
+    kind: "stop_loss" | "take_profit",
+    options: PlaceOrderOptions = {},
+  ): Promise<{ success: boolean; orderId?: string; error?: string }> {
+    // Mark `kind` as intentionally consumed — base impl is exchange-agnostic.
+    void kind
+    return this.placeOrder(symbol, closeSide, quantity, triggerPrice, "limit", options)
+  }
+
   abstract cancelOrder(symbol: string, orderId: string): Promise<{ success: boolean; error?: string }>
 
   abstract getOrder(symbol: string, orderId: string): Promise<ExchangeOrder | null>

@@ -1,7 +1,90 @@
 /**
- * Progression State Manager
- * Tracks trade engine progression metrics (cycles completed, success rates, etc.)
- * State is persisted to Redis for durability across restarts
+ * ╔═════════════════════════════════════════════════════════════════════════╗
+ * ║              PROGRESSION STATE — REDIS SCHEMA (CANONICAL)              ║
+ * ║                                                                         ║
+ * ║  Hash key:                       progression:{connectionId}            ║
+ * ║  Sibling string keys (per-stage Set fan-out, 24h TTL):                 ║
+ * ║      strategies:{id}:base:count        strategies:{id}:base:evaluated  ║
+ * ║      strategies:{id}:main:count        strategies:{id}:main:evaluated  ║
+ * ║      strategies:{id}:real:count        strategies:{id}:real:evaluated  ║
+ * ║                                                                         ║
+ * ║  Update discipline (PRESERVE THIS — concurrent processors race):       ║
+ * ║   • COUNTERS  → `hincrby` ONLY. Never `hset` a counter; three           ║
+ * ║                  processors (indication / strategy / realtime) and     ║
+ * ║                  the strategy-coordinator all write the same hash      ║
+ * ║                  concurrently, so read-modify-write loses updates.     ║
+ * ║   • SNAPSHOTS → `hset` (a single newest value wins).                   ║
+ * ║   • FLOATS    → stored as ASCII strings; read with `parseFloat`.       ║
+ * ║   • Reset is operator-driven only (see `resetProgressionState`).       ║
+ * ║     Engine restart MUST preserve every counter — `engine-manager       ║
+ * ║     .ts:start()` only writes `last_update` + `engine_started` when     ║
+ * ║     the hash already exists (and now backfills `started_at` if         ║
+ * ║     absent).                                                            ║
+ * ║                                                                         ║
+ * ║  ── Field families (the names below match exact Redis hash keys) ──   ║
+ * ║                                                                         ║
+ * ║   GLOBAL CYCLE COUNTERS (hincrby) — written by every processor on      ║
+ * ║   every productive tick via `incrementCycle`:                          ║
+ * ║      cycles_completed         successful_cycles      failed_cycles     ║
+ * ║                                                                         ║
+ * ║   PER-PROCESSOR CYCLE COUNTERS (hincrby) — taxonomy:                   ║
+ * ║      *_cycle_count       = every tick (churn / scheduler heartbeat)    ║
+ * ║      *_live_cycle_count  = ticks that did real work (≥1 entry)         ║
+ * ║      indication_cycle_count       indication_live_cycle_count          ║
+ * ║      strategy_cycle_count         strategy_live_cycle_count            ║
+ * ║      realtime_cycle_count         realtime_live_cycle_count            ║
+ * ║      frames_processed             ← cross-processor cumulative sum     ║
+ * ║                                                                         ║
+ * ║   INDICATION-SET COUNTERS (hincrby, one per type — additive on every   ║
+ * ║   `saveIndicationToSet`/`batchSaveIndications` call):                  ║
+ * ║      indications_direction_count        indications_move_count        ║
+ * ║      indications_active_count           indications_active_advanced_count
+ * ║      indications_optimal_count          indications_auto_count        ║
+ * ║      ▸ Adding a new type to `DEFAULT_LIMITS` in                        ║
+ * ║        `lib/indication-sets-processor.ts` REQUIRES adding the counter  ║
+ * ║        to (a) `ProgressionState`, (b) `getProgressionState` parser,    ║
+ * ║        (c) `getDefaultState`, and (d) the per-type hincrby write in    ║
+ * ║        `engine-manager.ts → startIndicationProcessor`.                 ║
+ * ║                                                                         ║
+ * ║   STRATEGY-SET COUNTERS (hincrby — written by                          ║
+ * ║   `StrategyCoordinator.executeStrategyFlow` on every Set creation;     ║
+ * ║   `engine-manager` writes ONLY cycle metrics to avoid double-count):   ║
+ * ║      strategies_base_total              strategies_base_evaluated     ║
+ * ║      strategies_main_total              strategies_main_evaluated     ║
+ * ║      strategies_real_total              strategies_real_evaluated     ║
+ * ║      ▸ Note: NOT `strategy_evaluated_*`. The "evaluated" counters      ║
+ * ║        currently mirror "total" 1:1 (`evaluated += entryCount` per     ║
+ * ║        Set) — kept distinct so future filtering (skip-empty etc.)      ║
+ * ║        can diverge them without a data migration.                      ║
+ * ║                                                                         ║
+ * ║   TRADE / PROFIT (mixed — see field):                                   ║
+ * ║      total_trades         (hincrby)                                    ║
+ * ║      successful_trades    (hincrby)                                    ║
+ * ║      total_profit         (hincrbyfloat — atomic float add)            ║
+ * ║                                                                         ║
+ * ║   SNAPSHOT FIELDS (hset; newest wins):                                 ║
+ * ║      cycle_success_rate (float-as-string, %)                           ║
+ * ║      trade_success_rate (float-as-string, %)                           ║
+ * ║      cycle_time_ms      (int-as-string)                                ║
+ * ║      last_cycle_time    (ISO-8601)                                     ║
+ * ║      last_update        (ISO-8601)                                     ║
+ * ║      started_at         (epoch-ms; written on first init,              ║
+ * ║                          backfilled on restart if absent — feeds       ║
+ * ║                          `/api/connections/progression/[id]/stats`     ║
+ * ║                          rolling-window rate calculations)             ║
+ * ║      connection_id      (string)                                       ║
+ * ║      engine_started     ("true" / "false")                             ║
+ * ║      prehistoric_phase_active   ("true" / "false")                     ║
+ * ║      prehistoric_symbols_processed (JSON-encoded string[])             ║
+ * ║      intervals_processed  indications_count  strategies_count          ║
+ * ║      prehistoric_candles_processed                                     ║
+ * ║      prehistoric_symbols_processed_count                               ║
+ * ║                                                                         ║
+ * ║  Read path:                                                             ║
+ * ║   • `getProgressionState(connectionId)` HGETALLs the hash and parses   ║
+ * ║     numeric fields. Missing fields default via `getDefaultState` so    ║
+ * ║     consumers always see a complete, well-typed `ProgressionState`.   ║
+ * ╚═════════════════════════════════════════════════════════════════════════╝
  */
 
 import { getRedisClient } from "@/lib/redis-db"
@@ -27,10 +110,16 @@ export interface ProgressionState {
   prehistoricCandlesProcessed?: number
   prehistoricSymbolsProcessedCount?: number
   
-  // Indications by type (direction, move, active, optimal, auto)
+  // Indications by type. EVERY type used by IndicationSetsProcessor has its
+  // own independent cumulative counter on `progression:{connId}` written
+  // atomically via hincrby in EngineManager.startIndicationProcessor.
+  // Adding a new type to DEFAULT_LIMITS in indication-sets-processor.ts
+  // requires adding the matching counter here AND in `getProgressionState`
+  // / `getDefaultState` so the dashboard surfaces it.
   indicationsDirectionCount?: number
   indicationsMoveCount?: number
   indicationsActiveCount?: number
+  indicationsActiveAdvancedCount?: number
   indicationsOptimalCount?: number
   indicationsAutoCount?: number
   
@@ -47,6 +136,23 @@ export interface ProgressionState {
   intervalsProcessed?: number
   indicationsCount?: number
   strategiesCount?: number
+
+  // ── Per-processor cycle counters (cumulative, hincrby) ─────────────
+  // Each processor (indication / strategy / realtime) writes these
+  // atomically on every tick. They survive engine restarts and are the
+  // canonical source of truth used by `/api/connections/progression/[id]/stats`.
+  // The "_live_" variants only increment on productive ticks (work was done).
+  indicationCycleCount?: number
+  indicationLiveCycleCount?: number
+  strategyCycleCount?: number
+  strategyLiveCycleCount?: number
+  realtimeCycleCount?: number
+  realtimeLiveCycleCount?: number
+  // Cross-processor cumulative tick counter — sum of all per-processor
+  // cycle increments since the engine started. Independent of per-Set
+  // DB-entry caps. This is the "Frames / Total Ticks" number on the
+  // dashboard.
+  framesProcessed?: number
 }
 
 export class ProgressionStateManager {
@@ -66,7 +172,8 @@ export class ProgressionStateManager {
       let data: Record<string, string> = {}
       
       try {
-        data = await client.hgetall(key)
+        const raw = await client.hgetall(key)
+        if (raw !== null && raw !== undefined) data = raw as Record<string, string>
       } catch (redisError) {
         console.warn(`[v0] Redis connection error reading progression:${connectionId}, using default state:`, redisError)
         return this.getDefaultState(connectionId)
@@ -96,6 +203,7 @@ export class ProgressionStateManager {
          indicationsDirectionCount: parseInt(data.indications_direction_count || "0", 10),
          indicationsMoveCount: parseInt(data.indications_move_count || "0", 10),
          indicationsActiveCount: parseInt(data.indications_active_count || "0", 10),
+         indicationsActiveAdvancedCount: parseInt(data.indications_active_advanced_count || "0", 10),
          indicationsOptimalCount: parseInt(data.indications_optimal_count || "0", 10),
          indicationsAutoCount: parseInt(data.indications_auto_count || "0", 10),
          strategiesBaseTotal: parseInt(data.strategies_base_total || "0", 10),
@@ -108,6 +216,14 @@ export class ProgressionStateManager {
          intervalsProcessed: parseInt(data.intervals_processed || "0", 10),
          indicationsCount: parseInt(data.indications_count || "0", 10),
          strategiesCount: parseInt(data.strategies_count || "0", 10),
+         // Per-processor cycle counters (cumulative, atomic)
+         indicationCycleCount: parseInt(data.indication_cycle_count || "0", 10),
+         indicationLiveCycleCount: parseInt(data.indication_live_cycle_count || "0", 10),
+         strategyCycleCount: parseInt(data.strategy_cycle_count || "0", 10),
+         strategyLiveCycleCount: parseInt(data.strategy_live_cycle_count || "0", 10),
+         realtimeCycleCount: parseInt(data.realtime_cycle_count || "0", 10),
+         realtimeLiveCycleCount: parseInt(data.realtime_live_cycle_count || "0", 10),
+         framesProcessed: parseInt(data.frames_processed || "0", 10),
        }
     } catch (error) {
       console.error(`[v0] Failed to get progression state for ${connectionId}:`, error)
@@ -140,6 +256,7 @@ export class ProgressionStateManager {
       indicationsDirectionCount: 0,
       indicationsMoveCount: 0,
       indicationsActiveCount: 0,
+      indicationsActiveAdvancedCount: 0,
       indicationsOptimalCount: 0,
       indicationsAutoCount: 0,
       strategiesBaseTotal: 0,
@@ -152,6 +269,13 @@ export class ProgressionStateManager {
       intervalsProcessed: 0,
       indicationsCount: 0,
       strategiesCount: 0,
+      indicationCycleCount: 0,
+      indicationLiveCycleCount: 0,
+      strategyCycleCount: 0,
+      strategyLiveCycleCount: 0,
+      realtimeCycleCount: 0,
+      realtimeLiveCycleCount: 0,
+      framesProcessed: 0,
     }
   }
 

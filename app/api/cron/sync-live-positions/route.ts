@@ -25,6 +25,36 @@ export async function GET() {
   await initRedis()
   const client = getRedisClient()
 
+  // ── Overlap guard (atomic) ─────────────────────────────────────────
+  //
+  // Previous implementation:
+  //     await client.set(LOCK_KEY, "1")
+  //     await client.expire(LOCK_KEY, 55)
+  //
+  // — that pair is NOT a lock. `set` always succeeds and unconditionally
+  // overwrites the existing value, so two concurrent invocations both
+  // pass through and stack reconcile passes on top of each other. With a
+  // slow exchange API + large connection pool the second invocation can
+  // double-cancel orphan SL/TP orders and double-increment the
+  // `live_positions_closed_count` counter (the moved-marker dedup
+  // catches that one, but the wasted REST calls + log noise are real).
+  //
+  // We now use atomic `SET key value NX EX ttl`, which only succeeds
+  // when the key did not previously exist. When acquisition fails we
+  // return early with `skipped: true` — the next minute's tick will run
+  // normally. TTL = 55s so a crashed run can never permanently block
+  // the cron.
+  const LOCK_KEY = "cron:sync-live-positions:lock"
+  const acquired = await client.set(LOCK_KEY, String(started), { NX: true, EX: 55 })
+  if (!acquired) {
+    return NextResponse.json({
+      ok: true,
+      skipped: true,
+      reason: "another_invocation_in_progress",
+      ms: Date.now() - started,
+    })
+  }
+
   const summary = {
     connectionsChecked: 0,
     connectionsSkipped: 0,
@@ -79,6 +109,7 @@ export async function GET() {
       }
     }
 
+    await client.del(LOCK_KEY).catch(() => {})
     return NextResponse.json({
       ok: true,
       ms: Date.now() - started,
@@ -86,6 +117,7 @@ export async function GET() {
     })
   } catch (err) {
     console.error("[SyncLivePositions] Fatal:", err)
+    await client.del(LOCK_KEY).catch(() => {})
     return NextResponse.json(
       {
         ok: false,
