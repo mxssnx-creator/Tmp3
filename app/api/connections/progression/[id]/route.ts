@@ -133,9 +133,29 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     let phase = progression?.phase || "idle"
     let progress = Number(progression?.progress) || 0
     let detail = progression?.detail || "Not running"
-    
-    // Better phase detection based on actual metrics (most reliable)
-    if (indicationCycleCount > 100 || progressionState.cyclesCompleted > 100) {
+
+    // ── Prehistoric gate (spec: realtime starts AFTER prehistoric done) ──
+    // Read the prehistoric `:done` flag eagerly. While it is unset AND
+    // the engine is running, force phase = "prehistoric_data" with the
+    // live percent from the stored `engine_progression:{id}` hash —
+    // regardless of any incidental indication/strategy cycle counters
+    // (which can be non-zero on engine restart from a previous live run).
+    // The downstream auto-derivation only kicks in once prehistoric is
+    // truly complete, so the user always sees the honest phase + percent.
+    const prehistoricDoneRaw = await client?.get(`prehistoric:${connectionId}:done`).catch(() => null)
+    const prehistoricDone = String(prehistoricDoneRaw) === "1"
+
+    if (engineRunning && !prehistoricDone) {
+      // Trust the engine's own phase update (written per-symbol-completion
+      // by config-set-processor) — it carries the live 15 → 95 percent.
+      // Fall back to a "starting" 15% if the engine hasn't written one
+      // yet (boot transient).
+      phase = "prehistoric_data"
+      progress = progression?.phase === "prehistoric_data" ? (Number(progression?.progress) || 15) : 15
+      detail = progression?.phase === "prehistoric_data"
+        ? (progression?.detail || "Prehistoric calc filling sets…")
+        : "Prehistoric calc filling sets…"
+    } else if (indicationCycleCount > 100 || progressionState.cyclesCompleted > 100) {
       phase = "live_trading"
       progress = 100
       detail = `Live trading active - ${Math.max(indicationCycleCount, progressionState.cyclesCompleted)} cycles`

@@ -603,44 +603,48 @@ export class TradeEngineManager {
       // leaving strategy/indication stats stuck at zero.
       this.isRunning = true
 
-      // Phase 3-4: Start indication and strategy processors
-      await this.updateProgressionPhase("indications", 60, "Processing indications continuously")
+      // ── Spec contract (prehistoric → realtime ordering) ─────────────────
+      // All three live processors (indication / strategy / realtime) are
+      // ARMED here so their timer infrastructure is live, but every tick
+      // SELF-GATES on the `prehistoric:{id}:done` flag (set at the end of
+      // loadPrehistoricData). Until that flag flips the ticks return a
+      // "gated" outcome with zero counters bumped — guaranteeing realtime
+      // only evaluates the SET data that prehistoric calculations created,
+      // never half-filled or empty sets.
+      //
+      // We deliberately DO NOT run forced "immediate" indication/strategy
+      // warm-up cycles before prehistoric is complete: those bypass the
+      // tick gate and would poison `indications_count` / `strategy_cycle_count`
+      // with empty-set evaluations, which in turn flipped the dashboard
+      // phase auto-derivation straight to "live_trading" while the
+      // prehistoric calculator was still running. The first productive
+      // tick of each processor fires the moment the `:done` flag flips.
       this.startIndicationProcessor(config.indicationInterval)
-      // Force an immediate indication cycle
-      let immediateSymbols = await this.getSymbols()
-      if (!immediateSymbols || immediateSymbols.length === 0) {
-        immediateSymbols = ["DRIFTUSDT"]
-      }
-      const immediateResults = await Promise.all(immediateSymbols.map((symbol) => this.indicationProcessor.processIndication(symbol).catch(() => [])))
-      const totalImmediateIndications = immediateResults.reduce((sum, arr) => sum + arr.length, 0)
-
-      await this.updateProgressionPhase("strategies", 75, "Processing strategies continuously")
       this.startStrategyProcessor(config.strategyInterval)
-      // Kick off an immediate strategy evaluation cycle
-      const strategyResults = await Promise.all(immediateSymbols.map((symbol) => this.strategyProcessor.processStrategy(symbol).catch(() => ({ strategiesEvaluated: 0, liveReady: 0 }))))
-      const totalStrategies = strategyResults.reduce((sum, result) => sum + (result?.strategiesEvaluated || 0), 0)
-
-      // Phase 5: Start realtime processor
-      //
-      // IMPORTANT: The realtime processor is STARTED here (timer loop is
-      // armed immediately so the dashboard reports an active processor),
-      // but individual ticks SELF-GATE on the `prehistoric:{id}:done` flag
-      // written at the end of `loadPrehistoricData`. Until that flag is
-      // set the tick returns early with zero updates so the realtime logic
-      // never runs against an empty previous-position context.
-      //
-      // We deliberately DO NOT run a warm-up pass here: firing
-      // `processRealtimeUpdates()` before prehistoric is finished would
-      // evaluate live positions without any prehistoric-calculated prev-
-      // position context, producing TP/SL decisions on cold state. The
-      // self-gated loop will run the first productive pass the instant
-      // prehistoric completes.
-      await this.updateProgressionPhase(
-        "realtime",
-        85,
-        "Realtime processor armed — waiting for prehistoric calc to finish",
-      )
       this.startRealtimeProcessor(config.realtimeInterval)
+
+      // Phase stays at `prehistoric_data` while the historical calculator
+      // is filling sets. `loadPrehistoricData` updates the phase percent
+      // and sub_progress (X/Y symbols) live on every symbol completion;
+      // `loadPrehistoricDataInBackground` advances the phase to
+      // `live_trading` after the done flag flips. Cache-hit path falls
+      // straight through to live_trading below since prehistoric is
+      // already complete.
+      const cacheHit = prehistoricCached === "1"
+      if (cacheHit) {
+        await this.updateProgressionPhase(
+          "live_trading",
+          100,
+          `Live trading ACTIVE - monitoring ${symbols.length} symbols (cached prehistoric)`,
+        )
+      } else {
+        await this.updateProgressionPhase(
+          "prehistoric_data",
+          15,
+          `Prehistoric calc filling sets — processors armed, gated until done`,
+          { current: 0, total: symbols.length, item: "symbols" },
+        )
+      }
 
       // Verify timers are running
       setTimeout(async () => {
@@ -666,17 +670,26 @@ export class TradeEngineManager {
       // them WITHOUT requiring a manual restart. See `applyPendingSettingsChange`.
       this.startSettingsWatcher()
       
-      // Phase 6: Live trading ready (isRunning was set earlier before processors started)
+      // Phase 6: Boot complete. The engine is now "ready":
+      //   - Cache-hit path: live_trading @ 100% (set above).
+      //   - Cache-miss path: phase stays at `prehistoric_data` with live
+      //     percent — `loadPrehistoricDataInBackground` advances it to
+      //     `live_trading` once prehistoric calc has finished filling sets.
+      // Do NOT unconditionally overwrite the phase here — that would
+      // backfill a fake 100% over the real prehistoric percent the user
+      // sees on the progress bar.
       this.isStarting = false
       this.startTime = new Date()
-      await this.updateProgressionPhase("live_trading", 100, `Live trading ACTIVE - monitoring ${symbols.length} symbols`)
-      
-      // Log final initialization success
-      await logProgressionEvent(this.connectionId, "live_trading", "info", `Engine initialized with ${totalImmediateIndications} indications and ${totalStrategies} strategies`, {
+
+      // Log boot completion. Real indication/strategy counts will appear
+      // only after prehistoric is done and the gated ticks start
+      // producing work — at boot time both are intentionally zero.
+      await logProgressionEvent(this.connectionId, "engine_started", "info", `Engine boot complete — processors armed${cacheHit ? " (cached prehistoric)" : ", waiting for prehistoric calc"}`, {
         symbols: symbols.length,
         indicationInterval: config.indicationInterval,
         strategyInterval: config.strategyInterval,
         realtimeInterval: config.realtimeInterval,
+        prehistoricCached: cacheHit,
       })
       
       // Also update engine state to indicate all phases are running
@@ -923,7 +936,7 @@ export class TradeEngineManager {
    * Allows engine to proceed to processor startup immediately
    */
   private loadPrehistoricDataInBackground(cacheKey: string, redisClient: ReturnType<typeof getRedisClient>): void {
-    this.updateProgressionPhase("prehistoric_data", 15, "Loading historical data in background...")
+    this.updateProgressionPhase("prehistoric_data", 15, "Prehistoric calc starting — filling sets...")
       .then(() => this.loadPrehistoricData())
       .then(async () => {
         await redisClient.set(cacheKey, "1", { EX: 86400 })
@@ -932,6 +945,32 @@ export class TradeEngineManager {
           prehistoric_data_source: "background",
           updated_at: new Date().toISOString(),
         })
+        // ── Phase hand-off: prehistoric → live_trading ─────────────────
+        // Prehistoric finished filling sets. The `:done` flag was set
+        // inside loadPrehistoricData, so the indication/strategy/realtime
+        // tick gates flip on their next refresh. Advance the dashboard
+        // phase to `live_trading @ 100%` so the user sees the transition
+        // immediately — without waiting for the tick gates to detect the
+        // flag (up to 3 s lag on the cached refresh).
+        try {
+          const symCount = (await this.getSymbols()).length
+          await this.updateProgressionPhase(
+            "live_trading",
+            100,
+            `Live trading ACTIVE — evaluating ${symCount} symbol${symCount === 1 ? "" : "s"} against prehistoric sets`,
+          )
+          await setSettings(`trade_engine_state:${this.connectionId}`, {
+            all_phases_started: true,
+            indications_started: true,
+            strategies_started: true,
+            realtime_started: true,
+            live_trading_started: true,
+            engine_ready: true,
+            updated_at: new Date().toISOString(),
+          })
+        } catch (phaseErr) {
+          console.warn(`[v0] [Engine] Failed to advance phase to live_trading after prehistoric:`, phaseErr instanceof Error ? phaseErr.message : String(phaseErr))
+        }
       })
       .catch(async (err) => {
         console.warn(`[v0] [Engine] Prehistoric loading error:`, err instanceof Error ? err.message : String(err))
@@ -940,6 +979,20 @@ export class TradeEngineManager {
           prehistoric_data_error: err instanceof Error ? err.message : String(err),
           updated_at: new Date().toISOString(),
         })
+        // ── Error-path phase advance ───────────────────────────────────
+        // Even on prehistoric failure, force the gate open so the engine
+        // doesn't appear "stuck at prehistoric_data" forever. The
+        // realtime processor's Phase A (TP/SL on open positions) still
+        // needs to run — only the prev-set enrichment depends on
+        // prehistoric output, and that's a soft dependency.
+        try {
+          await redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 })
+          await this.updateProgressionPhase(
+            "live_trading",
+            100,
+            `Live trading ACTIVE — prehistoric failed, running without prev-set enrichment`,
+          )
+        } catch { /* best-effort */ }
         // Fallback: load minimal market data
         try {
           const fallbackSymbols = ["DRIFTUSDT"]
@@ -1330,6 +1383,24 @@ export class TradeEngineManager {
           return
         }
 
+        // ── Prehistoric gate (spec: realtime starts AFTER prehistoric done) ──
+        // The indication tick evaluates sets that the prehistoric calculator
+        // is busy filling. Running it on half-filled or empty sets pollutes
+        // `indications_count` / `indication_cycle_count` and flips the
+        // dashboard phase auto-derivation to "live_trading" prematurely.
+        // Stay silent until the `:done` flag flips — `producedIndications`
+        // remains false so scheduleNext re-polls quickly via the empty-cycle
+        // backoff (capped at 1s) rather than churning.
+        if (!prehistoricDoneFlag) {
+          // Force a fresh flag read on every gated tick (cheap single-key
+          // GET) so we flip to productive within one tick of prehistoric
+          // completing, not up to 3s later.
+          await refreshPrehistoricDone()
+          if (!prehistoricDoneFlag) {
+            return
+          }
+        }
+
         attemptedCycles++
 
         // Batch-prefetch all symbols' market data in one Redis pipeline pass
@@ -1649,6 +1720,19 @@ export class TradeEngineManager {
       // `!this.isRunning`.
 
       try {
+        // ── Prehistoric gate (spec: realtime starts AFTER prehistoric done) ──
+        // Strategy evaluation reads the same per-Set DBs that prehistoric
+        // is filling. Skipping the tick until `:done` flips guarantees we
+        // never evaluate strategies against an empty / half-populated set,
+        // and prevents the `strategy_cycle_count` counter from inflating
+        // before the calc actually completes.
+        if (!prehistoricDoneFlag) {
+          await refreshPrehistoricDone()
+          if (!prehistoricDoneFlag) {
+            return
+          }
+        }
+
         const symbols = await this.getSymbols()
         // Per-cycle deadline — see `withCycleDeadline` rationale at the
         // top of this file. Guards against a single hung
