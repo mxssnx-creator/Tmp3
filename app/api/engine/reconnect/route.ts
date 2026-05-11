@@ -102,7 +102,9 @@ export async function POST(request: Request) {
       const { VolumeCalculator } = await import("@/lib/volume-calculator")
       const { getAppSettings: _gas, getSettings: _gs } = await import("@/lib/redis-db")
 
-      ;(VolumeCalculator as any).prototype.calculateVolumeForConnection = async function(
+      // Called as static: VolumeCalculator.calculateVolumeForConnection(...)
+      // Must patch on the class object itself, not on prototype.
+      ;(VolumeCalculator as any).calculateVolumeForConnection = async function(
         connectionId: string,
         symbol: string,
         currentPrice: number,
