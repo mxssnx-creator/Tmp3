@@ -4,7 +4,7 @@
  * NOW: 100% Redis-backed, no SQL
  */
 
-import { getRedisClient, getAppSettings, getSettingsVersionCachedSync, createPosition as redisCreatePosition } from "@/lib/redis-db"
+import { getRedisClient, getAppSettings, getSettings, getSettingsVersionCachedSync, createPosition as redisCreatePosition } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { emitPositionUpdate } from "@/lib/broadcast-helpers"
 import { StrategyConfigManager, type PseudoPosition as StrategyPseudoPosition } from "@/lib/strategy-config-manager"
@@ -257,13 +257,49 @@ export class PseudoPositionManager {
         return null  // silent — one position per config set is expected, or direction cap reached
       }
 
-      // Calculate volume — delegates balance-fetch + leverage-cap to
-      // VolumeCalculator.resolveBalanceAndLeverage (no TDZ risk).
-      const volumeCalc = await VolumeCalculator.calculateVolumeForConnection(
-        this.connectionId,
-        params.symbol,
-        params.entryPrice,
-      )
+      // ── Volume calculation ─────────────────────────────────────────
+      // IMPORTANT: Do NOT call VolumeCalculator.calculateVolumeForConnection
+      // here. The dev-server compiled that method with the old broken source
+      // (let balanceCap before let accountBalance — TDZ crash) and the
+      // in-memory eval'd module cannot be hot-reloaded for singleton chunks.
+      //
+      // Instead, call the two methods that ARE safe in the cached bundle:
+      //   1. resolveBalanceAndLeverage  — new method, not in old cache
+      //   2. calculatePositionVolume    — pure static, always correct
+      // This bypasses the broken cached function entirely.
+      const volumeCalc = await (async () => {
+        const { initRedis, getRedisClient: _grc } = await import("@/lib/redis-db")
+        await initRedis()
+        const settings = (await getAppSettings()) || {}
+        const positionCostPercent = parseFloat(
+          String(settings.exchangePositionCost ?? settings.positionCost ?? "0.1")
+        )
+        const positionCost = positionCostPercent / 100
+        const positionsAverage = (() => {
+          const raw = parseFloat(String(settings.positions_average ?? "2"))
+          return Number.isFinite(raw) && raw > 0 ? raw : 2
+        })()
+        const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))
+        const useMaxLeverage =
+          settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
+        const rawLeverage = useMaxLeverage
+          ? 125
+          : Math.round(125 * (leveragePercentage / 100))
+        const { accountBalance, maxLeverage } =
+          await VolumeCalculator.resolveBalanceAndLeverage(this.connectionId, rawLeverage)
+        const tradingPair = await getSettings(`trading_pair:${params.symbol}`)
+        const exchangeMinVolume = tradingPair?.min_order_size
+          ? parseFloat(tradingPair.min_order_size)
+          : undefined
+        return VolumeCalculator.calculatePositionVolume({
+          positionCost,
+          positionsAverage,
+          accountBalance,
+          currentPrice: params.entryPrice,
+          leverage: maxLeverage,
+          exchangeMinVolume,
+        })
+      })()
 
       // Check if volume calculation succeeded and meets minimum requirements
       if (!volumeCalc.finalVolume || volumeCalc.finalVolume <= 0) {
