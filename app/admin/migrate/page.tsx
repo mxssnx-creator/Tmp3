@@ -103,7 +103,7 @@ export default function MigratePage() {
   }
 
   return (
-    <div className="container mx-auto p-8">
+    <div className="p-6">
       <Card className="p-6 max-w-2xl mx-auto">
         <h1 className="text-2xl font-bold mb-4">Database Migrations</h1>
         <p className="text-muted-foreground mb-6">

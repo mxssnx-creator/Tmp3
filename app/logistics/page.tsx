@@ -757,7 +757,7 @@ function LogisticsContent() {
   const refreshLabel  = lastRefresh ? lastRefresh.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—"
 
   return (
-    <div className="flex min-h-screen flex-col">
+    <div className="flex flex-col flex-1 overflow-auto">
       {/* Top bar */}
       <div className="sticky top-0 z-10 flex items-center justify-between border-b bg-background/95 px-4 py-2 backdrop-blur">
         <div className="flex items-center gap-2">

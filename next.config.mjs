@@ -133,6 +133,7 @@ const nextConfig = {
     serverActions: {
       allowedOrigins: ["*"],
     },
+    turbopackFileSystemCacheForDev: false,
   },
   // Next.js passes its own bundled `webpack` instance as the second
   // argument here. We DON'T `import "webpack"` at the top of this file
