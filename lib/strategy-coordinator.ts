@@ -92,6 +92,40 @@ export interface StrategySet {
     last:  number
     cont:  number
     pause: number
+    /**
+     * Direction the axis-Cartesian Set executes in. Set ONLY on Sets
+     * produced by `expandAxisSets()` (the operator-spec'd Cartesian
+     * fan-out). Profile-variant Sets and Base Sets inherit direction
+     * from `StrategySet.direction` and leave this field undefined.
+     *
+     * Hedge netting in `evaluateRealSets` uses this field to group
+     * Sets by `(symbol × indicationType × triple × outcome)` and keep
+     * only the `|long − short|` dominant-direction remainder.
+     */
+    direction?: "long" | "short"
+    /**
+     * Stable axis-bucket key —
+     * `p{prev}_l{last}_c{cont}_o{pos|neg}_d{long|short}` — used to:
+     *   1. Compose the axis-Set's own `setKey` (avoids collisions with
+     *      profile-variant Sets sharing the same parent).
+     *   2. Drive the hedge-net bucket identity
+     *      (`symbol × ind × p|l|c × outcome`).
+     *   3. Persist per-bucket net targets for Live partial open/close.
+     */
+    axisKey?: string
+    /**
+     * Last-axis outcome categorisation per operator spec:
+     *
+     *   `pos` = aggregate of parent's last `last` COMPLETED entries was
+     *           profitable (mean PF ≥ 1.0).
+     *   `neg` = aggregate was unprofitable (mean PF < 1.0).
+     *
+     * pos / neg Sets are HEDGE-NET-ISOLATED: they represent two
+     * different realised market regimes for the same axis triple and
+     * must not cancel each other. Bucket identity therefore includes
+     * `outcome`.
+     */
+    outcome?: "pos" | "neg"
   }
 
   /**
@@ -148,6 +182,74 @@ export interface PositionContext {
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
 }
+
+// ── Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+//
+// At Strategy Main, every Base Set that survives the Base→Main gate fans out
+// into additional "position-count" Sets along three operator-defined axes
+// (plus a direction Cartesian, plus a last-outcome split):
+//
+//   previous   : 4..12 step 2  → [4, 6, 8, 10, 12]      (5 values, ACTS AS FILTER)
+//   last       : 1..4  step 1  → [1, 2, 3, 4]           (4 values, OUTCOME SPLIT)
+//   continuous : 1..8  step 1  → [1..8]                 (8 values, POS-COUNT CONTRIB)
+//   direction  : long / short                           (2 values)
+//
+// SEMANTICS PER OPERATOR SPEC:
+//
+//   • previous (PF FILTER): For each `prev ∈ AXIS_PREV`, compute the
+//     aggregate (mean) profit-factor of the parent Base Set's LAST `prev`
+//     COMPLETED entries. If aggregate PF < `metrics.minProfitFactor` (the
+//     same Main PF threshold used by the Base→Main gate), the entire
+//     prev-row is REJECTED for this Base Set — no Sets emitted for that
+//     prev value. This implements: "previous 4-12 step 2; Calculate by
+//     Minimal Profitfactor as defined for Main".
+//
+//   • last (OUTCOME SPLIT): For each `last ∈ AXIS_LAST`, classify the
+//     parent's LAST `last` COMPLETED entries as either profitable
+//     (mean PF ≥ 1.0 → `outcome = "pos"`) or unprofitable
+//     (`outcome = "neg"`). Both outcome variants are NOT emitted —
+//     only the realised outcome is tagged on the surviving Set,
+//     because pos and neg are different market regimes that should
+//     NOT hedge-net against each other.  Implements: "last 1-4 step 1;
+//     Calculate if Positive or Negative (Combined, own Sets for Pos. and Neg.)".
+//
+//   • continuous (POS-COUNT CONTRIB): For each `cont ∈ AXIS_CONT`, the
+//     emitted Set's `entryCount` = `baseDefault.entryCount + cont`. This
+//     is the "positions to be counted, inserted into the positions counts
+//     sets" semantic. Per spec: "continuous 3 → add actual and next 2
+//     positions to set" → `entryCount = base + 3` (base counts as 1 of 3,
+//     +2 more accumulate over subsequent intervals).
+//
+//   • direction (CARTESIAN): Both long and short axis Sets are emitted
+//     regardless of the parent's own direction, so the Real-stage hedge
+//     netter has both sides of every bucket to compare.
+//
+// IMPORTANT — "Do not Calculate the Open Positions, only positions already
+// Completed" (operator spec): `baseDefault.entries` is the parent's
+// historical entry array, where each entry is an already-completed
+// strategy position with a defined `profitFactor`. We treat the full
+// `entries` array as completed; open positions are tracked in the
+// separate pseudo-position store and never appear here.
+//
+// NO LOCK — recompute every cycle. The hedge netter in `evaluateRealSets`
+// detects per-bucket net-target deltas and the Live stage opens/closes
+// partial positions in response. The "no calcs while continuous pos are
+// valid" guarantee is satisfied naturally: while a Set's continuous
+// window is filling, no new completed entries land → the prev-PF filter
+// & last-outcome classification cannot change → the same Set re-emerges
+// next cycle unchanged.
+//
+// FAN-OUT MATH:
+//   Worst case (all prev pass + both outcomes possible):
+//     5 (prev) × 4 (last) × 8 (cont) × 2 (dir) = 320 Sets / Base
+//   Typical (prev filter rejects ~half; outcome split halves last):
+//     ~2-3 (prev survivors) × 4 (last, single outcome) × 8 × 2 ≈ 128-192 / Base
+//   After Real hedge-net (≤ ½):
+//     ≤ 96 effective Sets / Base reaching Live evaluation
+const AXIS_PREV     = [4, 6, 8, 10, 12]    as const
+const AXIS_LAST     = [1, 2, 3, 4]         as const
+const AXIS_CONT     = [1, 2, 3, 4, 5, 6, 7, 8] as const
+const AXIS_DIRS     = ["long", "short"]    as const
 
 export interface StrategyCoordinatorConfig {
   maxEntriesPerSet?: number   // Default 250 (entries inside one Set)
@@ -789,6 +891,12 @@ export class StrategyCoordinator {
     // ── 2. Variant profiles ─────────────────────────────────────────────
     const activeVariants = this.selectActiveVariants(ctx)
 
+    // Track the freshly-built `default` Main Set per Base so we can fan it
+    // out into the operator-spec'd Position-Count Cartesian (prev × last ×
+    // cont × dir) AFTER the profile loop completes. Both cache-hit and
+    // cache-miss paths populate this map so reuses still trigger fan-out.
+    const defaultByBaseKey = new Map<string, StrategySet>()
+
     for (const baseSet of baseSets) {
       // Base-level validation — P0-2: PF + DDT are the ONLY filter axes.
       // Confidence is advisory metadata (used by Live stage's trailing-
@@ -828,6 +936,9 @@ export class StrategyCoordinator {
                 cached.trailingProfile = baseSet.trailingProfile
               }
               mainSets.push(cached)
+              // Capture the `default` Main variant for downstream
+              // Position-Count Cartesian fan-out (even on cache hit).
+              if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, cached)
               nextFpCache[fingerprint] = fpCache[fingerprint]
               reused++
               continue
@@ -850,10 +961,48 @@ export class StrategyCoordinator {
         if (baseSet.trailingProfile) built.trailingProfile = baseSet.trailingProfile
 
         mainSets.push(built)
+        // Capture the `default` Main variant for downstream Position-
+        // Count Cartesian fan-out (see expandAxisSets call below).
+        if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, built)
         // Store a compact serialisation in the fingerprint cache. Capped at
         // ~4KB per entry (the bulky `entries` array is already pruned to
         // maxEntries upstream; we stringify the whole Set for fidelity).
         nextFpCache[fingerprint] = JSON.stringify(built)
+      }
+    }
+
+    // ── 3. Position-Count Cartesian fan-out (operator spec) ──────────
+    //
+    // For each Base that yielded a `default` Main variant, emit:
+    //
+    //   prev (PF-filtered) × last (outcome-tagged) × cont × dir
+    //
+    // Axis Sets are pure projections of the parent default — they
+    // inherit PF / DDT / conf / trailingProfile, carry `entries: []`,
+    // and tag `axisWindows.{prev,last,cont,direction,outcome,axisKey}`
+    // so Real-stage hedge netting can bucket them by
+    // `(symbol × ind × triple × outcome)`.
+    //
+    // Per-cycle recompute is intentional ("No Lock, handle after
+    // situation"). The hedge-net delta + Live partial open/close path
+    // takes care of accumulating continuous-count positions and
+    // adjusting exchange exposure as new entries land.
+    let axisSetsAdded = 0
+    if (defaultByBaseKey.size > 0) {
+      const minPF = metrics.minProfitFactor   // Same gate as Base→Main
+      for (const defaultSet of defaultByBaseKey.values()) {
+        const expanded = this.expandAxisSets(defaultSet, minPF)
+        for (const axisSet of expanded) {
+          mainSets.push(axisSet)
+          axisSetsAdded++
+        }
+      }
+      if (axisSetsAdded > 0) {
+        console.log(
+          `[v0] [StrategyFlow] ${symbol} MAIN axis-fanout: +${axisSetsAdded} Sets ` +
+          `from ${defaultByBaseKey.size} Base default(s) (prev=PF filter, ` +
+          `last=outcome-split, cont=pos-count, dir=Cartesian)`,
+        )
       }
     }
 
@@ -1232,6 +1381,76 @@ export class StrategyCoordinator {
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )
 
+    // ── HEDGE NETTING (operator spec: Real stage only) ───────────────────
+    //
+    // The Main-stage Position-Count Cartesian emits a long/short pair for
+    // every (prev × last × cont × outcome) tuple. Real collapses that to
+    // the NET direction per bucket so Live only opens positions where the
+    // realised signal is asymmetric.
+    //
+    // Bucket identity: `${symbol}|${ind}|p${prev}|l${last}|c${cont}|o${outcome}`
+    //   • Axis Sets only (those with `axisWindows.direction` populated).
+    //     Profile-variant Sets and legacy non-axis Sets pass through
+    //     unchanged — their direction-asymmetry is encoded elsewhere and
+    //     netting them would lose signal.
+    //   • Outcome is part of the bucket: pos and neg Sets represent
+    //     different realised market regimes and must NOT cancel each
+    //     other.
+    //   • Within bucket: keep |L − S| Sets in the dominant direction
+    //     (PF-sorted by parent `realSorted` order). If L == S → drop
+    //     both sides (perfect hedge → no exchange exposure for this
+    //     bucket).
+    //
+    // Per-bucket net target is persisted to `live_net_target:{conn}` so
+    // the Live exchange layer can reconcile via partial-open / partial-
+    // close orders when the dominant direction or magnitude changes
+    // between cycles.
+    type HedgeBucket = { long: StrategySet[]; short: StrategySet[] }
+    const hedgeBuckets = new Map<string, HedgeBucket>()
+    const passthrough: StrategySet[] = []
+    for (const s of realSorted) {
+      const dir = s.axisWindows?.direction
+      if (!dir || !s.axisWindows) { passthrough.push(s); continue }
+      const aw = s.axisWindows
+      const outcome = aw.outcome ?? "pos"
+      const bucketKey = `${symbol}|${s.indicationType}|p${aw.prev}|l${aw.last}|c${aw.cont}|o${outcome}`
+      let b = hedgeBuckets.get(bucketKey)
+      if (!b) { b = { long: [], short: [] }; hedgeBuckets.set(bucketKey, b) }
+      if (dir === "short") b.short.push(s); else b.long.push(s)
+    }
+
+    const netted: StrategySet[] = []
+    const netTargetWrites: Record<string, string> = {}
+    let netCancelled = 0
+    for (const [bucketKey, b] of hedgeBuckets) {
+      const L = b.long.length
+      const S = b.short.length
+      if (L === S) {
+        netCancelled += L + S
+        netTargetWrites[bucketKey] = "flat:0"
+        continue
+      }
+      const winnerDir: "long" | "short" = L > S ? "long" : "short"
+      const winnerPool                  = L > S ? b.long : b.short
+      const remainder                   = Math.abs(L - S)
+      // PF-desc preserved by `realSorted` upstream → winnerPool is best-first.
+      netted.push(...winnerPool.slice(0, remainder))
+      netCancelled += Math.min(L, S) * 2 + Math.max(0, winnerPool.length - remainder)
+      netTargetWrites[bucketKey] = `${winnerDir}:${remainder}`
+    }
+
+    const realPostHedge = [...passthrough, ...netted].sort(
+      (a, b) => b.avgProfitFactor - a.avgProfitFactor,
+    )
+
+    if (hedgeBuckets.size > 0) {
+      console.log(
+        `[v0] [StrategyFlow] ${symbol} REAL hedge-net: ${hedgeBuckets.size} buckets, ` +
+        `${netted.length} survivors (+ ${passthrough.length} passthrough), ` +
+        `${netCancelled} axis Sets cancelled out`,
+      )
+    }
+
     // Resolve the cap with this precedence:
     //   1. Operator-set `maxRealSets` in Settings → System (Redis app_settings)
     //   2. Per-instance config override (if any caller passed one)
@@ -1250,7 +1469,25 @@ export class StrategyCoordinator {
         maxRealSets = fromSettings
       }
     } catch { /* fall back to default */ }
-    const realSets = realSorted.slice(0, maxRealSets)
+    const realSets = realPostHedge.slice(0, maxRealSets)
+
+    // Persist per-bucket net targets for the Live-stage partial open/close
+    // reconciliation hook. Documented on `reconcileLivePositions` —
+    // direction unchanged & magnitude grew → partial OPEN for Δ; direction
+    // unchanged & magnitude shrunk → partial CLOSE lowest-PF; direction
+    // flipped or flat:0 → close all in bucket then optionally re-open.
+    if (Object.keys(netTargetWrites).length > 0) {
+      try {
+        // Inline client — `client` for the broader function is declared
+        // further below; we want a one-shot write here without forward
+        // ref. The hot-path overhead of a second `getRedisClient()` call
+        // is negligible (returns a cached singleton).
+        const netClient = getRedisClient()
+        const targetKey = `live_net_target:${this.connectionId}`
+        await netClient.hset(targetKey, netTargetWrites)
+        await netClient.expire(targetKey, 7 * 24 * 60 * 60)
+      } catch { /* non-critical */ }
+    }
 
     // Debug: show why sets failed REAL filter
     if (mainSets.length > 0 && realSets.length === 0) {
@@ -2186,6 +2423,117 @@ export class StrategyCoordinator {
    *   block    — there's an open position we can add to (continuation)
    *   dca      — recent losses to recover with averaged entries
    */
+  /**
+   * Compute the mean profit-factor of the last `n` COMPLETED entries.
+   *
+   * Returns `null` when there are fewer than `n` entries — the prev-axis
+   * filter treats this as "insufficient data" and rejects emission for
+   * that prev value (we never speculate when the operator's PF gate
+   * can't actually be evaluated).
+   *
+   * Only `entries` with a numeric `profitFactor` are considered. The
+   * StrategySetEntry shape always carries a defined PF for completed
+   * historical evaluations, so this is mostly a defensive guard.
+   */
+  private meanPFOfLastN(entries: StrategySetEntry[], n: number): number | null {
+    if (!entries || entries.length < n || n <= 0) return null
+    const slice = entries.slice(-n)
+    let sum = 0
+    let count = 0
+    for (const e of slice) {
+      const pf = Number(e.profitFactor)
+      if (Number.isFinite(pf)) { sum += pf; count++ }
+    }
+    if (count === 0) return null
+    return sum / count
+  }
+
+  /**
+   * Expand a single `default`-variant Main Set into the operator-spec'd
+   * Position-Count Cartesian axis fan-out.
+   *
+   *   prev (4-12 step 2) × last (1-4 step 1) × cont (1-8 step 1) × dir
+   *
+   * With:
+   *   • prev   = PF FILTER on the parent's last N completed entries
+   *              (rejects whole prev-row when meanPF < `minPF`).
+   *   • last   = OUTCOME SPLIT (pos / neg) based on parent's last M
+   *              completed entries' meanPF. ONE Set emitted per (last)
+   *              tagged with the realised outcome.
+   *   • cont   = POS-COUNT CONTRIBUTION (entryCount = base + cont).
+   *   • dir    = Cartesian (long + short) so hedge-net has both sides.
+   *
+   * All axis Sets inherit `avgProfitFactor` / `avgDrawdownTime` /
+   * `avgConfidence` / `trailingProfile` from `baseDefault` unchanged —
+   * they are PROJECTIONS, not re-evaluations. `entries` is deliberately
+   * empty (`[]`) to prevent 320× JSON duplication on Redis persist and
+   * 80,000× inflation of per-variant entry-counters downstream.
+   *
+   * `entries` hydration for downstream consumers (exchange order
+   * construction, per-entry stats) is via `parentSetKey` at execution
+   * time — the in-memory axis Set is purely metadata.
+   */
+  private expandAxisSets(
+    baseDefault: StrategySet,
+    minPF: number,
+  ): StrategySet[] {
+    const axisSets: StrategySet[] = []
+    const baseEC = baseDefault.entryCount || 0
+    const entries = baseDefault.entries || []
+
+    // Parent baseKey (strip any prior `#variant` / `#axis:*` suffixes)
+    // so `parentSetKey` always points at the originating Base Set.
+    const parentKey = baseDefault.parentSetKey || baseDefault.setKey.split("#")[0]
+
+    for (const prev of AXIS_PREV) {
+      // ── prev FILTER (PF gate on last `prev` completed entries) ─────
+      const prevMeanPF = this.meanPFOfLastN(entries, prev)
+      if (prevMeanPF === null) continue          // insufficient data
+      if (prevMeanPF < minPF)  continue          // PF gate failed → skip whole prev row
+
+      for (const last of AXIS_LAST) {
+        // ── last OUTCOME SPLIT (single realised outcome per cycle) ───
+        const lastMeanPF = this.meanPFOfLastN(entries, last)
+        if (lastMeanPF === null) continue        // insufficient data
+        const outcome: "pos" | "neg" = lastMeanPF >= 1.0 ? "pos" : "neg"
+
+        for (const cont of AXIS_CONT) {
+          for (const dir of AXIS_DIRS) {
+            const axisKey = `p${prev}_l${last}_c${cont}_o${outcome}_d${dir}`
+            axisSets.push({
+              setKey:          `${parentKey}#axis:${axisKey}`,
+              parentSetKey:    parentKey,
+              variant:         "default",
+              indicationType:  baseDefault.indicationType,
+              // Direction is fan-out axis (Cartesian), not inherited.
+              direction:       dir,
+              // Inherited quality fields — axis Sets do not re-evaluate.
+              avgProfitFactor: baseDefault.avgProfitFactor,
+              avgConfidence:   baseDefault.avgConfidence,
+              avgDrawdownTime: baseDefault.avgDrawdownTime,
+              // Position-count contribution per spec ("Base pos + cont").
+              entryCount:      baseEC + cont,
+              // Empty entries — axis Sets are pure-metadata projections.
+              entries:         [],
+              createdAt:       new Date().toISOString(),
+              axisWindows: {
+                prev,
+                last,
+                cont,
+                pause:     0,
+                direction: dir,
+                axisKey,
+                outcome,
+              },
+              trailingProfile: baseDefault.trailingProfile,
+            })
+          }
+        }
+      }
+    }
+    return axisSets
+  }
+
   private variantProfiles(): Array<{
     name: "default" | "trailing" | "block" | "dca" | "pause"
     gate: (ctx: PositionContext) => boolean

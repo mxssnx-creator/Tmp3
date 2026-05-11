@@ -265,6 +265,108 @@ export function StrategyCoordinationSection({
         </CardContent>
       </Card>
 
+      {/* ── Position-Count Cartesian Fan-out (read-only spec) ────── */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <CardTitle className="text-sm">
+                Position-Count Sets — Cartesian Fan-out
+              </CardTitle>
+              <CardDescription className="text-xs">
+                Each validated Base Set fans out at Main into additional
+                Position-Count Sets along three axes plus a direction split.{" "}
+                <strong>Previous</strong> is a PF filter — only emits when the
+                mean PF of the last N completed positions meets Main&apos;s
+                threshold. <strong>Last</strong> tags each Set by outcome
+                (positive / negative aggregate of last M completed
+                positions). <strong>Continuous</strong> contributes to
+                position count:{" "}
+                <span className="font-mono text-[11px]">
+                  entries = base + cont
+                </span>
+                . Open positions are excluded — only completed ones count.
+                Real-stage hedge-netting collapses bucket{" "}
+                <span className="font-mono text-[11px]">
+                  (symbol × indication × triple × outcome)
+                </span>{" "}
+                to the dominant direction; Live opens/closes partial
+                positions on hedge-count deltas.
+              </CardDescription>
+            </div>
+            <Badge variant="secondary" className="text-[10px]">
+              5 × 4 × 8 × 2
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+            <div className="rounded-md border border-border/60 p-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-semibold">Previous</div>
+                <Badge variant="outline" className="text-[9px] tabular-nums">
+                  PF filter
+                </Badge>
+              </div>
+              <div className="text-muted-foreground tabular-nums">
+                4 → 12 step 2
+              </div>
+              <div className="font-mono text-[11px] text-muted-foreground">
+                4, 6, 8, 10, 12
+              </div>
+            </div>
+            <div className="rounded-md border border-border/60 p-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-semibold">Last</div>
+                <Badge variant="outline" className="text-[9px] tabular-nums">
+                  pos / neg
+                </Badge>
+              </div>
+              <div className="text-muted-foreground tabular-nums">
+                1 → 4 step 1
+              </div>
+              <div className="font-mono text-[11px] text-muted-foreground">
+                1, 2, 3, 4
+              </div>
+            </div>
+            <div className="rounded-md border border-border/60 p-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-semibold">Continuous</div>
+                <Badge variant="outline" className="text-[9px] tabular-nums">
+                  pos count
+                </Badge>
+              </div>
+              <div className="text-muted-foreground tabular-nums">
+                1 → 8 step 1
+              </div>
+              <div className="font-mono text-[11px] text-muted-foreground">
+                1, 2, …, 8
+              </div>
+            </div>
+            <div className="rounded-md border border-border/60 p-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-semibold">Direction</div>
+                <Badge variant="outline" className="text-[9px] tabular-nums">
+                  Cartesian
+                </Badge>
+              </div>
+              <div className="text-muted-foreground tabular-nums">2 values</div>
+              <div className="font-mono text-[11px] text-muted-foreground">
+                long, short
+              </div>
+            </div>
+          </div>
+          <p className="text-xs text-muted-foreground leading-relaxed pt-1">
+            Worst-case fan-out per Base = 5 × 4 × 8 × 2 ={" "}
+            <strong>320</strong> Sets. Typical (prev PF-filter rejects ~half;
+            last single-outcome-tagged): ≈ 128–192. After Real hedge-net
+            cancellation: ≈ 96 surviving Sets per Base reaching Live. No
+            lock — recompute every cycle; hedge-count deltas drive partial
+            open/close at Live.
+          </p>
+        </CardContent>
+      </Card>
+
       {/* ── Variant profiles card ────────────────────────────────── */}
       <Card>
         <CardHeader className="pb-3">
