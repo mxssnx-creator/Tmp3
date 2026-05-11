@@ -361,12 +361,18 @@ export async function POST(request: Request) {
      
      const updated = {
        ...connection,
-       // Explicit quickstart assignment/enabling for engine processing
+       // Explicit quickstart assignment/enabling for engine processing.
+       // is_enabled + is_inserted are required by getAssignedAndEnabledConnections()
+       // which filters on these base fields — without them coordinator.startAll()
+       // finds zero eligible connections and never starts an engine.
+       is_enabled: "1",
+       is_inserted: "1",
        is_active_inserted: "1",
        is_dashboard_inserted: "1",
        is_enabled_dashboard: "1",
        is_assigned: "1",
        is_active: "1",
+       is_live_trade: "1",
        active_symbols: JSON.stringify(symbols),
        last_test_status: testPassed ? "success" : "failed",
        last_test_balance: testBalance,

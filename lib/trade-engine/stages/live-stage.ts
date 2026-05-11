@@ -2054,7 +2054,7 @@ export async function closeLivePosition(
     const wasAlreadyClosed = await client.get(movedMarker).catch(() => null)
     await savePosition(position)
 
-    // ── 5. Release dedup lock + counters + audit log ──────────────────
+    // ── 5. Release dedup lock + counters + audit log ───────────────��──
     await releaseLock(connectionId, position.symbol, position.direction)
     if (!wasAlreadyClosed) {
       await incrementMetric(connectionId, "live_positions_closed_count")
@@ -2493,6 +2493,32 @@ export async function reconcileLivePositions(
             continue // close already persisted by helper
           }
 
+          // ── Max-hold-time safety closer (reconcile path) ────────────
+          const MAX_HOLD_TIME_MS = Number(process.env.MAX_POSITION_HOLD_MS ?? 4 * 60 * 60 * 1000)
+          const openedAt = pos.createdAt || pos.updatedAt || 0
+          const heldMs = Date.now() - openedAt
+          if (
+            MAX_HOLD_TIME_MS > 0 &&
+            heldMs > MAX_HOLD_TIME_MS &&
+            pos.executedQuantity > 0 &&
+            (pos.status === "open" || pos.status === "filled")
+          ) {
+            const exitPrice = markPrice || pos.averageExecutionPrice || pos.entryPrice
+            console.warn(
+              `${LOG_PREFIX} [reconcile] MAX HOLD TIME exceeded for ${pos.symbol} (held ${Math.round(heldMs / 60000)}min) — force-closing`,
+            )
+            await logProgressionEvent(
+              connectionId,
+              "live_trading",
+              "warning",
+              `Max hold time exceeded for ${pos.symbol} — force-closing (reconcile)`,
+              { positionId: pos.id, heldMs, maxHoldMs: MAX_HOLD_TIME_MS, exitPrice },
+            )
+            await closeLivePosition(connectionId, pos.id, exitPrice, exchangeConnector, "max_hold_time_exceeded")
+            summary.closed++
+            continue
+          }
+
           await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
           summary.updated++
         } else {
@@ -2644,7 +2670,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           position.updatedAt = Date.now()
         }
 
-        // ── Delayed-fill SL/TP arming ─────────────────────────────────
+        // ── Delayed-fill SL/TP arming ─────────────────────────���───────
         // If the entry order was still pending when `executeLivePosition`
         // tried to place SL/TP, that step pushed `place_sl_tp = skipped`
         // and the position ended up `placed` with no protection orders.
@@ -2717,6 +2743,39 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             exchangeConnector,
           )
           if (crossed) continue
+        }
+
+        // ── Max-hold-time safety closer ────────────────────────────────
+        // If the position has been open longer than MAX_HOLD_TIME_MS,
+        // force-close it regardless of whether SL/TP levels were
+        // crossed. This is the "orders not closing in time" safety net —
+        // even if the exchange-placed SL/TP orders fail to fire (e.g.
+        // network issue, illiquid gap, operator manual cancel), the
+        // position will not be held indefinitely.
+        //
+        // Default: 4 hours. Override via env MAX_POSITION_HOLD_MS.
+        const MAX_HOLD_TIME_MS = Number(process.env.MAX_POSITION_HOLD_MS ?? 4 * 60 * 60 * 1000)
+        const openedAt = position.createdAt || position.updatedAt || 0
+        const heldMs = Date.now() - openedAt
+        if (
+          MAX_HOLD_TIME_MS > 0 &&
+          heldMs > MAX_HOLD_TIME_MS &&
+          position.executedQuantity > 0 &&
+          (position.status === "open" || position.status === "filled")
+        ) {
+          const exitPrice = markPrice || position.averageExecutionPrice || position.entryPrice
+          console.warn(
+            `${LOG_PREFIX} MAX HOLD TIME exceeded for ${position.symbol} (held ${Math.round(heldMs / 60000)}min > ${Math.round(MAX_HOLD_TIME_MS / 60000)}min) — force-closing`,
+          )
+          await logProgressionEvent(
+            connectionId,
+            "live_trading",
+            "warning",
+            `Max hold time exceeded for ${position.symbol} — force-closing`,
+            { positionId: position.id, heldMs, maxHoldMs: MAX_HOLD_TIME_MS, exitPrice },
+          )
+          await closeLivePosition(connectionId, position.id, exitPrice, exchangeConnector, "max_hold_time_exceeded")
+          continue
         }
 
         const key = `live:position:${position.id}`

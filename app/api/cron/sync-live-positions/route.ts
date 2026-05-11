@@ -79,7 +79,12 @@ export async function GET() {
       const isLiveTrade =
         settings?.live_trade === "true" ||
         settings?.live_trade === "1" ||
-        (conn as any).live_trade === true
+        (conn as any).live_trade === true ||
+        // Quickstart sets is_live_trade on the connection object, not in
+        // connection:settings — check both locations so the cron fires.
+        (conn as any).is_live_trade === "1" ||
+        (conn as any).is_live_trade === true ||
+        settings?.is_live_trade === "1"
 
       if (!isLiveTrade) {
         summary.connectionsSkipped++
