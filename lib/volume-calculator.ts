@@ -377,33 +377,11 @@ export class VolumeCalculator {
       const useMaxLeverage = settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
       const rawLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
 
-      // ── Balance-based leverage safety cap ───────────────────────────
-      // High leverage on low-balance accounts produces BingX code 101204
-      // (Insufficient margin) even for small notional positions, because
-      // the exchange enforces a minimum initial-margin ratio per position.
-      // Cap the effective leverage so the margin per position stays above
-      // the exchange's floor. Thresholds chosen to keep margin ≥ ~$0.50/pos:
-      //   ≤ $50  → 10x  (margin ratio 10%; keeps min position affordable)
-      //   ≤ $200 → 20x
-      //   ≤ $500 → 50x
-      //   >$500  → up to 125x (full user setting respected)
-      let balanceCap = 125
-      if (accountBalance <= 50) balanceCap = 10
-      else if (accountBalance <= 200) balanceCap = 20
-      else if (accountBalance <= 500) balanceCap = 50
-      const maxLeverage = Math.min(rawLeverage, balanceCap)
-
-      // Get exchange min volume from Redis trading pair data. When the
-      // metadata is missing or zero we leave `exchangeMinVolume`
-      // undefined — `calculatePositionVolume` will then apply the
-      // universal $5-notional floor itself, which works for ANY quote
-      // currency (USDT, USDC, USD, BTC, BUSD, ...) without per-quote
-      // string sniffing.
-      const tradingPair = await getSettings(`trading_pair:${symbol}`)
-      const exchangeMinVolume = tradingPair?.min_order_size
-        ? parseFloat(tradingPair.min_order_size)
-        : undefined
-
+      // ── Fetch account balance FIRST (needed for leverage cap below) ──
+      // Declaration must come before the balance-cap block to avoid the
+      // `let` temporal dead zone (TDZ). Previously `accountBalance` was
+      // declared on line 407 but used on line 391, causing:
+      //   ReferenceError: Cannot access 'accountBalance' before initialization
       let accountBalance = 10000 // Default fallback
 
       try {
@@ -440,6 +418,22 @@ export class VolumeCalculator {
       } catch (balanceError) {
         console.warn("[v0] Failed to fetch account balance, using default:", balanceError)
       }
+
+      // ── Balance-based leverage safety cap ───────────────────────────
+      // Cap effective leverage so margin per position stays above the
+      // exchange floor. Thresholds keep margin ≥ ~$0.50/pos:
+      //   ≤$50  → 10x  |  ≤$200 → 20x  |  ≤$500 → 50x  |  >$500 → 125x
+      let balanceCap = 125
+      if (accountBalance <= 50) balanceCap = 10
+      else if (accountBalance <= 200) balanceCap = 20
+      else if (accountBalance <= 500) balanceCap = 50
+      const maxLeverage = Math.min(rawLeverage, balanceCap)
+
+      // ── Exchange minimum order size from Redis trading-pair metadata ─
+      const tradingPair = await getSettings(`trading_pair:${symbol}`)
+      const exchangeMinVolume = tradingPair?.min_order_size
+        ? parseFloat(tradingPair.min_order_size)
+        : undefined
 
       // ── Resolve engine factor IFF caller asked for it ──────────────
       //
