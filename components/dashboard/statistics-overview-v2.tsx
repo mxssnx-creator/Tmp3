@@ -643,10 +643,15 @@ export function StatisticsOverviewV2() {
           // Fall back to cumulative indicationsTotal when the per-cycle
           // active-sets count is 0 — keeps the tile non-zero while the
           // engine is running but nothing has crossed the threshold yet.
+          // Third fallback: breakdown.indications.total (type-summed)
+          // which is the most reliable cumulative source and does not
+          // depend on the per-cycle active-hash write timing.
           activeIndTotal: (() => {
             const active = Number(d.activeCounts?.indications?.total) || 0
             if (active > 0) return active
-            return Number(d.realtime?.indicationsTotal) || 0
+            const rt = Number(d.realtime?.indicationsTotal) || 0
+            if (rt > 0) return rt
+            return Number(d.breakdown?.indications?.total) || 0
           })(),
           activeStratBase:    Number(d.activeCounts?.strategies?.base)            || 0,
           activeStratMain:    Number(d.activeCounts?.strategies?.main)            || 0,

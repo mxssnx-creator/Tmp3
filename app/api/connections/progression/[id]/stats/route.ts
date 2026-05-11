@@ -165,7 +165,14 @@ export async function GET(
     )
     const historicCyclesCompleted = pick(
       n(progHash.prehistoric_cycles_completed),
-      n(es.config_set_symbols_processed)
+      n(es.config_set_symbols_processed),
+      // Tertiary: use the number of symbols processed as a minimum
+      // non-zero cycle count — each symbol constitutes one prehistoric
+      // cycle even if the dedicated `prehistoric_cycles_completed`
+      // counter was never written (e.g. the increment call silently
+      // failed). This prevents P-Cycles from showing 0 when 4 symbols
+      // have clearly been processed (Frames and Indicators are non-zero).
+      historicSymbolsProcessed
     )
     const historicIsComplete =
       prehistoricHash.is_complete === "1" ||
@@ -513,7 +520,7 @@ export async function GET(
       // ── Risk-management levels ───────────────────────────────────────
       stopLossPrice: number
       takeProfitPrice: number
-      // ── Exchange order references ────────────────────────────────────
+      // ── Exchange order references ─────────────────────────��──────────
       orderId?: string
       stopLossOrderId?: string
       takeProfitOrderId?: string
@@ -1361,7 +1368,15 @@ export async function GET(
         // per-Set 250-entry DB cap. Counts every loop tick across all
         // three processors since the engine started.
         framesProcessed,
-        indicationsTotal,
+        // `indTotal` is the better canonical count: it is the per-type
+        // summation (direction + move + active + optimal + auto) which
+        // falls back to `indicationsTotal` (progHash.indications_count)
+        // when no per-type keys exist. Using `indicationsTotal` alone
+        // here caused the realtime.indicationsTotal tile to show 0
+        // even when 92K+ indications had been generated, because the
+        // `indications_count` key was only written when per-type counts
+        // were non-zero on the SAME cycle — a write-order race.
+        indicationsTotal: indTotal,
         strategiesTotal,
         positionsOpen,
         // Sets + Positions are the canonical "continuous live progression" anchors
