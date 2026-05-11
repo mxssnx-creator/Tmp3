@@ -66,5 +66,63 @@ export async function register() {
     console.error("[Instrumentation] auto-start init failed:", error)
   }
 
+  // ── Patch VolumeCalculator.calculateVolumeForConnection ────────────
+  // The webpack dev-server compiled this method into a stale eval() closure
+  // with the old broken source (let balanceCap referenced let accountBalance
+  // before it was declared — TDZ crash). Editing source files doesn't fix
+  // the in-memory eval; only a process restart does. Since this
+  // instrumentation register() runs once on boot, we patch the prototype
+  // here so ALL callers — including the stale PseudoPositionManager
+  // singleton — pick up the corrected implementation immediately.
+  try {
+    const { VolumeCalculator } = await import("@/lib/volume-calculator")
+    const { getAppSettings, getSettings } = await import("@/lib/redis-db")
+
+    ;(VolumeCalculator as any).prototype.calculateVolumeForConnection = async function(
+      this: typeof VolumeCalculator,
+      connectionId: string,
+      symbol: string,
+      currentPrice: number,
+      options: { tradeMode?: string } = {},
+    ) {
+      try {
+        const settings = (await getAppSettings()) || {}
+        const positionCostPercent = parseFloat(
+          String((settings as any).exchangePositionCost ?? (settings as any).positionCost ?? "0.1")
+        )
+        const positionCost = positionCostPercent / 100
+        const positionsAverage = (() => {
+          const raw = parseFloat(String((settings as any).positions_average ?? "2"))
+          return Number.isFinite(raw) && raw > 0 ? raw : 2
+        })()
+        const leveragePercentage = parseFloat(String((settings as any).leveragePercentage ?? "100"))
+        const useMaxLeverage =
+          (settings as any).useMaximalLeverage === true ||
+          (settings as any).useMaximalLeverage === "true"
+        const rawLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
+        const { accountBalance, maxLeverage } =
+          await VolumeCalculator.resolveBalanceAndLeverage(connectionId, rawLeverage)
+        const tradingPair = await getSettings(`trading_pair:${symbol}`)
+        const exchangeMinVolume = (tradingPair as any)?.min_order_size
+          ? parseFloat((tradingPair as any).min_order_size)
+          : undefined
+        return VolumeCalculator.calculatePositionVolume({
+          positionCost,
+          positionsAverage,
+          accountBalance,
+          currentPrice,
+          leverage: maxLeverage,
+          exchangeMinVolume,
+        })
+      } catch (err) {
+        console.error("[v0] [patch] calculateVolumeForConnection error:", err)
+        throw err
+      }
+    }
+    console.log("[Instrumentation] VolumeCalculator.calculateVolumeForConnection patched — TDZ fix applied")
+  } catch (patchError) {
+    console.error("[Instrumentation] Failed to patch VolumeCalculator:", patchError)
+  }
+
   return
 }
