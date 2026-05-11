@@ -116,6 +116,25 @@ export function DashboardActiveConnectionsManager() {
         }
       }
 
+      // ── Merge-not-replace for in-flight toggles ─────────────────────
+      // If a connection is currently mid-toggle/mid-remove, we don't
+      // want a transient Redis read (flags briefly 0 due to write
+      // ordering, or a partial response) to drop the card and re-add
+      // it on the next poll. Preserve the optimistic entry until the
+      // toggle settles.
+      const inFlight = new Set<string>([
+        ...togglingRef.current,
+        ...removingRef.current,
+      ])
+      if (inFlight.size > 0) {
+        const fetchedIds = new Set(activeConns.map(ac => ac.connectionId))
+        const previous = activeConnectionsRef.current
+        for (const prev of previous) {
+          if (inFlight.has(prev.connectionId) && !fetchedIds.has(prev.connectionId)) {
+            activeConns.push(prev)
+          }
+        }
+      }
       updateActiveConnections(activeConns)
     } catch (error) {
       console.error("[Manager] Error loading connections:", error)
@@ -213,10 +232,18 @@ export function DashboardActiveConnectionsManager() {
         window.dispatchEvent(new CustomEvent("engine-state-changed", { detail: { connectionId, newState } }))
       }
 
+      // ── Hold optimistic state longer (3s vs 800ms) ──────────────────
+      // The toggle endpoint returns immediately after writing the
+      // connection flags, but downstream side-effects (engine start,
+      // global state hash update, progression init) may race the very
+      // next poll. Holding the optimistic state for 3s gives the
+      // back-end time to converge BEFORE we re-fetch the truth — this
+      // is what kept "just-enabled" cards disappearing for a tick
+      // before re-appearing, producing the visual flicker.
       setTimeout(() => {
         loadConnections({ force: true })
         checkGlobalEngine()
-      }, 800)
+      }, 3000)
     } catch (error) {
       console.error(`[Manager] Toggle error for ${connName}:`, error)
       updateActiveConnections(prev => prev.map(ac =>

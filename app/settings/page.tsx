@@ -63,6 +63,11 @@ interface Settings {
   baseRatioMin: number
   baseRatioMax: number
   trailingOption: boolean
+  // Multi-step trailing matrix — Settings → Strategy → Trailing.
+  // Each enabled (start, stop) combo spawns one independent Base Set per
+  // (indication_type × direction). See `lib/strategy-coordinator.ts`.
+  strategyBaseTrailingEnabled: boolean
+  strategyBaseTrailingVariants: string[]
   previousPositionsCount: number
   lastStateCount: number
   trailingEnabled: boolean
@@ -73,9 +78,16 @@ interface Settings {
   arrangementType: string
   numberOfSymbolsToSelect: number
   quoteAsset: string
+  // ── Main Trade PF thresholds per stage ───────────────────────────
+  // Operator-tunable gates for Base → Main → Real → Live promotion.
+  // Spec defaults: 0.9 / 1.0 / 1.0 / 1.0. Wired into
+  // `lib/strategy-coordinator.ts` via `loadAppPFThresholds()` so a
+  // slider change in the Strategies tab flows into the live engine
+  // within 5s (TTL cap on the loader cache).
   baseProfitFactor: number
   mainProfitFactor: number
   realProfitFactor: number
+  liveProfitFactor: number
   trailingStopLoss: boolean
   maxDrawdownTimeHours: number
   mainEngineIntervalMs: number
@@ -94,6 +106,7 @@ interface Settings {
   maxPositionsShort: number // Max 1 short position per config
   indicationTimeoutMs: number // 100ms to 3000ms, step 100ms
   maxConcurrentOperations: number
+  cyclePauseMs?: number // 10-200ms, step 10, default 50ms — pause between engine cycles
   autoRestartOnErrors: boolean
   logLevel: string
   maxDatabaseSizeMB: number
@@ -349,7 +362,10 @@ interface Settings {
 const initialSettings: Settings = {
   // Overall / Main
   base_volume_factor: 1.0,
-  positions_average: 50,
+  // Default raised 50 → 300; see components/settings/utils.ts for the
+  // rationale. The two defaults must stay in lock-step or first-load
+  // will paint stale UI before the live settings hydrate from Redis.
+  positions_average: 300,
   max_leverage: 125,
   negativeChangePercent: 20, // 5-30 step 5, Default 20 - used for loss trigger calculation
   leveragePercentage: 100, // 5-100 step 5, Default 100
@@ -371,6 +387,16 @@ const initialSettings: Settings = {
   baseRatioMin: 0.2,
   baseRatioMax: 1,
   trailingOption: false,
+  // Multi-step trailing matrix defaults — full 5×5 matrix on.
+  // Spec: start ∈ {0.3,0.6,0.9,1.2,1.5}, stop ∈ {0.1,0.2,0.3,0.4,0.5}.
+  strategyBaseTrailingEnabled: true,
+  strategyBaseTrailingVariants: [
+    "0.3:0.1", "0.3:0.2", "0.3:0.3", "0.3:0.4", "0.3:0.5",
+    "0.6:0.1", "0.6:0.2", "0.6:0.3", "0.6:0.4", "0.6:0.5",
+    "0.9:0.1", "0.9:0.2", "0.9:0.3", "0.9:0.4", "0.9:0.5",
+    "1.2:0.1", "1.2:0.2", "1.2:0.3", "1.2:0.4", "1.2:0.5",
+    "1.5:0.1", "1.5:0.2", "1.5:0.3", "1.5:0.4", "1.5:0.5",
+  ],
 
   // Main Strategy
   previousPositionsCount: 5,
@@ -392,10 +418,14 @@ const initialSettings: Settings = {
   // numberOfSymbolsToSelect: 12, // Moved to exchange tab default
   quoteAsset: "USDT", // Moved to exchange tab default
 
-  // Minimum Profit Factor Requirements
-  baseProfitFactor: 0.6,
-  mainProfitFactor: 0.6,
-  realProfitFactor: 0.6,
+  // ── Main Trade PF thresholds per stage (spec defaults) ───────────
+  // Base 0.9 / Main 1.0 / Real 1.0 / Live 1.0 — operator-tunable via
+  // Settings → Strategy → Main → Profit Factor Thresholds. Read by
+  // `lib/strategy-coordinator.ts` on every flow cycle (5s TTL cache).
+  baseProfitFactor: 0.9,
+  mainProfitFactor: 1.0,
+  realProfitFactor: 1.0,
+  liveProfitFactor: 1.0,
 
   // Risk Management
   trailingStopLoss: false,
@@ -420,10 +450,10 @@ const initialSettings: Settings = {
   maxActiveBasePseudoPositionsPerDirection: 1,
   maxPositionsLong: 1, // Max 1 long position per configuration
   maxPositionsShort: 1, // Max 1 short position per configuration
-    indicationTimeoutMs: 1000, // 100ms to 3000ms, step 100ms, default 1000ms
-    maxConcurrentOperations: 100, // 10-250, default 100
-    cyclePauseMs: 50, // 10-200ms, step 10, default 50ms — pause between engine cycles
-    prehistoric_range_hours: 8, // 1-50h, step 1, default 8h — look-back window for prehistoric calc
+  indicationTimeoutMs: 1000, // 100ms to 3000ms, step 100ms, default 1000ms
+  maxConcurrentOperations: 100, // 10-250, default 100
+  cyclePauseMs: 50, // 10-200ms, step 10, default 50ms — pause between engine cycles
+  // prehistoric_range_hours is already set at line 366 above (first occurrence wins)
 
   // System Configuration
   autoRestartOnErrors: true,

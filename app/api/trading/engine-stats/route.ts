@@ -94,8 +94,8 @@ export async function GET(req: Request) {
         for (const stage of ["base", "main", "real", "live"]) {
           const stageIds = await redis.smembers(`${stage}_pseudo_positions:${connectionId}`).catch(() => [] as string[])
           for (const posId of stageIds) {
-            const hash = await redis.hgetall(`${stage}_pseudo_position:${connectionId}:${posId}`).catch(() => ({})) || {}
-            if ((hash.status || "active") === "active") positionsCount++
+            const hash = (await redis.hgetall(`${stage}_pseudo_position:${connectionId}:${posId}`).catch(() => ({}))) as Record<string, any> || {}
+            if (((hash as any).status || "active") === "active") positionsCount++
           }
         }
       }

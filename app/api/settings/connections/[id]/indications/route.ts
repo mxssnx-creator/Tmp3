@@ -24,13 +24,14 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
 
     // Save indications to Redis
     for (const ind of indications) {
-      await saveIndication(id, {
+      const indication = {
         id: ind.id || `${id}-ind-${Date.now()}`,
         connection_id: id,
         type: ind.type || ind.indication_type,
         enabled: ind.enabled !== false,
         config: ind,
-      })
+      }
+      await saveIndication({ ...indication, connection_id: id })
     }
 
     return NextResponse.json({ success: true })

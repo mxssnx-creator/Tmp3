@@ -40,10 +40,18 @@ export function StatisticsOverview({ settings }: StatisticsOverviewProps) {
   }
 
   const calculateProfitFactorDistribution = () => {
+    // ── Main Trade PF thresholds (spec defaults 0.9/1.0/1.0/1.0) ─────
+    // `live` was added alongside base/main/real per spec — the four
+    // Main-Trade stages are gated independently from the Strategies
+    // tab. Preset stays distinct (separate engine, separate threshold
+    // at `presetProfitFactor`). Fallback values match the engine's
+    // own fallbacks so the overview reflects exactly what the engine
+    // gates with when settings haven't loaded yet.
     return {
-      base: settings.baseProfitFactor || 0.6,
-      main: settings.mainProfitFactor || 0.6,
-      real: settings.realProfitFactor || 0.6,
+      base: settings.baseProfitFactor || 0.9,
+      main: settings.mainProfitFactor || 1.0,
+      real: settings.realProfitFactor || 1.0,
+      live: settings.liveProfitFactor || 1.0,
       preset: settings.presetProfitFactor || 0.6,
     }
   }

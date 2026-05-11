@@ -487,7 +487,7 @@ export function ExchangeConnectionDialog({
           arrangementType: "market_cap_24h",
           arrangementCount: 10,
           volumeRangePercentage: 20,
-          targetPositions: globalSettings?.positions_average || 50,
+          targetPositions: globalSettings?.positions_average || 300,
         },
       }
 

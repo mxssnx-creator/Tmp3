@@ -4,7 +4,7 @@
  * NOW: 100% Redis-backed, no SQL
  */
 
-import { getRedisClient, getSettings, getAppSettings, getSettingsVersionCachedSync, setSettings, createPosition as redisCreatePosition } from "@/lib/redis-db"
+import { getRedisClient, getAppSettings, getSettingsVersionCachedSync, createPosition as redisCreatePosition } from "@/lib/redis-db"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { emitPositionUpdate } from "@/lib/broadcast-helpers"
 import { StrategyConfigManager, type PseudoPosition as StrategyPseudoPosition } from "@/lib/strategy-config-manager"
@@ -203,15 +203,47 @@ export class PseudoPositionManager {
     trailingEnabled: boolean
     configSetKey?: string  // unique fingerprint of the config combination
     strategyConfigId?: string  // StrategyConfig.id (DB primary key) — optional link into the historic-fill Set keyspace
+    /**
+     * Multi-step trailing — when present, forces `trailingEnabled = true`
+     * and switches `realtime-processor.updateTrailingStop` to the 2-phase
+     * state machine (activation gate + ratchet step). All three are
+     * RATIOS where 0.1 ≡ 10 % of price.
+     *
+     * Set by `lib/strategy-coordinator.ts` from the per-Set
+     * `trailingProfile` produced by the Settings → Strategy → Trailing
+     * matrix. When absent, the legacy single-step path runs.
+     */
+    trailingStartRatio?: number
+    trailingStopRatio?: number
+    trailingStepRatio?: number
   }): Promise<string | null> {
     try {
-      // Build a canonical config set key if not provided
+      // Multi-step path forces trailing on regardless of caller flag —
+      // the operator opted into the matrix so the position MUST honour it.
+      const hasTrailingProfile =
+        Number.isFinite(params.trailingStartRatio) &&
+        Number.isFinite(params.trailingStopRatio) &&
+        Number.isFinite(params.trailingStepRatio) &&
+        (params.trailingStartRatio as number) > 0 &&
+        (params.trailingStopRatio as number) > 0
+      const effectiveTrailing = hasTrailingProfile ? true : params.trailingEnabled
+
+      // Build a canonical config set key if not provided. Including the
+      // trailing tuple makes each multi-step variant occupy its own
+      // uniqueness slot — distinct (start, stop) combos are NOT collapsed
+      // even when TP/SL/side match.
       const configSetKey = params.configSetKey || [
         params.indicationType,
         params.side,
         params.takeprofitFactor.toFixed(4),
         params.stoplossRatio.toFixed(4),
-        params.trailingEnabled ? "1" : "0",
+        effectiveTrailing ? "1" : "0",
+        ...(hasTrailingProfile
+          ? [
+              `s${(params.trailingStartRatio as number).toFixed(2)}`,
+              `k${(params.trailingStopRatio as number).toFixed(2)}`,
+            ]
+          : []),
       ].join(":")
 
       // P0-4: Gate on both Set-uniqueness AND the per-direction cap.
@@ -280,8 +312,29 @@ export class PseudoPositionManager {
         stoploss_ratio: String(params.stoplossRatio),
         stoploss_price: String(stopLossPrice),
         profit_factor: String(params.profitFactor),
-        trailing_enabled: params.trailingEnabled ? "1" : "0",
+        trailing_enabled: effectiveTrailing ? "1" : "0",
         trailing_stop_price: "0",
+        // Multi-step trailing state machine — see
+        // `realtime-processor.updateTrailingStop`. All three fields are
+        // ratios (0.1 ≡ 10 %). When `trailing_start_ratio === "0"` the
+        // legacy single-step code path runs (back-compat for positions
+        // that pre-date this feature).
+        trailing_start_ratio: hasTrailingProfile
+          ? String(params.trailingStartRatio)
+          : "0",
+        trailing_stop_ratio: hasTrailingProfile
+          ? String(params.trailingStopRatio)
+          : "0",
+        trailing_step_ratio: hasTrailingProfile
+          ? String(params.trailingStepRatio)
+          : "0",
+        // Activation state — flipped to "1" the first cycle in which
+        // `gain_ratio >= trailing_start_ratio`. Until then trailing is
+        // dormant and only the fixed TP/SL gates fire.
+        trailing_active: "0",
+        // High-water mark anchor for the ratchet. Long: highest price
+        // seen since activation. Short: lowest price seen.
+        trailing_anchor: "0",
         status: "active",
         opened_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
@@ -626,14 +679,38 @@ export class PseudoPositionManager {
   }
 
   /**
-   * Update active positions count in engine state (Redis)
+   * Update active positions count in engine state (Redis).
+   *
+   * ── Atomic single-field write (P0-3 race fix) ─────────────────────
+   * The previous implementation was a classic read-modify-write:
+   *
+   *     const current = await getSettings(stateKey)
+   *     await setSettings(stateKey, { ...current, active_positions_count: count })
+   *
+   * — which spread the entire fetched hash back through `setSettings` →
+   * `client.hset(...)`. Field-level merge means we never wiped the hash,
+   * but ANY field that another writer (realtime heartbeat, engine
+   * startup, watchdog re-arm) updated between our read and our write
+   * would be silently overwritten with the stale value we'd read.
+   * Worst-case: heartbeat-set `last_realtime_run` flapped backwards
+   * every time createPosition / closePosition fired concurrently with a
+   * realtime tick, breaking the dashboard's "engine is alive" signal.
+   *
+   * Now: count the active positions and write JUST that one field via
+   * `client.hset(stateKey, "active_positions_count", String(count))`.
+   * No read, no spread, no race — every other field on the hash is
+   * untouched. The realtime processor's heartbeat path is unaffected
+   * (it writes its own fields with its own hset).
    */
   private async updateActivePositionsCount(): Promise<void> {
     try {
       const count = await this.getPositionCount()
       const stateKey = `trade_engine_state:${this.connectionId}`
-      const current = (await getSettings(stateKey)) || {}
-      await setSettings(stateKey, { ...current, active_positions_count: count })
+      const client = getRedisClient()
+      // Single-field hset is atomic at the Redis level; safe under any
+      // concurrency. We don't bother re-reading other fields because we
+      // don't need them — only this one is being updated.
+      await client.hset(stateKey, "active_positions_count", String(count))
     } catch (error) {
       console.error("[v0] Failed to update active positions count:", error)
     }

@@ -14,6 +14,11 @@ import { Progress } from "@/components/ui/progress"
 import { QuickstartComprehensiveLogDialog } from "./quickstart-comprehensive-log-dialog"
 import { QuickstartOverviewDialog } from "./quickstart-overview-dialog"
 import { EngineProgressionTestButton } from "./engine-progression-test-dialog"
+// Top-of-card controls strip — connection picker (add base connection
+// to Active panel) + Reset DB button. Lives in its own file because
+// QuickStart is already large; mounting it as a single child keeps
+// the header markup readable.
+import { QuickstartConnectionControls } from "./quickstart-connection-controls"
 import { useExchange } from "@/lib/exchange-context"
 
 // ─── types ────────────────────────────────────────────────────────────────────
@@ -74,30 +79,43 @@ interface IndicationConfigCounts {
 
 // Live exchange footer — aggregates REAL-exchange positions & account balance
 // across every enabled connection. Not the same as pseudo-position counts.
-interface ExchangeLiveSummary {
-  connections: Array<{
-    connectionId: string
-    name: string
-    exchange: string
-    openPositions: number
-    longPositions: number
-    shortPositions: number
-    unrealizedPnl: number
-    balance: { total: number; available: number; equity: number; currency: string }
-    positions: Array<{ symbol: string; side: string; qty: number; entry: number; mark: number; pnl: number }>
-  }>
-  totals: {
-    openPositions: number
-    longPositions: number
-    shortPositions: number
-    unrealizedPnl: number
-    totalBalance:  number
-    availableBalance: number
-    equity:        number
-    currency:      string
+  interface ExchangeLiveSummary {
+    connections: Array<{
+      connectionId: string
+      name: string
+      exchange: string
+      openPositions: number
+      longPositions: number
+      shortPositions: number
+      unrealizedPnl: number
+      /** Used balance committed to live positions on this connection
+       *  (margin = sum of notional/leverage). Canonical USDT figure. */
+      marginUsd?: number
+      /** Leveraged notional exposure on this connection. */
+      volumeUsd?: number
+      balance: { total: number; available: number; equity: number; currency: string }
+      positions: Array<{
+        symbol: string; side: string; qty: number
+        entry: number; mark: number; pnl: number
+        marginUsd?: number; volumeUsd?: number; leverage?: number
+      }>
+    }>
+    totals: {
+      openPositions: number
+      longPositions: number
+      shortPositions: number
+      unrealizedPnl: number
+      totalBalance:  number
+      availableBalance: number
+      equity:        number
+      /** USDT used balance across every connection. */
+      marginUsd?: number
+      /** USDT leveraged notional across every connection. */
+      volumeUsd?: number
+      currency:      string
+    }
+    updatedAt: number
   }
-  updatedAt: number
-}
 
 // Main-stage coordination snapshot — surfaces the per-cycle position context
 // (pseudo-positions gating variant selection), how many related variant Sets
@@ -137,6 +155,16 @@ interface LiveStats {
   historicFrames: number
   historicFramesMissing: number
   historicTimeframeSec: number
+  // ── Historic Profit Factor + Executed Positions ─────────────────────
+  // Spec ask: "Add also ExecutedPositions, AverageProfitFactor Infos."
+  // These come straight off the `historic` block of the /stats endpoint.
+  // `historicAvgProfitFactor` aggregates every closed prehistoric
+  // position into one PF number (sum(+pct)/|sum(-pct)|). `executedPositions`
+  // is the cumulative live-exchange-position count — the canonical
+  // "Executed Positions" metric across the whole engine lifetime.
+  historicAvgProfitFactor: number
+  historicAvgProfitFactorCount: number
+  executedPositions: number
   // realtime
   indicationCycles: number
   strategyCycles: number
@@ -185,7 +213,26 @@ interface LiveStats {
   pseudoOpen: number
   pseudoRunningSets: number
   realOpen: number
+  // Running average of currently-active validated Real positions,
+  // accumulated server-side across stats fetches. UNBOUNDED — unlike
+  // `stageReal.avgPosPerSet` (which is mathematically capped at the
+  // per-set 250-entry DB capacity), this is a true running mean of
+  // open Real-stage positions and can grow as deep as `realOpen` does.
+  realActivePosAvg: number
+  realActivePosSamples: number
   liveVolumeUsd: number
+  // ── Active Progressing (per type / per stage) ──────────────────────
+  // Three orthogonal counters fed from `activeProgressing.*` of the
+  // /stats endpoint. Each row is one indication-type or one strategy-
+  // stage:
+  //   * sets       — distinct (symbol × type|stage) pairs that produced
+  //                  qualified entries on the latest cycle.
+  //   * trackings  — cumulative entries observed since run start.
+  //   * positions  — open positions held at that type/stage right now.
+  // Surfaced in dedicated tables in the QuickStart breakdown so the
+  // operator can see RIGHT-NOW health per pool rather than just totals.
+  apIndications: ActiveProgressingByName
+  apStrategies:  ActiveProgressingByName
   // windows
   indLast5m: number
   indLast60m: number
@@ -193,6 +240,17 @@ interface LiveStats {
   phase: string
   engineRunning: boolean
 }
+
+// One row of the Active Progressing breakdown — sets/trackings/positions.
+// Used for both indication-types and strategy-stages so the rendering
+// table can be reused across both blocks.
+type ActiveProgressingRow = {
+  sets:      number
+  trackings: number
+  positions: number
+}
+type ActiveProgressingByName = Record<string, ActiveProgressingRow>
+const EMPTY_AP_ROW: ActiveProgressingRow = { sets: 0, trackings: 0, positions: 0 }
 
 const EMPTY_STAGE: StageDetail = {
   createdSets: 0, avgPosPerSet: 0, avgProfitFactor: 0, avgDrawdownTime: 0,
@@ -216,6 +274,7 @@ const EMPTY_STATS: LiveStats = {
   historicSymbols: 0, historicSymbolsTotal: 0, historicCycles: 0,
   historicComplete: false, historicProgress: 0, historicCandles: 0, historicIndicators: 0,
   historicFrames: 0, historicFramesMissing: 0, historicTimeframeSec: 1,
+  historicAvgProfitFactor: 0, historicAvgProfitFactorCount: 0, executedPositions: 0,
   indicationCycles: 0, strategyCycles: 0, realtimeCycles: 0, indicationsTotal: 0,
   strategiesTotal: 0, positionsOpen: 0, successRate: 0, avgCycleMs: 0, isActive: false,
   indDirection: 0, indMove: 0, indActive: 0, indOptimal: 0, indAuto: 0,
@@ -231,7 +290,10 @@ const EMPTY_STATS: LiveStats = {
   },
   livePositionsOpen: 0, livePositionsCreated: 0, livePositionsClosed: 0,
   liveOrdersPlaced: 0, liveOrdersFilled: 0, liveWinRate: 0,
-  pseudoOpen: 0, pseudoRunningSets: 0, realOpen: 0, liveVolumeUsd: 0,
+  pseudoOpen: 0, pseudoRunningSets: 0, realOpen: 0,
+  realActivePosAvg: 0, realActivePosSamples: 0, liveVolumeUsd: 0,
+  apIndications: {},
+  apStrategies:  {},
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
 }
 
@@ -273,8 +335,12 @@ function MiniStat({ label, value, sub }: { label: string; value: string; sub?: s
 
 export function QuickstartSection() {
   const { selectedConnectionId, selectedExchange } = useExchange()
-  // Default to bingx-x01 — the canonical BingX base connection ID used by the engine
-  const connectionId = selectedConnectionId || "bingx-x01"
+  // Use the exchange-selected connection. Fall back to "bingx-x01" ONLY
+  // once a connection has been added to the Active panel so the QuickStart
+  // strip shows meaningful stats rather than a stale 404 response from a
+  // connection that doesn't exist yet. An explicit null means "no selection
+  // yet" and the polling useEffect guards against it below.
+  const connectionId = selectedConnectionId ?? null
 
   // volatile symbol for start button label
   const [volatileSymbol, setVolatileSymbol] = useState<{ symbol: string | null; exchange: string | null; pct: number | null; loading: boolean }>({
@@ -295,7 +361,7 @@ export function QuickstartSection() {
   const [liveTradeLoading, setLiveTradeLoading] = useState<boolean>(false)
   // Connection the quickstart actually bound to on last start (or the
   // component default) — used as the target for the Live toggle.
-  const [activeConnectionId, setActiveConnectionId] = useState<string>(connectionId)
+  const [activeConnectionId, setActiveConnectionId] = useState<string>(connectionId ?? "")
 
   // ── Indication configuration Set-count snapshot (static enumeration) ─
   // Pulled from /api/indications/config-counts. Refreshed every 60s since it
@@ -308,13 +374,21 @@ export function QuickstartSection() {
   const [liveSummary, setLiveSummary] = useState<ExchangeLiveSummary | null>(null)
 
   const logsEndRef = useRef<HTMLDivElement>(null)
-  const pollRef    = useRef<NodeJS.Timeout>()
-  const configPollRef = useRef<NodeJS.Timeout>()
-  const livePollRef   = useRef<NodeJS.Timeout>()
+  // `useRef<T>()` with no argument is rejected by stricter `@types/react`
+  // versions ("Expected 1 arguments, but got 0"). Pass an explicit
+  // `undefined` initial value so the call shape is unambiguous.
+  const pollRef       = useRef<NodeJS.Timeout | undefined>(undefined)
+  const configPollRef = useRef<NodeJS.Timeout | undefined>(undefined)
+  const livePollRef   = useRef<NodeJS.Timeout | undefined>(undefined)
 
   // ── fetch live stats ──────────────────────────────────────────────────────
   const fetchStats = useCallback(async (silent = false) => {
-    if (!connectionId) return
+    // No connection selected yet — clear stats and bail rather than
+    // polling a nonexistent id and getting confusing 404s.
+    if (!connectionId) {
+      setStats(EMPTY_STATS)
+      return
+    }
     if (!silent) setLoadingStats(true)
     try {
       // Primary: /stats endpoint (full breakdown)
@@ -415,6 +489,13 @@ export function QuickstartSection() {
         historicFrames:        s.historic?.framesProcessed     || 0,
         historicFramesMissing: s.historic?.framesMissingLoaded || 0,
         historicTimeframeSec:  s.historic?.timeframeSeconds    || 1,
+        // Historic PF + Executed Positions — spec-mandated overview metrics.
+        // Both fall back to 0 silently when the engine hasn't produced
+        // closed prehistoric positions or live exchange orders yet, so
+        // the QuickStart strip renders "—" instead of misleading zeros.
+        historicAvgProfitFactor:      Number(s.historic?.avgProfitFactor)      || 0,
+        historicAvgProfitFactorCount: Number(s.historic?.avgProfitFactorCount) || 0,
+        executedPositions:            Number(s.historic?.executedPositions)    || 0,
         indicationCycles:      indCycles,
         strategyCycles:        stratCycles,
         realtimeCycles:        s.realtime?.realtimeCycles      || 0,
@@ -459,7 +540,26 @@ export function QuickstartSection() {
         pseudoOpen:            Number(s.openPositions?.pseudo?.open)         || 0,
         pseudoRunningSets:     Number(s.openPositions?.pseudo?.runningSets)  || 0,
         realOpen:              Number(s.openPositions?.real?.open)           || 0,
-        liveVolumeUsd:         Number(s.openPositions?.live?.volumeUsd)      || 0,
+        // True running mean of active validated Real positions —
+        // unbounded, accumulated server-side across stats fetches.
+        // Used by the "Avg Real Pos" tile in place of the bounded
+        // `stageReal.avgPosPerSet` ratio (which caps at 250).
+        realActivePosAvg:      Number(s.openPositions?.real?.activeAvg)      || 0,
+        realActivePosSamples:  Number(s.openPositions?.real?.activeSamples)  || 0,
+        // Active Progressing — per indication type and per strategy
+        // stage. Defaults silently to empty objects so the dashboard
+        // never crashes when the API hasn't shipped the new block yet
+        // (e.g. zero-arg upgrade window).
+        apIndications: (s.activeProgressing?.indications || {}) as ActiveProgressingByName,
+        apStrategies:  (s.activeProgressing?.strategies  || {}) as ActiveProgressingByName,
+        // USDT figure on the QuickStart strip is the **used balance**
+        // (margin actually committed to live exchange positions), NOT
+        // the leveraged notional. We prefer the new `marginUsd` field
+        // and fall back to legacy `volumeUsd` when the server hasn't
+        // emitted it yet (cumulative counter empty + no live positions).
+        liveVolumeUsd:         Number(s.openPositions?.live?.marginUsd)
+                                 || Number(s.openPositions?.live?.volumeUsd)
+                                 || 0,
         indLast5m:             s.windows?.indications?.last5m     || 0,
         indLast60m:            s.windows?.indications?.last60m    || 0,
         phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
@@ -550,7 +650,7 @@ export function QuickstartSection() {
     return () => clearInterval(configPollRef.current)
   }, [expanded])
 
-  // ── Poll live exchange summary (positions + balance) ──────────────────────
+  // ── Poll live exchange summary (positions + balance) ���─────────────────────
   // 10s when expanded, 30s otherwise. Kept lightweight — this endpoint just
   // reads already-materialised Redis hashes, so frequent polling is fine.
   useEffect(() => {
@@ -566,13 +666,21 @@ export function QuickstartSection() {
     return () => clearInterval(livePollRef.current)
   }, [expanded])
 
-  // ── log helper ─────────────────────────────────────────────────────────────
+  // ── log helper ──────────────────────────────────────���──────────────────────
   const addLog = (msg: string, type: LogEntry["type"] = "info") =>
     setLogs(prev => [...prev, { id: Math.random().toString(), message: msg, type, timestamp: new Date() }])
 
-  // ── start / stop ─────────────────────────────────────────��─────────────────
+  // ── start / stop ���───────────────────────────────────────������─────────────────
   const handleStart = async () => {
     if (starting || isRunning) return
+
+    // Hard guard: a connection must be explicitly selected before starting.
+    // No silent fallback to a random connection — the operator must pick one.
+    if (!selectedConnectionId) {
+      addLog("Select a connection first — use the connection picker above", "warning")
+      return
+    }
+
     setStarting(true)
     setLogs([])
     addLog("Initializing connection...", "info")
@@ -581,19 +689,10 @@ export function QuickstartSection() {
       if (!connRes.ok) throw new Error("Failed to get connections")
       const data = await connRes.json()
       const conns: any[] = Array.isArray(data) ? data : (data?.connections || [])
-      const isActive = (c: any) =>
-        c.is_active_inserted === "1" || c.is_active_inserted === true ||
-        c.is_assigned === "1" || c.is_assigned === true ||
-        c.is_active === "1" || c.is_active === true ||
-        c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true
 
-      // Always use the exchange-selected connection first
-      const conn =
-        conns.find(c => c.id === selectedConnectionId) ||
-        conns.find(c => isActive(c) && (c.exchange || "").toLowerCase() === (selectedExchange || "").toLowerCase()) ||
-        conns.find(c => isActive(c)) ||
-        conns[0]
-      if (!conn) throw new Error("No active connections found")
+      // Use ONLY the explicitly selected connection — no fallback.
+      const conn = conns.find(c => c.id === selectedConnectionId)
+      if (!conn) throw new Error(`Selected connection not found (id: ${selectedConnectionId}). Try refreshing.`)
       addLog(`Connected to ${conn.exchange?.toUpperCase() || "exchange"}`, "success")
       setActiveConnectionId(conn.id)
       // Seed live state from whatever the connection already says
@@ -652,8 +751,29 @@ export function QuickstartSection() {
 
   const handleStop = async () => {
     addLog("Stopping engine...", "info")
-    setIsRunning(false)
-    addLog("Engine stopped", "success")
+    try {
+      // Determine which connection to stop — prefer the one we actually
+      // started with over the component default so the right engine is
+      // targeted when the user changed the selection mid-run.
+      const targetId = activeConnectionId || connectionId
+      const res = await fetch("/api/trade-engine/quick-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "disable", connectionId: targetId }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({} as any))
+        addLog(`Stop warning: ${body?.error || res.statusText} (engine may already be stopped)`, "warning")
+      } else {
+        addLog("Engine stopped", "success")
+      }
+    } catch (err) {
+      addLog(`Stop error: ${err instanceof Error ? err.message : String(err)}`, "error")
+    } finally {
+      setIsRunning(false)
+      // Refresh stats after stop so counters reset to idle state.
+      setTimeout(() => void fetchStats(true), 800)
+    }
   }
 
   const handleRefresh = async () => {
@@ -661,8 +781,15 @@ export function QuickstartSection() {
     await fetchStats(true)
     await refreshLiveTradeStatus()
   }
+  // NOTE: the `quickstart:refresh` window-event listener that re-runs
+  // loadSymbol/fetchStats/refreshLiveTradeStatus lives further down,
+  // immediately after `refreshLiveTradeStatus` is declared — a previous
+  // version placed it here and crashed with a TDZ error
+  // ("Cannot access 'refreshLiveTradeStatus' before initialization")
+  // because the dependency array is evaluated synchronously during
+  // render, before the `useCallback` further down has executed.
 
-  // ── live-trade toggle ─────────────────────────────────────────────────────
+  // ── live-trade toggle ─────────────────────────────────────���───────────────
   // Enables or disables real exchange trading for the active connection via
   // /api/settings/connections/[id]/live-trade. The server validates that
   // credentials exist and starts the independent live-trade engine.
@@ -724,6 +851,27 @@ export function QuickstartSection() {
     refreshLiveTradeStatus()
   }, [refreshLiveTradeStatus])
 
+  // ── External `quickstart:refresh` listener ─────────────────────────────
+  // The `QuickstartConnectionControls` strip (mounted at the top of the
+  // card) dispatches a `quickstart:refresh` window event after the
+  // operator adds a base connection or runs Reset DB, so this section
+  // re-fetches volatile-symbol pick, stats, and live-trade flag without
+  // requiring a manual Refresh click. Placed after `refreshLiveTradeStatus`
+  // is declared to avoid the TDZ crash mentioned above.
+  useEffect(() => {
+    const handler = () => {
+      // Fire and forget — each wrapped function guards against
+      // concurrent invocations internally (`loadSymbol` has a ref-based
+      // guard, `fetchStats` is debounced, and `refreshLiveTradeStatus`
+      // is idempotent).
+      void loadSymbol(true)
+      void fetchStats(true)
+      void refreshLiveTradeStatus()
+    }
+    window.addEventListener("quickstart:refresh", handler)
+    return () => window.removeEventListener("quickstart:refresh", handler)
+  }, [loadSymbol, fetchStats, refreshLiveTradeStatus])
+
   const logColor = (type: string) => {
     switch (type) {
       case "success": return "text-green-600 dark:text-green-400"
@@ -744,6 +892,17 @@ export function QuickstartSection() {
 
   return (
     <Card className="border-primary/20 overflow-hidden">
+      {/* ── connection picker + Reset DB strip ──────────────────────────────
+          Sits ABOVE the engine status header so the operator can:
+            • see at-a-glance which base connections are in the Active
+              panel (and add more directly without leaving QuickStart),
+            • clear runtime DB state in one click before starting a fresh
+              QuickStart run.
+          The component is self-fetching and emits `connections:refresh`
+          + `quickstart:refresh` events on success so this section's own
+          pollers (further down) pick the changes up immediately. */}
+      <QuickstartConnectionControls />
+
       {/* ── compact header bar ─────────────────────────────────────────────── */}
       <div className="flex items-center gap-2 px-3 py-2 bg-primary/5 border-b border-primary/10">
         {/* status dot + label */}
@@ -786,7 +945,8 @@ export function QuickstartSection() {
             size="sm"
             variant={isRunning ? "destructive" : "default"}
             onClick={isRunning ? handleStop : handleStart}
-            disabled={starting || volatileSymbol.loading}
+            disabled={starting || volatileSymbol.loading || (!isRunning && !selectedConnectionId)}
+            title={!selectedConnectionId && !isRunning ? "Select a connection first" : undefined}
             className="h-7 text-xs px-2.5 gap-1"
           >
             {starting ? <Loader2 className="w-3 h-3 animate-spin" /> : isRunning ? <StopCircle className="w-3 h-3" /> : <Play className="w-3 h-3" />}
@@ -794,11 +954,13 @@ export function QuickstartSection() {
               ? "Starting..."
               : isRunning
                 ? "Stop"
-                : volatileSymbol.symbol
-                  ? symbolCount === 1
-                    ? `Start (${volatileSymbol.symbol})`
-                    : `Start (top ${symbolCount})`
-                  : "Start Engine"}
+                : !selectedConnectionId
+                  ? "Select Connection"
+                  : volatileSymbol.symbol
+                    ? symbolCount === 1
+                      ? `Start (${volatileSymbol.symbol})`
+                      : `Start (top ${symbolCount})`
+                    : "Start Engine"}
           </Button>
 
           {/* Symbol count selector — controls how many top-volatile symbols the quickstart processes. */}
@@ -961,21 +1123,115 @@ export function QuickstartSection() {
                 sub={stats.historicFramesMissing > 0 ? `${fmt(stats.historicFramesMissing)} new` : undefined}
               />
             )}
-            {stats.historicCandles > 0 && (
-              <MiniStat label="Candles" value={fmt(stats.historicCandles)} />
-            )}
+            {/* "Candles" tile intentionally omitted — it duplicated the
+                250-set per-Set DB capacity counter shown elsewhere and
+                wasn't a true candle count, just confusing the operator. */}
             {stats.historicIndicators > 0 && (
               <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
             )}
-            <MiniStat label="P-Cycles" value={fmt(stats.historicCycles)} />
+            {/* P-Cycles tile reflects the cycle-frame work magnitude, not
+                symbol count. Value = cycles × frames (the high-magnitude
+                number the operator sees grow during prehistoric processing).
+                Falls back to plain `historicCycles` only when no frames
+                have been counted yet (very early in a run) so we never
+                display a misleading "0" for non-zero work. */}
+            <MiniStat
+              label="P-Cycles"
+              value={
+                stats.historicFrames > 0 && stats.historicCycles > 0
+                  ? fmt(stats.historicCycles * stats.historicFrames)
+                  : fmt(stats.historicCycles)
+              }
+              sub={
+                stats.historicFrames > 0 && stats.historicCycles > 0
+                  ? `${fmt(stats.historicCycles)}×${fmt(stats.historicFrames)}`
+                  : undefined
+              }
+            />
+            {/* Base PF — average Profit Factor across ALL closed Base
+                pseudo positions in the prehistoric run, computed from
+                `historicAvgProfitFactor` (sum(+pct) / |sum(-pct)| over
+                every closed prehistoric position). Switched away from
+                the per-stage `stageBase.avgProfitFactor` because the
+                spec asks for the overall pseudo-position aggregate, not
+                the strategy-stage-specific number. */}
+            <MiniStat
+              label="Base PF"
+              value={
+                stats.historicAvgProfitFactor > 0
+                  ? stats.historicAvgProfitFactor.toFixed(2)
+                  : "—"
+              }
+              sub={
+                stats.historicAvgProfitFactorCount > 0
+                  ? `n=${fmt(stats.historicAvgProfitFactorCount)}`
+                  : undefined
+              }
+            />
+            {/* Avg Real Pos — true running mean of currently-active
+                validated Real-stage positions (unbounded). Sourced
+                from `realActivePosAvg`, NOT `stageReal.avgPosPerSet`:
+                the latter is mathematically capped at the per-set
+                250-entry DB capacity (entries/sets ≤ 250) and would
+                always be ≤ 250 even when the operator has many
+                hundreds of validated positions in flight. The new
+                source accumulates `realOpen` samples server-side
+                and is reset by ResetDB. 0 samples ⇒ render "—". */}
+            <MiniStat
+              label="Avg Real Pos"
+              value={
+                stats.realActivePosSamples > 0 && stats.realActivePosAvg > 0
+                  ? stats.realActivePosAvg.toFixed(2)
+                  : "—"
+              }
+              sub={
+                stats.realActivePosSamples > 0
+                  ? `n=${fmt(stats.realActivePosSamples)}`
+                  : undefined
+              }
+            />
+            {/* Real Positions — currently active, valid, opened
+                Real-stage strategies (snapshot from openPositions.real.open). */}
+            {stats.realOpen > 0 && (
+              <MiniStat
+                label="Real Pos"
+                value={fmt(stats.realOpen)}
+                sub="active"
+              />
+            )}
           </div>
         </div>
 
-        {/* ── live processing row (always visible, AFTER historical) ───── */}
+        {/* ── live processing row (always visible, AFTER historical) ─────
+              Indications / Strategies tiles now show the count of
+              ACTIVELY-PROCESSING Sets — the headline operator metric for
+              "what's alive RIGHT NOW" — instead of the cumulative
+              `indicationsTotal` / `strategiesTotal` counters that grew
+              forever even when the engine was idle. The cumulative
+              total is preserved as the `sub` so it's still visible in
+              one glance. Source = `apIndications.total.sets` and
+              `apStrategies.total.sets` from `activeProgressing.*` of
+              the /stats response. */}
         <div className="flex flex-wrap gap-1.5">
           <MiniStat label="Ind Cycles"   value={fmt(stats.indicationCycles)}  />
-          <MiniStat label="Indications"  value={fmt(stats.indicationsTotal)}   />
-          <MiniStat label="Strategies"   value={fmt(stats.strategiesTotal)}    />
+          <MiniStat
+            label="Indications"
+            value={fmt(stats.apIndications?.total?.sets ?? 0)}
+            sub={
+              stats.indicationsTotal > 0
+                ? `${fmt(stats.indicationsTotal)} total`
+                : "active sets"
+            }
+          />
+          <MiniStat
+            label="Strategies"
+            value={fmt(stats.apStrategies?.total?.sets ?? 0)}
+            sub={
+              stats.strategiesTotal > 0
+                ? `${fmt(stats.strategiesTotal)} total`
+                : "active sets"
+            }
+          />
           <MiniStat label="Positions"    value={fmt(stats.positionsOpen)}      />
           {/* Live positions — real exchange positions mirrored by the live engine.
               Always shown (even at 0) so users can see the counter spin up. */}
@@ -1064,9 +1320,12 @@ export function QuickstartSection() {
               </div>
               <div
                 className="flex flex-col gap-0.5"
-                title="Cumulative live-trade USD volume transacted on the exchange (the only authoritative exposure figure)."
+                title={
+                  "USDT used balance — the actual capital committed to live exchange positions " +
+                  "(margin = sum of notional/leverage). NOT the leveraged notional exposure."
+                }
               >
-                <span className="text-muted-foreground">Live Volume</span>
+                <span className="text-muted-foreground">USDT</span>
                 <span className="font-bold text-amber-700 dark:text-amber-400 tabular-nums">
                   {fmtUsd(stats.liveVolumeUsd)}
                 </span>
@@ -1097,7 +1356,23 @@ export function QuickstartSection() {
               )}
               <div className="flex flex-wrap gap-1.5">
                 <MiniStat label="Symbols"    value={`${stats.historicSymbols}/${stats.historicSymbolsTotal}`} />
-                <MiniStat label="Preh Cycles" value={fmt(stats.historicCycles)} />
+                {/* Preh Cycles → cycle-frame work magnitude (cycles × frames).
+                    Replaces the previous symbol-magnitude display. Subtitle
+                    keeps the breakdown visible so the operator can read
+                    both counters at a glance. */}
+                <MiniStat
+                  label="Preh Cycles"
+                  value={
+                    stats.historicCycles > 0 && stats.historicFrames > 0
+                      ? fmt(stats.historicCycles * stats.historicFrames)
+                      : fmt(stats.historicCycles)
+                  }
+                  sub={
+                    stats.historicCycles > 0 && stats.historicFrames > 0
+                      ? `${fmt(stats.historicCycles)}×${fmt(stats.historicFrames)}`
+                      : undefined
+                  }
+                />
                 {stats.historicFrames > 0 && (
                   <MiniStat
                     label={`Frames ${stats.historicTimeframeSec}s`}
@@ -1105,11 +1380,63 @@ export function QuickstartSection() {
                     sub={stats.historicFramesMissing > 0 ? `${fmt(stats.historicFramesMissing)} missing` : undefined}
                   />
                 )}
-                {stats.historicCandles > 0 && (
-                  <MiniStat label="Candles" value={fmt(stats.historicCandles)} />
-                )}
+                {/* "Candles" tile intentionally omitted — it duplicated the
+                    250-set per-Set DB capacity counter and wasn't a true
+                    candle count. See note in the always-visible row above. */}
                 {stats.historicIndicators > 0 && (
                   <MiniStat label="Indicators" value={fmt(stats.historicIndicators)} />
+                )}
+                {/* ── Spec-mandated Historic overview tiles ──────────────
+                      • ExecPos — cumulative live exchange positions created.
+                      • Base PF — overall Profit Factor across all closed
+                        Base pseudo positions in the prehistoric run
+                        (sum(+pct)/|sum(-pct)|). Sourced from
+                        `historicAvgProfitFactor`, not the per-stage
+                        Base aggregate.
+                      • Avg Real Pos — average open validated positions
+                        per Real-stage set (`stageReal.avgPosPerSet`).
+                      • Real Pos — currently active Real-stage strategies
+                        with valid, opened positions (snapshot). */}
+                <MiniStat
+                  label="Exec Pos"
+                  value={fmt(stats.executedPositions)}
+                  sub={stats.livePositionsOpen > 0 ? `${fmt(stats.livePositionsOpen)} open` : undefined}
+                />
+                <MiniStat
+                  label="Base PF"
+                  value={
+                    stats.historicAvgProfitFactor > 0
+                      ? stats.historicAvgProfitFactor.toFixed(2)
+                      : "—"
+                  }
+                  sub={
+                    stats.historicAvgProfitFactorCount > 0
+                      ? `n=${fmt(stats.historicAvgProfitFactorCount)}`
+                      : undefined
+                  }
+                />
+                {/* See the always-visible row above for the rationale —
+                    `realActivePosAvg` is unbounded, `stageReal.avgPosPerSet`
+                    is capped at 250 by the per-set entry DB cap. */}
+                <MiniStat
+                  label="Avg Real Pos"
+                  value={
+                    stats.realActivePosSamples > 0 && stats.realActivePosAvg > 0
+                      ? stats.realActivePosAvg.toFixed(2)
+                      : "—"
+                  }
+                  sub={
+                    stats.realActivePosSamples > 0
+                      ? `n=${fmt(stats.realActivePosSamples)}`
+                      : undefined
+                  }
+                />
+                {stats.realOpen > 0 && (
+                  <MiniStat
+                    label="Real Pos"
+                    value={fmt(stats.realOpen)}
+                    sub="active"
+                  />
                 )}
               </div>
             </div>
@@ -1131,8 +1458,28 @@ export function QuickstartSection() {
                 {stats.realtimeCycles > 0 && (
                   <MiniStat label="RT Cycles" value={fmt(stats.realtimeCycles)} />
                 )}
-                <MiniStat label="Indications" value={fmt(stats.indicationsTotal)} sub={stats.indicationCycles > 0 ? `${(stats.indicationsTotal / Math.max(stats.indicationCycles, 1)).toFixed(1)}/cyc` : undefined} />
-                <MiniStat label="Strategies"  value={fmt(stats.strategiesTotal)}  sub={stats.strategyCycles > 0 ? `${(stats.strategiesTotal / Math.max(stats.strategyCycles, 1)).toFixed(1)}/cyc` : undefined} />
+                {/* Active processing Sets — see note in the compact row.
+                    Sub shows cumulative-per-cycle ratio so the operator
+                    can still see the throughput rate (which is what
+                    the previous total/cycle ratio expressed). */}
+                <MiniStat
+                  label="Indications"
+                  value={fmt(stats.apIndications?.total?.sets ?? 0)}
+                  sub={
+                    stats.indicationCycles > 0 && stats.indicationsTotal > 0
+                      ? `${(stats.indicationsTotal / Math.max(stats.indicationCycles, 1)).toFixed(1)}/cyc`
+                      : "active sets"
+                  }
+                />
+                <MiniStat
+                  label="Strategies"
+                  value={fmt(stats.apStrategies?.total?.sets ?? 0)}
+                  sub={
+                    stats.strategyCycles > 0 && stats.strategiesTotal > 0
+                      ? `${(stats.strategiesTotal / Math.max(stats.strategyCycles, 1)).toFixed(1)}/cyc`
+                      : "active sets"
+                  }
+                />
               </div>
             </div>
 
@@ -1261,6 +1608,55 @@ export function QuickstartSection() {
                   )
                 })}
               </div>
+
+              {/* ── Indications: Active Progressing breakdown ─────────────
+                  Per spec: surface per-type "Active Progressing Sets,
+                  trackings, active positions". `sets` is distinct
+                  (symbol×type) pairs producing qualified entries on the
+                  latest cycle; `trackings` is cumulative entries observed;
+                  `positions` is the indication slots currently filled.
+                  Shown only when the API surfaced the block (graceful
+                  degradation for older servers). */}
+              {stats.apIndications && Object.keys(stats.apIndications).length > 0 && (
+                <div className="rounded bg-muted/30 border border-border/30 p-1.5 mt-1">
+                  <div className="flex items-center justify-between text-[9px] text-muted-foreground/80 mb-1 px-1">
+                    <span className="uppercase tracking-wide font-semibold">Active Progressing</span>
+                    <span className="tabular-nums">
+                      {fmt(stats.apIndications.total?.sets ?? 0)} sets ·
+                      {" "}{fmt(stats.apIndications.total?.trackings ?? 0)} tracked ·
+                      {" "}{fmt(stats.apIndications.total?.positions ?? 0)} pos
+                    </span>
+                  </div>
+                  <table className="w-full text-[10px] tabular-nums">
+                    <thead>
+                      <tr className="text-muted-foreground/70 border-b border-border/30">
+                        <th className="text-left py-0.5 pr-1 font-medium">Type</th>
+                        <th className="text-right py-0.5 px-1 font-medium" title="Distinct (symbol × type) Sets producing qualified entries on the latest cycle.">Sets</th>
+                        <th className="text-right py-0.5 px-1 font-medium" title="Cumulative entries tracked across all Sets of this type since run start.">Trackings</th>
+                        <th className="text-right py-0.5 pl-1 font-medium" title="Indications currently passing thresholds (slots actively held).">Pos</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(["direction", "move", "active", "activeAdvanced", "optimal", "auto"] as const).map((k) => {
+                        const r = stats.apIndications[k] ?? EMPTY_AP_ROW
+                        if (r.sets === 0 && r.trackings === 0 && r.positions === 0) return null
+                        const labelMap: Record<string, string> = {
+                          direction: "Direction", move: "Move", active: "Active",
+                          activeAdvanced: "Active Adv", optimal: "Optimal", auto: "Auto",
+                        }
+                        return (
+                          <tr key={k} className="border-b border-border/20 last:border-0">
+                            <td className="text-left py-0.5 pr-1 text-muted-foreground capitalize">{labelMap[k]}</td>
+                            <td className="text-right py-0.5 px-1 font-medium text-violet-700 dark:text-violet-300">{fmt(r.sets)}</td>
+                            <td className="text-right py-0.5 px-1">{fmt(r.trackings)}</td>
+                            <td className="text-right py-0.5 pl-1 font-medium">{fmt(r.positions)}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
 
             {/* strategies breakdown
@@ -1300,6 +1696,56 @@ export function QuickstartSection() {
                   </div>
                 ))}
               </div>
+
+              {/* ── Strategies: Active Progressing breakdown ─────────────
+                  Per-stage view of Sets/Trackings/Positions currently
+                  alive. `Sets` reflects distinct (symbol×stage) pools
+                  producing qualified entries this cycle. `Positions`
+                  follows the mirroring pipeline:
+                    base/main → pseudoOpen
+                    real      → realOpen (Real-stage promotions)
+                    live      → exchange open (created − closed) */}
+              {stats.apStrategies && Object.keys(stats.apStrategies).length > 0 && (
+                <div className="rounded bg-muted/30 border border-border/30 p-1.5 mt-1">
+                  <div className="flex items-center justify-between text-[9px] text-muted-foreground/80 mb-1 px-1">
+                    <span className="uppercase tracking-wide font-semibold">Active Progressing</span>
+                    <span className="tabular-nums">
+                      {fmt(stats.apStrategies.total?.sets ?? 0)} sets ·
+                      {" "}{fmt(stats.apStrategies.total?.trackings ?? 0)} tracked ·
+                      {" "}{fmt(stats.apStrategies.total?.positions ?? 0)} pos
+                    </span>
+                  </div>
+                  <table className="w-full text-[10px] tabular-nums">
+                    <thead>
+                      <tr className="text-muted-foreground/70 border-b border-border/30">
+                        <th className="text-left py-0.5 pr-1 font-medium">Stage</th>
+                        <th className="text-right py-0.5 px-1 font-medium" title="Distinct (symbol × stage) Sets producing qualified entries on the latest cycle.">Sets</th>
+                        <th className="text-right py-0.5 px-1 font-medium" title="Cumulative entries tracked across all Sets of this stage since run start.">Trackings</th>
+                        <th className="text-right py-0.5 pl-1 font-medium" title="Open positions held at this stage right now (pseudo for base/main, Real-stage for real, exchange-open for live).">Pos</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {([
+                        { key: "base", label: "Base", color: "text-orange-600 dark:text-orange-400" },
+                        { key: "main", label: "Main", color: "text-yellow-600 dark:text-yellow-400" },
+                        { key: "real", label: "Real", color: "text-green-600 dark:text-green-400" },
+                        { key: "live", label: "Live", color: "text-blue-600 dark:text-blue-400" },
+                      ] as const).map(({ key, label, color }) => {
+                        const r = stats.apStrategies[key] ?? EMPTY_AP_ROW
+                        if (r.sets === 0 && r.trackings === 0 && r.positions === 0) return null
+                        return (
+                          <tr key={key} className="border-b border-border/20 last:border-0">
+                            <td className={`text-left py-0.5 pr-1 font-semibold ${color}`}>{label}</td>
+                            <td className="text-right py-0.5 px-1 font-medium">{fmt(r.sets)}</td>
+                            <td className="text-right py-0.5 px-1">{fmt(r.trackings)}</td>
+                            <td className="text-right py-0.5 pl-1 font-medium">{fmt(r.positions)}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
 
             {/* ── Strategy Stages — detailed per-stage metrics ───────────

@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { flushAll, getRedisClient, initRedis } from "@/lib/redis-db"
 import { runMigrations } from "@/lib/redis-migrations"
 import { SystemLogger } from "@/lib/system-logger"
+import { stopAllProgressionsBeforeReset } from "@/lib/db-reset-helper"
 
 export const runtime = "nodejs"
 
@@ -33,6 +34,29 @@ export async function POST(request: NextRequest) {
     } catch (error) {
       logs.push(`✗ Redis connection failed: ${error}`)
       throw new Error("Redis connection failed")
+    }
+
+    // Step 1.5: Stop ALL progressions BEFORE wiping the DB
+    // (engines, interval timers, stale __engine_timers, mark global stopped)
+    // This prevents an in-flight tick from repopulating progression rows /
+    // counter keys between FLUSHALL and migration replay.
+    try {
+      const stopResult = await stopAllProgressionsBeforeReset()
+      logs.push(
+        `✓ Stopped progressions before flush ` +
+        `(coordinator=${stopResult.coordinator_stopped}, ` +
+        `intervals=${stopResult.interval_manager_stopped}, ` +
+        `timers_cleared=${stopResult.engine_timers_cleared}, ` +
+        `global_marked=${stopResult.global_state_marked_stopped})`
+      )
+      if (stopResult.errors.length > 0) {
+        logs.push(`⚠ Non-fatal stop errors: ${stopResult.errors.join("; ")}`)
+      }
+      console.log("[v0] Progressions stopped before flush:", stopResult)
+    } catch (error) {
+      // Non-fatal: a crashed coordinator should not block the operator
+      // from resetting state. Log and continue.
+      logs.push(`⚠ stop-progressions warning: ${error}`)
     }
 
     // Step 2: Flush all data

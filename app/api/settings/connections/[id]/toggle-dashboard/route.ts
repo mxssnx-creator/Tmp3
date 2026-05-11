@@ -99,8 +99,36 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       if (enableMain) {
         const coordinator = getGlobalTradeEngineCoordinator()
         if (!coordinator.isEngineRunning(resolvedId)) {
-          engineAction = "start" // Ensure engine is started if it is unexpectedly down
-          console.log(`[v0] [Toggle] Already enabled - engine not running, starting...`)
+          // ── Minimal anti-burst guard (2 s) ───────────────────────────
+          // The hard anti-flap guarantees already live in the coordinator
+          // (`startingEngines` mutex + progression-lock self-heal), which
+          // make a second `startEngine` during an in-flight start a safe
+          // no-op. This tiny 2 s window is purely cosmetic: it absorbs
+          // rapid-fire polls from the dashboard (every ~8 s) and any
+          // accidental double-click on the toggle so we don't spam
+          // `startEngine` from MULTIPLE requests in the SAME tick. A
+          // genuine user toggle to enable/disable goes through the
+          // `needsUpdate` branch above and is NEVER throttled.
+          const cooldownKey = `engine_restart_cooldown:${resolvedId}`
+          const cooldownClient = getRedisClient()
+          const lastRestartRaw = await cooldownClient.get(cooldownKey).catch(() => null)
+          const lastRestartMs = Number(lastRestartRaw)
+          const RESTART_COOLDOWN_MS = 2_000
+          if (Number.isFinite(lastRestartMs) && Date.now() - lastRestartMs < RESTART_COOLDOWN_MS) {
+            console.log(
+              `[v0] [Toggle] Already enabled - engine not running but restart attempted ${Date.now() - lastRestartMs}ms ago; skipping (burst guard)`,
+            )
+          } else {
+            engineAction = "start"
+            try {
+              // Short TTL so the key self-cleans well before the next
+              // legitimate restart could fire.
+              await cooldownClient.set(cooldownKey, String(Date.now()), { EX: 5 })
+            } catch {
+              /* best-effort */
+            }
+            console.log(`[v0] [Toggle] Already enabled - engine not running, starting...`)
+          }
         } else {
           console.log(`[v0] [Toggle] Already enabled - engine already running, no restart`)
         }

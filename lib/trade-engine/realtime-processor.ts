@@ -17,7 +17,7 @@
  * NOW: 100% Redis-backed, no SQL.
  */
 
-import { getSettings, setSettings, getRedisClient } from "@/lib/redis-db"
+import { getRedisClient } from "@/lib/redis-db"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { StrategyConfigManager, type PseudoPosition } from "@/lib/strategy-config-manager"
@@ -210,26 +210,34 @@ export class RealtimeProcessor {
       if (countChanged || heartbeatDue) {
         const stateKey = `trade_engine_state:${this.connectionId}`
         try {
-          if (countChanged) {
-            // Only re-fetch the state hash when we actually need to merge a
-            // new count. The heartbeat-only path uses hset to touch two
-            // fields without read-modify-write.
-            const engineState = (await getSettings(stateKey)) || {}
-            await setSettings(stateKey, {
-              ...engineState,
-              active_positions_count: count,
-              last_realtime_run: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-              realtime_processor_active: true,
-            })
-          } else {
-            const client = getRedisClient()
-            await client.hset(stateKey, {
-              last_realtime_run: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-              realtime_processor_active: "true",
-            })
+          // ── Atomic heartbeat write (P0-3 race fix) ─────────────────
+          // Both branches now use direct field-level hset — no
+          // getSettings + spread merge. Previously the `countChanged`
+          // branch did a read-modify-write that could clobber field
+          // updates from concurrent writers (PseudoPositionManager.create
+          // / close, engine startup, watchdog re-arm) between our read
+          // and our write. With Redis hash semantics the rewrite was
+          // technically a per-field merge, but the RE-WRITTEN fields
+          // came from the stale read snapshot, silently losing other
+          // writers' progress.
+          //
+          // Now: hset only the fields THIS cycle actually owns
+          // (active_positions_count, last_realtime_run, updated_at,
+          // realtime_processor_active). Every other field on the hash
+          // — symbols, prehistoric flags, started_at, etc. — is
+          // preserved untouched, regardless of who wrote it last.
+          const client = getRedisClient()
+          const fields: Record<string, string> = {
+            last_realtime_run: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            realtime_processor_active: "true",
           }
+          if (countChanged) {
+            // Only stamp the count when we know it changed — saves
+            // pointless writes on the heartbeat-only path.
+            fields.active_positions_count = String(count)
+          }
+          await client.hset(stateKey, fields)
           this.lastPositionsCount = count
           this.lastHeartbeatAt = now
         } catch (hbErr) {
@@ -268,6 +276,40 @@ export class RealtimeProcessor {
           this.processPosition(position, prehistoricReady),
         ),
       )
+
+      // ── Cross-tick visibility for the "open positions are being
+      //    handled independent of indication/strategy" guarantee ─────
+      // Spec: open pseudo positions inside the multiple Sets must get
+      // mark-to-market refreshed on EVERY realtime cycle, before/
+      // independent of indication+strategy ticks. We already do that
+      // above (this is the only writer of `updatePosition` inside
+      // trade-engine — verified by grep), but the dashboard needed a
+      // way to *see* that it was firing without sampling individual
+      // position hashes. We surface two atomic counters:
+      //
+      //   pseudo_positions_updated_count : cumulative position-tick events
+      //                                    (= sum of `updates` across ticks)
+      //   pseudo_positions_update_cycles : cumulative realtime cycles that
+      //                                    actually touched ≥1 position
+      //
+      // These are independent of the existing realtime_*_cycle_count
+      // family (which tracks tick existence regardless of work).
+      try {
+        const client = getRedisClient()
+        const progKey = `progression:${this.connectionId}`
+        await Promise.all([
+          client.hincrby(progKey, "pseudo_positions_updated_count", count),
+          client.hincrby(progKey, "pseudo_positions_update_cycles", 1),
+          client.hset(progKey, {
+            pseudo_positions_last_update_at: new Date().toISOString(),
+            pseudo_positions_last_count: String(count),
+          }),
+          client.expire(progKey, 7 * 24 * 60 * 60),
+        ])
+      } catch {
+        // Non-critical visibility metric — never break the realtime loop.
+      }
+
       return { updates: count }
     } catch (error) {
       console.error("[v0] Failed to process realtime updates:", error)
@@ -349,7 +391,7 @@ export class RealtimeProcessor {
       // feeding the decision.
       if (Math.random() < 0.01) { // Log ~1% of cycles
         const prevTag = prevSetPos
-          ? ` | prevSet=${prevSetPos.status}/${prevSetPos.result.toFixed(2)}`
+          ? ` | prevSet=${prevSetPos.status}/${(prevSetPos.result ?? 0).toFixed(2)}`
           : " | prevSet=none"
         console.log(
           `[v0] [Realtime] Monitoring ${position.symbol} ${side}: ` +
@@ -417,78 +459,283 @@ export class RealtimeProcessor {
   }
 
   /**
-   * Check if take profit should be triggered
+   * Check if take profit should be triggered.
+   *
+   * **Source of truth**: prefer the *assigned* `takeprofit_price` stored
+   * on the position hash at creation time. That value is the SAME one
+   * placed on the exchange for the corresponding live position, so this
+   * pseudo-evaluator and the exchange's own TP order will fire on the
+   * exact same threshold — no drift between the two.
+   *
+   * Recomputing from `(entry_price × takeprofit_factor%)` on every tick
+   * (the legacy behaviour) was numerically equivalent for unaltered
+   * positions, but if the assigned percent was ever overridden after
+   * creation the two paths would silently diverge. The assigned price
+   * is the definitive contract.
+   *
+   * Falls back to the percent-based recompute only when the stored
+   * `takeprofit_price` is absent — preserves back-compat with legacy
+   * position hashes opened before this field was persisted.
    */
   private shouldCloseTakeProfit(position: any, currentPrice: number): boolean {
-    const entryPrice = parseFloat(position.entry_price || "0")
-    const takeprofitFactor = parseFloat(position.takeprofit_factor || "0")
     const side = position.side || "long"
 
-    if (side === "long") {
-      const takeProfitPrice = entryPrice * (1 + takeprofitFactor / 100)
-      return currentPrice >= takeProfitPrice
-    } else {
-      const takeProfitPrice = entryPrice * (1 - takeprofitFactor / 100)
-      return currentPrice <= takeProfitPrice
+    const assignedTpPrice = parseFloat(position.takeprofit_price || "0")
+    if (assignedTpPrice > 0) {
+      return side === "long" ? currentPrice >= assignedTpPrice : currentPrice <= assignedTpPrice
     }
+
+    // Fallback: legacy hashes without `takeprofit_price`.
+    const entryPrice = parseFloat(position.entry_price || "0")
+    const takeprofitFactor = parseFloat(position.takeprofit_factor || "0")
+    if (entryPrice <= 0 || takeprofitFactor <= 0) return false
+    const recomputed =
+      side === "long"
+        ? entryPrice * (1 + takeprofitFactor / 100)
+        : entryPrice * (1 - takeprofitFactor / 100)
+    return side === "long" ? currentPrice >= recomputed : currentPrice <= recomputed
   }
 
   /**
-   * Check if stop loss should be triggered
+   * Check if stop loss should be triggered.
+   *
+   * Same source-of-truth rationale as `shouldCloseTakeProfit` — prefer
+   * the assigned `stoploss_price` snapshot on the position hash, which
+   * is the SAME price placed on the exchange. Trailing-stop checks
+   * still come first (a tighter ratchet trigger should always win over
+   * the static SL gate).
    */
   private shouldCloseStopLoss(position: any, currentPrice: number): boolean {
-    const entryPrice = parseFloat(position.entry_price || "0")
-    const stoplossRatio = parseFloat(position.stoploss_ratio || "0")
     const side = position.side || "long"
 
-    // Check trailing stop first if it exists
+    // Trailing stop wins when armed — it's by definition tighter than the
+    // static SL (otherwise the ratchet wouldn't have moved it).
     const trailingStopPrice = parseFloat(position.trailing_stop_price || "0")
     if (trailingStopPrice > 0) {
       if (side === "long" && currentPrice <= trailingStopPrice) return true
       if (side === "short" && currentPrice >= trailingStopPrice) return true
     }
 
-    // Check regular stop loss
-    if (side === "long") {
-      const stopLossPrice = entryPrice * (1 - stoplossRatio / 100)
-      return currentPrice <= stopLossPrice
-    } else {
-      const stopLossPrice = entryPrice * (1 + stoplossRatio / 100)
-      return currentPrice >= stopLossPrice
+    const assignedSlPrice = parseFloat(position.stoploss_price || "0")
+    if (assignedSlPrice > 0) {
+      return side === "long" ? currentPrice <= assignedSlPrice : currentPrice >= assignedSlPrice
     }
+
+    // Fallback: legacy hashes without `stoploss_price`.
+    const entryPrice = parseFloat(position.entry_price || "0")
+    const stoplossRatio = parseFloat(position.stoploss_ratio || "0")
+    if (entryPrice <= 0 || stoplossRatio <= 0) return false
+    const recomputed =
+      side === "long"
+        ? entryPrice * (1 - stoplossRatio / 100)
+        : entryPrice * (1 + stoplossRatio / 100)
+    return side === "long" ? currentPrice <= recomputed : currentPrice >= recomputed
   }
 
   /**
-   * Update trailing stop (Redis-based)
+   * Trailing-stop tick — supports BOTH the legacy single-step path AND
+   * the multi-step state machine driven by the Settings → Strategy →
+   * Trailing matrix.
+   *
+   *   • Legacy path (no `trailing_start_ratio` on the hash, or 0): trail
+   *     distance = `stoploss_ratio` %; ratchet on every favourable move.
+   *     Identical to the previous behaviour — kept for back-compat with
+   *     positions opened before multi-step trailing existed.
+   *
+   *   • Multi-step path (3 ratio fields populated): a 2-phase state
+   *     machine.
+   *
+   *       1. INACTIVE — `gain_ratio < trailing_start_ratio` → no-op.
+   *       2. ACTIVATION — `gain_ratio >= trailing_start_ratio` →
+   *          flip `trailing_active = 1`, set `trailing_anchor` to
+   *          `currentPrice` (high-water for long, low-water for short),
+   *          set `trailing_stop_price` to
+   *          `anchor × (1 ∓ trailing_stop_ratio)`.
+   *       3. ACTIVE — re-anchor only when price has moved at least
+   *          `trailing_step_ratio × anchor` in the favourable direction
+   *          (so jitter inside the step doesn't re-write Redis on every
+   *          tick). Stop ratchets one direction.
+   *
+   *   When stop is hit, `shouldCloseStopLoss` (unchanged) closes the
+   *   position with reason `stop_loss`. The check there reads
+   *   `trailing_stop_price`, which we set in BOTH paths, so the close
+   *   gate is shared.
    */
   private async updateTrailingStop(position: any, currentPrice: number): Promise<void> {
     try {
       const entryPrice = parseFloat(position.entry_price || "0")
-      const stoplossRatio = parseFloat(position.stoploss_ratio || "0")
-      const side = position.side || "long"
-      const currentTrailingStop = parseFloat(position.trailing_stop_price || "0")
+      const side: "long" | "short" = position.side === "short" ? "short" : "long"
+      if (entryPrice <= 0 || currentPrice <= 0) return
 
+      const startRatio = parseFloat(position.trailing_start_ratio || "0")
+      const stopRatio = parseFloat(position.trailing_stop_ratio || "0")
+      const stepRatio = parseFloat(position.trailing_step_ratio || "0")
+      const useMultiStep = startRatio > 0 && stopRatio > 0
+
+      const client = getRedisClient()
+      const hashKey = `pseudo_position:${this.connectionId}:${position.id}`
+
+      // ── Multi-step path ────────────────────────────────────────────
+      if (useMultiStep) {
+        // Profit ratio in the trade's favourable direction.
+        const gainRatio =
+          side === "long"
+            ? (currentPrice - entryPrice) / entryPrice
+            : (entryPrice - currentPrice) / entryPrice
+
+        const wasActive = position.trailing_active === "1" || position.trailing_active === true
+        const anchorStored = parseFloat(position.trailing_anchor || "0")
+        const currentTrailingStop = parseFloat(position.trailing_stop_price || "0")
+
+        // Phase 1 — INACTIVE: not yet at the activation threshold.
+        if (!wasActive) {
+          if (gainRatio < startRatio) return  // dormant; pure TP/SL governs
+
+          // Phase 2 — ACTIVATION: cross the start threshold for the first time.
+          const anchor = currentPrice
+          const newStop =
+            side === "long"
+              ? anchor * (1 - stopRatio)
+              : anchor * (1 + stopRatio)
+
+          await client.hset(hashKey, {
+            trailing_active: "1",
+            trailing_anchor: String(anchor),
+            trailing_stop_price: String(newStop),
+            updated_at: new Date().toISOString(),
+          })
+          // Mutate in-place so the very next gate (shouldCloseStopLoss)
+          // sees the freshly-armed stop without re-fetching the hash.
+          position.trailing_active = "1"
+          position.trailing_anchor = String(anchor)
+          position.trailing_stop_price = String(newStop)
+          // Spec §6: trailing just armed — sync to live position now
+          // so the exchange SL/TP reflects the activated stop level.
+          void this.fireSyncLiveFromPseudo(position).catch(() => {})
+          return
+        }
+
+        // Phase 3 — ACTIVE: re-anchor only when price has moved by ≥ step
+        // in the favourable direction. Step is computed against the
+        // STORED anchor (not currentPrice) so a single big tick doesn't
+        // skip over and immediately re-anchor on the next.
+        const stepDistance = anchorStored * stepRatio
+        if (side === "long") {
+          if (currentPrice <= anchorStored + stepDistance) return
+          const newAnchor = currentPrice
+          const newStop = newAnchor * (1 - stopRatio)
+          // Ratchet — never relax the stop downward for longs
+          if (currentTrailingStop > 0 && newStop <= currentTrailingStop) {
+            // Anchor moved but stop didn't tighten meaningfully — write
+            // the anchor only so subsequent steps measure from the new
+            // high. Cheap one-field write.
+            await client.hset(hashKey, {
+              trailing_anchor: String(newAnchor),
+              updated_at: new Date().toISOString(),
+            })
+            position.trailing_anchor = String(newAnchor)
+            return
+          }
+          await client.hset(hashKey, {
+            trailing_anchor: String(newAnchor),
+            trailing_stop_price: String(newStop),
+            updated_at: new Date().toISOString(),
+          })
+          position.trailing_anchor = String(newAnchor)
+          position.trailing_stop_price = String(newStop)
+          // Spec §6: re-arm matching live position's exchange SL/TP.
+          void this.fireSyncLiveFromPseudo(position).catch(() => {})
+        } else {
+          if (currentPrice >= anchorStored - stepDistance) return
+          const newAnchor = currentPrice
+          const newStop = newAnchor * (1 + stopRatio)
+          if (currentTrailingStop > 0 && newStop >= currentTrailingStop) {
+            await client.hset(hashKey, {
+              trailing_anchor: String(newAnchor),
+              updated_at: new Date().toISOString(),
+            })
+            position.trailing_anchor = String(newAnchor)
+            return
+          }
+          await client.hset(hashKey, {
+            trailing_anchor: String(newAnchor),
+            trailing_stop_price: String(newStop),
+            updated_at: new Date().toISOString(),
+          })
+          position.trailing_anchor = String(newAnchor)
+          position.trailing_stop_price = String(newStop)
+          // Spec §6: re-arm matching live position's exchange SL/TP.
+          void this.fireSyncLiveFromPseudo(position).catch(() => {})
+        }
+        return
+      }
+
+      // ── Legacy single-step path (back-compat) ─────────────────────
+      const stoplossRatio = parseFloat(position.stoploss_ratio || "0")
+      const currentTrailingStop = parseFloat(position.trailing_stop_price || "0")
       const trailingDistance = currentPrice * (stoplossRatio / 100)
 
       let newTrailingStop: number
       if (side === "long") {
         newTrailingStop = currentPrice - trailingDistance
-        // Only move trailing stop UP for longs
         if (newTrailingStop <= currentTrailingStop && currentTrailingStop > 0) return
       } else {
         newTrailingStop = currentPrice + trailingDistance
-        // Only move trailing stop DOWN for shorts
         if (newTrailingStop >= currentTrailingStop && currentTrailingStop > 0) return
       }
 
-      // Update via the position manager's update
-      const client = getRedisClient()
-      await client.hset(`pseudo_position:${this.connectionId}:${position.id}`, {
+      await client.hset(hashKey, {
         trailing_stop_price: String(newTrailingStop),
         updated_at: new Date().toISOString(),
       })
+
+      // ── Pseudo → Live sync hook (spec §6) ─────────────────────────
+      //
+      // Single-step path tail. Call the sync helper so any matching
+      // live position re-arms its exchange-side SL/TP at the new
+      // trailing stop. We intentionally use the percent form
+      // (`stoploss_ratio`) rather than the absolute trailing price —
+      // `recalculateAndApplySLTP` re-derives the trigger from the
+      // percent + live entry price, which is correct even when the
+      // live entry differs from the pseudo entry by fees / slippage.
+      //
+      // Fire-and-forget: `syncLiveFromPseudo` returns Promise<void>
+      // and swallows every error. Never await on the hot path.
+      void this.fireSyncLiveFromPseudo(position).catch(() => {})
     } catch (error) {
       console.error(`[v0] Failed to update trailing stop for position ${position.id}:`, error)
+    }
+  }
+
+  /**
+   * Build a connector + invoke `syncLiveFromPseudo` for the connection.
+   * Kept as a separate method so we can call it from both the
+   * multi-step and single-step trailing branches without duplicating
+   * the connector boilerplate. Best-effort; logs and swallows errors.
+   */
+  private async fireSyncLiveFromPseudo(position: any): Promise<void> {
+    try {
+      const { getConnection } = await import("@/lib/redis-db")
+      const connection = await getConnection(this.connectionId)
+      if (!connection) return
+      const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
+      const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
+      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) return
+
+      const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+      const connector = await createExchangeConnector(connection.exchange, {
+        apiKey,
+        apiSecret,
+        apiType: connection.api_type,
+        contractType: connection.contract_type,
+        isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
+      })
+
+      const { syncLiveFromPseudo } = await import("@/lib/trade-engine/stages/live-stage")
+      await syncLiveFromPseudo(this.connectionId, position, connector)
+    } catch (err) {
+      // Best-effort — never propagate.
+      console.warn(`[v0] fireSyncLiveFromPseudo error for ${position?.id}:`, err instanceof Error ? err.message : String(err))
     }
   }
 

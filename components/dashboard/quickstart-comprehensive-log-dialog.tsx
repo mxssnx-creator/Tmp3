@@ -18,6 +18,10 @@ import { useExchange } from "@/lib/exchange-context"
 interface StratDetail {
   avgPosPerSet: number; createdSets: number; avgProfitFactor: number
   avgProcessingTimeMs: number; evalPct: number
+  // Optional cross-stage evaluation counters (used by the Live StratCard
+  // to show ordersFilled / ordersPlaced as a fallback when liveExecution
+  // is not yet populated).
+  passed?: number; evaluated?: number
   // Live-only extras (optional on base/main/real)
   winRate?: number; totalPnl?: number; avgPnl?: number
   openPositions?: number; volumeUsdTotal?: number
@@ -27,7 +31,12 @@ interface LiveExecution {
   ordersPlaced: number; ordersFilled: number; ordersFailed: number
   ordersRejected: number; ordersSimulated: number
   positionsCreated: number; positionsClosed: number; positionsOpen: number
-  wins: number; volumeUsdTotal: number
+  wins: number
+  /** Cumulative leveraged notional (qty × price). Legacy; the UI now
+   *  prefers `marginUsdTotal` for any "USDT" display. */
+  volumeUsdTotal: number
+  /** Cumulative used balance (margin = notional / leverage). */
+  marginUsdTotal?: number
   fillRate: number; winRate: number
 }
 
@@ -35,14 +44,36 @@ interface StatsResponse {
   historic: {
     symbolsProcessed: number; symbolsTotal: number; candlesLoaded: number
     indicatorsCalculated: number; cyclesCompleted: number; isComplete: boolean; progressPercent: number
+    processing?: { indicationChurnCycles: number; strategyChurnCycles: number }
   }
   realtime: {
     indicationCycles: number; strategyCycles: number; realtimeCycles: number
     indicationsTotal: number; strategiesTotal: number; positionsOpen: number
     isActive: boolean; successRate: number; avgCycleTimeMs: number
+    // Per-processor cycle counters. Each processor maintains TWO counters:
+    //   - <name>      : every tick (incl. idle / empty / gated)
+    //   - <name>Live  : only ticks that produced real work
+    cycleCounters?: {
+      indication: number; indicationLive: number
+      strategy: number;   strategyLive: number
+      realtime: number;   realtimeLive: number
+    }
+    // Cumulative tick total across ALL processors. Independent of the
+    // per-Set 250-entry DB cap. Equivalent to "Frames / Total Ticks".
+    framesProcessed?: number
   }
   breakdown: {
-    indications: { direction: number; move: number; active: number; optimal: number; auto: number; total: number }
+    // Each indication TYPE counted independently. `activeAdvanced` was
+    // previously missing from this shape despite the engine generating it.
+    indications: {
+      direction:      number
+      move:           number
+      active:         number
+      activeAdvanced: number
+      optimal:        number
+      auto:           number
+      total:          number
+    }
     strategies: { base: number; main: number; real: number; live: number; total: number
                   baseEvaluated: number; mainEvaluated: number; realEvaluated: number }
   }
@@ -149,7 +180,7 @@ export function QuickstartComprehensiveLogDialog() {
   const [expandedLog, setExpandedLog] = useState<number | null>(null)
   const [logFilter, setLogFilter] = useState<"all" | "info" | "success" | "warning" | "error">("all")
   const logsEndRef = useRef<HTMLDivElement>(null)
-  const pollRef = useRef<NodeJS.Timeout>()
+  const pollRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined)
 
   const fetchData = useCallback(async (silent = false) => {
     if (!activeConnectionId) return
@@ -196,12 +227,17 @@ export function QuickstartComprehensiveLogDialog() {
   const win = stats?.windows
   const meta = stats?.metadata
 
+  // Indication types — MUST stay in sync with `DEFAULT_LIMITS` in
+  // `lib/indication-sets-processor.ts`. Each type has its own independent
+  // counter on `progression:{connId}`. Each is its own column in the
+  // breakdown so the operator can see contributions per type at a glance.
   const indTypes = [
-    { label: "Direction", key: "direction" as const },
-    { label: "Move",      key: "move"      as const },
-    { label: "Active",    key: "active"    as const },
-    { label: "Optimal",   key: "optimal"   as const },
-    { label: "Auto",      key: "auto"      as const },
+    { label: "Direction",  key: "direction"      as const },
+    { label: "Move",       key: "move"           as const },
+    { label: "Active",     key: "active"         as const },
+    { label: "Active Adv", key: "activeAdvanced" as const },
+    { label: "Optimal",    key: "optimal"        as const },
+    { label: "Auto",       key: "auto"           as const },
   ]
   const totalIndByType = indTypes.reduce((s, { key }) => s + (bd?.indications[key] ?? 0), 0) || 1
   const totalIndAll = rt?.indicationsTotal || bd?.indications.total || 0
@@ -420,8 +456,27 @@ export function QuickstartComprehensiveLogDialog() {
                     Cycle Metrics
                   </div>
                   <div className="grid grid-cols-2 gap-1">
+                    {/*
+                     * "Cycles" rows show TOTAL ticks per processor (incl. idle).
+                     * "Live" rows (when present) show only ticks that produced
+                     * real work — a meaningful "engine doing useful things"
+                     * signal that's not skewed by warmup churn.
+                     * Each processor type has its OWN counter — they are NOT
+                     * the same number unless every tick was productive.
+                     */}
                     <Row label="Indication Cycles" value={fmt(rt?.indicationCycles || 0)} />
+                    <Row label="Strategy Cycles"   value={fmt(rt?.strategyCycles   || 0)} />
                     <Row label="Realtime Cycles"   value={fmt(rt?.realtimeCycles   || 0)} />
+                    {rt?.cycleCounters && (
+                      <>
+                        <Row label="Indication Live" value={fmt(rt.cycleCounters.indicationLive || 0)} />
+                        <Row label="Strategy Live"   value={fmt(rt.cycleCounters.strategyLive   || 0)} />
+                        <Row label="Realtime Live"   value={fmt(rt.cycleCounters.realtimeLive   || 0)} />
+                      </>
+                    )}
+                    {(rt?.framesProcessed || 0) > 0 && (
+                      <Row label="Frames Processed" value={fmt(rt!.framesProcessed!)} />
+                    )}
                     <Row label="Open Positions"    value={fmt(rt?.positionsOpen     || 0)} />
                     <Row label="Success Rate"      value={`${(rt?.successRate || 0).toFixed(1)}%`} />
                     {(rt?.avgCycleTimeMs || 0) > 0 && (
@@ -504,11 +559,22 @@ export function QuickstartComprehensiveLogDialog() {
                       <Row label="Fill Rate" value={`${stats.liveExecution.fillRate.toFixed(1)}%`} />
                       <Row label="Win Rate"  value={`${stats.liveExecution.winRate.toFixed(1)}%`} />
                       <Row label="Wins"      value={fmt(stats.liveExecution.wins)} />
+                      {/* USDT row shows used-balance (margin), not the
+                          leveraged notional. We fall back to the legacy
+                          notional only when no margin counter exists. */}
                       <Row
-                        label="Volume"
-                        value={stats.liveExecution.volumeUsdTotal >= 1000
-                          ? `$${(stats.liveExecution.volumeUsdTotal / 1000).toFixed(1)}K`
-                          : `$${stats.liveExecution.volumeUsdTotal.toFixed(2)}`}
+                        label="USDT (used)"
+                        value={(() => {
+                          const v = stats.liveExecution.marginUsdTotal || stats.liveExecution.volumeUsdTotal
+                          // Sub-dollar margins (high leverage on tiny
+                          // notional) need 4-decimal precision so the
+                          // operator can see cents committed instead
+                          // of an apparent zero.
+                          if (v >= 1000) return `$${(v / 1000).toFixed(1)}K`
+                          if (v >= 1)    return `$${v.toFixed(2)}`
+                          if (v > 0)     return `$${v.toFixed(4)}`
+                          return "$0.00"
+                        })()}
                       />
                     </div>
                     {(stats.liveExecution.ordersRejected > 0 || stats.liveExecution.ordersFailed > 0 || stats.liveExecution.ordersSimulated > 0) && (

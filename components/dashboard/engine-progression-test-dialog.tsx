@@ -138,7 +138,11 @@ interface StatsSample {
     positionsClosed: number
     positionsOpen: number
     wins: number
+    /** Cumulative leveraged notional (qty × price). Kept for back-compat. */
     volumeUsdTotal: number
+    /** Cumulative used balance (margin = notional / leverage). The
+     *  canonical "USDT" figure shown to operators. */
+    marginUsdTotal: number
     fillRate: number
     winRate: number
     totalPnl: number
@@ -220,7 +224,12 @@ function fmtUsd(n: number | undefined): string {
   const abs = Math.abs(n)
   if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(2)}M`
   if (abs >= 1_000)     return `${sign}$${(abs / 1_000).toFixed(2)}K`
-  return `${sign}$${abs.toFixed(2)}`
+  if (abs >= 1)         return `${sign}$${abs.toFixed(2)}`
+  // Sub-dollar values (e.g. high-leverage margins like $0.04) need
+  // extra precision — without this, fmtUsd rendered "$0.00" and the
+  // operator couldn't tell zero from a few cents committed.
+  if (abs > 0)          return `${sign}$${abs.toFixed(4)}`
+  return "$0.00"
 }
 
 /** Normalise the `/stats` endpoint response into our sample shape. */
@@ -270,6 +279,7 @@ function parseStatsSample(body: any): StatsSample | null {
       positionsOpen:    Number(le.positionsOpen)    || 0,
       wins:             Number(le.wins)             || 0,
       volumeUsdTotal:   Number(le.volumeUsdTotal)   || 0,
+      marginUsdTotal:   Number(le.marginUsdTotal)   || 0,
       fillRate:         Number(le.fillRate)         || 0,
       winRate:          Number(le.winRate)          || 0,
       totalPnl:         Number(sd.totalPnl)         || 0,
@@ -420,12 +430,18 @@ export function EngineProgressionTestDialog({ trigger, autoRun = true }: DialogP
 
     // ── P3: enable with 1 symbol ─────────────────────────────────────
     const p3 = await run(2, async () => {
+      // Use `symbolCount` (an explicit number) instead of the legacy
+      // `symbols: 1` ambiguity. The route accepted only string arrays
+      // for `symbols` and crashed with "symbols.join is not a function"
+      // when it received a number, which is why P3 failed every run.
+      // The route now also normalizes both shapes defensively, but the
+      // client should still send the right one.
       const r = await jsonFetch(
         "/api/trade-engine/quick-start",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "enable", symbols: 1 }),
+          body: JSON.stringify({ action: "enable", symbolCount: 1 }),
         },
       )
       if (!r.ok || !r.body?.success) {
@@ -1125,7 +1141,21 @@ function ResultsPanel({
           <ResultRow label="Avg Hold Time"     value={`${le.avgHoldMinutes.toFixed(1)} min`} />
           <ResultRow label="Profit Factor"     value={le.profitFactor >= 999 ? "∞" : le.profitFactor.toFixed(2)}
                      tone={le.profitFactor >= 1.5 ? "ok" : le.profitFactor >= 1 ? "warn" : "bad"} />
-          <ResultRow label="Volume"            value={fmtUsd(le.volumeUsdTotal)} />
+          {/*
+           * USDT row shows the *used balance* (capital committed = sum of
+           * notional/leverage), NOT the leveraged notional. The notional
+           * is preserved in the tooltip for operators who need it for
+           * exchange-margin calculations.
+           */}
+          <ResultRow
+            label="USDT (used)"
+            value={fmtUsd(le.marginUsdTotal || le.volumeUsdTotal)}
+            tooltip={
+              le.marginUsdTotal > 0
+                ? `Margin committed: ${fmtUsd(le.marginUsdTotal)}\nLeveraged notional: ${fmtUsd(le.volumeUsdTotal)}`
+                : `Leveraged notional: ${fmtUsd(le.volumeUsdTotal)} (margin counter not yet populated)`
+            }
+          />
         </ResultSection>
       </div>
     </Card>
@@ -1149,12 +1179,18 @@ function ResultSection({
 }
 
 function ResultRow({
-  label, value, delta, tone = "neutral",
+  label, value, delta, tone = "neutral", tooltip,
 }: {
   label: string
   value: string
   delta?: string
   tone?: "ok" | "warn" | "bad" | "neutral"
+  /**
+   * Native title attribute applied to the row wrapper. Used to expose
+   * extra context (e.g. "leveraged notional vs used margin") without
+   * cluttering the dense KPI grid.
+   */
+  tooltip?: string
 }) {
   const toneClass =
     tone === "ok"   ? "text-emerald-600 dark:text-emerald-400"
@@ -1162,7 +1198,10 @@ function ResultRow({
   : tone === "bad"  ? "text-red-600 dark:text-red-400"
                     : "text-foreground"
   return (
-    <div className="flex items-baseline justify-between gap-2 text-[11px]">
+    <div
+      className="flex items-baseline justify-between gap-2 text-[11px]"
+      title={tooltip}
+    >
       <span className="text-muted-foreground truncate">{label}</span>
       <span className={`font-mono font-semibold tabular-nums ${toneClass}`}>
         {value}

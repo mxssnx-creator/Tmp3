@@ -1,3 +1,4 @@
+// Plain `crypto` — Edge build aliases this to `false` via `next.config.mjs`.
 import * as crypto from "crypto"
 import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-connector"
 
@@ -752,6 +753,15 @@ export class OKXConnector extends BaseExchangeConnector {
     try {
       this.log(`Fetching OHLCV for ${symbol} (${timeframe}, ${limit} candles)`)
 
+      // ── 1s timeframe (spec §7): aggregate trades ──────────────────
+      if (timeframe === "1s") {
+        const endMs = Date.now()
+        const startMs = endMs - (Math.max(1, Math.min(86_400, limit)) * 1000)
+        const aggregated = await this.getOHLCV1s(symbol, startMs, endMs)
+        if (aggregated && aggregated.length > 0) return aggregated
+        return null
+      }
+
       const timestamp = new Date().toISOString()
       const baseUrl = this.getBaseUrl()
       
@@ -800,6 +810,39 @@ export class OKXConnector extends BaseExchangeConnector {
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch OHLCV: ${errorMsg}`)
+      return null
+    }
+  }
+
+  /**
+   * ── 1-second OHLCV (spec §7) ──────────────────────────────────────
+   *
+   * Aggregates from `/api/v5/market/trades`. OKX returns the last 500
+   * trades by default (max 500). Like Bybit, true backfill of a full
+   * day is not possible from public endpoints — we return whatever
+   * coverage we get.
+   */
+  async getOHLCV1s(
+    symbol: string,
+    startMs: number,
+    endMs: number,
+  ): Promise<Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }> | null> {
+    try {
+      const baseUrl = this.getBaseUrl()
+      const { aggregateTradesTo1sOHLCV } = await import("./aggregate-1s")
+      const url = `${baseUrl}/api/v5/market/trades?instId=${symbol}&limit=500`
+      const resp = await this.rateLimitedFetch(url)
+      if (!resp.ok) return null
+      const data = await resp.json()
+      const rows = data?.data as Array<{ ts: string; px: string; sz: string }> | undefined
+      if (!Array.isArray(rows) || rows.length === 0) return []
+      const trades = rows.map((r) => ({
+        timestamp: Number(r.ts),
+        price: Number(r.px),
+        quantity: Number(r.sz),
+      }))
+      return aggregateTradesTo1sOHLCV(trades, startMs, endMs)
+    } catch {
       return null
     }
   }

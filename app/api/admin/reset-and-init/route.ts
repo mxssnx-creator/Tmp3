@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server"
 import { initRedis, getRedisClient, flushAll } from "@/lib/redis-db"
 import { runMigrations } from "@/lib/redis-migrations"
+import { stopAllProgressionsBeforeReset } from "@/lib/db-reset-helper"
 
 export const runtime = "nodejs"
 
@@ -9,6 +10,12 @@ export async function POST() {
     console.log("[v0] === FLUSHING REDIS DATABASE ===")
     
     await initRedis()
+
+    // Stop every engine, interval, and stale timer BEFORE the wipe so
+    // a tick mid-flight cannot rewrite progression / counter keys
+    // between FLUSHALL and migration replay.
+    const stopResult = await stopAllProgressionsBeforeReset()
+    console.log("[v0] Progressions stopped before reset-and-init:", stopResult)
     
     // Flush all data from Redis
     await flushAll()
@@ -24,6 +31,7 @@ export async function POST() {
       success: true,
       message: "Redis database reset and initialized successfully",
       database_type: "redis",
+      stopped: stopResult,
     })
   } catch (error: any) {
     console.error("[v0] Reset and init failed:", error)

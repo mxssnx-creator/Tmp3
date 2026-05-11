@@ -15,7 +15,11 @@ export const EXCHANGE_MAX_POSITIONS: Record<string, number> = {
 export const initialSettings: Settings = {
   // Overall / Main
   base_volume_factor: 1.0,
-  positions_average: 50,
+  // Default raised 50 → 300 so per-position USD shrinks by 6× and lots
+  // more concurrent positions fit inside a tiny live balance. The
+  // universal $5 minimum-notional floor in VolumeCalculator still
+  // protects every order from going below the exchange minimum.
+  positions_average: 300,
   max_leverage: 125,
   negativeChangePercent: 20, // 5-30 step 5, Default 20 - used for loss trigger calculation
   leveragePercentage: 100, // 5-100 step 5, Default 100
@@ -38,6 +42,21 @@ export const initialSettings: Settings = {
   baseRatioMax: 1,
   trailingOption: false,
 
+  // Multi-step trailing — Base Strategies
+  // Default: master enabled, full 5×5 matrix on. Operator prunes in
+  // Settings → Strategy → Trailing. Spec values:
+  //   start ∈ {0.3, 0.6, 0.9, 1.2, 1.5}   step 0.3   (activation)
+  //   stop  ∈ {0.1, 0.2, 0.3, 0.4, 0.5}   step 0.1   (trail distance)
+  //   step  = stop / 2                                (ratchet increment)
+  strategyBaseTrailingEnabled: true,
+  strategyBaseTrailingVariants: [
+    "0.3:0.1", "0.3:0.2", "0.3:0.3", "0.3:0.4", "0.3:0.5",
+    "0.6:0.1", "0.6:0.2", "0.6:0.3", "0.6:0.4", "0.6:0.5",
+    "0.9:0.1", "0.9:0.2", "0.9:0.3", "0.9:0.4", "0.9:0.5",
+    "1.2:0.1", "1.2:0.2", "1.2:0.3", "1.2:0.4", "1.2:0.5",
+    "1.5:0.1", "1.5:0.2", "1.5:0.3", "1.5:0.4", "1.5:0.5",
+  ],
+
   // Main Strategy
   previousPositionsCount: 5,
   lastStateCount: 3,
@@ -57,10 +76,14 @@ export const initialSettings: Settings = {
   arrangementType: "marketCap24h",
   quoteAsset: "USDT",
 
-  // Minimum Profit Factor Requirements
-  baseProfitFactor: 0.6,
-  mainProfitFactor: 0.6,
-  realProfitFactor: 0.6,
+  // ── Main Trade PF thresholds per stage (spec defaults) ───────────
+  // Base 0.9 / Main 1.0 / Real 1.0 / Live 1.0 — mirrored from
+  // `app/settings/page.tsx`. Engine reads via
+  // `lib/strategy-coordinator.ts:loadAppPFThresholds()` (5s TTL).
+  baseProfitFactor: 0.9,
+  mainProfitFactor: 1.0,
+  realProfitFactor: 1.0,
+  liveProfitFactor: 1.0,
 
   // Risk Management
   trailingStopLoss: false,
@@ -85,6 +108,13 @@ export const initialSettings: Settings = {
   // Default 1 (Long/Short each capped at 1 concurrent pseudo position
   // across ALL Sets). Operator-tunable in Settings → Strategy → Base.
   maxActiveBasePseudoPositionsPerDirection: 1,
+
+  // Hard ceiling on REAL-stage Sets that pass through to Live each cycle.
+  // 12000 is the operational default — high enough that the cap rarely
+  // binds during normal scans yet bounds runaway growth when the funnel
+  // widens (many symbols × many strategy variants). Operator-tunable via
+  // Settings → System; consumed by `StrategyCoordinator.evaluateRealSets`.
+  maxRealSets: 12000,
 
   // System Configuration
   autoRestartOnErrors: true,

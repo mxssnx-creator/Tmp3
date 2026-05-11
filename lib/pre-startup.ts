@@ -45,17 +45,20 @@ async function seedMarketData() {
     for (let i = 0; i < 20; i += 1) {
       const variation = base * 0.02
       const close = base + (Math.random() - 0.5) * variation
-      await saveMarketData(symbol, {
+      // Spec §7: pre-startup seeds 1s placeholders so the engine has
+      // *something* under the canonical key before the real loader
+      // runs. Timestamps step at 1s instead of 60s.
+      await saveMarketData(symbol, "1s", {
         symbol,
         exchange: "bybit",
-        interval: "1m",
+        interval: "1s",
         price: close,
         open: base,
         high: base + variation,
         low: base - variation,
         close,
         volume: Math.random() * 1_000_000,
-        timestamp: new Date(Date.now() - (20 - i) * 60_000).toISOString(),
+        timestamp: new Date(Date.now() - (20 - i) * 1_000).toISOString(),
       })
     }
   }

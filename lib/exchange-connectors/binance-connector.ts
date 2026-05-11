@@ -1,3 +1,12 @@
+// Plain `crypto` (NOT `node:crypto`). Webpack 5 cannot resolve `node:` URIs
+// in the Edge build, and this connector is reached via instrumentation.ts
+// (compiled for BOTH nodejs and edge runtimes). The Edge bundle never
+// actually executes this code — `instrumentation.ts` returns before
+// `await import("@/lib/startup-coordinator")` runs when
+// `NEXT_RUNTIME !== "nodejs"` — but Webpack still has to *build* the graph
+// for both targets. The Edge build resolves `crypto` to `false` via the
+// alias declared in `next.config.mjs`, so the build succeeds and the
+// runtime guard ensures the empty stub is never called.
 import * as crypto from "crypto"
 import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-connector"
 
@@ -721,7 +730,26 @@ export class BinanceConnector extends BaseExchangeConnector {
 
       const baseUrl = this.getBaseUrl()
       const apiType = this.credentials.apiType || "perpetual_futures"
-      
+
+      // ── 1-second timeframe (spec §7) ─────────────────────────────
+      //
+      // Binance SPOT supports `interval=1s` natively (since 2023).
+      // FUTURES does NOT — for FAPI we aggregate `/fapi/v1/aggTrades`.
+      // We page backward from now and cap the total fetch at `limit`
+      // seconds (caller already passes a 1-day-sized limit). The
+      // shared aggregator handles bucket alignment + missing seconds.
+      if (timeframe === "1s") {
+        const endMs = Date.now()
+        const startMs = endMs - (Math.max(1, Math.min(86_400, limit)) * 1000)
+        const aggregated = await this.getOHLCV1s(symbol, startMs, endMs)
+        if (aggregated && aggregated.length > 0) {
+          this.log(`✓ OHLCV 1s built: ${aggregated.length} buckets (window ${Math.round((endMs - startMs) / 1000)}s)`)
+          return aggregated
+        }
+        this.log(`⚠ 1s aggregation returned 0 buckets for ${symbol}`)
+        return null
+      }
+
       // Convert timeframe to Binance interval format
       const intervalMap: Record<string, string> = {
         "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
@@ -764,6 +792,102 @@ export class BinanceConnector extends BaseExchangeConnector {
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch OHLCV: ${errorMsg}`)
+      return null
+    }
+  }
+
+  /**
+   * ── 1-second OHLCV (spec §7) ──────────────────────────────────────
+   *
+   * Strategy:
+   *   - SPOT  → use native `interval=1s` klines, paginate by `startTime`.
+   *   - FAPI  → aggregate from `/fapi/v1/aggTrades`, paginate by `endTime`.
+   *
+   * Returns an array of 1s OHLCV candles in [startMs, endMs), sorted
+   * ascending. Returns null on hard error; empty array if no data.
+   *
+   * Caller (market-data-loader / engine-manager) decides whether to
+   * fall back to synthetic.
+   */
+  async getOHLCV1s(
+    symbol: string,
+    startMs: number,
+    endMs: number,
+  ): Promise<Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }> | null> {
+    try {
+      const apiType = this.credentials.apiType || "perpetual_futures"
+      const baseUrl = this.getBaseUrl()
+      const isSpot = apiType === "spot"
+
+      if (isSpot) {
+        // ── Native 1s klines (spot only) ──────────────────────────
+        // Max 1000 per call; we page forward by `startTime`. The
+        // weight cost is 2 for `limit=1000` on spot — at one call
+        // per second of wall clock we comfortably stay under the
+        // 6000/min IP-weight cap.
+        const out: Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }> = []
+        const PAGE = 1000
+        let cursor = startMs
+        let iter = 0
+        while (cursor < endMs && iter < 200) {
+          iter++
+          const url = `${baseUrl}/api/v3/klines?symbol=${symbol}&interval=1s&startTime=${cursor}&endTime=${endMs}&limit=${PAGE}`
+          const resp = await this.rateLimitedFetch(url, {
+            headers: { "X-MBX-APIKEY": this.credentials.apiKey },
+          })
+          if (!resp.ok) {
+            this.logError(`✗ 1s klines page ${iter} HTTP ${resp.status}`)
+            break
+          }
+          const rows = (await resp.json()) as any[][]
+          if (!Array.isArray(rows) || rows.length === 0) break
+          for (const r of rows) {
+            const ts = Number(r[0])
+            if (!Number.isFinite(ts) || ts < startMs || ts >= endMs) continue
+            out.push({
+              timestamp: ts,
+              open: Number(r[1]),
+              high: Number(r[2]),
+              low: Number(r[3]),
+              close: Number(r[4]),
+              volume: Number(r[5]),
+            })
+          }
+          const lastTs = Number(rows[rows.length - 1]?.[0])
+          if (!Number.isFinite(lastTs) || lastTs <= cursor) break
+          // Advance cursor PAST the last returned bucket (each row is
+          // a 1s bucket, so +1000ms gives the next second).
+          cursor = lastTs + 1000
+          if (rows.length < PAGE) break
+        }
+        return out
+      }
+
+      // ── Futures: aggregate aggTrades into 1s buckets ───────────
+      const { build1sOhlcvFromTrades } = await import("./aggregate-1s")
+      const paginator = async (sym: string, fromMs: number, untilMs: number) => {
+        // /fapi/v1/aggTrades returns 500 trades by default, max 1000.
+        // We page BACKWARD by `endTime` (cursor at right edge).
+        const url = `${baseUrl}/fapi/v1/aggTrades?symbol=${sym}&startTime=${fromMs}&endTime=${untilMs}&limit=1000`
+        const resp = await this.rateLimitedFetch(url, {
+          headers: { "X-MBX-APIKEY": this.credentials.apiKey },
+        })
+        if (!resp.ok) return []
+        const rows = (await resp.json()) as Array<{ T: number; p: string; q: string }>
+        if (!Array.isArray(rows)) return []
+        return rows.map((r) => ({
+          timestamp: Number(r.T),
+          price: Number(r.p),
+          quantity: Number(r.q),
+        }))
+      }
+      return await build1sOhlcvFromTrades(paginator, symbol, startMs, endMs, {
+        pageSize: 1000,
+        pageDelayMs: 250,
+        maxIterations: 400,
+      })
+    } catch (error) {
+      this.logError(`✗ getOHLCV1s failed: ${error instanceof Error ? error.message : String(error)}`)
       return null
     }
   }

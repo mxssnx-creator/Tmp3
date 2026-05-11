@@ -37,6 +37,14 @@ import {
 import { ConnectionInfoDialog } from "@/components/settings/connection-info-dialog"
 import { ConnectionSettingsDialog } from "@/components/settings/connection-settings-dialog"
 import { ProgressionLogsDialog } from "@/components/dashboard/progression-logs-dialog"
+// ── Additional diagnostic dialogs surfaced for operator review ─────
+// All three render their own button + DialogTrigger, so they slot in
+// as buttons inside the "Diagnostic Tools" row at the bottom of the
+// expanded card. The operator can compare them side-by-side and decide
+// which to keep / consolidate later.
+import { ConnectionDetailedLogDialog } from "@/components/dashboard/connection-detailed-log-dialog"
+import { EngineProcessingLogDialog }   from "@/components/dashboard/engine-processing-log-dialog"
+import { DetailedLoggingDialog }       from "@/components/dashboard/detailed-logging-dialog"
 import { VolumeConfigurationPanel } from "@/components/dashboard/volume-configuration-panel"
 import { OrderSettingsPanel } from "@/components/dashboard/order-settings-panel"
 import { MainTradeCard } from "@/components/dashboard/main-trade-card"
@@ -180,6 +188,14 @@ export function ActiveConnectionCard({
     liveOrdersFailed: number
     liveOrdersRejected: number
     liveOrdersSimulated: number
+    /**
+     * Number of upstream Real-stage Set signals that were merged into
+     * an already-open exchange position instead of creating a new one
+     * (so we never spam the venue with duplicate orders for the same
+     * symbol+direction). This is the canonical "Pos Accumulated"
+     * counter the user wants surfaced at the Real → Live boundary.
+     */
+    liveOrdersAccumulated: number
     livePositionsCreated: number
     livePositionsClosed: number
     livePositionsOpen: number
@@ -389,11 +405,48 @@ export function ActiveConnectionCard({
         )
         if (!res.ok) return
         const data = await res.json()
+        // Cycles label in the header should report the real interval-
+        // frame count — every loop tick the indication processor fired
+        // since the engine started — NOT the "live cycle" subset that
+        // only counts ticks which actually generated indications. The
+        // user reported "showing very Low number or Just '1'" which is
+        // exactly what `indicationCycles` (= live || churn) does on a
+        // freshly started engine that has not yet produced any indication
+        // (e.g. during prehistoric warmup). We now read the explicit
+        // churn counter from `cycleCounters.indication`, falling through
+        // to the older shapes for backwards compat with the previous
+        // payload.
+        const cc = data.realtime?.cycleCounters || {}
         setLiveStats({
-          indicationCycles: data.realtime?.indicationCycles  || data.indicationCycleCount  || 0,
-          strategyCycles:   data.realtime?.strategyCycles    || data.strategyCycleCount    || 0,
-          indications:      data.realtime?.indicationsTotal  || data.totalIndicationsCount || 0,
-          strategies:       data.realtime?.strategiesTotal   || data.totalStrategyCount    || 0,
+          indicationCycles:
+            Number(cc.indication) ||
+            data.realtime?.indicationCycles ||
+            data.indicationCycleCount ||
+            0,
+          strategyCycles:
+            Number(cc.strategy) ||
+            data.realtime?.strategyCycles ||
+            data.strategyCycleCount ||
+            0,
+          // ── Indications / Strategies — actively processing Sets ───────
+          // Operators want the "Ind." / "Strat." counters on the live
+          // card to reflect what's processing RIGHT NOW (Sets currently
+          // producing qualified entries on the latest cycle), not the
+          // cumulative `indicationsTotal` / `strategiesTotal` which
+          // only ever grew. Source = `activeProgressing.{indications|
+          // strategies}.total.sets`. Falls back to the legacy
+          // cumulative counters when the new field is absent (older
+          // API revs).
+          indications:
+            data.activeProgressing?.indications?.total?.sets ??
+            data.realtime?.indicationsTotal ??
+            data.totalIndicationsCount ??
+            0,
+          strategies:
+            data.activeProgressing?.strategies?.total?.sets ??
+            data.realtime?.strategiesTotal ??
+            data.totalStrategyCount ??
+            0,
           positions:        data.realtime?.positionsOpen     || data.positionsCount        || 0,
         })
 
@@ -449,22 +502,35 @@ export function ActiveConnectionCard({
           liveOrdersFailed:      data?.liveExecution?.ordersFailed     || 0,
           liveOrdersRejected:    data?.liveExecution?.ordersRejected   || 0,
           liveOrdersSimulated:   data?.liveExecution?.ordersSimulated  || 0,
+          liveOrdersAccumulated: data?.liveExecution?.ordersAccumulated || 0,
           livePositionsCreated:  data?.liveExecution?.positionsCreated || 0,
           livePositionsClosed:   data?.liveExecution?.positionsClosed  || 0,
           livePositionsOpen:     data?.liveExecution?.positionsOpen    || 0,
           liveWins:              data?.liveExecution?.wins             || 0,
-          liveVolumeUsdTotal:    data?.liveExecution?.volumeUsdTotal   || 0,
+          // USDT figures shown on the card represent the **used balance
+          // (margin)** committed to live exchange positions, NOT the
+          // leveraged notional (qty × price). The /stats route exposes
+          // both: `marginUsdTotal` (preferred, capital at risk) and
+          // `volumeUsdTotal` (legacy, leveraged notional). We prefer
+          // margin and fall back to notional only when the connection
+          // started before margin tracking existed (counter is 0).
+          liveVolumeUsdTotal:    Number(data?.liveExecution?.marginUsdTotal)
+                                   || Number(data?.liveExecution?.volumeUsdTotal)
+                                   || 0,
           liveFillRate:          data?.liveExecution?.fillRate         || 0,
           liveWinRate:           data?.liveExecution?.winRate          || 0,
           // ── Mirroring pipeline open-position counts ─────────────
-          // Counts only for pseudo/real; volume only at the live
-          // exchange layer (real USD). See /stats openPositions
-          // block for the authoritative semantics.
+          // Counts only for pseudo/real; USD only at the live exchange
+          // layer. We prefer the per-position margin aggregate
+          // (`marginUsd`, capital committed) and fall back to the
+          // leveraged `volumeUsd` for legacy clients.
           pseudoOpen:            Number(data?.openPositions?.pseudo?.open)        || 0,
           pseudoRunningSets:     Number(data?.openPositions?.pseudo?.runningSets) || 0,
           realOpen:              Number(data?.openPositions?.real?.open)          || 0,
           liveOpenPositions:     Number(data?.openPositions?.live?.open)          || 0,
-          liveVolumeUsd:         Number(data?.openPositions?.live?.volumeUsd)     || 0,
+          liveVolumeUsd:         Number(data?.openPositions?.live?.marginUsd)
+                                   || Number(data?.openPositions?.live?.volumeUsd)
+                                   || 0,
           rangeDays:               pm.rangeDays              || 1,
           timeframeSeconds:        pm.timeframeSeconds        || 1,
           intervalsProcessed:      pm.intervalsProcessed      || 0,
@@ -539,7 +605,23 @@ export function ActiveConnectionCard({
   }
 
   const phase = progression?.phase || "idle"
-  const progress = progression?.progress || 0
+  // Override the engine's coarse phase progress with the live prehistoric
+  // symbols-processed percent while we're in `prehistoric_data`. The
+  // engine sets the phase to 15% the moment it enters that phase and
+  // doesn't touch it again until the realtime processor takes over —
+  // resulting in a progress bar that looks frozen for minutes during
+  // a long historic load. Spec ask: "Show Correct Progress Bar (with
+  // Percentage) for PreHistoric Calculations within UIs".
+  //
+  // Falls back to the engine's value when:
+  //   • the prehistoric percent is 0 (nothing to render yet), or
+  //   • we're in any other phase (engine progress is correct elsewhere).
+  const enginePhaseProgress = progression?.progress || 0
+  const prehistoricPercent = progression?.prehistoricProgress?.percentComplete ?? 0
+  const progress =
+    phase === "prehistoric_data" && prehistoricPercent > 0
+      ? prehistoricPercent
+      : enginePhaseProgress
   const isRunning = phase === "live_trading"
   const isStarting = phase !== "idle" && phase !== "stopped" && phase !== "live_trading" && phase !== "error" && progress < 100
   const hasError = phase === "error"
@@ -875,7 +957,7 @@ export function ActiveConnectionCard({
                     {progression.subPhase && <span className="ml-1">- {progression.subPhase}</span>}
                   </p>
                 )}
-                
+
                 {/* Per-connection engine stats — always shown when connection is active */}
                 {liveStats && phase !== "prehistoric_data" && (
                   <div className="flex items-center gap-3 mt-1.5 flex-wrap">
@@ -940,9 +1022,12 @@ export function ActiveConnectionCard({
                     </div>
                     <div
                       className="flex items-center gap-1"
-                      title="Cumulative live-trade USD volume on the exchange (the only authoritative exposure figure)."
+                      title={
+                        "USDT used balance committed to live exchange positions — the actual capital at risk (sum of notional/leverage), " +
+                        "NOT the leveraged exposure."
+                      }
                     >
-                      <span className="text-muted-foreground">Live Vol</span>
+                      <span className="text-muted-foreground">USDT</span>
                       <span className="font-semibold text-amber-700 dark:text-amber-400 tabular-nums">
                         {prehistoricStats.liveVolumeUsd >= 1_000_000
                           ? `$${(prehistoricStats.liveVolumeUsd / 1_000_000).toFixed(2)}M`
@@ -1074,7 +1159,9 @@ export function ActiveConnectionCard({
                     {/* Indications breakdown */}
                     {prehistoricStats && prehistoricStats.indicationsTotal > 0 && (
                       <div className="space-y-0.5">
-                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Indications ({prehistoricStats.indicationsTotal.toLocaleString()})</div>
+                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">
+                          Indications Evaluated ({prehistoricStats.indicationsTotal.toLocaleString()})
+                        </div>
                         <div className="grid grid-cols-5 gap-1">
                           {[
                             { label: "Dir", value: prehistoricStats.indicationsDirection },
@@ -1095,9 +1182,25 @@ export function ActiveConnectionCard({
                     )}
 
                     {/* Strategy stages breakdown */}
-                    {prehistoricStats && (prehistoricStats.stratBase > 0 || prehistoricStats.stratMain > 0 || prehistoricStats.stratReal > 0 || prehistoricStats.livePositionsCreated > 0) && (
+                    {prehistoricStats && (
+                      prehistoricStats.stratBase > 0 ||
+                      prehistoricStats.stratMain > 0 ||
+                      prehistoricStats.stratReal > 0 ||
+                      prehistoricStats.livePositionsCreated > 0 ||
+                      // Also surface the section during pure prehistoric
+                      // processing — the historic PF aggregate is written
+                      // even before any Set is "created" in the realtime
+                      // sense, so we open the section when any stage's PF
+                      // is non-zero. See historic PF block in
+                      // lib/trade-engine/config-set-processor.ts.
+                      prehistoricStats.avgProfitFactorBase > 0 ||
+                      prehistoricStats.avgProfitFactorMain > 0 ||
+                      prehistoricStats.avgProfitFactorReal > 0
+                    ) && (
                       <div className="space-y-1">
-                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Strategy Sets</div>
+                        <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">
+                          Strategy Sets with Open Positions
+                        </div>
                         {/* Stage rows: Base → Main → Real → Live (exchange-side outcomes) */}
                         {[
                           {
@@ -1155,7 +1258,16 @@ export function ActiveConnectionCard({
                             isLive: true,
                           },
                         ].map(({ label, count, evaluated, passed, passRatio, avgPF, avgDDT, avgPosEval, countPosEval, color, isLive }) => (
-                          count > 0 && (
+                          // Render the row whenever ANY metric for the stage
+                          // has data — count, evaluated/passed, OR an avg
+                          // profit factor. Previously this was gated on
+                          // `count > 0`, which hid Base/Main/Real PF entirely
+                          // during pure prehistoric processing (set count is
+                          // populated by realtime strategy-coordinator only,
+                          // but the PF aggregate is now also written by the
+                          // prehistoric path — see config-set-processor's
+                          // historic PF aggregation block).
+                          (count > 0 || evaluated > 0 || avgPF > 0) && (
                             <div key={label} className="space-y-0.5">
                               {/* Main row: label, sets/positions count, pass/fill ratio, PF */}
                               <div className="flex items-center gap-2 text-[10px]">
@@ -1194,7 +1306,7 @@ export function ActiveConnectionCard({
                                   </span>
                                 </span>
                               </div>
-                              {/* Real-stage extra row: PosEval avg + count */}
+                              {/* Real-stage extra row: PosEval avg + count + Pos Accumulated */}
                               {avgPosEval !== null && !isLive && (
                                 <div className="flex items-center gap-2 text-[10px] pl-7">
                                   <span className="text-muted-foreground">PosEval avg</span>
@@ -1206,14 +1318,35 @@ export function ActiveConnectionCard({
                                       count <span className="text-foreground font-medium tabular-nums">{countPosEval}</span>
                                     </span>
                                   )}
+                                  {/* Pos Accumulated — the Real → Live consolidation counter.
+                                     Counts how many Real-stage Set signals for this connection
+                                     were merged into an already-open exchange position rather
+                                     than spawning a new one. Spec: *"ON Real Show count Sets
+                                     and Pos Accumulated"*. */}
+                                  {label === "Real" && prehistoricStats.liveOrdersAccumulated > 0 && (
+                                    <span
+                                      className="text-muted-foreground ml-auto"
+                                      title="Real-stage signals merged into existing exchange positions to avoid duplicate orders on the same symbol+direction."
+                                    >
+                                      Pos Accum <span className="text-cyan-600 dark:text-cyan-400 font-semibold tabular-nums">
+                                        {prehistoricStats.liveOrdersAccumulated}
+                                      </span>
+                                    </span>
+                                  )}
                                 </div>
                               )}
                               {/* Live-tier exclusive sub-row: realised ROI, win-rate, total PnL */}
                               {isLive && (
                                 <div className="flex items-center gap-2 text-[10px] pl-7">
                                   <span className="text-muted-foreground">ROI avg</span>
-                                  <span className={`font-medium tabular-nums ${avgPosEval > 0 ? "text-green-600 dark:text-green-400" : avgPosEval < 0 ? "text-red-500" : "text-foreground"}`}>
-                                    {avgPosEval !== 0 ? `${(avgPosEval * 100).toFixed(2)}%` : "—"}
+                                  {/* Narrow `avgPosEval` (typed `number | null`
+                                      across all tiers) before arithmetic so
+                                      strict TS doesn't flag possible-null
+                                      access. The live tier always populates
+                                      it from `avgPosEvalLive`, but the union
+                                      type comes from the other tiers. */}
+                                  <span className={`font-medium tabular-nums ${(avgPosEval ?? 0) > 0 ? "text-green-600 dark:text-green-400" : (avgPosEval ?? 0) < 0 ? "text-red-500" : "text-foreground"}`}>
+                                    {avgPosEval !== null && avgPosEval !== 0 ? `${(avgPosEval * 100).toFixed(2)}%` : "—"}
                                   </span>
                                   <span className="text-muted-foreground">
                                     WR <span className={`font-medium ${prehistoricStats.liveWinRate >= 60 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveWinRate >= 40 ? "text-amber-600 dark:text-amber-400" : "text-red-500"}`}>
@@ -1240,15 +1373,34 @@ export function ActiveConnectionCard({
                       </div>
                     )}
 
-                    {/* Live Exchange Execution — shown when any live-stage activity has occurred */}
+                    {/* ── Realtime Execution sub-section ────────────────
+                        Visually split inside the existing detailed panel:
+                        the historic backfill content (symbols/candles/
+                        intervals + indications + strategy stages) keeps the
+                        amber theme above; below this divider the realtime
+                        engine pulse (live orders, fills, wins, USDT) is
+                        re-themed in blue.
+
+                        The inner status chips deliberately keep their
+                        semantic colours (green for fills/wins, amber for
+                        rejected, red for failed/PnL-loss) so the operator
+                        can still read outcome quality at a glance. */}
                     {prehistoricStats && (
                       prehistoricStats.liveOrdersPlaced > 0 ||
                       prehistoricStats.liveOrdersSimulated > 0 ||
                       prehistoricStats.livePositionsCreated > 0
                     ) && (
-                      <div className="space-y-1 border-t border-border/40 pt-2">
+                      <div className="space-y-1 -mx-2 -mb-2 mt-1 px-2 pt-2 pb-2 border-t-2 border-blue-300/60 dark:border-blue-700/50 bg-blue-50/60 dark:bg-blue-950/25 rounded-b">
                         <div className="flex items-center justify-between">
-                          <div className="text-[9px] font-medium text-muted-foreground uppercase tracking-wide">Live Execution</div>
+                          <div className="flex items-center gap-1.5">
+                            <div className="text-[9px] font-semibold text-blue-700 dark:text-blue-400 uppercase tracking-wide">
+                              Realtime Execution
+                            </div>
+                            <span
+                              className="inline-block h-1.5 w-1.5 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse"
+                              aria-hidden="true"
+                            />
+                          </div>
                           {prehistoricStats.livePositionsOpen > 0 && (
                             <div className="flex items-center gap-1 text-[9px]">
                               <span className="relative flex h-1.5 w-1.5">
@@ -1297,6 +1449,19 @@ export function ActiveConnectionCard({
                               </span>
                             </span>
                           )}
+                          {/* Accumulated entries — Real-stage Set signals merged
+                              into existing exchange positions (avoids duplicate
+                              orders for the same symbol/direction). */}
+                          {prehistoricStats.liveOrdersAccumulated > 0 && (
+                            <span
+                              className="text-muted-foreground"
+                              title="Real-stage Set signals merged into an existing exchange position instead of opening a new one — keeps live exposure consolidated."
+                            >
+                              accum <span className="text-cyan-600 dark:text-cyan-400 font-semibold tabular-nums">
+                                {prehistoricStats.liveOrdersAccumulated}
+                              </span>
+                            </span>
+                          )}
                           {prehistoricStats.liveFillRate > 0 && (
                             <span className="ml-auto text-muted-foreground">
                               fill <span className={`font-semibold ${prehistoricStats.liveFillRate >= 80 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveFillRate >= 50 ? "text-amber-600 dark:text-amber-400" : "text-foreground"}`}>
@@ -1335,8 +1500,14 @@ export function ActiveConnectionCard({
                             </span>
                           )}
                           {prehistoricStats.liveVolumeUsdTotal > 0 && (
-                            <span className="ml-auto text-muted-foreground">
-                              vol <span className="text-foreground font-semibold tabular-nums">
+                            <span
+                              className="ml-auto text-muted-foreground"
+                              title={
+                                "USDT used balance committed (cumulative margin = sum of notional/leverage across every fill + accumulation). " +
+                                "Reflects actual capital deployed, NOT leveraged exposure."
+                              }
+                            >
+                              USDT <span className="text-foreground font-semibold tabular-nums">
                                 ${prehistoricStats.liveVolumeUsdTotal >= 1000
                                   ? `${(prehistoricStats.liveVolumeUsdTotal / 1000).toFixed(1)}K`
                                   : prehistoricStats.liveVolumeUsdTotal.toFixed(2)}
@@ -1542,6 +1713,33 @@ export function ActiveConnectionCard({
                   </div>
                 </div>
               )}
+              {/* ── Diagnostic Tools row ───────────────────────────
+                  Renders the additional dialogs the user asked us to
+                  expose so they can pick which to keep. Each component
+                  brings its own DialogTrigger button — we just lay them
+                  out in a flexible row with a sub-heading for context.
+                  Once the operator decides which to keep, the unwanted
+                  imports + entries can be removed without touching the
+                  rest of the card. */}
+              <div className="mt-3 pt-3 border-t border-dashed">
+                <div className="flex items-center gap-1.5 mb-2">
+                  <Activity className="h-3 w-3 text-muted-foreground" />
+                  <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    Diagnostic Tools
+                  </span>
+                  <Badge variant="outline" className="text-[9px] h-3.5 px-1 ml-auto">
+                    review
+                  </Badge>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {/* Per-connection categorized log dialog */}
+                  {details && <ConnectionDetailedLogDialog connection={details as any} />}
+                  {/* Engine processing log + live stats */}
+                  <EngineProcessingLogDialog connectionId={connection.connectionId} />
+                  {/* System-wide detailed logging stream */}
+                  <DetailedLoggingDialog />
+                </div>
+              </div>
             </CardContent>
           </CollapsibleContent>
         </Card>
