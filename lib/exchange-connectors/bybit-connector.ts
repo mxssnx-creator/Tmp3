@@ -39,6 +39,10 @@ import { safeParseResponse } from "@/lib/safe-response-parser"
  * Docs: https://bybit-exchange.github.io/docs/v5/intro
  */
 export class BybitConnector extends BaseExchangeConnector {
+  constructor(credentials: ExchangeCredentials, exchange: string = "bybit") {
+    super(credentials, exchange)
+  }
+
   private getBaseUrl(): string {
     return this.credentials.isTestnet ? "https://api-testnet.bybit.com" : "https://api.bybit.com"
   }

@@ -35,6 +35,10 @@ import { safeParseResponse } from "@/lib/safe-response-parser"
  * - Hedge position mode
  */
 export class BingXConnector extends BaseExchangeConnector {
+  constructor(credentials: ExchangeCredentials, exchange: string = "bingx") {
+    super(credentials, exchange)
+  }
+
   private getBaseUrl(): string {
     return this.credentials.isTestnet ? "https://testnet-open-api.bingx.com" : "https://open-api.bingx.com"
   }
