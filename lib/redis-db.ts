@@ -1064,11 +1064,20 @@ export async function initRedis(): Promise<void> {
   if (isConnected) return
 
   if (!redisInstance) {
+    // Track whether the global data store was freshly created (empty) so
+    // we know whether to load from disk. If globalForRedis.__redis_data
+    // already exists, the in-memory store is populated from a previous
+    // module evaluation (hot-reload) — reloading the snapshot at this point
+    // would OVERWRITE any migration writes that already ran in this process.
+    const wasEmpty = !globalForRedis.__redis_data
     redisInstance = new InlineLocalRedis()
-    // Restore from disk snapshot before any caller reads keys. The
-    // constructor also kicks off a background load, but awaiting here
-    // guarantees migrations + readers see hydrated state on first tick.
-    await redisInstance.loadFromDisk().catch(() => { /* fresh start ok */ })
+    if (wasEmpty) {
+      // Restore from disk snapshot before any caller reads keys. Only do
+      // this when the store was genuinely empty; subsequent module reloads
+      // must not re-apply the snapshot (it contains pre-migration state and
+      // would clobber is_enabled_dashboard writes from migration 021+).
+      await redisInstance.loadFromDisk().catch(() => { /* fresh start ok */ })
+    }
   }
 
   isConnected = true
