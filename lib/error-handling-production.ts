@@ -131,14 +131,63 @@ export class ProductionErrorHandler {
 
     shutdownTimeout.unref() // Don't block process exit
 
-    // Attempt graceful cleanup
+    // Attempt graceful cleanup — close all open live positions on the exchange
+    // before the process dies. This is the last-resort safety net to prevent
+    // positions staying open on the exchange after a dev server restart.
+    this.emergencyCloseAllPositions()
+      .then(() => {
+        console.log('[SHUTDOWN] Emergency position close complete, exiting...')
+        process.exit(exitCode)
+      })
+      .catch((error) => {
+        console.error('[SHUTDOWN] Error during emergency close:', error)
+        process.exit(exitCode)
+      })
+  }
+
+  /**
+   * Emergency close all open live positions across all connections.
+   * Best-effort — errors per connection are swallowed so other connections
+   * still get cleaned up. Called synchronously from the SIGTERM handler
+   * with a hard 8s budget (within the 10s shutdown window).
+   */
+  private static async emergencyCloseAllPositions(): Promise<void> {
     try {
-      // Close connections, flush logs, etc.
-      console.log('[SHUTDOWN] Cleanup complete, exiting...')
-      process.exit(exitCode)
-    } catch (error) {
-      console.error('[SHUTDOWN] Error during cleanup:', error)
-      process.exit(exitCode)
+      const { getAllConnections, initRedis } = await import("@/lib/redis-db")
+      const { getLivePositions, closeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
+      const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
+      await initRedis()
+      const connections = await getAllConnections()
+
+      const deadline = Date.now() + 8000 // 8s budget
+      for (const conn of connections) {
+        if (Date.now() > deadline) break
+        const connId: string = conn.id || conn.connection_id || conn.connectionId
+        if (!connId) continue
+        const isLive =
+          conn.is_live_trade === "1" || conn.is_live_trade === true ||
+          (conn as any).live_trade === "1" || (conn as any).live_trade === true
+        if (!isLive) continue
+
+        try {
+          const connector = await exchangeConnectorFactory.getOrCreateConnector(connId)
+          if (!connector) continue
+
+          const all = await getLivePositions(connId)
+          const open = all.filter(
+            (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled",
+          )
+
+          for (const pos of open) {
+            if (Date.now() > deadline) break
+            const exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || pos.entryPrice
+            console.log(`[SHUTDOWN] Emergency-closing ${pos.symbol} @ ${exitPrice}`)
+            await closeLivePosition(connId, pos.id, exitPrice, connector, "shutdown").catch(() => {})
+          }
+        } catch { /* per-connection errors must not abort other connections */ }
+      }
+    } catch (err) {
+      console.warn('[SHUTDOWN] emergencyCloseAllPositions failed:', err instanceof Error ? err.message : String(err))
     }
   }
 
