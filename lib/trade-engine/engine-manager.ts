@@ -1134,12 +1134,11 @@ export class TradeEngineManager {
       await redisClient.set(`prehistoric:${this.connectionId}:done`, "1", { EX: 86400 })
 
       // Emit a log event (NOT a phase overwrite) so the dashboard can show
-      // prehistoric completion in its event stream without clobbering the
-      // main `engine_progression:{id}` phase hash — which by this point has
-      // already advanced to `live_trading @ 100%` (set during boot while
-      // prehistoric was running in the background). Rolling the phase
-      // backward would be confusing UX; an explicit event is the right
-      // channel for this one-shot milestone.
+      // prehistoric completion in its event stream. The PHASE itself is
+      // advanced to `live_trading @ 100%` by the caller
+      // (`loadPrehistoricDataInBackground.then(...)`) after this function
+      // resolves — keeping the phase write co-located with the cache-key
+      // write and the `engine_ready` state flip for atomic transition.
       try {
         await logProgressionEvent(
           this.connectionId,
