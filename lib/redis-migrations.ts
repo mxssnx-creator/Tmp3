@@ -765,6 +765,75 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "18")
     },
   },
+  {
+    name: "021-restore-dashboard-enabled-for-auto-active-base-connections",
+    version: 21,
+    up: async (client: any) => {
+      await client.set("_schema_version", "21")
+
+      // Migrations 015/016/017 unconditionally reset is_enabled_dashboard to
+      // "0" for all base connections on every boot. This leaves the engine
+      // coordinator with shouldBeRunning=0 forever because
+      // getAssignedAndEnabledConnections() requires is_enabled/is_enabled_dashboard.
+      //
+      // This migration re-enables dashboard activation for autoActive base
+      // connections (bybit-x03, bingx-x01) that already have API credentials
+      // stored. It runs AFTER the cleanup migrations so it is not overridden.
+      //
+      // A connection is considered credential-ready if it has a non-empty
+      // api_key stored in its connection hash OR in its credentials hash.
+      const AUTO_ACTIVE_IDS = ["bybit-x03", "bingx-x01"]
+      let fixed = 0
+
+      for (const connId of AUTO_ACTIVE_IDS) {
+        try {
+          const connData = await client.hgetall(`connection:${connId}`)
+          if (!connData) continue
+
+          // Check for credentials in the connection hash or dedicated creds hash
+          const credsHash = await client.hgetall(`credentials:${connId}`) || {}
+          const hasApiKey =
+            (connData.api_key && connData.api_key.length > 4) ||
+            (credsHash.api_key && credsHash.api_key.length > 4) ||
+            (connData.apiKey && connData.apiKey.length > 4)
+
+          const currentlyEnabled = connData.is_enabled_dashboard === "1"
+          if (currentlyEnabled) {
+            console.log(`[v0] Migration 021: ${connId} already dashboard_enabled=1, skipping`)
+            continue
+          }
+
+          const update: Record<string, string> = {
+            is_enabled_dashboard: "1",
+            is_active_inserted: "1",
+            is_assigned: "1",
+            is_enabled: "1",
+            is_inserted: "1",
+            is_active: hasApiKey ? "1" : "0",
+          }
+
+          await client.hset(`connection:${connId}`, update)
+          // Also refresh the main:enabled index
+          await client.sadd("connections:main:enabled", connId)
+
+          fixed++
+          console.log(
+            `[v0] Migration 021: ${connId} -> dashboard_enabled=1, active=${update.is_active} (hasApiKey=${hasApiKey})`,
+          )
+        } catch (err) {
+          console.warn(`[v0] Migration 021: error processing ${connId}:`, err)
+        }
+      }
+
+      console.log(`[v0] Migration 021: COMPLETE - ${fixed} base connections restored to dashboard_enabled=1`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "20")
+      for (const connId of ["bybit-x03", "bingx-x01"]) {
+        await client.hset(`connection:${connId}`, { is_enabled_dashboard: "0", is_active: "0" })
+      }
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
