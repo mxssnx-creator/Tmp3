@@ -110,20 +110,15 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
         // lets all concurrent snapshot loads settle — so the engine sweep
         // always has the correct flag value regardless of load timing.
         //
-        // Only touches connections that already have API credentials in Redis.
-        // Connections without credentials are intentionally left disabled.
+        // No API-key guard here: the predefined base connections are always
+        // enabled at the connection level. Whether they actually trade is
+        // gated by hasConnectionCredentials() later in the coordinator sweep.
         const BASE_CONNECTION_IDS = ["bybit-x03", "bingx-x01"]
         try {
           const activationClient = getRedisClient()
           for (const connId of BASE_CONNECTION_IDS) {
             const connData = await activationClient.hgetall(`connection:${connId}`)
             if (!connData) continue
-            const credsHash = (await activationClient.hgetall(`credentials:${connId}`)) || {}
-            const hasApiKey =
-              (connData.api_key && connData.api_key.length > 4) ||
-              (credsHash.api_key && credsHash.api_key.length > 4) ||
-              (connData.apiKey && connData.apiKey.length > 4)
-            if (!hasApiKey) continue
             if (connData.is_enabled_dashboard === "1") continue // already correct
             await activationClient.hset(`connection:${connId}`, {
               is_enabled_dashboard: "1",
