@@ -25,7 +25,7 @@ export default function CheckTablesPage() {
   }
 
   return (
-    <div className="container mx-auto p-8">
+    <div className="p-6">
       <h1 className="text-3xl font-bold mb-6">Database Table Inspector</h1>
       
       <Button onClick={checkTables} disabled={loading} className="mb-6">

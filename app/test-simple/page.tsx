@@ -4,7 +4,7 @@ export const dynamic = "force-dynamic"
 
 export default function TestPage() {
   return (
-    <div className="flex items-center justify-center min-h-screen bg-background">
+    <div className="flex flex-1 items-center justify-center">
       <div className="text-center space-y-4">
         <h1 className="text-4xl font-bold">System Test</h1>
         <p className="text-lg text-muted-foreground">If you see this, the app is rendering correctly.</p>
