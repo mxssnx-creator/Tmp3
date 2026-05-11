@@ -12,7 +12,7 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
       <SidebarProvider>
         <div className="flex h-screen w-full overflow-hidden bg-muted/20">
           <AppSidebar />
-          <main className="flex flex-col flex-1 min-w-0 overflow-hidden">
+          <main className="flex flex-col flex-1 min-w-0 overflow-y-auto overflow-x-hidden">
             {children}
           </main>
         </div>
