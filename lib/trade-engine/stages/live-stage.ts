@@ -2332,6 +2332,33 @@ async function checkAndForceCloseOnSltpCross(
  *     PnL, move to the closed archive, increment metrics, release the lock.
  *
  * Returns a summary usable for logging / API responses.
+ *
+ * ── Hedge-Net Reconciliation Hook (operator spec, Position-Count axis) ──────
+ * `strategy-coordinator.evaluateRealSets` writes per-bucket net targets to
+ * the Redis hash `live_net_target:{connectionId}`. Each field is keyed by
+ *
+ *   `${symbol}|${ind}|p${prev}|l${last}|c${cont}|o${outcome}`
+ *
+ * (the axis-Cartesian triple + last-axis outcome) and its value encodes the
+ * dominant-direction target:
+ *
+ *   `long:N`   → keep N net-long axis OPEN positions in this bucket
+ *   `short:N`  → keep N net-short axis OPEN positions in this bucket
+ *   `flat:0`   → perfect long/short cancellation; close any open in bucket
+ *
+ * The `cont` component is the OPEN-position accumulation count per spec
+ * ("continuous 3: add actual and next 2 positions"). Each reconcile tick
+ * advances the bucket toward `N = cont` open positions in the net direction.
+ * As completed positions close out under the bucket the next coordinator
+ * cycle re-evaluates the prev/last PF gates (closed-only) over the now-
+ * larger completed sample and either:
+ *   (a) keep bucket alive at same magnitude  → no exchange op
+ *   (b) flip outcome (pos ↔ neg)             → close + reopen
+ *   (c) flip dominant direction (long ↔ short) → close + reopen
+ *   (d) drop bucket from net targets         → close all in bucket
+ *
+ * Reconciliation reuses the existing `closeLivePosition` and
+ * `executeLivePosition` paths — no new exchange-call surface.
  */
 export async function reconcileLivePositions(
   connectionId: string,
