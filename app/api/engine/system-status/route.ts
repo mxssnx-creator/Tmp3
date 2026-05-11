@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { initRedis, getAllConnections, getSettings } from "@/lib/redis-db"
+import { initRedis, getAllConnections, getRedisClient } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 
 /**
@@ -49,18 +49,33 @@ export async function GET() {
       activeConnections[0]?.id ||
       connections.find((c: any) => c.is_enabled_dashboard === "1" || c.is_assigned === "1")?.id ||
       "unknown"
-    const engineState = (await getSettings(`trade_engine_state:${connectionId}`)) || {}
-    const progression = (await getSettings(`progression:${connectionId}`)) || {}
+
+    // Read counters from the authoritative Redis keys:
+    //   progression:{id}      — atomic hincrby counters (ProgressionStateManager)
+    //   trade_engine_state:{id} — heartbeat snapshot written each cycle
+    // getSettings() uses a "settings:" prefix so it is the wrong read path
+    // for these keys — use hgetall directly.
+    const client = getRedisClient()
+    const progression = (connectionId !== "unknown" ? await client.hgetall(`progression:${connectionId}`) : null) || {}
+    const engineState = (connectionId !== "unknown" ? await client.hgetall(`trade_engine_state:${connectionId}`) : null) || {}
 
     const indicationCycles =
       Number((progression as any).indication_cycle_count) ||
-      Number(engineState.indication_cycle_count) || 0
+      Number((engineState as any).indication_cycle_count) || 0
     const strategyCycles =
       Number((progression as any).strategy_cycle_count) ||
-      Number(engineState.strategy_cycle_count) || 0
+      Number((engineState as any).strategy_cycle_count) || 0
     const totalStrategiesEvaluated =
       Number((progression as any).total_strategies_evaluated) ||
-      Number(engineState.total_strategies_evaluated) || 0
+      Number((engineState as any).total_strategies_evaluated) || 0
+    const totalTrades =
+      Number((progression as any).total_trades) || 0
+    const openPositions =
+      Number((progression as any).open_positions) ||
+      Number((engineState as any).open_positions) || 0
+    const closedToday =
+      Number((progression as any).closed_today) ||
+      Number((engineState as any).closed_today) || 0
 
     const status = {
       timestamp: new Date().toISOString(),
@@ -81,6 +96,11 @@ export async function GET() {
         avgDurationMs: Math.round(engineState.strategy_avg_duration_ms || 0),
         totalEvaluated: totalStrategiesEvaluated,
         status: strategyCycles > 0 ? "running" : "idle",
+      },
+      live: {
+        openPositions,
+        closedToday,
+        totalTrades,
       },
       recommendation: getRecommendation(activeConnections, {
         indication_cycle_count: indicationCycles,
