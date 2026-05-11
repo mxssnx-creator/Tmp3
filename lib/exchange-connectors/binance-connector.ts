@@ -11,6 +11,9 @@ import * as crypto from "crypto"
 import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-connector"
 
 export class BinanceConnector extends BaseExchangeConnector {
+  constructor(credentials: ExchangeCredentials, exchange: string = "binance") {
+    super(credentials, exchange)
+  }
   private getBaseUrl(): string {
     const testnet = this.credentials.isTestnet
     const apiType = this.credentials.apiType || "perpetual_futures"

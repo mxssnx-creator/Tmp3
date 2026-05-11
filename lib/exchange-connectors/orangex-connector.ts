@@ -4,6 +4,9 @@ import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-conn
 import { safeParseResponse } from "@/lib/safe-response-parser"
 
 export class OrangeXConnector extends BaseExchangeConnector {
+  constructor(credentials: ExchangeCredentials, exchange: string = "orangex") {
+    super(credentials, exchange)
+  }
   private getBaseUrl(): string {
     return "https://api.orangex.com"
   }

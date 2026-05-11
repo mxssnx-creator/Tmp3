@@ -3,6 +3,9 @@ import * as crypto from "crypto"
 import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-connector"
 
 export class OKXConnector extends BaseExchangeConnector {
+  constructor(credentials: ExchangeCredentials, exchange: string = "okx") {
+    super(credentials, exchange)
+  }
   private getBaseUrl(): string {
     return this.credentials.isTestnet ? "https://www.okx.com" : "https://www.okx.com"
   }
