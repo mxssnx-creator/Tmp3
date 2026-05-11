@@ -430,6 +430,26 @@ export class RealtimeProcessor {
         return
       }
 
+      // Max hold-time force-close — matches the same env-var used by the
+      // live-stage so both pseudo and live positions share one time limit.
+      // Reads `opened_at` first (canonical pseudo-position field), falls
+      // back to `entry_time` (historic fills) then `created_at` (legacy).
+      const MAX_HOLD_MS = Number(process.env.MAX_POSITION_HOLD_MS ?? 4 * 60 * 60 * 1000)
+      if (MAX_HOLD_MS > 0) {
+        const openedRaw = position.opened_at || position.entry_time || position.created_at
+        const openedAt = openedRaw ? new Date(openedRaw).getTime() : 0
+        if (openedAt > 0 && Date.now() - openedAt > MAX_HOLD_MS) {
+          await this.positionManager.closePosition(position.id, "max_hold_time_exceeded", position)
+          this.invalidatePrevSet(cacheConfigId)
+          const heldHrs = ((Date.now() - openedAt) / 3_600_000).toFixed(1)
+          console.log(
+            `[v0] [Realtime] Max hold exceeded for ${position.symbol} ${side} ` +
+            `(held ${heldHrs}h) | PnL: ${pnl.toFixed(4)}`,
+          )
+          return
+        }
+      }
+
       // Update trailing stop if enabled — the prev-set context is on
       // the position object so `updateTrailingStop` can honour it.
       if (position.trailing_enabled === "1" || position.trailing_enabled === true) {
