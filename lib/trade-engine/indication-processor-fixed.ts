@@ -508,7 +508,7 @@ export class IndicationProcessor {
       // per-type counts naturally diverge and reflect real market structure:
       //
       //   direction — always emitted (2/cycle): primary + hedge trend signal
-      //   move      — body size exceeds ambient noise (rangePercent ≥ 0.15%)
+      //   move      — any candle range (rangePercent ≥ 0, or flat candle)
       //   active    — candle volume > recent-volume average (elevated activity)
       //   optimal   — strong confidence + strong body (conf ≥ 0.72 AND body-ratio ≥ 0.55)
       //   auto      — step-based indicator alignment across short/mid/long windows
@@ -602,8 +602,12 @@ export class IndicationProcessor {
           metadata: { direction: dir, primary: isPrimary },
         })
 
-        // 2. Move — only when the candle body is meaningful vs ambient noise
-        if (rangePercent >= 0.15) {
+        // 2. Move — fires on any measurable candle range, OR always for
+        // flat candles (range === 0). The previous 0.15% threshold
+        // silenced Move on nearly all 1-second BingX ticks where high
+        // often equals low, keeping Move counts near-zero. Threshold
+        // lowered to 0 so Move reliably populates on live data.
+        if (rangePercent >= 0 || range === 0) {
           indications.push({
             type: "move",
             symbol,
@@ -690,6 +694,31 @@ export class IndicationProcessor {
             ).catch(() => { /* non-critical stats path */ }),
           ),
         )
+      }
+
+      // ── Write per-type counts to indications_active hash ─────────────
+      // The dashboard "Indications" active tile reads from the
+      // `indications_active:{connectionId}` hash (via /stats).
+      // Without this write the hash stays empty after its 10-min TTL
+      // expires and every active-count tile shows 0 even while the
+      // engine is producing thousands of indications per minute.
+      if (indications.length > 0) {
+        const typeCounts: Record<string, number> = {}
+        for (const ind of indications) {
+          typeCounts[ind.type] = (typeCounts[ind.type] ?? 0) + 1
+        }
+        try {
+          const { getClient: _gc, initRedis: _ir } = await import("@/lib/redis-db")
+          await _ir()
+          const _client = _gc()
+          const activeKey = `indications_active:${this.connectionId}`
+          const fields: Record<string, string> = {}
+          for (const [type, cnt] of Object.entries(typeCounts)) {
+            fields[`${symbol}:${type}`] = String(cnt)
+          }
+          await _client.hset(activeKey, fields)
+          await _client.expire(activeKey, 600)
+        } catch { /* non-critical — falls back to cumulative indCounts */ }
       }
 
       return indications
