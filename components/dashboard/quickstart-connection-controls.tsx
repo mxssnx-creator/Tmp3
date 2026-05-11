@@ -47,7 +47,7 @@ import {
 } from "@/components/ui/popover"
 import {
   Plug, Plus, Trash2, Loader2, AlertCircle, CheckCircle2,
-  Circle as CircleIcon, RefreshCw, Wifi, WifiOff,
+  Circle as CircleIcon,
 } from "lucide-react"
 import {
   isBaseConnection, isConnectionEnabled,
@@ -90,10 +90,6 @@ export function QuickstartConnectionControls() {
   const [adding, setAdding] = useState<string | null>(null)
   const [resetting, setResetting] = useState(false)
   const [resetResult, setResetResult] = useState<
-    { ok: boolean; message: string } | null
-  >(null)
-  const [reconnecting, setReconnecting] = useState(false)
-  const [reconnectResult, setReconnectResult] = useState<
     { ok: boolean; message: string } | null
   >(null)
   const [popoverOpen, setPopoverOpen] = useState(false)
@@ -271,44 +267,6 @@ export function QuickstartConnectionControls() {
     }
   }, [resetting, loadConnections])
 
-  const handleReconnect = useCallback(async () => {
-    if (reconnecting) return
-    setReconnecting(true)
-    setReconnectResult(null)
-    try {
-      const body = selectedConnectionId
-        ? JSON.stringify({ connectionId: selectedConnectionId })
-        : JSON.stringify({})
-      const res = await fetch("/api/engine/reconnect", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || data?.success === false) {
-        setReconnectResult({
-          ok: false,
-          message: data?.error || data?.message || `Reconnect failed (HTTP ${res.status})`,
-        })
-      } else {
-        setReconnectResult({
-          ok: true,
-          message: data?.message || `Reconnected (${data?.startedEngines ?? 0} started)`,
-        })
-        window.dispatchEvent(new CustomEvent("connections:refresh"))
-        window.dispatchEvent(new CustomEvent("quickstart:refresh"))
-      }
-    } catch (err) {
-      setReconnectResult({
-        ok: false,
-        message: err instanceof Error ? err.message : "Reconnect failed",
-      })
-    } finally {
-      setReconnecting(false)
-      setTimeout(() => setReconnectResult(null), 6000)
-    }
-  }, [reconnecting, selectedConnectionId])
-
   // ── render ─────────────────────────────────────────────────────────────
   return (
     <div className="flex flex-wrap items-center gap-1.5 px-3 py-1.5 border-b border-primary/10 bg-muted/30">
@@ -480,52 +438,6 @@ export function QuickstartConnectionControls() {
         </PopoverContent>
       </Popover>
 
-      {/* ── Connection health badge ───────────────────────────────────── */}
-      {selectedConnection && (
-        <span
-          className={`flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border ${
-            (selectedConnection as any).is_enabled_dashboard === "1" ||
-            (selectedConnection as any).is_enabled_dashboard === true
-              ? "bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-400 border-green-300 dark:border-green-800"
-              : "bg-amber-50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-400 border-amber-300 dark:border-amber-800"
-          }`}
-          title={
-            (selectedConnection as any).is_enabled_dashboard === "1" ||
-            (selectedConnection as any).is_enabled_dashboard === true
-              ? "Connection is enabled"
-              : "Connection is disabled — click Reconnect to restore"
-          }
-        >
-          {(selectedConnection as any).is_enabled_dashboard === "1" ||
-          (selectedConnection as any).is_enabled_dashboard === true ? (
-            <Wifi className="w-3 h-3" />
-          ) : (
-            <WifiOff className="w-3 h-3" />
-          )}
-          {(selectedConnection as any).is_enabled_dashboard === "1" ||
-          (selectedConnection as any).is_enabled_dashboard === true
-            ? "running"
-            : "disabled"}
-        </span>
-      )}
-
-      {/* ── Reconnect ─────────────────────────────────────────────────── */}
-      <Button
-        size="sm"
-        variant="outline"
-        disabled={reconnecting}
-        onClick={handleReconnect}
-        className="h-7 text-[11px] px-2 gap-1.5 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-950/30 border-blue-300 dark:border-blue-900"
-        title="Soft reconnect: clears margin cooldowns, restores base connection flags, starts any missing engines. Non-destructive — does not clear progression data."
-      >
-        {reconnecting ? (
-          <Loader2 className="w-3 h-3 animate-spin" />
-        ) : (
-          <RefreshCw className="w-3 h-3" />
-        )}
-        Reconnect
-      </Button>
-
       {/* ── Reset DB ──────────────────────────────────────────────────── */}
       <AlertDialog>
         <AlertDialogTrigger asChild>
@@ -593,7 +505,7 @@ export function QuickstartConnectionControls() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* ── Inline result chips — auto-dismiss after 6s ──────────────── */}
+      {/* ── Inline result chip — auto-dismisses after 6s ─────────────── */}
       {resetResult && (
         <span
           className={`flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded ${
@@ -609,23 +521,6 @@ export function QuickstartConnectionControls() {
             <AlertCircle className="w-3 h-3" />
           )}
           {resetResult.message}
-        </span>
-      )}
-      {reconnectResult && (
-        <span
-          className={`flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded ${
-            reconnectResult.ok
-              ? "bg-blue-100 dark:bg-blue-950/30 text-blue-700 dark:text-blue-400"
-              : "bg-red-100 dark:bg-red-950/30 text-red-700 dark:text-red-400"
-          }`}
-          role="status"
-        >
-          {reconnectResult.ok ? (
-            <CheckCircle2 className="w-3 h-3" />
-          ) : (
-            <AlertCircle className="w-3 h-3" />
-          )}
-          {reconnectResult.message}
         </span>
       )}
     </div>
