@@ -257,7 +257,8 @@ export class PseudoPositionManager {
         return null  // silent — one position per config set is expected, or direction cap reached
       }
 
-      // Calculate volume for this position
+      // Calculate volume — delegates balance-fetch + leverage-cap to
+      // VolumeCalculator.resolveBalanceAndLeverage (no TDZ risk).
       const volumeCalc = await VolumeCalculator.calculateVolumeForConnection(
         this.connectionId,
         params.symbol,

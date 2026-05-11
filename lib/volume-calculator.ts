@@ -81,6 +81,63 @@ export class VolumeCalculator {
   private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 5
 
   /**
+   * Fetch account balance and compute the leverage safety cap.
+   *
+   * Extracted into its own method so the balance-fetch + cap logic lives in
+   * a single clean scope with no `let` mutation — eliminating the TDZ risk
+   * that existed when this logic was inlined inside calculateVolumeForConnection.
+   *
+   * Returns { accountBalance, maxLeverage } — both always finite numbers.
+   */
+  static async resolveBalanceAndLeverage(
+    connectionId: string,
+    rawLeverage: number,
+  ): Promise<{ accountBalance: number; maxLeverage: number }> {
+    // Fetch balance — default $10,000 so the leverage cap is benign when
+    // the exchange API is unreachable or the connection has no real key.
+    let balance = 10000
+    try {
+      const cachedBalance = await getSettings(`connection_balance:${connectionId}`)
+      if (cachedBalance?.balance) {
+        balance = parseFloat(String(cachedBalance.balance))
+      } else {
+        const connection = await getConnection(connectionId)
+        if (
+          connection?.api_key &&
+          connection?.api_secret &&
+          !connection.api_key.includes("PLACEHOLDER") &&
+          connection.api_key.length >= 20
+        ) {
+          const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+          const connector = await createExchangeConnector(connection.exchange, {
+            apiKey: connection.api_key,
+            apiSecret: connection.api_secret,
+            apiType: connection.api_type,
+            contractType: connection.contract_type,
+            isTestnet:
+              connection.is_testnet === true || connection.is_testnet === "true",
+          })
+          const result = await connector.getBalance()
+          if (result?.balance) {
+            balance = result.balance
+            await setSettings(`connection_balance:${connectionId}`, {
+              balance,
+              updated_at: new Date().toISOString(),
+            })
+          }
+        }
+      }
+    } catch {
+      // Non-critical — fall back to the $10k default so volume is calculated.
+    }
+
+    // Leverage safety cap: keep margin per position above exchange floor.
+    //   ≤$50  → 10x  |  ≤$200 → 20x  |  ≤$500 → 50x  |  >$500 → 125x
+    const cap = balance <= 50 ? 10 : balance <= 200 ? 20 : balance <= 500 ? 50 : 125
+    return { accountBalance: balance, maxLeverage: Math.min(rawLeverage, cap) }
+  }
+
+  /**
    * Calculate position volume with risk management (pure math, no DB).
    *
    * BEHAVIOR: minimum volume is ALWAYS enforced — never reject for "qty
@@ -377,57 +434,10 @@ export class VolumeCalculator {
       const useMaxLeverage = settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
       const rawLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
 
-      // ── Fetch account balance FIRST (needed for leverage cap below) ──
-      // Declaration must come before the balance-cap block to avoid the
-      // `let` temporal dead zone (TDZ). Previously `accountBalance` was
-      // declared on line 407 but used on line 391, causing:
-      //   ReferenceError: Cannot access 'accountBalance' before initialization
-      let accountBalance = 10000 // Default fallback
-
-      try {
-        // Try to get cached balance from Redis
-        const cachedBalance = await getSettings(`connection_balance:${connectionId}`)
-        if (cachedBalance?.balance) {
-          accountBalance = parseFloat(String(cachedBalance.balance))
-        } else {
-          // Try to fetch from exchange via connector
-          const connection = await getConnection(connectionId)
-          if (connection?.api_key && connection?.api_secret
-            && !connection.api_key.includes("PLACEHOLDER")
-            && connection.api_key.length >= 20) {
-            const { createExchangeConnector } = await import("@/lib/exchange-connectors")
-            const connector = await createExchangeConnector(connection.exchange, {
-              apiKey: connection.api_key,
-              apiSecret: connection.api_secret,
-              apiType: connection.api_type,
-              contractType: connection.contract_type,
-              isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
-            })
-
-            const balanceResult = await connector.getBalance()
-            if (balanceResult?.balance) {
-              accountBalance = balanceResult.balance
-              // Cache the balance in Redis
-              await setSettings(`connection_balance:${connectionId}`, {
-                balance: accountBalance,
-                updated_at: new Date().toISOString(),
-              })
-            }
-          }
-        }
-      } catch (balanceError) {
-        console.warn("[v0] Failed to fetch account balance, using default:", balanceError)
-      }
-
-      // ── Balance-based leverage safety cap ───────────────────────────
-      // Cap effective leverage so margin per position stays above the
-      // exchange floor. Thresholds keep margin ≥ ~$0.50/pos:
-      //   ≤$50  → 10x  |  ≤$200 → 20x  |  ≤$500 → 50x  |  >$500 → 125x
-      let balanceCap = 125
-      if (accountBalance <= 50) balanceCap = 10
-      else if (accountBalance <= 200) balanceCap = 20
-      else if (accountBalance <= 500) balanceCap = 50
-      const maxLeverage = Math.min(rawLeverage, balanceCap)
+      // Delegate balance-fetch + leverage-cap to the helper method so the
+      // logic lives in its own clean scope (no let mutation, no TDZ risk).
+      const { accountBalance, maxLeverage } =
+        await VolumeCalculator.resolveBalanceAndLeverage(connectionId, rawLeverage)
 
       // ── Exchange minimum order size from Redis trading-pair metadata ─
       const tradingPair = await getSettings(`trading_pair:${symbol}`)
