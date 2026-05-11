@@ -8,7 +8,7 @@
 
 import { IndicationConfigManager, IndicationResult, IndicationConfig } from "@/lib/indication-config-manager"
 import { StrategyConfigManager, PseudoPosition, StrategyConfig } from "@/lib/strategy-config-manager"
-import { getRedisClient, initRedis, getSettings } from "@/lib/redis-db"
+import { getRedisClient, initRedis, getSettings, setSettings } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
@@ -364,6 +364,29 @@ export class ConfigSetProcessor {
           // distinguishes "prehistoric done" from "never ran".
           ProgressionStateManager.incrementPrehistoricCycle(this.connectionId, symbol).catch(() => { /* non-critical */ }),
         ]).catch(() => { /* non-critical */ })
+
+        // ── Live phase progression update (per-symbol cadence) ─────────
+        // Push the actual percent + sub_progress (X/Y symbols) into
+        // `engine_progression:{id}` so the dashboard progress bar
+        // advances in real time as parallel workers tick off symbols.
+        // The phase percent maps the prehistoric work onto the
+        // 15 → 95 range (live_trading @ 100 is set by the engine boot
+        // path's post-prehistoric handler). Fire-and-forget — a stuck
+        // Redis write should never delay the next symbol.
+        try {
+          const total = Math.max(1, symbols.length)
+          const pct = Math.min(95, 15 + Math.round((symbolsProcessed / total) * 80))
+          void setSettings(`engine_progression:${this.connectionId}`, {
+            phase: "prehistoric_data",
+            progress: pct,
+            detail: `Prehistoric calc filling sets — ${symbolsProcessed}/${total} symbols processed`,
+            sub_current: symbolsProcessed,
+            sub_total: total,
+            sub_item: symbol,
+            connection_id: this.connectionId,
+            updated_at: new Date().toISOString(),
+          }).catch(() => { /* non-critical */ })
+        } catch { /* non-critical */ }
 
         const tSymMs = Date.now() - tSymStart
         console.log(
