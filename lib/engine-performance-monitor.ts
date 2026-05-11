@@ -121,7 +121,10 @@ class EnginePerformanceMonitor {
     const lastMinute = now - 60000
     const recentCycles = (await client.lrange(cycleKey, 0, this.MAX_HISTORY as number))
       .map((c: string) => JSON.parse(c))
-      .filter((c: CycleMetrics) => new Date(c.timestamp).getTime() > lastMinute)
+      .filter((c: CycleMetrics) => {
+        if (!c.timestamp || typeof c.timestamp !== 'string') return false
+        return new Date(c.timestamp).getTime() > lastMinute
+      })
       .length
 
     const flatHash: Record<string, string> = {
