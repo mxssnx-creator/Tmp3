@@ -137,7 +137,7 @@ export default function ConnectionTestingPage() {
         description="Test exchange API connectivity and functionality"
       />
       <div className="flex-1 overflow-auto">
-        <div className="container mx-auto p-6 space-y-6">
+        <div className="p-6 space-y-6">
       <div>
         <h1 className="text-3xl font-bold mb-2">Connection Testing</h1>
         <p className="text-muted-foreground">
