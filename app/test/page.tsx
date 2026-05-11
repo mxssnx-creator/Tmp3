@@ -8,7 +8,7 @@ export default function TestPage() {
   const { user, isLoading } = useAuth()
 
   return (
-    <div className="min-h-screen w-full bg-background p-8">
+    <div className="flex flex-col flex-1 overflow-auto p-6">
       <div className="max-w-2xl mx-auto space-y-6">
         <h1 className="text-3xl font-bold">AuthGuard Test Page</h1>
 

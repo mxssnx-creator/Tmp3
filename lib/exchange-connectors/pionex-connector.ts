@@ -4,6 +4,9 @@ import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-conn
 import { safeParseResponse } from "@/lib/safe-response-parser"
 
 export class PionexConnector extends BaseExchangeConnector {
+  constructor(credentials: ExchangeCredentials, exchange: string = "pionex") {
+    super(credentials, exchange)
+  }
   private getBaseUrl(): string {
     return "https://api.pionex.com"
   }

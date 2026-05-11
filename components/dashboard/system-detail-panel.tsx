@@ -121,15 +121,17 @@ export function SystemDetailPanel() {
 
       const effectiveId = candidates[0] || ""
 
-      const [progressRes, logsRes, statusRes] = await Promise.all([
+      const [progressRes, logsRes, statusRes, statsRes] = await Promise.all([
         fetch(`/api/connections/progression/${effectiveId || "default"}/logs`).catch(() => null),
         fetch(`/api/trade-engine/structured-logs?connectionId=${effectiveId || "default"}&limit=200`).catch(() => null),
         fetch(`/api/trade-engine/status`).catch(() => null),
+        fetch(`/api/connections/progression/${effectiveId || "default"}/stats`).catch(() => null),
       ])
 
       let progressionState: any = null
       let structuredLogs: LogEntry[] = []
       let engineStatus: any = null
+      let statsData: any = null
 
       if (progressRes?.ok) {
         const d = await progressRes.json().catch(() => ({}))
@@ -141,6 +143,9 @@ export function SystemDetailPanel() {
       }
       if (statusRes?.ok) {
         engineStatus = await statusRes.json().catch(() => ({}))
+      }
+      if (statsRes?.ok) {
+        statsData = await statsRes.json().catch(() => ({}))
       }
 
       const connList = exchangeConnectionsActive.map(c => ({
@@ -202,11 +207,11 @@ export function SystemDetailPanel() {
             passed: 0,
           },
           positions: {
-            base: progressionState?.setsBaseCount ?? 0,
-            main: progressionState?.setsMainCount ?? 0,
-            real: progressionState?.setsRealCount ?? 0,
-            live: 0,
-            total: progressionState?.setsTotalCount ?? 0,
+            base: statsData?.openPositions?.pseudo?.open || 0,
+            main: statsData?.openPositions?.real?.open || 0,
+            real: statsData?.openPositions?.real?.open || 0,
+            live: statsData?.openPositions?.live?.open || 0,
+            total: (statsData?.openPositions?.live?.open || 0),
           },
         },
         database: {

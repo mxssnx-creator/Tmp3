@@ -12,7 +12,7 @@ export default function MinimalPage() {
 
   return (
     <AuthGuard>
-      <div className="flex items-center justify-center min-h-screen bg-gradient-to-b from-background to-background/95">
+      <div className="flex flex-1 items-center justify-center">
         <div className="text-center space-y-8 max-w-md mx-auto px-4">
           <div className="space-y-2">
             <h1 className="text-5xl font-bold">CTS v3.2</h1>
