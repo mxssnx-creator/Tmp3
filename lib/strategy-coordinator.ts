@@ -2454,13 +2454,26 @@ export class StrategyCoordinator {
    *
    *   prev (4-12 step 2) × last (1-4 step 1) × cont (1-8 step 1) × dir
    *
-   * With:
-   *   • prev   = PF FILTER on the parent's last N completed entries
+   * With (precise spec semantics):
+   *   • prev   = PF FILTER on the parent's last N COMPLETED entries
    *              (rejects whole prev-row when meanPF < `minPF`).
+   *              Spec: "Do not Calculate the Open Positions, only
+   *              positions already Completed" — applies here.
    *   • last   = OUTCOME SPLIT (pos / neg) based on parent's last M
-   *              completed entries' meanPF. ONE Set emitted per (last)
-   *              tagged with the realised outcome.
-   *   • cont   = POS-COUNT CONTRIBUTION (entryCount = base + cont).
+   *              COMPLETED entries' meanPF. ONE Set emitted per (last)
+   *              tagged with the realised outcome. Open positions are
+   *              also excluded from the outcome aggregate.
+   *   • cont   = OPEN-POSITION ACCUMULATION COUNT per spec
+   *              ("continuous 3: add actual and next 2 positions to
+   *              set"). The Set is configured to accumulate `cont`
+   *              OPEN positions on top of the base's completed count —
+   *              the currently-open one ("actual") plus `cont − 1`
+   *              future ones to be opened across subsequent intervals.
+   *              Encoded as `entryCount = baseEC + cont`, where baseEC
+   *              counts completed historic entries and cont counts the
+   *              open-position accumulation window. The Live stage's
+   *              `live_net_target` reconciliation drives partial
+   *              open/close orders as the window fills.
    *   • dir    = Cartesian (long + short) so hedge-net has both sides.
    *
    * All axis Sets inherit `avgProfitFactor` / `avgDrawdownTime` /
@@ -2472,6 +2485,13 @@ export class StrategyCoordinator {
    * `entries` hydration for downstream consumers (exchange order
    * construction, per-entry stats) is via `parentSetKey` at execution
    * time — the in-memory axis Set is purely metadata.
+   *
+   * Source of "only completed entries": `baseDefault.entries` is built
+   * by `strategy-sets-processor` from completed strategy evaluations
+   * only (each carries a defined `profitFactor`). The separate
+   * `getPositionContext()` P2-1 closed-only gate keeps open positions
+   * out of variant-selection state; together those two invariants give
+   * the prev/last calcs a closed-only contract end-to-end.
    */
   private expandAxisSets(
     baseDefault: StrategySet,
@@ -2511,7 +2531,13 @@ export class StrategyCoordinator {
               avgProfitFactor: baseDefault.avgProfitFactor,
               avgConfidence:   baseDefault.avgConfidence,
               avgDrawdownTime: baseDefault.avgDrawdownTime,
-              // Position-count contribution per spec ("Base pos + cont").
+              // Position-count contribution per spec:
+              //   baseEC = parent's COMPLETED historic entry count.
+              //   cont   = OPEN positions to accumulate into this Set
+              //            (the "actual" currently-open one + cont-1
+              //            future ones to be opened across intervals).
+              // Example: continuous=3 ⇒ "add actual and next 2 positions"
+              // ⇒ axis Set's entryCount = baseEC + 3.
               entryCount:      baseEC + cont,
               // Empty entries — axis Sets are pure-metadata projections.
               entries:         [],
