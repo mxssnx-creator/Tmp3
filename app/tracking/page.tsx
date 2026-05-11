@@ -112,8 +112,8 @@ export default function TrackingPage() {
   }, [visibleItems])
 
   return (
-    <main className="min-h-screen bg-background p-6">
-      <div className="mx-auto max-w-7xl space-y-6">
+    <main className="flex flex-col flex-1 overflow-auto p-6">
+      <div className="space-y-6">
         <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
           <div>
             <h1 className="flex items-center gap-2 text-3xl font-bold">
