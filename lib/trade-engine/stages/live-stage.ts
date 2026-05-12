@@ -2453,9 +2453,14 @@ async function checkAndForceCloseOnSltpCross(
 ): Promise<"sl_hit" | "tp_hit" | null> {
   if (!Number.isFinite(markPrice) || markPrice <= 0) return null
   if (pos.executedQuantity <= 0) return null
-  if (pos.status === "closed" || pos.status === "rejected" || pos.status === "error") return null
+  // Skip positions whose entry order has not confirmed yet — using entryPrice
+  // as a proxy for the fill price would produce incorrect SL/TP cross signals.
+  if (pos.status === "closed" || pos.status === "rejected" || pos.status === "error" || pos.status === "placed") return null
 
-  const fillPrice = pos.averageExecutionPrice || pos.entryPrice
+  const fillPrice = pos.averageExecutionPrice
+  // Require a confirmed fill price — entryPrice is an estimate and can be
+  // stale. If averageExecutionPrice is missing the position has not been
+  // confirmed filled yet; skip until it is.
   if (!fillPrice || fillPrice <= 0) return null
 
   const slPct = Math.max(0, pos.stopLoss || 0) / 100
@@ -2669,9 +2674,17 @@ export async function reconcileLivePositions(
       return summary
     }
 
+    // Normalise a raw exchange symbol for map-key comparison.
+    // BingX (and several other venues) return "BTC-USDT" or "BTC_USDT"
+    // while Redis stores the normalised form "BTCUSDT". Strip all
+    // separators before building / querying the key so a BingX position
+    // is never mistaken for "externally closed" simply because the symbol
+    // format differs.
+    const normSym = (raw: string) => raw.toUpperCase().replace(/[-_]/g, "")
+
     const exchangeMap = new Map<string, any>()
     for (const ep of exchangePositions) {
-      const sym = String(ep.symbol || ep.Symbol || "").toUpperCase()
+      const sym = normSym(String(ep.symbol || ep.Symbol || ""))
       if (!sym) continue
       const size = parseFloat(String(ep.size ?? ep.positionAmt ?? ep.quantity ?? "0"))
       if (!size) continue
@@ -2683,7 +2696,7 @@ export async function reconcileLivePositions(
     for (const pos of openPositions) {
       summary.reconciled++
       try {
-        const mapKey = `${pos.symbol.toUpperCase()}|${pos.direction}`
+        const mapKey = `${normSym(pos.symbol)}|${pos.direction}`
         const exPos = exchangeMap.get(mapKey)
 
         if (exPos) {
@@ -2700,7 +2713,41 @@ export async function reconcileLivePositions(
           }
           pos.updatedAt = Date.now()
 
-          // ── SL/TP self-healing ───────���──────────────────────────────
+          // ── Entry-order fill detection (reconcile path) ───────────────
+          // syncWithExchange() detects delayed fills via getOrder(), but it
+          // is only called from the engine loop — not from the reconcile cron.
+          // Replicate the same check here so "placed" positions transition to
+          // "open" and get their SL/TP armed on the next cron tick even when
+          // the engine is not running.
+          let justFilled = false
+          if (pos.status === "placed" && pos.orderId) {
+            try {
+              const order = await exchangeConnector.getOrder(pos.symbol, pos.orderId)
+              const statusLower = String(order?.status ?? "").toLowerCase()
+              if (order && (statusLower === "filled" || order.status === "FILLED")) {
+                pos.executedQuantity = order.filledQty || order.executedQty || pos.quantity
+                pos.remainingQuantity = Math.max(0, pos.quantity - pos.executedQuantity)
+                pos.averageExecutionPrice = order.filledPrice || order.avgPrice || pos.entryPrice
+                pos.status = "open"
+                pos.updatedAt = Date.now()
+                justFilled = true
+                await incrementMetric(connectionId, "live_orders_filled_count")
+                console.log(`${LOG_PREFIX} [reconcile] Fill detected for ${pos.symbol} orderId=${pos.orderId} qty=${pos.executedQuantity}`)
+              } else if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
+                // Entry order was cancelled/rejected — close the position record
+                pos.status = "rejected"
+                pos.closeReason = `entry_order_${statusLower}`
+                pos.closedAt = Date.now()
+                await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
+                summary.updated++
+                continue
+              }
+            } catch {
+              /* getOrder() may fail transiently — retry next cycle */
+            }
+          }
+
+          // ── SL/TP self-healing ──────────────────────────────────────────
           // Every reconcile cycle (driven by the cron) we verify the
           // protection orders match the desired levels derived from the
           // position's current stopLoss / takeProfit percentages and
@@ -2713,7 +2760,7 @@ export async function reconcileLivePositions(
           // this is cheap on the steady state — only fires real REST
           // calls when something actually needs to change.
           try {
-            await updateProtectionOrders(exchangeConnector, pos, "reconcile")
+            await updateProtectionOrders(exchangeConnector, pos, justFilled ? "reconcile_fill_detected" : "reconcile")
           } catch (slTpErr) {
             console.warn(
               `${LOG_PREFIX} reconcile SL/TP heal error for ${pos.id}:`,
@@ -2774,7 +2821,22 @@ export async function reconcileLivePositions(
           summary.updated++
         } else {
           // Position closed externally — compute PnL, move to archive.
-          const exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || pos.entryPrice
+          // Exit-price resolution order:
+          //   1. Last markPrice the reconcile loop refreshed from the exchange
+          //   2. averageExecutionPrice (confirmed fill price from original entry)
+          //   3. Redis market_data hash for the symbol (most-recent tick price)
+          //   4. entryPrice as last resort (PnL will read 0 but position is closed)
+          let exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || 0
+          if (exitPrice <= 0) {
+            try {
+              const mdHash = await client.hgetall(`market_data:${pos.symbol}`)
+              const mdPrice = parseFloat(
+                String(mdHash?.lastPrice ?? mdHash?.price ?? mdHash?.close ?? "0")
+              )
+              if (mdPrice > 0) exitPrice = mdPrice
+            } catch { /* ignore — fall through to entryPrice */ }
+          }
+          if (exitPrice <= 0) exitPrice = pos.entryPrice || 0
           const qty      = pos.executedQuantity || pos.quantity || 0
           const avgEntry = pos.averageExecutionPrice || pos.entryPrice || 0
 
@@ -2805,6 +2867,21 @@ export async function reconcileLivePositions(
             await Promise.all(cancellations).catch(() => {})
             pos.stopLossOrderId = undefined
             pos.takeProfitOrderId = undefined
+          }
+
+          // Best-effort market-close on the exchange for positions that
+          // disappeared without a known SL/TP order (e.g. a partial fill
+          // that then stalled, or a network partition that left the entry
+          // order orphaned). If the position is truly gone (SL/TP already
+          // fired) the connector's closePosition() will get a "position
+          // not found" error which is silently swallowed — the only side-
+          // effect is one extra REST call per such reconcile cycle.
+          if (pos.executedQuantity > 0 && pos.status !== "placed") {
+            try {
+              await exchangeConnector.closePosition(pos.symbol, pos.direction)
+            } catch {
+              /* already gone — this is expected when SL/TP fired normally */
+            }
           }
 
           pos.status = "closed"
