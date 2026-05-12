@@ -2738,7 +2738,6 @@ export async function reconcileLivePositions(
                 pos.updatedAt = Date.now()
                 justFilled = true
                 await incrementMetric(connectionId, "live_orders_filled_count")
-                console.log(`${LOG_PREFIX} [reconcile] Fill detected for ${pos.symbol} orderId=${pos.orderId} qty=${pos.executedQuantity}`)
               } else if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
                 // Entry order was cancelled/rejected — close the position record.
                 // Use savePosition() so the terminal-archival logic moves the
@@ -2775,7 +2774,7 @@ export async function reconcileLivePositions(
           // placing SL/TP before the position exists on the exchange
           // will always fail with "position not found".
           if (pos.status === "placed") {
-            await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
+            await savePosition(pos)
             summary.updated++
             continue
           }
@@ -2837,7 +2836,7 @@ export async function reconcileLivePositions(
             continue
           }
 
-          await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
+          await savePosition(pos)
           summary.updated++
         } else {
           // Position closed externally — compute PnL, move to archive.
@@ -2926,7 +2925,7 @@ export async function reconcileLivePositions(
           // marker so we don't double-archive. Everything after the marker
           // check is independent — fan it out in a single Promise.all so each
           // reconciliation pays one RTT window instead of ~7 sequential ones.
-          await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
+          await savePosition(pos)
           const alreadyMoved = await client.get(movedMarker).catch(() => null)
 
           const progKey = `progression:${connectionId}`
