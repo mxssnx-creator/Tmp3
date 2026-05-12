@@ -1,42 +1,32 @@
-node_modules
-.next
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+
+# Dev server runtime artifacts
 dev.log
 dev.pid
+dev-server-runtime.log
+*.log
+
+# TypeScript incremental build info
 tsconfig.tsbuildinfo
+
+# Environment secrets
 .env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
-node_modules
-.next
-dev.log
-dev.pid
-tsconfig.tsbuildinfo
-.env.local
+.env*.local
+
+# Local Redis data snapshots (can be GB-scale; never commit)
+.v0-data/
+redis-snapshot.json
+redis-snapshot.json.*
+
+# Duplicate / alternative lockfiles (project uses npm + package-lock.json)
+pnpm-lock.yaml
+bun.lock
+yarn.lock
+
+# OS artifacts
+.DS_Store
+Thumbs.db
