@@ -34,7 +34,7 @@ export class PositionsCacheOptimizer {
 
       for (const posId of posIds) {
         const pos = await getSettings(`pseudo_position:${posId}`)
-        if (pos && pos.symbol === symbol && pos.status === "active") {
+        if (pos && pos.symbol === symbol && (pos.status === "open" || pos.status === "active")) { // "active" kept for legacy Redis data
           positions.push(pos)
         }
       }
@@ -71,7 +71,7 @@ export class PositionsCacheOptimizer {
 
       for (const posId of posIds) {
         const pos = await getSettings(`pseudo_position:${posId}`)
-        if (!pos || pos.status !== "active") continue
+        if (!pos || (pos.status !== "open" && pos.status !== "active")) continue // "active" kept for legacy Redis data
 
         if (!symbolIndex.has(pos.symbol)) {
           symbolIndex.set(pos.symbol, [])
@@ -185,7 +185,7 @@ export class PositionsCacheOptimizer {
 
       for (const posId of posIds) {
         const pos = await getSettings(`pseudo_position:${posId}`)
-        if (pos && pos.status === "active" && new Date(pos.opened_at || pos.created_at).getTime() < cutoffTime) {
+        if (pos && (pos.status === "open" || pos.status === "active") && new Date(pos.opened_at || pos.created_at).getTime() < cutoffTime) { // "active" kept for legacy Redis data
           expiring.push(pos)
         }
       }

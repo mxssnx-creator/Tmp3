@@ -889,7 +889,16 @@ export class StrategyCoordinator {
     let reused = 0
 
     // ── 2. Variant profiles ─────────────────────────────────────────────
-    const activeVariants = this.selectActiveVariants(ctx)
+    // The `block` gate must fire when THIS symbol already has an open
+    // position — not when any symbol globally does. Patch continuousCount
+    // to the per-symbol open count so both gate evaluation and the `cont`
+    // axis in axisWindows reflect the per-symbol reality. All other
+    // ctx fields (prev, last, pause) remain global / shared as designed.
+    const symbolCtx: PositionContext = {
+      ...ctx,
+      continuousCount: ctx.perSymbolOpen[symbol] ?? 0,
+    }
+    const activeVariants = this.selectActiveVariants(symbolCtx)
 
     // Track the freshly-built `default` Main Set per Base so we can fan it
     // out into the operator-spec'd Position-Count Cartesian (prev × last ×
@@ -947,13 +956,14 @@ export class StrategyCoordinator {
         }
 
         // Cache miss — build a fresh related Set from this profile.
-        // We thread `ctx` through so the freshly-built Set carries an
+        // We thread `symbolCtx` through so the freshly-built Set carries an
         // accurate `axisWindows` snapshot (prev/last/cont/pause) for
-        // downstream stats dimensioning. Cached Sets keep the axis
-        // window from the cycle they were materialised in (this is the
-        // correct semantics — the gate that admitted them was based on
-        // *that* ctx, and we don't want to retroactively re-bucket).
-        const built = await this.buildVariantSet(baseSet, profile, metrics, maxEntries, ctx)
+        // downstream stats dimensioning. The `cont` axis uses the per-symbol
+        // open count (from symbolCtx) so Stats reflects the same reality as
+        // the block gate. Cached Sets keep the axis window from the cycle
+        // they were materialised in (this is the correct semantics — the gate
+        // that admitted them was based on *that* ctx).
+        const built = await this.buildVariantSet(baseSet, profile, metrics, maxEntries, symbolCtx)
         if (!built) continue
 
         // Propagate Base's trailingProfile to the freshly-built Main Set
@@ -1991,9 +2001,16 @@ export class StrategyCoordinator {
 
             for (const set of qualifying) {
               try {
-                const bestEntry = set.entries.reduce(
+                // Axis Sets are pure-metadata projections (entries=[]).
+                // Hydrate from the parent Real Set when entries is empty so
+                // the live execution path can still derive SL/TP from PF.
+                const effectiveEntries =
+                  set.entries.length > 0
+                    ? set.entries
+                    : (realSets.find((s) => s.setKey === set.parentSetKey)?.entries ?? [])
+                const bestEntry = effectiveEntries.reduce(
                   (best, e) => (e.profitFactor > best.profitFactor ? e : best),
-                  set.entries[0]
+                  effectiveEntries[0]
                 )
                 if (!bestEntry) continue
 
@@ -2149,9 +2166,16 @@ export class StrategyCoordinator {
           const creations = await Promise.all(
             qualifying.map(async (set) => {
               try {
-                const bestEntry = set.entries.reduce(
+                // Axis Sets are pure-metadata projections (entries=[]).
+                // Hydrate from the parent Real Set when entries is empty so
+                // the pseudo creation path can still derive SL/TP from PF.
+                const effectiveEntries =
+                  set.entries.length > 0
+                    ? set.entries
+                    : (realSets.find((s) => s.setKey === set.parentSetKey)?.entries ?? [])
+                const bestEntry = effectiveEntries.reduce(
                   (best, e) => (e.profitFactor > best.profitFactor ? e : best),
-                  set.entries[0],
+                  effectiveEntries[0],
                 )
                 if (!bestEntry) return false
 
@@ -2336,15 +2360,31 @@ export class StrategyCoordinator {
           // gates. Now we enforce three explicit conditions:
           //   (1) `status === "closed"` — hard gate. Any other value
           //       (open, pending, rejected, error, partial) is ignored.
-          //   (2) a valid numeric `closed_at` / `closedAt` within the
-          //       lookback window. `opened_at` is NO LONGER a fallback.
+          //   (2) a valid timestamp within the lookback window.
+          //       `closePosition()` writes `closed_at` as an ISO-8601
+          //       string (e.g. "2025-01-01T12:00:00.000Z") via
+          //       `new Date().toISOString()`. Older writers may have
+          //       stored a Unix-ms number. We handle BOTH: try
+          //       `new Date(raw).getTime()` first (works for both ISO
+          //       strings and numeric strings), with a direct
+          //       `Number()` fast-path as a fallback.
+          //       `opened_at` is NO LONGER a fallback — it is the
+          //       entry time, not the exit time.
           //   (3) a realized-pnl field (`realized_pnl` or `pnl` written
           //       AT close) — not the live unrealised value.
           const status = String(h.status || "").toLowerCase()
           if (status !== "closed") continue
-          const closedAtRaw = h.closed_at ?? h.closedAt ?? 0
-          const closedAt = Number(closedAtRaw)
-          if (!Number.isFinite(closedAt) || closedAt <= 0) continue
+          const closedAtRaw = h.closed_at ?? h.closedAt ?? ""
+          // Parse ISO string ("2025-01-01T...") or numeric ms ("1735689600000").
+          const closedAtMs = (() => {
+            if (!closedAtRaw) return NaN
+            const n = Number(closedAtRaw)
+            if (Number.isFinite(n) && n > 1_000_000_000_000) return n  // already ms
+            const d = new Date(closedAtRaw as string).getTime()
+            return Number.isFinite(d) ? d : NaN
+          })()
+          if (!Number.isFinite(closedAtMs) || closedAtMs <= 0) continue
+          const closedAt = closedAtMs
           if (closedAt < cutoff) continue
           // Prefer `realized_pnl`; fall back to `pnl` only when the row
           // is marked closed (the closePosition pipeline writes `pnl`
@@ -2748,13 +2788,15 @@ export class StrategyCoordinator {
     // Mirrors the spec's four position-count axes with the documented
     // step-1 windows (see StrategySet.axisWindows). When ctx is absent
     // (legacy diagnostic call paths) we emit zeros, signalling "no axis
-    // dimensioning available". The `last` axis encodes the *magnitude*
-    // of the most recent dimensional skew (max of wins or losses) so a
-    // single 0..4 figure suffices instead of two parallel counters.
+    // dimensioning available". The `last` axis encodes the total count
+    // of recently-closed positions (lastPosCount, capped at 4) — using
+    // the raw count rather than the directional skew keeps the axis
+    // semantics consistent with the pause axis (which also counts all
+    // recent closes) and avoids the two-counters vs one-counter mismatch.
     const axisWindows = ctx
       ? {
           prev:  Math.max(0, Math.min(12, ctx.prevPosCount)),
-          last:  Math.max(0, Math.min(4,  Math.max(ctx.lastWins, ctx.lastLosses))),
+          last:  Math.max(0, Math.min(4,  ctx.lastPosCount)),
           cont:  Math.max(0, Math.min(8,  ctx.continuousCount)),
           pause: Math.max(0, Math.min(8,  ctx.lastPosCount)),
         }

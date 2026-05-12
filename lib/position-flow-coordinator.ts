@@ -71,7 +71,7 @@ export class PositionFlowCoordinator {
       
       for (const posId of positionIds) {
         const mainPos = await getSettings(`pseudo_position:${posId}`)
-        if (!mainPos || mainPos.symbol !== symbol || mainPos.status !== "active") continue
+        if (!mainPos || mainPos.symbol !== symbol || (mainPos.status !== "open" && mainPos.status !== "active")) continue // "active" kept for legacy Redis data
         if ((mainPos.profit_factor || 0) < 0.6) continue
 
         // Check if real pseudo already exists
