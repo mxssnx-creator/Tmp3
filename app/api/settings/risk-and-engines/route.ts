@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
-import { initRedis, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getAllConnections } from "@/lib/redis-db"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 export async function GET() {
   try {
@@ -85,6 +86,30 @@ export async function POST(request: NextRequest) {
     }
 
     console.log("[v0] Risk management, engine, and strategy settings updated")
+
+    // Signal all running engines to immediately recoordinate with the new
+    // risk/engine settings (e.g. new max positions, TP/SL, leverage limits).
+    // Errors are swallowed so a coordinator failure never blocks the save.
+    try {
+      const connections = await getAllConnections().catch(() => [])
+      const changedFields = [
+        ...(body.riskManagement ? ["riskManagement"] : []),
+        ...(body.engines ? ["engines"] : []),
+        ...(body.strategy ? ["strategy", "maxActiveBasePseudoPositionsPerDirection"] : []),
+      ]
+      const activeConns = (connections || []).filter((c: any) =>
+        c.is_enabled === "1" || c.is_enabled === true
+      )
+      await Promise.all(
+        activeConns.map(async (conn: any) => {
+          try {
+            await notifySettingsChanged(conn.id, changedFields.length > 0 ? changedFields : ["risk_engines"])
+            const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+            await getGlobalTradeEngineCoordinator().applyPendingChangesNow(conn.id)
+          } catch { /* non-critical */ }
+        })
+      )
+    } catch { /* non-critical */ }
 
     return NextResponse.json({
       success: true,

@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { getSettings, setSettings } from "@/lib/redis-db"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 // ── Channel-aware indication settings ──────────────────────────────
 // Each connection holds two profiles: `main` (the active config the
@@ -142,6 +143,14 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
       updated_at: new Date().toISOString(),
     }
     await setSettings(`active_indications:${id}`, flat)
+
+    // Signal the running engine to immediately reload its indication
+    // configuration — new channels take effect on the very next cycle.
+    try {
+      await notifySettingsChanged(id, ["active_indications", "indications"])
+      const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+      await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
+    } catch { /* non-critical — watcher will pick it up */ }
 
     return NextResponse.json({
       success: true,

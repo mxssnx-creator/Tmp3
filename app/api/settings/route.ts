@@ -7,28 +7,49 @@ import {
 } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { invalidateCompactionCache } from "@/lib/sets-compaction"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 /**
- * Fan out a single "settings_changed" progression log event to every
- * active connection so the operator sees confirmation in the Engine
- * Progression dashboard that their saved change was detected by the
- * running engine on the very next cycle. Errors are swallowed — a log
- * failure must never cause a settings save to 500.
+ * Fan out a "settings_changed" progression log event AND a settings-
+ * coordinator reload signal to every active connection. The coordinator
+ * signal causes each running engine to call `applyPendingChangesNow`
+ * immediately — new values (positionCost, leverage, TP/SL, etc.) take
+ * effect within milliseconds rather than waiting for the next 3 s watcher
+ * tick. Log emission is best-effort; coordinator failures are swallowed
+ * so a log/signal failure never causes the settings save to 500.
  */
-async function emitSettingsChanged(keyCount: number): Promise<void> {
+async function emitSettingsChanged(keyCount: number, changedKeys: string[]): Promise<void> {
   try {
     const connections = await getAllConnections().catch(() => [])
-    await Promise.all(
-      (connections || []).map((conn: any) =>
+    const activeConnections = (connections || []).filter((c: any) =>
+      c.is_enabled === "1" || c.is_enabled === true
+    )
+
+    await Promise.all([
+      // Progression log fan-out (operator visibility)
+      ...activeConnections.map((conn: any) =>
         logProgressionEvent(
           conn.id,
           "settings_changed",
           "info",
-          `Operator saved ${keyCount} setting${keyCount === 1 ? "" : "s"} — change will apply on the next cycle`,
-          { keyCount },
+          `Operator saved ${keyCount} setting${keyCount === 1 ? "" : "s"} — recoordinating engine`,
+          { keyCount, fields: changedKeys.slice(0, 20) },
         ).catch(() => { /* non-critical */ }),
       ),
-    )
+      // Settings-coordinator reload signal — causes engine to immediately
+      // consume the new app-settings values (volume, leverage, TP/SL, etc.)
+      // without waiting for the periodic 3 s watcher.
+      ...activeConnections.map((conn: any) =>
+        notifySettingsChanged(conn.id, changedKeys.length > 0 ? changedKeys : ["app_settings"])
+          .then(async () => {
+            try {
+              const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+              await getGlobalTradeEngineCoordinator().applyPendingChangesNow(conn.id)
+            } catch { /* coordinator may not be running in this process; watcher will pick it up */ }
+          })
+          .catch(() => { /* non-critical */ }),
+      ),
+    ])
   } catch {
     /* non-critical */
   }
@@ -124,9 +145,11 @@ export async function POST(request: Request) {
     // TTL inside `lib/sets-compaction.ts` would delay propagation in
     // this Node instance).
     invalidateCompactionCache()
-    // Fan out a progression event so the operator can confirm the new
-    // values reached every running engine.
-    await emitSettingsChanged(Object.keys(body || {}).length)
+    // Fan out a progression event AND a coordinator reload signal so the
+    // running engine immediately picks up new positionCost / leverage /
+    // TP/SL values without waiting for the 3 s watcher tick.
+    const changedKeys = Object.keys(body || {})
+    await emitSettingsChanged(changedKeys.length, changedKeys)
 
     console.log("[v0] Settings saved successfully to Redis (canonical + legacy mirror)")
 
@@ -159,7 +182,8 @@ export async function PUT(request: Request) {
 
     await setAppSettings(mergedSettings)
     invalidateCompactionCache()
-    await emitSettingsChanged(Object.keys(incoming || {}).length)
+    const putChangedKeys = Object.keys(incoming || {})
+    await emitSettingsChanged(putChangedKeys.length, putChangedKeys)
 
     console.log("[v0] Settings updated successfully in Redis (canonical + legacy mirror)")
 

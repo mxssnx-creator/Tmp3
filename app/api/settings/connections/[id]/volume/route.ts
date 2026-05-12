@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { getConnection, updateConnection, initRedis } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 /**
  * Per-connection volume-factor overrides.
@@ -112,6 +113,14 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       id,
       "info",
     ).catch(() => {})
+
+    // Signal the running engine to reload volume factors immediately
+    // so the very next order cycle uses the new live/preset multipliers.
+    try {
+      await notifySettingsChanged(id, Object.keys(patch))
+      const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+      await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
+    } catch { /* non-critical — watcher will pick it up */ }
 
     return NextResponse.json({
       success: true,
