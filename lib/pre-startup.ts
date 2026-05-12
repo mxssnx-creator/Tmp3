@@ -30,6 +30,23 @@ async function seedPredefinedConnections() {
 }
 
 async function seedMarketData() {
+  // Only seed placeholder prices when the canonical key for BTCUSDT does not
+  // already exist. This prevents overwriting real market data that was fetched
+  // by the live-price loader on a previous run (e.g. after a hot-reload in dev
+  // or after a cold start where the Redis snapshot was already restored from disk).
+  try {
+    const { getRedisClient } = await import("@/lib/redis-db")
+    const client = getRedisClient()
+    const existing = await client.exists("market_data:BTCUSDT")
+    if (existing) {
+      console.log("[v0] [PreStartup] seedMarketData: real data present — skipping placeholder seed")
+      return
+    }
+  } catch {
+    // If the Redis check fails, fall through and seed anyway so the engine has
+    // something to work with on a completely fresh DB.
+  }
+
   const symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "SOLUSDT"]
   const basePrices: Record<string, number> = {
     BTCUSDT: 100000,
@@ -62,6 +79,7 @@ async function seedMarketData() {
       })
     }
   }
+  console.log("[v0] [PreStartup] seedMarketData: seeded placeholder prices for", symbols.length, "symbols")
 }
 
 export async function testAllExchangeConnections() {

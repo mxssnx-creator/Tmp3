@@ -465,9 +465,9 @@ const migrations: Migration[] = [
     up: async (client: any) => {
       await client.set("_schema_version", "15")
       
-      // The 2 base exchanges that should be marked as INSERTED and ENABLED
-      // Main connections are ONLY bybit and bingx
-      const baseExchangeIds = ["bybit-x03", "bingx-x01"]
+      // The base exchange that should be marked as INSERTED and ENABLED.
+      // Bybit (bybit-x03) is no longer a canonical base connection — only bingx-x01.
+      const baseExchangeIds = ["bingx-x01"]
       
       const connections = await client.smembers("connections")
       let updatedBase = 0
@@ -519,10 +519,10 @@ const migrations: Migration[] = [
     up: async (client: any) => {
       await client.set("_schema_version", "16")
       
-// Migration 016: Ensure the 2 base connections are properly set up with predefined real credentials
-       // Base connections: bybit, bingx only - should be INSERTED and ENABLED
-       // NOTE: is_active_inserted is NOT set here - user must explicitly assign to main via dashboard
-       const baseTemplateIds = ["bybit-x03", "bingx-x01"]
+// Migration 016: Ensure canonical base connections are properly set up with predefined real credentials.
+       // Bybit (bybit-x03) is no longer canonical — only bingx-x01 is auto-seeded.
+       // NOTE: is_active_inserted is NOT set here - user must explicitly assign to main via dashboard.
+       const baseTemplateIds = ["bingx-x01"]
        
        const connections = await client.smembers("connections") || []
        let updatedTemplates = 0
@@ -674,6 +674,21 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "17")
+    },
+  },
+  {
+    // Version 19 was intentionally skipped during a refactor cycle — this tombstone
+    // prevents the gap from causing confusion if a v19 migration is ever introduced
+    // later, and ensures any system that somehow stored "_schema_version"="19" in
+    // Redis is still advanced to v20 on the next startup.
+    name: "019-tombstone-skipped-version",
+    version: 19,
+    up: async (client: any) => {
+      await client.set("_schema_version", "19")
+      console.log("[v0] Migration 019: tombstone — version 19 was intentionally skipped")
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "18")
     },
   },
   {
@@ -860,7 +875,10 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   let createdOrUpdated = 0
   let credentialsInjected = 0
 
-  const legacyIds = ["bybit-base", "bingx-base", "binance-base", "okx-base", "bybit-default-disabled", "bingx-default-disabled"]
+  // bybit-x03 is included here: it was previously a canonical base connection but is no
+  // longer auto-seeded. Any row in Redis left over from an older schema version must be
+  // cleaned up so it does not appear as a ghost connection in the dashboard.
+  const legacyIds = ["bybit-base", "bingx-base", "binance-base", "okx-base", "bybit-default-disabled", "bingx-default-disabled", "bybit-x03"]
   for (const legacyId of legacyIds) {
     const exists = await client.sismember("connections", legacyId)
     if (exists) {
@@ -1064,17 +1082,17 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
  * Run all pending migrations
  */
 export async function runMigrations(): Promise<{ success: boolean; message: string; version: number }> {
+  // If a run is already in-flight (or completed), return the same promise so
+  // concurrent callers coalesce onto a single execution and never re-enter
+  // runMigrationsInternal(). The promise is intentionally kept after resolution —
+  // clearing it in `finally` caused a race where a second caller that had just
+  // started awaiting would see null and immediately start a second migration run.
   if (migrationRunPromise) {
     return migrationRunPromise
   }
 
   migrationRunPromise = runMigrationsInternal()
-
-  try {
-    return await migrationRunPromise
-  } finally {
-    migrationRunPromise = null
-  }
+  return migrationRunPromise
 }
 
 async function runMigrationsInternal(): Promise<{ success: boolean; message: string; version: number }> {

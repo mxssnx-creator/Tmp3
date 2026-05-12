@@ -139,17 +139,17 @@ export async function completeStartup() {
 
   try {
     // Step 1: Initialize Redis
-    console.log(`[v0] [Startup] Step 1/7: Initializing Redis...`)
+    console.log(`[v0] [Startup] Step 1/8: Initializing Redis...`)
     await initRedis()
     console.log(`[v0] [Startup] ✓ Redis initialized\n`)
 
     // Step 2: Run migrations
-    console.log(`[v0] [Startup] Step 2/7: Running database migrations...`)
+    console.log(`[v0] [Startup] Step 2/8: Running database migrations...`)
     const migResult = await runMigrations()
     console.log(`[v0] [Startup] ✓ Migrations complete (v${migResult.version})\n`)
 
     // Step 3: Validate database integrity
-    console.log(`[v0] [Startup] Step 3/7: Validating database integrity...`)
+    console.log(`[v0] [Startup] Step 3/8: Validating database integrity...`)
     try {
       await validateDatabase()
       console.log(`[v0] [Startup] ✓ Database validation passed\n`)
@@ -159,12 +159,12 @@ export async function completeStartup() {
     }
 
     // Step 4: Load base connections (no start)
-    console.log(`[v0] [Startup] Step 4/7: Loading base connections...`)
+    console.log(`[v0] [Startup] Step 4/8: Loading base connections...`)
     const allConnections = await getAllConnections()
     console.log(`[v0] [Startup] ✓ Loaded ${allConnections.length} base connections\n`)
 
     // Step 5: Consolidate database (Phase 3)
-    console.log(`[v0] [Startup] Step 5/7: Consolidating database structures...`)
+    console.log(`[v0] [Startup] Step 5/8: Consolidating database structures...`)
     try {
       await consolidateDatabase()
       console.log(`[v0] [Startup] ✓ Database consolidation complete\n`)
@@ -173,14 +173,21 @@ export async function completeStartup() {
     }
 
     // Step 6: Initialize coordinator (don't start engines)
-    console.log(`[v0] [Startup] Step 6/7: Initializing engine coordinator...`)
+    console.log(`[v0] [Startup] Step 6/8: Initializing engine coordinator...`)
     const coordinator = getGlobalTradeEngineCoordinator()
     console.log(`[v0] [Startup] ✓ Engine coordinator initialized (ready for manual start)\n`)
 
-    // Step 7: Clean up orphaned progress
-    console.log(`[v0] [Startup] Step 7/7: Cleaning up orphaned state...`)
+    // Step 7: Clean up orphaned progress flags from incomplete shutdowns
+    console.log(`[v0] [Startup] Step 7/8: Cleaning up orphaned engine state...`)
     await cleanupOrphanedProgress()
     console.log(`[v0] [Startup] ✓ Cleanup complete\n`)
+
+    // Step 8: Reconcile stranded live positions left open by a prior unclean shutdown.
+    // This runs after the coordinator is initialized so the engine can be queried.
+    // Errors are non-fatal — logged and swallowed so startup always completes.
+    console.log(`[v0] [Startup] Step 8/8: Reconciling stranded open positions...`)
+    await reconcileStrandedPositions()
+    console.log(`[v0] [Startup] ✓ Stranded position reconciliation complete\n`)
 
     console.log(`[v0] [Startup] ========================================`)
     console.log(`[v0] [Startup] ✓ Pre-startup sequence complete`)
