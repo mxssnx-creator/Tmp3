@@ -9,6 +9,20 @@ dev.log
 dev.pid
 dev-server-runtime.log
 *.log
+*.pid
+
+# One-off root scripts and debug files
+/fix-lint-*.js
+/check-connections.ts
+/debug-redis.ts
+/proxy.ts
+/verify-redis-persistence.ts
+/clear-cache.sh
+/health-check.sh
+/deploy.sh
+/vercel-deploy.sh
+/run-test.sh
+/bunfig.toml
 
 # TypeScript incremental build info
 tsconfig.tsbuildinfo
