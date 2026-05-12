@@ -57,6 +57,9 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === "reset") {
+      // Stamp ended_at on the existing progression (epoch=0 skips stale guard)
+      // so history is correct, then delete the hash for a clean slate.
+      await ProgressionStateManager.endProgression(connectionId, 0)
       await ProgressionStateManager.resetProgressionState(connectionId)
       return NextResponse.json({ success: true, message: "Progression reset" })
     }

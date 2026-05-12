@@ -91,6 +91,13 @@ import { getRedisClient } from "@/lib/redis-db"
 
 export interface ProgressionState {
   connectionId: string
+  // Session identity — increments each time a new progression starts
+  sessionNumber?: number
+  // Epoch written by engine-manager on every new start; used for stale-write guards
+  epoch?: number
+  // Timestamps for the current session
+  startedAt?: number       // epoch-ms; set on first/new session start
+  endedAt?: number         // epoch-ms; set when engine stops cleanly
   cyclesCompleted: number
   successfulCycles: number
   failedCycles: number
@@ -185,6 +192,11 @@ export class ProgressionStateManager {
 
        return {
          connectionId,
+         // Session identity
+         sessionNumber: data.session_number ? parseInt(data.session_number, 10) : undefined,
+         epoch: data.epoch ? Number(data.epoch) : undefined,
+         startedAt: data.started_at ? Number(data.started_at) : undefined,
+         endedAt: data.ended_at ? Number(data.ended_at) : undefined,
          cyclesCompleted: parseInt(data.cycles_completed || "0", 10),
          successfulCycles: parseInt(data.successful_cycles || "0", 10),
          failedCycles: parseInt(data.failed_cycles || "0", 10),
@@ -549,6 +561,172 @@ export class ProgressionStateManager {
       console.log(`[v0] [Progression] State reset for ${connectionId}`)
     } catch (error) {
       console.error(`[v0] Failed to reset progression state for ${connectionId}:`, error)
+    }
+  }
+
+  /**
+   * Stamp the current progression as ended.
+   *
+   * Writes `ended_at` (epoch-ms) and `engine_started = "false"` into the
+   * canonical `progression:{id}` hash. Safe to call multiple times — the
+   * second call is a no-op if `ended_at` is already set and the epoch
+   * matches (idempotent for crash-restart scenarios).
+   *
+   * @param connectionId  Target connection.
+   * @param epoch         Epoch that is ending. Used to guard against a
+   *                      stale stop() racing a freshly-started new epoch.
+   *                      Pass 0 to skip the epoch guard (operator-driven
+   *                      reset from the admin panel).
+   */
+  static async endProgression(connectionId: string, epoch = 0): Promise<void> {
+    try {
+      const client = getRedisClient()
+      const key = `progression:${connectionId}`
+      const now = Date.now()
+
+      // Epoch guard: if the hash already carries a newer epoch we are a
+      // stale stop() from a superseded engine instance — bail out.
+      if (epoch > 0) {
+        const storedEpoch = await client.hget(key, "epoch").catch(() => null)
+        if (storedEpoch && Number(storedEpoch) > epoch) {
+          console.warn(
+            `[v0] [Progression] endProgression(${connectionId}) skipped — stored epoch ${storedEpoch} > ending epoch ${epoch}`,
+          )
+          return
+        }
+      }
+
+      await client.hset(key, {
+        ended_at: String(now),
+        engine_started: "false",
+        last_update: new Date(now).toISOString(),
+      })
+      console.log(`[v0] [Progression] Ended progression for ${connectionId} at epoch ${epoch}`)
+    } catch (error) {
+      console.error(`[v0] Failed to end progression for ${connectionId}:`, error)
+    }
+  }
+
+  /**
+   * Archive the current progression and initialise a clean new one.
+   *
+   * Called at the START of a new engine run when a prior progression hash
+   * already exists. The old hash is:
+   *   1. Stamped with `ended_at` if not already set.
+   *   2. Snapshot-copied to `progression:{id}:history:{oldEpoch}` with a
+   *      24-hour TTL so the dashboard can show "previous session" data.
+   *   3. Deleted (replaced) with a fresh hash carrying:
+   *        started_at, epoch, session_number (old + 1), all counters = 0.
+   *
+   * If no prior hash exists this function simply creates the initial hash
+   * (same as the "first start" path in engine-manager).
+   *
+   * @param connectionId  Target connection.
+   * @param newEpoch      The epoch of the engine that is just starting.
+   * @returns             The session_number written into the new progression.
+   */
+  static async archiveAndStartNewProgression(
+    connectionId: string,
+    newEpoch: number,
+  ): Promise<number> {
+    const client = getRedisClient()
+    const key = `progression:${connectionId}`
+    const now = Date.now()
+
+    try {
+      const existing = await client.hgetall(key).catch(() => null)
+
+      let sessionNumber = 1
+
+      if (existing && Object.keys(existing).length > 0) {
+        // ── Step 1: stamp ended_at on the old progression if absent ──
+        const endedAt = existing.ended_at ? Number(existing.ended_at) : 0
+        if (!endedAt || !Number.isFinite(endedAt)) {
+          await client.hset(key, {
+            ended_at: String(now),
+            engine_started: "false",
+            last_update: new Date(now).toISOString(),
+          })
+        }
+
+        // ── Step 2: archive the (now-closed) old hash ─────────────────
+        // Re-read so the snapshot includes the ended_at we just wrote.
+        const snapshot = await client.hgetall(key).catch(() => existing)
+        const oldEpoch = existing.epoch || String(newEpoch - 1)
+        const historyKey = `progression:${connectionId}:history:${oldEpoch}`
+        if (snapshot && Object.keys(snapshot).length > 0) {
+          // Pipeline: write history hash + set its TTL atomically.
+          // 7-day TTL — enough for a weekly review without bloating Redis.
+          const HISTORY_TTL_SEC = 7 * 24 * 3600
+          // Pass as a plain object — avoids TS spread-tuple restriction
+          // while remaining compatible with ioredis / upstash hset overloads.
+          const snapshotRecord: Record<string, string> = {}
+          for (const [k, v] of Object.entries(snapshot)) {
+            snapshotRecord[k] = String(v)
+          }
+          await client.hset(historyKey, snapshotRecord)
+          await client.expire(historyKey, HISTORY_TTL_SEC)
+        }
+
+        // ── Step 3: derive session number ────────────────────────────
+        const prevSession = parseInt(existing.session_number || "0", 10)
+        sessionNumber = (Number.isFinite(prevSession) ? prevSession : 0) + 1
+
+        // ── Step 4: delete old hash so we start fully clean ───────────
+        await client.del(key)
+        console.log(
+          `[v0] [Progression] Archived old progression for ${connectionId} (oldEpoch=${oldEpoch}) → ${historyKey}`,
+        )
+      }
+
+      // ── Step 5: write fresh progression hash ─────────────────────────
+      await client.hset(key, {
+        // Identity
+        connection_id: connectionId,
+        session_number: String(sessionNumber),
+        epoch: String(newEpoch),
+        // Timestamps
+        started_at: String(now),
+        last_update: new Date(now).toISOString(),
+        // State
+        engine_started: "true",
+        // All cumulative counters start at zero for this session.
+        cycles_completed: "0",
+        successful_cycles: "0",
+        failed_cycles: "0",
+        total_trades: "0",
+        successful_trades: "0",
+        total_profit: "0",
+        cycle_success_rate: "0",
+        trade_success_rate: "0",
+        indication_cycle_count: "0",
+        indication_live_cycle_count: "0",
+        strategy_cycle_count: "0",
+        strategy_live_cycle_count: "0",
+        realtime_cycle_count: "0",
+        realtime_live_cycle_count: "0",
+        frames_processed: "0",
+        indications_direction_count: "0",
+        indications_move_count: "0",
+        indications_active_count: "0",
+        indications_active_advanced_count: "0",
+        indications_optimal_count: "0",
+        indications_auto_count: "0",
+        strategies_base_total: "0",
+        strategies_main_total: "0",
+        strategies_real_total: "0",
+        strategy_evaluated_base: "0",
+        strategy_evaluated_main: "0",
+        strategy_evaluated_real: "0",
+      })
+
+      console.log(
+        `[v0] [Progression] Started new progression for ${connectionId} (session=${sessionNumber}, epoch=${newEpoch})`,
+      )
+      return sessionNumber
+    } catch (error) {
+      console.error(`[v0] Failed to archive/start progression for ${connectionId}:`, error)
+      return 1
     }
   }
 }
