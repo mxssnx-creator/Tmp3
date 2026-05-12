@@ -1149,8 +1149,10 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:main:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:base:passed`, 86400),
       ]
-      if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", baseSets.length))
-      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", mainSets.length))
+      // strategies_main_total = cumulative Sets PRODUCED by MAIN (output count).
+      // strategies_main_evaluated = Base Sets that entered MAIN (input count).
+      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", mainSets.length))
+      if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", baseSets.length))
 
       // ── Main-stage COORDINATION metrics (per-cycle snapshot + cumulative) ─
       // These let the stats API answer the user's question "is the Main stage
@@ -1629,8 +1631,10 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:main:passed`, 86400),
       ]
-      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", mainSets.length))
-      if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realSets.length))
+      // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
+      // strategies_real_evaluated = Main Sets that entered REAL (input count).
+      if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
+      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", mainSets.length))
 
       // ── ACTIVE-NOW snapshot for Real stage ──────────────────────────
       // Mirrors the Base/Main pattern. The dashboard reads this hash and
@@ -2163,14 +2167,16 @@ export class StrategyCoordinator {
                 const profile = set.trailingProfile
                 const trailing = profile ? true : bestEntry.confidence >= 0.85
 
-                // Include the trailing tuple in the per-Set uniqueness
-                // key so each variant occupies its own slot. The
-                // per-direction cap in `canCreatePosition` still gates
-                // the total — only one Long + one Short open at a time.
-                const tagSuffix = profile
+                // Build a fully-qualified uniqueness key including TP, SL,
+                // direction and trailing so sets with the same indicationType
+                // and direction but different PF-derived TP/SL occupy distinct
+                // slots and are not collapsed into one active position.
+                const trailingSuffix = profile
                   ? `:t${Math.round(profile.startRatio * 100)}-${Math.round(profile.stopRatio * 100)}`
-                  : ""
-                const configSetKey = `${set.indicationType}:${set.direction}:${symbol}${tagSuffix}`
+                  : trailing ? `:tr1` : `:tr0`
+                const configSetKey =
+                  `${set.indicationType}:${set.direction}:${symbol}` +
+                  `:tp${tp.toFixed(2)}:sl${sl.toFixed(2)}${trailingSuffix}`
 
                 const posId = await posManager.createPosition({
                   symbol,
@@ -2188,15 +2194,21 @@ export class StrategyCoordinator {
                     trailingStepRatio: profile.stepRatio,
                   }),
                 })
-                return Boolean(posId)
+                return posId ? ("created" as const) : ("gated" as const)
               } catch (posErr) {
                 console.error(`[v0] [StrategyFlow] ${symbol} LIVE: createPosition error:`, posErr instanceof Error ? posErr.message : String(posErr))
-                return false
+                return "error" as const
               }
             }),
           )
-          const positionsCreated = creations.filter(Boolean).length
-          console.log(`[v0] [StrategyFlow] ${symbol} LIVE: Created/updated ${positionsCreated} pseudo positions for ${qualifying.length} Sets`)
+          const positionsCreated = creations.filter((r) => r === "created").length
+          const positionsGated   = creations.filter((r) => r === "gated").length
+          const positionErrors   = creations.filter((r) => r === "error").length
+          console.log(
+            `[v0] [StrategyFlow] ${symbol} LIVE: ${positionsCreated} new pseudo positions` +
+            ` (${positionsGated} gated/already-active, ${positionErrors} errors)` +
+            ` for ${qualifying.length} Sets`
+          )
         } else {
           console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: No entry price, skipping position creation`)
         }
