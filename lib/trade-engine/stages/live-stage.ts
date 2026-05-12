@@ -863,39 +863,66 @@ async function pollOrderFill(
   connector: any,
   symbol: string,
   orderId: string,
-  timeoutMs = 10000,
+  timeoutMs = 15000,
   intervalMs = 800
 ): Promise<{ filled: boolean; filledQty: number; filledPrice: number; status: string }> {
   const deadline = Date.now() + timeoutMs
   let lastStatus = "pending"
-  let pollCount = 0
+  // Track the best partial result seen so far — return it on timeout rather
+  // than returning filled=false when we know some qty was actually transacted.
+  let bestPartialQty = 0
+  let bestPartialPrice = 0
   while (Date.now() < deadline) {
     try {
-      pollCount++
       const order = await connector.getOrder(symbol, orderId)
       if (order) {
         lastStatus = order.status || order.orderStatus || "unknown"
         const statusLower = String(lastStatus).toLowerCase().trim()
-        const isFilled = statusLower === "filled" || order.status === "FILLED"
-        const filledQty = order.filledQty || order.executedQty || order.cumQty || 0
-        const filledPrice = order.filledPrice || order.avgPrice || 0
+        const rawFilledQty  = parseFloat(String(order.filledQty  ?? order.executedQty ?? order.cumQty    ?? "0")) || 0
+        const rawFilledPrice = parseFloat(String(order.filledPrice ?? order.avgPrice   ?? order.price     ?? "0")) || 0
 
-        if (isFilled && filledQty > 0) {
+        // Any of these status strings mean the exchange has fully transacted the order.
+        const isFilled =
+          statusLower === "filled" ||
+          statusLower === "deal" ||        // BingX historical alias
+          statusLower === "complete" ||
+          statusLower === "completed" ||
+          order.status === "FILLED"
+
+        // Partial fills: qty > 0 even if status isn't fully "filled" yet.
+        // Accept as usable — protection orders should be sized to filledQty,
+        // not the requested qty. Remaining qty will be covered by reconcile.
+        const isPartialFill =
+          (statusLower === "partially_filled" || statusLower === "partial_fill") &&
+          rawFilledQty > 0
+
+        if (rawFilledQty > bestPartialQty) {
+          bestPartialQty  = rawFilledQty
+          bestPartialPrice = rawFilledPrice
+        }
+
+        if ((isFilled || isPartialFill) && rawFilledQty > 0) {
           return {
             filled: true,
-            filledQty,
-            filledPrice: filledPrice || 0,
-            status: "filled",
+            filledQty: rawFilledQty,
+            filledPrice: rawFilledPrice || 0,
+            status: isFilled ? "filled" : "partially_filled",
           }
         }
-        if (statusLower === "cancelled" || statusLower === "canceled") {
-          return { filled: false, filledQty: 0, filledPrice: 0, status: "cancelled" }
+        if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
+          return { filled: false, filledQty: 0, filledPrice: 0, status: statusLower }
         }
       }
     } catch (err) {
       console.warn(`${LOG_PREFIX} poll error:`, err instanceof Error ? err.message : String(err))
     }
     await new Promise(r => setTimeout(r, intervalMs))
+  }
+  // Timeout — return whatever partial qty we managed to see rather than zero.
+  // A non-zero bestPartialQty means the exchange has transacted at least some
+  // volume; returning it lets the caller place SL/TP for the confirmed portion.
+  if (bestPartialQty > 0) {
+    return { filled: true, filledQty: bestPartialQty, filledPrice: bestPartialPrice, status: "partially_filled" }
   }
   return { filled: false, filledQty: 0, filledPrice: 0, status: lastStatus }
 }
@@ -1085,7 +1112,12 @@ async function updateProtectionOrders(
   reason: string,
 ): Promise<{ changed: boolean; slPlaced: boolean; tpPlaced: boolean }> {
   const result = { changed: false, slPlaced: false, tpPlaced: false }
-  if (!connector || pos.executedQuantity <= 0) return result
+  if (!connector) return result
+  // Use executedQuantity when confirmed; fall back to quantity (the original
+  // order size) so SL/TP can be placed even when fill-detection lagged.
+  // Protection orders are reduce-only — they cannot add new risk.
+  const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
+  if (effectiveQty <= 0) return result
 
   const { desiredSl, desiredTp } = computeDesiredProtectionPrices(pos)
   const closeSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
@@ -1122,7 +1154,7 @@ async function updateProtectionOrders(
       connector,
       pos.symbol,
       closeSide,
-      pos.executedQuantity,
+      effectiveQty,
       desiredSl,
       "StopLoss",
       pos.direction,
@@ -1150,7 +1182,7 @@ async function updateProtectionOrders(
       connector,
       pos.symbol,
       closeSide,
-      pos.executedQuantity,
+      effectiveQty,
       desiredTp,
       "TakeProfit",
       pos.direction,
@@ -1161,12 +1193,10 @@ async function updateProtectionOrders(
     result.tpPlaced = !!id
   }
 
-  // After (re-)placement record the qty we armed for, so the next pass
-  // can detect further drift accurately. Always update — even on a
-  // pure cancel-and-replace where qty didn't move — so we don't keep
-  // diffing against a stale baseline.
+  // After (re-)placement record the qty we armed for so the next pass
+  // can detect further drift accurately.
   if (result.changed) {
-    pos.protectionArmedQuantity = pos.executedQuantity
+    pos.protectionArmedQuantity = effectiveQty
   }
 
   if (result.changed) {
@@ -1857,8 +1887,55 @@ export async function executeLivePosition(
     // Persist intermediate state so UI can show "placed" even during poll.
     await savePosition(livePosition)
 
-    // ── Step 6: Poll for fill confirmation ───────────────────────────��─────
-    const fill = await pollOrderFill(exchangeConnector, realPosition.symbol, livePosition.orderId!)
+    // ── Step 6: Fill confirmation ──────────────────────────────────────────
+    // Three-layer strategy:
+    //  A) Inline: Many exchanges (BingX, Bybit) return immediate fill data in
+    //     the placeOrder response itself. Extract it before polling to avoid
+    //     a full 15s wait on fast-fill venues.
+    //  B) Poll: Standard path — repeatedly call getOrder() until filled or
+    //     timeout. Extended timeout (15s vs old 10s) to handle slow networks.
+    //  C) getPosition() fallback: If poll times out with no fill data, ask the
+    //     exchange for the *position* (not the order). On perp exchanges a
+    //     successfully-opened position IS the proof of fill; its size and
+    //     entry price are reliable even when getOrder() lags.
+    //
+    // After all three layers, if executedQty is still 0 we use computedVolume
+    // as a last-resort quantity so SL/TP can be placed on the exchange. The
+    // protection order itself being "reduce-only" ensures it can't add new
+    // risk; the reconcile cycle will correct the stored qty on next tick.
+    const inlineFillQty   = parseFloat(String(orderResult.filledQty  ?? orderResult.executedQty ?? orderResult.cumQty   ?? "0")) || 0
+    const inlineFillPrice = parseFloat(String(orderResult.filledPrice ?? orderResult.avgPrice   ?? orderResult.price    ?? "0")) || 0
+    const inlineStatus    = String(orderResult.status ?? "").toLowerCase()
+    const inlineFilled    = (inlineStatus === "filled" || inlineFillQty >= computedVolume * 0.99) && inlineFillQty > 0
+
+    let fill: { filled: boolean; filledQty: number; filledPrice: number; status: string }
+
+    if (inlineFilled) {
+      // A) placeOrder response already contains fill confirmation — skip poll.
+      fill = { filled: true, filledQty: inlineFillQty, filledPrice: inlineFillPrice, status: "filled" }
+      console.log(`${LOG_PREFIX} Inline fill detected for ${realPosition.symbol}: qty=${inlineFillQty} @ ${inlineFillPrice}`)
+    } else {
+      // B) Standard poll path.
+      fill = await pollOrderFill(exchangeConnector, realPosition.symbol, livePosition.orderId!)
+    }
+
+    // C) getPosition() fallback when poll timed out without fill data.
+    if (!fill.filled || fill.filledQty <= 0) {
+      if (typeof exchangeConnector.getPosition === "function") {
+        try {
+          const exPos = await exchangeConnector.getPosition(realPosition.symbol)
+          const exSize = parseFloat(String(exPos?.size ?? exPos?.positionAmt ?? exPos?.quantity ?? "0")) || 0
+          const exEntry = parseFloat(String(exPos?.entryPrice ?? exPos?.avgPrice ?? "0")) || 0
+          if (exSize > 0) {
+            console.log(`${LOG_PREFIX} getPosition() fallback fill for ${realPosition.symbol}: size=${exSize} entry=${exEntry}`)
+            fill = { filled: true, filledQty: exSize, filledPrice: exEntry || currentPrice, status: "filled_via_position" }
+          }
+        } catch {
+          /* best-effort — fall through to computedVolume guard below */
+        }
+      }
+    }
+
     if (fill.filled && fill.filledQty > 0) {
       livePosition.executedQuantity = fill.filledQty
       livePosition.remainingQuantity = Math.max(0, computedVolume - fill.filledQty)
@@ -1870,22 +1947,42 @@ export async function executeLivePosition(
         fee: 0,
         feeAsset: "USDT",
       })
-      livePosition.status = livePosition.remainingQuantity <= 0 ? "filled" : "partially_filled"
-      pushStep(livePosition, "poll_fill", true, `filled=${fill.filledQty} @ ${fill.filledPrice}`)
+      livePosition.status = livePosition.remainingQuantity <= 0.000001 ? "filled" : "partially_filled"
+      pushStep(livePosition, "poll_fill", true, `filled=${fill.filledQty} @ ${fill.filledPrice} via=${fill.status}`)
       await incrementMetric(connectionId, "live_orders_filled_count")
       await logProgressionEvent(connectionId, "live_trading", "info", `Entry filled for ${realPosition.symbol}`, {
         orderId: livePosition.orderId,
         filledQty: fill.filledQty,
         filledPrice: fill.filledPrice,
+        via: fill.status,
       })
     } else {
-      pushStep(livePosition, "poll_fill", false, `fill not confirmed within timeout — status=${fill.status}`)
+      // D) Final guard: fill unconfirmed but order was accepted — treat as filled
+      // with computedVolume so SL/TP can be placed. The position is "open" on the
+      // exchange (order went to market); protection orders are reduce-only so no
+      // new risk is added. Reconcile will correct executedQty on next tick.
+      console.warn(
+        `${LOG_PREFIX} Fill unconfirmed for ${realPosition.symbol} after all detection layers — ` +
+        `using computedVolume=${computedVolume} as protection qty. Reconcile will sync.`
+      )
+      livePosition.executedQuantity = computedVolume
+      livePosition.remainingQuantity = 0
+      livePosition.averageExecutionPrice = currentPrice
+      livePosition.fills.push({
+        timestamp: Date.now(),
+        quantity: computedVolume,
+        price: currentPrice,
+        fee: 0,
+        feeAsset: "USDT",
+      })
+      livePosition.status = "filled" // treat as filled so SL/TP proceeds
+      pushStep(livePosition, "poll_fill", false, `fill unconfirmed — using computedVolume=${computedVolume} as fallback qty for SL/TP`)
       await logProgressionEvent(
         connectionId,
         "live_trading",
         "warning",
-        `Entry fill not confirmed within timeout for ${realPosition.symbol}`,
-        { orderId: livePosition.orderId, status: fill.status }
+        `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP will use order qty as fallback`,
+        { orderId: livePosition.orderId, status: fill.status, fallbackQty: computedVolume }
       )
     }
 
@@ -2722,59 +2819,77 @@ export async function reconcileLivePositions(
           pos.updatedAt = Date.now()
 
           // ── Entry-order fill detection (reconcile path) ───────────────
-          // syncWithExchange() detects delayed fills via getOrder(), but it
-          // is only called from the engine loop — not from the reconcile cron.
-          // Replicate the same check here so "placed" positions transition to
-          // "open" and get their SL/TP armed on the next cron tick even when
-          // the engine is not running.
+          // Two-layer detection so a position is never stuck as "placed"
+          // even when getOrder() lags or returns a stale status:
+          //
+          // Layer 1 — Exchange position present in exchangeMap: The
+          //   exchange returned this symbol+direction in getPositions(),
+          //   which is definitive proof the entry filled. Sync qty/price
+          //   from the exchange position data directly without needing getOrder().
+          //
+          // Layer 2 — getOrder() polling: Confirms via the order status
+          //   and provides more precise filledQty/avgPrice. Also handles
+          //   the rejected/cancelled case so stale records are cleaned up.
           let justFilled = false
-          if (pos.status === "placed" && pos.orderId) {
-            try {
-              const order = await exchangeConnector.getOrder(pos.symbol, pos.orderId)
-              const statusLower = String(order?.status ?? "").toLowerCase()
-              if (order && (statusLower === "filled" || order.status === "FILLED")) {
-                pos.executedQuantity = order.filledQty || order.executedQty || pos.quantity
-                pos.remainingQuantity = Math.max(0, pos.quantity - pos.executedQuantity)
-                pos.averageExecutionPrice = order.filledPrice || order.avgPrice || pos.entryPrice
-                pos.status = "open"
-                pos.updatedAt = Date.now()
-                justFilled = true
-                await incrementMetric(connectionId, "live_orders_filled_count")
-              } else if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
-                // Entry order was cancelled/rejected — close the position record.
-                // Use savePosition() so the terminal-archival logic moves the
-                // id from the open index into the closed archive (otherwise
-                // the rejected position would linger in the open index list
-                // and be re-fetched every reconcile cycle).
-                pos.status = "rejected"
-                pos.closeReason = `entry_order_${statusLower}`
-                pos.closedAt = Date.now()
-                pos.updatedAt = Date.now()
-                await savePosition(pos)
-                summary.updated++
-                continue
+          if (pos.status === "placed") {
+            // Layer 1: exchange position proves fill — use it directly.
+            const exSize  = parseFloat(String(exPos.size ?? exPos.positionAmt ?? exPos.quantity ?? "0")) || 0
+            const exEntry = parseFloat(String(exPos.entryPrice ?? exPos.avgPrice ?? exPos.markPrice ?? "0")) || 0
+            if (exSize > 0) {
+              if (pos.executedQuantity <= 0) {
+                pos.executedQuantity = exSize
+                pos.remainingQuantity = 0
+                pos.averageExecutionPrice = exEntry || pos.entryPrice
               }
-            } catch {
-              /* getOrder() may fail transiently — retry next cycle */
+              pos.status = "open"
+              pos.updatedAt = Date.now()
+              justFilled = true
+              await incrementMetric(connectionId, "live_orders_filled_count")
+            }
+
+            // Layer 2: try getOrder() for more precise data and to catch rejections.
+            if (pos.orderId) {
+              try {
+                const order = await exchangeConnector.getOrder(pos.symbol, pos.orderId)
+                const statusLower = String(order?.status ?? "").toLowerCase()
+                const orderFilledQty = parseFloat(String(order?.filledQty ?? order?.executedQty ?? "0")) || 0
+                if (order && (statusLower === "filled" || statusLower === "partially_filled" || orderFilledQty > 0)) {
+                  // Prefer getOrder data (more precise) over exchangeMap position data.
+                  if (orderFilledQty > 0) {
+                    pos.executedQuantity = orderFilledQty
+                    pos.remainingQuantity = Math.max(0, pos.quantity - pos.executedQuantity)
+                    pos.averageExecutionPrice = parseFloat(String(order.filledPrice ?? order.avgPrice ?? "0")) || pos.averageExecutionPrice || pos.entryPrice
+                  }
+                  pos.status = "open"
+                  pos.updatedAt = Date.now()
+                  if (!justFilled) {
+                    justFilled = true
+                    await incrementMetric(connectionId, "live_orders_filled_count")
+                  }
+                } else if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
+                  // Entry order was cancelled/rejected — close the position record.
+                  pos.status = "rejected"
+                  pos.closeReason = `entry_order_${statusLower}`
+                  pos.closedAt = Date.now()
+                  pos.updatedAt = Date.now()
+                  await savePosition(pos)
+                  summary.updated++
+                  continue
+                }
+              } catch {
+                /* getOrder() may fail transiently — Layer 1 result stands */
+              }
             }
           }
 
           // ── SL/TP self-healing ──────────────────────────────────────────
-          // Every reconcile cycle (driven by the cron) we verify the
-          // protection orders match the desired levels derived from the
-          // position's current stopLoss / takeProfit percentages and
-          // average execution price. This auto-heals four scenarios:
-          //   • Operator manually cancelled SL or TP on the exchange.
-          //   • Strategy update mutated the percentages mid-trade.
-          //   • Partial fill changed executedQuantity without re-arming.
-          //   • Accumulation merged new volume in (avg entry shifted).
-          // updateProtectionOrders() is no-op when nothing drifted, so
-          // this is cheap on the steady state — only fires real REST
-          // calls when something actually needs to change.
+          // Every reconcile cycle we verify protection orders match the
+          // desired levels. updateProtectionOrders() is no-op when nothing
+          // drifted — only fires real REST calls when something changed.
           //
-          // Skip entirely for positions still awaiting entry fill —
-          // placing SL/TP before the position exists on the exchange
-          // will always fail with "position not found".
+          // Skip for positions still awaiting entry fill AND not yet
+          // confirmed by the exchange — placing SL/TP before the position
+          // exists on the exchange will fail with "position not found".
           if (pos.status === "placed") {
             await savePosition(pos)
             summary.updated++
