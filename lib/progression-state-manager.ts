@@ -690,6 +690,10 @@ export class ProgressionStateManager {
         last_update: new Date(now).toISOString(),
         // State
         engine_started: "true",
+        // Prehistoric phase explicitly closed so a new engine start never
+        // inherits a stuck prehistoric_phase_active="true" from a prior
+        // crashed session, which would block the realtime phase from starting.
+        prehistoric_phase_active: "false",
         // All cumulative counters start at zero for this session.
         cycles_completed: "0",
         successful_cycles: "0",
