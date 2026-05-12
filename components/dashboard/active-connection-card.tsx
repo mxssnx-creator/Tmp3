@@ -956,7 +956,7 @@ export function ActiveConnectionCard({
                   { label: "Ind.",      value: liveStats.indications },
                   { label: "Strat.",    value: liveStats.strategies },
                   {
-                    label: prehistoricStats?.liveOpenPositions > 0 ? "Live" : "Pseudo",
+                    label: (prehistoricStats?.liveOpenPositions ?? 0) > 0 ? "Live" : "Pseudo",
                     value: liveStats.positions,
                   },
                 ].map(({ label, value }) => (
@@ -997,7 +997,7 @@ export function ActiveConnectionCard({
                       { label: "Ind.",      value: liveStats.indications },
                       { label: "Strat.",    value: liveStats.strategies },
                       {
-                        label: prehistoricStats?.liveOpenPositions > 0 ? "Live" : "Pseudo",
+                        label: (prehistoricStats?.liveOpenPositions ?? 0) > 0 ? "Live" : "Pseudo",
                         value: liveStats.positions,
                       },
                     ].map(({ label, value }) => (

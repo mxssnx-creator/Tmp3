@@ -120,7 +120,7 @@ export async function ensureDefaultExchangesExist() {
       } as Record<string, any>
 
         // ALWAYS inject real predefined credentials for base connections
-        // This ensures bybit-x03 and bingx-x01 have valid credentials on every startup
+        // This ensures canonical base connections (bingx-x01, etc.) have valid credentials on every startup
         if (hasConfiguredCreds) {
           normalizedBase.api_key = apiKey
           normalizedBase.api_secret = apiSecret

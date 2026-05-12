@@ -6,7 +6,6 @@ import { getBaseConnectionCredentials } from "@/lib/base-connection-credentials"
  * Includes API types, library names, and exchange-specific options.
  *
  * PRIMARY EXCHANGES (auto-created and enabled on initialization):
- * - Bybit (bybit-x03)
  * - BingX (bingx-x01)
  * - Pionex (pionex-x01)
  * - OrangeX (orangex-x01)

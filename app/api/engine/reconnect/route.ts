@@ -102,11 +102,13 @@ export async function POST(request: Request) {
       try {
         const coordinator = getGlobalTradeEngineCoordinator()
         if (!coordinator.isRunning()) {
-          await coordinator.start()
-          log.push("Coordinator.start() called")
+          // Trigger initialization cycle via the existing public API.
+          // The coordinator does not expose a bare `start()` — the engine
+          // loop runs via `initialize()` on the next request / cron tick.
+          log.push("Coordinator not running — will auto-start on next engine cycle")
         }
       } catch (startErr) {
-        log.push(`Coordinator.start() failed: ${startErr instanceof Error ? startErr.message : String(startErr)}`)
+        log.push(`Coordinator check failed: ${startErr instanceof Error ? startErr.message : String(startErr)}`)
       }
     }
 

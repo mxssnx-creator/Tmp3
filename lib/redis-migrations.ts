@@ -588,9 +588,9 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "17")
       
       // Cleanup migration: Reset all connections to proper state
-      // Only bybit-x03 and bingx-x01 should be base connections (inserted=1, enabled=1)
+      // Only bingx-x01 should be a base connection (inserted=1, enabled=1)
       // All others (pionex, orangex, binance, etc) should be templates only (inserted=0, enabled=0)
-      const baseExchangeIds = ["bybit-x03", "bingx-x01"]
+      const baseExchangeIds = ["bingx-x01"]
       
       const connections = await client.smembers("connections")
       let cleanedBase = 0
@@ -777,12 +777,12 @@ const migrations: Migration[] = [
       // getAssignedAndEnabledConnections() requires is_enabled/is_enabled_dashboard.
       //
       // This migration re-enables dashboard activation for autoActive base
-      // connections (bybit-x03, bingx-x01) that already have API credentials
+      // connections (bingx-x01) that already have API credentials
       // stored. It runs AFTER the cleanup migrations so it is not overridden.
       //
       // A connection is considered credential-ready if it has a non-empty
       // api_key stored in its connection hash OR in its credentials hash.
-      const AUTO_ACTIVE_IDS = ["bybit-x03", "bingx-x01"]
+      const AUTO_ACTIVE_IDS = ["bingx-x01"]
       let fixed = 0
 
       for (const connId of AUTO_ACTIVE_IDS) {
@@ -829,7 +829,7 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "20")
-      for (const connId of ["bybit-x03", "bingx-x01"]) {
+      for (const connId of ["bingx-x01"]) {
         await client.hset(`connection:${connId}`, { is_enabled_dashboard: "0", is_active: "0" })
       }
     },
@@ -851,7 +851,6 @@ const BASE_CONNECTION_CONFIG: Array<{
   // dashboard toggle) is preserved by the existing `(existing?.is_*) || …`
   // fallback chain in `ensureBaseConnections` below — autoActive only
   // affects the initial-create defaults, never overwrites prior state.
-  { id: "bybit-x03", name: "Bybit Base", exchange: "bybit", credentialId: "bybit-x03", autoActive: true },
   { id: "bingx-x01", name: "BingX Base", exchange: "bingx", credentialId: "bingx-x01", autoActive: true },
   { id: "pionex-x01", name: "Pionex Base", exchange: "pionex", credentialId: "pionex-x01", autoActive: false },
   { id: "orangex-x01", name: "OrangeX Base", exchange: "orangex", credentialId: "orangex-x01", autoActive: false },
@@ -914,7 +913,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     //
     // Root cause: previous version unconditionally set
     //   is_active_inserted: cfg.autoActive ? "1" : ...
-    // for autoActive base connections (bybit-x03, bingx-x01). Every
+    // for autoActive base connections (bingx-x01). Every
     // cold-start (or any code path that calls `initRedis` followed by
     // `runMigrations` — which is essentially every Vercel function
     // invocation) re-flipped the flag back to "1", undoing the

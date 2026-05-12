@@ -4,6 +4,7 @@
 import * as crypto from "crypto"
 import {
   BaseExchangeConnector,
+  type ExchangeCredentials,
   type ExchangeConnectorResult,
   type PlaceOrderOptions,
 } from "./base-connector"

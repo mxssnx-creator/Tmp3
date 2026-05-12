@@ -87,13 +87,13 @@ export async function GET() {
       indication: {
         lastRun: engineState.last_indication_run,
         cycleCount: indicationCycles,
-        avgDurationMs: Math.round(engineState.indication_avg_duration_ms || 0),
+        avgDurationMs: Math.round(Number(engineState.indication_avg_duration_ms) || 0),
         status: indicationCycles > 0 ? "running" : "idle",
       },
       strategy: {
         lastRun: engineState.last_strategy_run,
         cycleCount: strategyCycles,
-        avgDurationMs: Math.round(engineState.strategy_avg_duration_ms || 0),
+        avgDurationMs: Math.round(Number(engineState.strategy_avg_duration_ms) || 0),
         totalEvaluated: totalStrategiesEvaluated,
         status: strategyCycles > 0 ? "running" : "idle",
       },

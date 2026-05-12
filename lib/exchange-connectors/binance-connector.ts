@@ -8,7 +8,7 @@
 // alias declared in `next.config.mjs`, so the build succeeds and the
 // runtime guard ensures the empty stub is never called.
 import * as crypto from "crypto"
-import { BaseExchangeConnector, type ExchangeConnectorResult } from "./base-connector"
+import { BaseExchangeConnector, type ExchangeConnectorResult, type ExchangeCredentials } from "./base-connector"
 
 export class BinanceConnector extends BaseExchangeConnector {
   constructor(credentials: ExchangeCredentials, exchange: string = "binance") {

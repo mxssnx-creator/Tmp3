@@ -2594,7 +2594,8 @@ async function orphanCloseExpiredPositions(
       let exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || 0
       if (exitPrice <= 0) {
         try {
-          const mdHash = await client.hgetall(`market_data:${pos.symbol}`)
+          const orphanRedis = getRedisClient()
+          const mdHash = await orphanRedis.hgetall(`market_data:${pos.symbol}`)
           const mdPrice = parseFloat(String(mdHash?.lastPrice ?? mdHash?.price ?? mdHash?.close ?? "0"))
           if (mdPrice > 0) exitPrice = mdPrice
         } catch { /* ignore */ }

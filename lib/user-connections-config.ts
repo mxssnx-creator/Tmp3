@@ -33,6 +33,7 @@ export interface UserConnectionConfig {
 }
 
 export const USER_CONNECTIONS: UserConnectionConfig[] = [
+  // Bybit X03 is available for manual addition — not auto-assigned to Main Connections.
   {
     id: "bybit-x03-unified",
     name: "X03",

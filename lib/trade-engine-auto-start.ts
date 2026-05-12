@@ -82,7 +82,7 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
       return
     }
 
-    const BASE_CONNECTION_IDS = ["bybit-x03", "bingx-x01"]
+    const BASE_CONNECTION_IDS = ["bingx-x01"]
 
     async function runHealingSweep(isStartup: boolean): Promise<void> {
       try {
