@@ -511,7 +511,11 @@ export async function GET(request: Request) {
       // Detailed Live execution metrics — orders, positions, fill & win rates
       liveExecution: {
         ...aggregatedLive,
-        positionsOpen: Math.max(0, aggregatedLive.positionsCreated - aggregatedLive.positionsClosed),
+        positionsOpen: Math.max(
+          0,
+          aggregatedLive.positionsCreated - aggregatedLive.positionsClosed +
+          Math.max(0, aggregatedLive.ordersPlaced - aggregatedLive.ordersFilled)
+        ),
         fillRate: liveFillRate,
         winRate: liveWinRate,
       },

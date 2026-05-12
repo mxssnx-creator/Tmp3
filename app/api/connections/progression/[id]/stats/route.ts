@@ -1396,7 +1396,8 @@ export async function GET(
           closed:    n(progHash.live_positions_closed_count),
           open:      Math.max(
             0,
-            n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)
+            n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
+            Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count))
           ),
           ordersPlaced: n(progHash.live_orders_placed_count),
           ordersFilled: n(progHash.live_orders_filled_count),
@@ -1533,7 +1534,8 @@ export async function GET(
               trackings: stratCounts.live || 0,
               positions: Math.max(
                 0,
-                n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count),
+                n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
+                Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count)),
               ),
             },
             total: {
@@ -1846,7 +1848,13 @@ export async function GET(
         positionsClosed:  n(progHash.live_positions_closed_count),
         positionsOpen:    Math.max(
           0,
-          n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count)
+          // Show both filled positions AND currently-placed pending fills.
+          // Filled positions are tracked by `live_positions_created_count`
+          // (incremented on confirmed fill). Pending placed positions that
+          // haven't yet filled are (live_orders_placed_count - live_orders_filled_count).
+          // The sum gives the full count of "active" positions from the user's perspective.
+          n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
+          Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count))
         ),
         wins:             n(progHash.live_wins_count),
         // Volume — leveraged notional (cumulative qty × price across all fills)
