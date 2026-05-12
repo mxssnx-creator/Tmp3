@@ -386,19 +386,6 @@ export class RealtimeProcessor {
         ? (currentPrice - entryPrice) * quantity
         : (entryPrice - currentPrice) * quantity
 
-      // Log position monitoring (reduced frequency to avoid spam). Also
-      // surface prev-set outcome so operators can see the context
-      // feeding the decision.
-      if (Math.random() < 0.01) { // Log ~1% of cycles
-        const prevTag = prevSetPos
-          ? ` | prevSet=${prevSetPos.status}/${(prevSetPos.result ?? 0).toFixed(2)}`
-          : " | prevSet=none"
-        console.log(
-          `[v0] [Realtime] Monitoring ${position.symbol} ${side}: ` +
-          `Price=${currentPrice.toFixed(2)}, PnL=${pnl.toFixed(4)}${prevTag}`,
-        )
-      }
-
       // Before handing to closePosition, stamp the latest market price
       // onto the position object so the manager's PnL calculation uses
       // the live price (not the potentially-stale `current_price` hash
@@ -418,7 +405,6 @@ export class RealtimeProcessor {
       if (this.shouldCloseTakeProfit(position, currentPrice)) {
         await this.positionManager.closePosition(position.id, "take_profit", position)
         this.invalidatePrevSet(cacheConfigId)
-        console.log(`[v0] [Realtime] TP hit for ${position.symbol} ${side} | PnL: ${pnl.toFixed(4)}`)
         return
       }
 
@@ -426,7 +412,6 @@ export class RealtimeProcessor {
       if (this.shouldCloseStopLoss(position, currentPrice)) {
         await this.positionManager.closePosition(position.id, "stop_loss", position)
         this.invalidatePrevSet(cacheConfigId)
-        console.log(`[v0] [Realtime] SL hit for ${position.symbol} ${side} | PnL: ${pnl.toFixed(4)}`)
         return
       }
 

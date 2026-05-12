@@ -25,7 +25,7 @@ export async function GET(request: NextRequest) {
             getAllPositions(connectionId!).catch(() => []),
           ])
           const activePositions = (positions as any[]).filter(
-            (p: any) => p?.status === "open" || p?.status === "active",
+            (p: any) => p?.status === "open",
           )
           const activeSymbols = new Set(activePositions.map((p: any) => p.symbol).filter(Boolean)).size
           return {

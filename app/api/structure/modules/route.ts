@@ -25,7 +25,7 @@ export async function GET(request: NextRequest) {
       recentIndications = inds.length
       activeStrategiesCount = strats.length
       activePositions = (positions as any[]).filter(
-        (p: any) => p?.status === "open" || p?.status === "active",
+        (p: any) => p?.status === "open",
       ).length
     } else {
       const connectionCheck = await query(`SELECT COUNT(*) as count FROM exchange_connections WHERE is_enabled = 1`)
@@ -33,7 +33,7 @@ export async function GET(request: NextRequest) {
         SELECT COUNT(*) as count FROM indications 
         WHERE datetime(created_at) > datetime('now', '-5 minutes')
       `)
-      const positionCheck = await query(`SELECT COUNT(*) as count FROM pseudo_positions WHERE status = 'active'`)
+      const positionCheck = await query(`SELECT COUNT(*) as count FROM pseudo_positions WHERE status = 'open'`)
       activeConnections = Number.parseInt(connectionCheck[0]?.count || "0") || 0
       recentIndications = Number.parseInt(indicationCheck[0]?.count || "0") || 0
       activePositions = Number.parseInt(positionCheck[0]?.count || "0") || 0

@@ -87,7 +87,7 @@ export async function GET(req: Request) {
       const posIds = await redis.smembers(`pseudo_positions:${connectionId}`) || []
       for (const posId of posIds) {
         const hash = await redis.hgetall(`pseudo_position:${connectionId}:${posId}`) || {}
-        if ((hash.status || "active") === "active") positionsCount++
+        if (hash.status === "open") positionsCount++
       }
       // Also check stage-specific position sets
       if (positionsCount === 0) {
@@ -95,7 +95,7 @@ export async function GET(req: Request) {
           const stageIds = await redis.smembers(`${stage}_pseudo_positions:${connectionId}`).catch(() => [] as string[])
           for (const posId of stageIds) {
             const hash = (await redis.hgetall(`${stage}_pseudo_position:${connectionId}:${posId}`).catch(() => ({}))) as Record<string, any> || {}
-            if (((hash as any).status || "active") === "active") positionsCount++
+            if ((hash as any).status === "open") positionsCount++
           }
         }
       }

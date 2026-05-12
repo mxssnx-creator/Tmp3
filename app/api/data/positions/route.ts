@@ -94,7 +94,7 @@ function normalise(raw: Record<string, any>): Position | null {
   // Prefer authoritative `realized_pnl` for closed rows (written atomically
   // at close time); recompute mark-to-market for open rows. This matches
   // what `getPositionStats` does so dashboards stay consistent.
-  const status = (raw.status === "active" ? "open" : raw.status) || "open"
+  const status = raw.status || "open"
   let unrealizedPnl: number
   if (status === "closed" && raw.realized_pnl != null) {
     const stored = parseFloat(raw.realized_pnl)

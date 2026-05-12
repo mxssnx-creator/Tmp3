@@ -313,11 +313,10 @@ export async function GET(
       for (const h of hashes) {
         if (!h) continue
         const hh = h as Record<string, any>
-        const status = hh.status ?? "active"
-        // Only "open" rows count — status="active" (PseudoPositionManager
-        // default) and status="open" (legacy) are both live; everything
-        // else (closed, cancelled, rejected) is excluded.
-        if (status !== "active" && status !== "open") continue
+        const status = hh.status ?? ""
+        // Pseudo positions are written with status="open" directly.
+        // Skip anything that is not explicitly open.
+        if (status !== "open") continue
         pseudoOpen++
 
         const setKey = String(hh.config_set_key || "").trim()
