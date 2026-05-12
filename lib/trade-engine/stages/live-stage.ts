@@ -982,6 +982,14 @@ async function placeProtectionOrder(
     const kind: "stop_loss" | "take_profit" =
       orderLabel === "StopLoss" ? "stop_loss" : "take_profit"
 
+    // NOTE: We do NOT pass `hedgeMode` here. The BingX connector defaults to
+    // hedgeMode=true (sends `positionSide`) and includes a built-in one-way
+    // fallback retry that fires when BingX returns code=80014. Passing
+    // hedgeMode:false would suppress `positionSide` entirely — which works
+    // on one-way accounts but breaks hedge accounts (BingX requires
+    // positionSide there, and the retry path only handles the inverse
+    // hedge→one-way case). Letting the connector default to hedge-mode +
+    // auto-retry covers both account types correctly.
     const result = await connector.placeStopOrder(
       symbol,
       closeSide,
@@ -991,11 +999,6 @@ async function placeProtectionOrder(
       {
         reduceOnly: true,
         positionSide: positionDirection === "long" ? "LONG" : "SHORT",
-        // Default to one-way mode. The connector's 80014-retry path will
-        // promote to hedge-mode automatically if the account is actually
-        // in hedge mode — this avoids a redundant retry on the vast
-        // majority of one-way accounts.
-        hedgeMode: false,
       },
     )
     if (result?.success && (result.orderId || result.id)) {
@@ -2736,11 +2739,16 @@ export async function reconcileLivePositions(
                 await incrementMetric(connectionId, "live_orders_filled_count")
                 console.log(`${LOG_PREFIX} [reconcile] Fill detected for ${pos.symbol} orderId=${pos.orderId} qty=${pos.executedQuantity}`)
               } else if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
-                // Entry order was cancelled/rejected — close the position record
+                // Entry order was cancelled/rejected — close the position record.
+                // Use savePosition() so the terminal-archival logic moves the
+                // id from the open index into the closed archive (otherwise
+                // the rejected position would linger in the open index list
+                // and be re-fetched every reconcile cycle).
                 pos.status = "rejected"
                 pos.closeReason = `entry_order_${statusLower}`
                 pos.closedAt = Date.now()
-                await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
+                pos.updatedAt = Date.now()
+                await savePosition(pos)
                 summary.updated++
                 continue
               }
@@ -2761,6 +2769,15 @@ export async function reconcileLivePositions(
           // updateProtectionOrders() is no-op when nothing drifted, so
           // this is cheap on the steady state — only fires real REST
           // calls when something actually needs to change.
+          //
+          // Skip entirely for positions still awaiting entry fill —
+          // placing SL/TP before the position exists on the exchange
+          // will always fail with "position not found".
+          if (pos.status === "placed") {
+            await client.setex(`live:position:${pos.id}`, 604800, JSON.stringify(pos)).catch(() => {})
+            summary.updated++
+            continue
+          }
           try {
             await updateProtectionOrders(exchangeConnector, pos, justFilled ? "reconcile_fill_detected" : "reconcile")
           } catch (slTpErr) {
