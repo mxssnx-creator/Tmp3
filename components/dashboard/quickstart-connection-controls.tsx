@@ -47,7 +47,7 @@ import {
 } from "@/components/ui/popover"
 import {
   Plug, Plus, Trash2, Loader2, AlertCircle, CheckCircle2,
-  Circle as CircleIcon,
+  Circle as CircleIcon, RefreshCw,
 } from "lucide-react"
 import {
   isBaseConnection, isConnectionEnabled,
@@ -90,6 +90,10 @@ export function QuickstartConnectionControls() {
   const [adding, setAdding] = useState<string | null>(null)
   const [resetting, setResetting] = useState(false)
   const [resetResult, setResetResult] = useState<
+    { ok: boolean; message: string } | null
+  >(null)
+  const [reconnecting, setReconnecting] = useState(false)
+  const [reconnectResult, setReconnectResult] = useState<
     { ok: boolean; message: string } | null
   >(null)
   const [popoverOpen, setPopoverOpen] = useState(false)
@@ -266,6 +270,44 @@ export function QuickstartConnectionControls() {
       setTimeout(() => setResetResult(null), 6000)
     }
   }, [resetting, loadConnections])
+
+  const handleReconnect = useCallback(async () => {
+    if (reconnecting) return
+    setReconnecting(true)
+    setReconnectResult(null)
+    try {
+      const body: Record<string, string> = {}
+      if (selectedConnectionId) body.connectionId = selectedConnectionId
+      const res = await fetch("/api/engine/reconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data?.success === false) {
+        setReconnectResult({
+          ok: false,
+          message: data?.error || data?.details || `Reconnect failed (HTTP ${res.status})`,
+        })
+      } else {
+        setReconnectResult({
+          ok: true,
+          message: data?.message || "Reconnected",
+        })
+        window.dispatchEvent(new CustomEvent("connections:refresh"))
+        window.dispatchEvent(new CustomEvent("quickstart:refresh"))
+        window.dispatchEvent(new CustomEvent("progressions:refresh"))
+      }
+    } catch (err) {
+      setReconnectResult({
+        ok: false,
+        message: err instanceof Error ? err.message : "Reconnect failed",
+      })
+    } finally {
+      setReconnecting(false)
+      setTimeout(() => setReconnectResult(null), 6000)
+    }
+  }, [reconnecting, selectedConnectionId])
 
   // ── render ─────────────────────────────────────────────────────────────
   return (

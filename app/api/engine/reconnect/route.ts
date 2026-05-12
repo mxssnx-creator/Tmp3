@@ -81,16 +81,33 @@ export async function POST(request: Request) {
     }
 
     // ── 3. Ensure global engine is running ────────────────────────────
+    // If the engine is stopped (e.g. auto-stop after a code hot-reload, or a
+    // previous explicit stop), the reconnect endpoint re-arms it. This is the
+    // primary purpose of the "Reconnect" button: recover from any stopped state
+    // without requiring a full QuickStart flow.
     const globalState = await client.hgetall("trade_engine:global")
-    if (globalState?.status !== "running") {
-      log.push("Global engine is not running — skipping startMissingEngines (use QuickStart to start)")
-      return NextResponse.json({
-        success: true,
-        message: "Cooldowns cleared and flags restored, but global engine is not running.",
-        log,
-        healed,
-        durationMs: Date.now() - startedAt,
+    const globalIsRunning = globalState?.status === "running"
+    if (!globalIsRunning) {
+      const nowIso = new Date().toISOString()
+      await client.hset("trade_engine:global", {
+        status: "running",
+        started_at: nowIso,
+        coordinator_ready: "true",
+        reconnected_at: nowIso,
       })
+      log.push(`Set trade_engine:global status=running (was: ${globalState?.status ?? "missing"})`)
+
+      // Also start the in-memory coordinator so engines spin up without
+      // waiting for the next auto-start monitor tick (up to 30 s delay).
+      try {
+        const coordinator = getGlobalTradeEngineCoordinator()
+        if (!coordinator.isRunning()) {
+          await coordinator.start()
+          log.push("Coordinator.start() called")
+        }
+      } catch (startErr) {
+        log.push(`Coordinator.start() failed: ${startErr instanceof Error ? startErr.message : String(startErr)}`)
+      }
     }
 
     // ── 3b. Live-patch VolumeCalculator to fix TDZ crash ─────────────
