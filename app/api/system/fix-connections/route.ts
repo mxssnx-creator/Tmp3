@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic"
 /**
  * POST /api/system/fix-connections
  * 
- * Fixes all 4 base connections (bybit, bingx, pionex, orangex) to be:
+ * Fixes all 3 base connections (bingx, pionex, orangex) to be:
  * - is_active_inserted = 1 (in Active panel)
  * - is_enabled = 1 (enabled)
  * - is_enabled_dashboard = 0 (dashboard toggle off by default)
@@ -20,7 +20,7 @@ export async function POST() {
     await initRedis()
     const client = getRedisClient()
     
-    const baseConnections = ["bybit-x03", "bingx-x01", "pionex-x01", "orangex-x01"] as const
+    const baseConnections = ["bingx-x01", "pionex-x01", "orangex-x01"] as const
     
     const results: Record<string, any> = {}
     
@@ -85,7 +85,7 @@ export async function GET() {
     await initRedis()
     const client = getRedisClient()
     
-    const baseIds = ["bybit-x03", "bingx-x01", "pionex-x01", "orangex-x01"]
+    const baseIds = ["bingx-x01", "pionex-x01", "orangex-x01"]
     const status: Record<string, any> = {}
     
     for (const id of baseIds) {

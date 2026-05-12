@@ -32,8 +32,9 @@ export interface ActiveConnection {
  * - ANY connection with is_enabled_dashboard=1 -- user-activated connections
  * isActive = is_enabled_dashboard (the active toggle, independent from Settings)
  */
-// Only bybit and bingx shown in main connections by default
-const MAIN_DEFAULT_EXCHANGES = ["bybit", "bingx"]
+// Only bingx is shown in main connections by default.
+// Bybit can still be added manually but is no longer auto-default.
+const MAIN_DEFAULT_EXCHANGES = ["bingx"]
 
 export async function loadActiveConnections(): Promise<ActiveConnection[]> {
   try {
@@ -51,7 +52,7 @@ export async function loadActiveConnections(): Promise<ActiveConnection[]> {
       const isBase = BASE_EXCHANGES.includes(exchange)
       const isMainDefault = MAIN_DEFAULT_EXCHANGES.includes(exchange)
 
-      // Show if: it's a main default exchange (bybit/bingx), OR it's dashboard-active (user added)
+      // Show if: it's a main default exchange (bingx), OR it's dashboard-active (user added)
       if ((isBase && isMainDefault) || isDashboardActive) {
         if (seenIds.has(conn.id)) continue
         seenIds.add(conn.id)
@@ -190,7 +191,6 @@ export async function toggleActiveConnection(connectionId: string, isActive: boo
 function getDefaultActiveConnections(): ActiveConnection[] {
   const now = new Date().toISOString()
   return [
-    { id: "active-bybit-x03", connectionId: "bybit-x03", exchangeName: "Bybit", isActive: false, isBaseEnabled: true, addedAt: now },
     { id: "active-bingx-x01", connectionId: "bingx-x01", exchangeName: "BingX", isActive: false, isBaseEnabled: true, addedAt: now },
   ]
 }

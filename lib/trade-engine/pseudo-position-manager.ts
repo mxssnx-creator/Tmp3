@@ -360,7 +360,7 @@ export class PseudoPositionManager {
         // High-water mark anchor for the ratchet. Long: highest price
         // seen since activation. Short: lowest price seen.
         trailing_anchor: "0",
-        status: "active",
+        status: "open",
         opened_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }
@@ -407,7 +407,7 @@ export class PseudoPositionManager {
         return this.activePositionsCache
       }
 
-      const positions = await this.listPositions({ status: "active" })
+      const positions = await this.listPositions({ status: "open" })
 
       // Sort by opened_at DESC
       positions.sort((a, b) => {
@@ -714,7 +714,7 @@ export class PseudoPositionManager {
    * Get active position count
    */
   async getPositionCount(): Promise<number> {
-    const active = await this.listPositions({ status: "active" })
+    const active = await this.listPositions({ status: "open" })
     return active.length
   }
 
@@ -763,7 +763,7 @@ export class PseudoPositionManager {
     try {
       const allPositions = await this.listPositions()
 
-      const active = allPositions.filter(p => p.status === "active")
+      const active = allPositions.filter(p => p.status === "open")
       const closed = allPositions.filter(p => p.status === "closed")
       const activeLong = active.filter(p => p.side === "long").length
       const activeShort = active.filter(p => p.side === "short").length
@@ -898,7 +898,7 @@ export class PseudoPositionManager {
    * Get position count by direction
    */
   async getPositionCountByDirection(side: "long" | "short"): Promise<number> {
-    const positions = await this.listPositions({ status: "active", side })
+    const positions = await this.listPositions({ status: "open", side })
     return positions.length
   }
 

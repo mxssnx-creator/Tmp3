@@ -35,7 +35,6 @@ export async function POST() {
     }
 
     await injectForConnection("bingx-x01")
-    await injectForConnection("bybit-x03")
     await injectForConnection("pionex-x01")
     await injectForConnection("orangex-x01")
     
@@ -64,14 +63,13 @@ export async function GET() {
     
     const predefinedStatus = {
       "bingx-x01": BASE_CONNECTION_CREDENTIALS["bingx-x01"].apiKey.length > 0 && BASE_CONNECTION_CREDENTIALS["bingx-x01"].apiSecret.length > 0,
-      "bybit-x03": BASE_CONNECTION_CREDENTIALS["bybit-x03"].apiKey.length > 0 && BASE_CONNECTION_CREDENTIALS["bybit-x03"].apiSecret.length > 0,
       "pionex-x01": BASE_CONNECTION_CREDENTIALS["pionex-x01"].apiKey.length > 0 && BASE_CONNECTION_CREDENTIALS["pionex-x01"].apiSecret.length > 0,
       "orangex-x01": BASE_CONNECTION_CREDENTIALS["orangex-x01"].apiKey.length > 0 && BASE_CONNECTION_CREDENTIALS["orangex-x01"].apiSecret.length > 0,
     }
     
     // Check which connections have credentials in database
     const dbStatus: Record<string, boolean> = {}
-    for (const connId of ["bingx-x01", "bybit-x03", "pionex-x01", "orangex-x01"]) {
+    for (const connId of ["bingx-x01", "pionex-x01", "orangex-x01"]) {
       const conn = await client.hgetall(`connection:${connId}`)
       const hasKey = !!(conn?.api_key && conn.api_key.length > 10)
       const hasSecret = !!(conn?.api_secret && conn.api_secret.length > 10)

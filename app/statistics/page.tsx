@@ -160,7 +160,7 @@ export default function StatisticsPage() {
           // No real connections configured — fall back to demo positions so
           // the analytics views remain explorable on a fresh install.
           const tradingEngine = new TradingEngine()
-          const connections = ["bybit-x03", "bingx-x01", "pionex-x01"]
+          const connections = ["bingx-x01", "pionex-x01"]
           const positions: TradingPosition[] = []
 
           connections.forEach((connectionId) => {

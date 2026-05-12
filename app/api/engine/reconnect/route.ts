@@ -47,7 +47,7 @@ export async function POST(request: Request) {
       log.push(`Cleared margin cooldown for ${targetConnectionId}`)
     } else {
       // Clear for all base connections.
-      const BASE_CONNECTION_IDS = ["bybit-x03", "bingx-x01"]
+      const BASE_CONNECTION_IDS = ["bingx-x01"]
       for (const connId of BASE_CONNECTION_IDS) {
         clearMarginCooldown(connId)
       }
@@ -55,7 +55,7 @@ export async function POST(request: Request) {
     }
 
     // ── 2. Re-apply base connection enabled flags ─────────────────────
-    const BASE_CONNECTION_IDS = ["bybit-x03", "bingx-x01"]
+    const BASE_CONNECTION_IDS = ["bingx-x01"]
     const connIdsToHeal = targetConnectionId ? [targetConnectionId] : BASE_CONNECTION_IDS
     let healed = 0
     for (const connId of connIdsToHeal) {

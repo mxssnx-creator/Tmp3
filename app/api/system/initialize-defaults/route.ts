@@ -5,7 +5,7 @@ import { ensureDefaultExchangesExist } from "@/lib/default-exchanges-seeder"
 
 /**
  * POST /api/system/initialize-defaults
- * Initialize system with default disabled exchanges (Bybit and BingX)
+ * Initialize system with default disabled exchanges (BingX)
  * These are pre-configured but disabled until user provides credentials
  */
 export async function POST(request: NextRequest) {
@@ -52,14 +52,12 @@ export async function GET(request: NextRequest) {
     await initRedis()
     const connections = await getAllConnections()
 
-    const bybit = connections.find((c) => c.id === "bybit-x03")
     const bingx = connections.find((c) => c.id === "bingx-x01")
 
     return NextResponse.json(
       {
         status: "ready",
         defaults: {
-          bybit: bybit ? { id: bybit.id, enabled: bybit.is_enabled, active: bybit.is_active } : null,
           bingx: bingx
             ? {
                 id: bingx.id,

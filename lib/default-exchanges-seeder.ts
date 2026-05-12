@@ -11,8 +11,9 @@ type BaseSeedConfig = {
   connectionLibrary: string
 }
 
+// Bybit is intentionally NOT a canonical base connection. Users can add Bybit
+// manually as a regular connection — it is no longer auto-seeded.
 const CANONICAL_BASE_CONNECTIONS: BaseSeedConfig[] = [
-  { id: "bybit-x03", exchange: "bybit", name: "Bybit X03", apiType: "unified", contractType: "linear", connectionMethod: "library", connectionLibrary: "native" },
   { id: "bingx-x01", exchange: "bingx", name: "BingX X01", apiType: "perpetual_futures", contractType: "usdt-perpetual", connectionMethod: "library", connectionLibrary: "native" },
   { id: "pionex-x01", exchange: "pionex", name: "Pionex X01", apiType: "perpetual_futures", contractType: "usdt-perpetual", connectionMethod: "library", connectionLibrary: "native" },
   { id: "orangex-x01", exchange: "orangex", name: "OrangeX X01", apiType: "perpetual_futures", contractType: "usdt-perpetual", connectionMethod: "library", connectionLibrary: "native" },
@@ -25,11 +26,14 @@ const LEGACY_CONNECTION_IDS = [
   "okx-base",
   "bybit-default-disabled",
   "bingx-default-disabled",
+  // bybit-x03 was previously seeded as a canonical base connection. It is no
+  // longer auto-created; existing rows must be removed on the next seed run.
+  "bybit-x03",
 ]
 
 // Module-level flag to prevent re-seeding
 let seedingCompleted = false
-const SEED_MARKER_KEY = "system:base_connections_seeded_v3"
+const SEED_MARKER_KEY = "system:base_connections_seeded_v4"
 
 /**
  * Backward-compatible entrypoint. Ensures canonical base connections only.

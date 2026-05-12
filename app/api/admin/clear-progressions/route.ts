@@ -199,14 +199,14 @@ export async function POST() {
     // transient flags (paused-by-global, dashboard-active, live-trade)
     // must reset so the operator gets a clean slate on the next QuickStart.
     //
-    // EXCEPTION: base connections (bybit-x03, bingx-x01) are persistent
+    // EXCEPTION: base connection (bingx-x01) is persistent
     // operator choices — their is_enabled_dashboard / is_assigned flags
     // must NOT be zeroed out here. The self-healing monitor in
     // trade-engine-auto-start.ts re-applies them on every 30s tick, but
     // clearing them triggers a 30s window where those connections are
     // disabled, which is surprising and incorrect behaviour for a "Reset DB"
     // operation that is supposed to clear only runtime state.
-    const BASE_CONNECTION_IDS_CLEAR = ["bybit-x03", "bingx-x01"]
+    const BASE_CONNECTION_IDS_CLEAR = ["bingx-x01"]
     try {
       const { getAllConnections, updateConnection } = await import("@/lib/redis-db")
       const conns = await getAllConnections()

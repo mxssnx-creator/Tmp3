@@ -101,7 +101,7 @@ export async function POST(request: Request) {
       const exch = (c.exchange || "").toLowerCase()
       const hasCredentials = !!(c.api_key && c.api_secret && c.api_key.length >= 10 && c.api_secret.length >= 10)
       const isUserCreated = !(c.is_predefined === true || c.is_predefined === "1" || c.is_predefined === "true")
-      return exch === "bybit" && isUserCreated && hasCredentials
+      return false
     }) || allConnections.find((c: any) => {
       const exch = (c.exchange || "").toLowerCase()
       const hasCredentials = !!(c.api_key && c.api_secret && c.api_key.length >= 10 && c.api_secret.length >= 10)
@@ -109,20 +109,20 @@ export async function POST(request: Request) {
     }) || allConnections.find((c: any) => {
       const exch = (c.exchange || "").toLowerCase()
       const hasCredentials = !!(c.api_key && c.api_secret && c.api_key.length >= 10 && c.api_secret.length >= 10)
-      return exch === "bybit" && hasCredentials
+      return false
     }) || allConnections.find((c: any) => {
       const exch = (c.exchange || "").toLowerCase()
       // QuickStart startup relies on Main Connections assignment state.
       const isAssigned = c.is_assigned === "1" || c.is_assigned === true
-      const isBase = exch === "bingx" || exch === "bybit" || exch === "pionex" || exch === "orangex"
+      const isBase = exch === "bingx" || exch === "pionex" || exch === "orangex"
       return isBase && isAssigned
     })
     }  // ← close the body.connectionId preference block
 
     if (!connection) {
-      console.log(`${LOG_PREFIX}: No BingX/Bybit connections found in Main Connections`)
+      console.log(`${LOG_PREFIX}: No BingX connections found in Main Connections`)
       
-      await logProgressionEvent("global", "quickstart_no_connection", "warning", "No BingX/Bybit connections in Main Connections", {
+      await logProgressionEvent("global", "quickstart_no_connection", "warning", "No BingX connections in Main Connections", {
         totalConnections: allConnections.length,
         availableExchanges: [...new Set(allConnections.map((c: any) => c.exchange))],
       })
@@ -130,8 +130,8 @@ export async function POST(request: Request) {
       return NextResponse.json(
         { 
           success: false,
-          error: "No BingX/Bybit connections found in Main Connections",
-          message: "Add a BingX or Bybit connection to Main Connections first, then add API credentials in Settings",
+          error: "No BingX connections found in Main Connections",
+          message: "Add a BingX connection to Main Connections first, then add API credentials in Settings",
           availableConnections: allConnections.map((c: any) => ({ 
             name: c.name,
             id: c.id,

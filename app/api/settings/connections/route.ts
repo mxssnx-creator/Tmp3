@@ -57,12 +57,12 @@ export async function GET(request: NextRequest) {
     }
 
     // Log what we're returning
-    const bybitBingx = connections.filter(c => ["bybit", "bingx"].includes((c.exchange || "").toLowerCase()))
+    const bingxOnly = connections.filter(c => ["bingx"].includes((c.exchange || "").toLowerCase()))
     const inserted = connections.filter(c => c.is_inserted === "1" || c.is_inserted === true)
     const activeInserted = connections.filter(c => c.is_active_inserted === "1" || c.is_active_inserted === true)
     
     console.log(`[v0] [API] [Connections] ${API_VERSION}: Returning ${connections.length} total connections`)
-    console.log(`[v0] [API] [Connections] ${API_VERSION}: Bybit/BingX: ${bybitBingx.length}`)
+    console.log(`[v0] [API] [Connections] ${API_VERSION}: BingX: ${bingxOnly.length}`)
     console.log(`[v0] [API] [Connections] ${API_VERSION}: Inserted (visible): ${inserted.map(c => c.name).join(', ')}`)
     console.log(`[v0] [API] [Connections] ${API_VERSION}: Active-inserted (in main panel): ${activeInserted.map(c => c.name).join(', ') || 'none'}`)
     console.log(`[v0] [API] [Connections] ${API_VERSION}: Enabled dashboard: ${connections.filter(c => c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true).map(c => c.name).join(', ') || 'none'}`)

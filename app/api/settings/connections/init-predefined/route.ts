@@ -8,7 +8,7 @@ export async function POST() {
     await initRedis()
     const ensured = await ensureDefaultExchangesExist()
     const allConnections = await getAllConnections()
-    const baseConnections = allConnections.filter((c: any) => ["bybit-x03", "bingx-x01", "pionex-x01", "orangex-x01"].includes(c.id))
+    const baseConnections = allConnections.filter((c: any) => ["bingx-x01", "pionex-x01", "orangex-x01"].includes(c.id))
 
     return NextResponse.json({
       success: true,

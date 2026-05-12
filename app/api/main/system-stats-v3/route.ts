@@ -16,7 +16,7 @@ export const revalidate = 0
 export const fetchCache = "force-no-store"
 
 // Main/base connection scope for dashboard metrics.
-const BASE_EXCHANGES = ["bybit", "bingx"]
+const BASE_EXCHANGES = ["bingx"]
 
 function isBaseExchange(c: any): boolean {
   return BASE_EXCHANGES.includes((c?.exchange || "").toLowerCase().trim())

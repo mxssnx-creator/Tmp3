@@ -17,7 +17,7 @@ export async function GET() {
   try {
     await initRedis()
     const allConnections = await getAllConnections()
-    const BASE_EXCHANGES = ["bingx", "bybit", "pionex", "orangex"]
+    const BASE_EXCHANGES = ["bingx", "pionex", "orangex"]
 
     // Check for connections with credentials (highest priority)
     const connectionsWithCredentials = allConnections.filter((c: any) => {
@@ -63,7 +63,7 @@ export async function GET() {
       totalConnections: allConnections.length,
       message: isReady
         ? "System is ready for quickstart"
-        : "No suitable connections found. Add BingX/Bybit to Main Connections in Dashboard first.",
+        : "No suitable connections found. Add BingX to Main Connections in Dashboard first.",
     })
   } catch (error) {
     console.error("[v0] [QuickStartReady] Error:", error)

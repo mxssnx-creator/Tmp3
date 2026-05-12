@@ -13,7 +13,7 @@ export async function GET() {
   try {
     await initRedis()
     const allConnections = await getAllConnections()
-    const baseIds = new Set(["bybit-x03", "bingx-x01", "pionex-x01", "orangex-x01"])
+    const baseIds = new Set(["bingx-x01", "pionex-x01", "orangex-x01"])
     
     // Filter for base connections that are enabled but NOT in Active panel
     const availableConnections = allConnections.filter((c: any) => {
