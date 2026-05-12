@@ -22,7 +22,7 @@
  * records a "simulated" live position without touching the exchange.
  */
 
-import { getRedisClient, initRedis } from "@/lib/redis-db"
+import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { SystemLogger } from "@/lib/system-logger"
@@ -1883,18 +1883,19 @@ export async function executeLivePosition(
     if (!orderResult?.success && isMinOrderSizeError(orderResult)) {
       const requiredMin = extractMinOrderQty(orderResult)
       if (requiredMin && requiredMin > 0) {
-        // Persist to Redis so the volume calculator respects it from now on.
+        // Persist to `settings:trading_pair:{symbol}` hash via setSettings —
+        // this is the EXACT key that VolumeCalculator reads via
+        // `getSettings("trading_pair:{symbol}")`. The previous implementation
+        // wrote to a plain-string key `trading_pair:{symbol}` (via redis.set)
+        // which is a completely different Redis path from the settings hash.
         try {
-          await initRedis()
-          const redis = getRedisClient()
-          const tpKey = `trading_pair:${realPosition.symbol}`
-          const existing = await redis.get(tpKey).catch(() => null)
-          const tpData = existing ? (() => { try { return JSON.parse(existing as string) } catch { return {} } })() : {}
-          tpData.min_order_size = String(requiredMin)
-          tpData.updated_at = Date.now()
-          await redis.set(tpKey, JSON.stringify(tpData))
+          await setSettings(`trading_pair:${realPosition.symbol}`, {
+            min_order_size: String(requiredMin),
+            updated_at: String(Date.now()),
+            source: "101400_auto_correction",
+          })
           console.log(
-            `${LOG_PREFIX} Stored min_order_size=${requiredMin} for ${realPosition.symbol} in Redis (was: ${existing ? "present" : "absent"})`
+            `${LOG_PREFIX} Stored min_order_size=${requiredMin} for ${realPosition.symbol} in settings hash`
           )
         } catch (storeErr) {
           console.warn(`${LOG_PREFIX} Failed to persist min_order_size for ${realPosition.symbol}:`, storeErr)

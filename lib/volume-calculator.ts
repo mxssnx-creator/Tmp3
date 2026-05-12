@@ -60,23 +60,21 @@ interface VolumeCalculationResult {
 export class VolumeCalculator {
   /**
    * Universal hard floor: the smallest USD notional we will ever attempt to
-   * place on an exchange when no specific minimum is known. $5 covers the
-   * documented minimums of every major venue (Binance, BingX, Bybit, OKX,
-   * Bitget). Applied AFTER any per-pair `exchangeMinVolume` so a known
-   * larger minimum (e.g. some altcoin pairs require $10) still wins.
-   */
-  /**
-   * Universal minimum notional value in USD — the absolute floor used when
-   * NO per-pair `exchangeMinVolume` is known from Redis trading-pair metadata.
+   * place on an exchange when no specific minimum is known.
    *
-   * Set to $1 (the lowest practical value). The per-pair exchange minimum
-   * always wins via `effectiveMin = max(exchangeMinVolume, universalMin)`
-   * in `calculatePositionVolume`, so the actual order will never be below
-   * what the exchange enforces for that specific pair. This constant is ONLY
-   * the "unknown pair" safety net — keeping it at $1 ensures quickstart
-   * positions are as minimal as legally allowed by the exchange.
+   * $5 covers the documented minimums of every major venue (Binance $5,
+   * BingX $5, Bybit $1-$5, OKX $5, Bitget $5). Applied AFTER any per-pair
+   * `exchangeMinVolume` (from `settings:trading_pair:{symbol}`) so a known
+   * larger minimum (e.g. some altcoin pairs require $10+) still wins via
+   * `effectiveMin = max(exchangeMinVolume, universalMin)`.
+   *
+   * Previously set to $1, which caused BingX 101400 rejections on
+   * every altcoin pair whose minimum notional is ≥$2 (e.g. SAGA, SKYAI,
+   * DRIFT). The 101400 auto-correction handler in live-stage now also
+   * persists the exact per-pair minimum to `settings:trading_pair:{symbol}`
+   * so this floor is only the safety net for the very first order attempt.
    */
-  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 1
+  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 5
 
   /**
    * Fetch account balance and compute the leverage safety cap.
