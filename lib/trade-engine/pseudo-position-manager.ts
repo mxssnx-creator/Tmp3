@@ -254,23 +254,11 @@ export class PseudoPositionManager {
       )
 
       if (!canCreate) {
-        console.log(`[v0] [PseudoPos] canCreate=false for ${params.symbol} key=${configSetKey} side=${params.side}`)
         return null  // silent — one position per config set is expected, or direction cap reached
       }
 
-      // ── Volume calculation ─────────────────────────────────────────
-      // IMPORTANT: Do NOT call VolumeCalculator.calculateVolumeForConnection
-      // here. The dev-server compiled that method with the old broken source
-      // (let balanceCap before let accountBalance — TDZ crash) and the
-      // in-memory eval'd module cannot be hot-reloaded for singleton chunks.
-      //
-      // Instead, call the two methods that ARE safe in the cached bundle:
-      //   1. resolveBalanceAndLeverage  — new method, not in old cache
-      //   2. calculatePositionVolume    — pure static, always correct
-      // This bypasses the broken cached function entirely.
+      // ── Volume calculation ──────────────────────────────────────────
       const volumeCalc = await (async () => {
-        const { initRedis, getRedisClient: _grc } = await import("@/lib/redis-db")
-        await initRedis()
         const settings = (await getAppSettings()) || {}
         const positionCostPercent = parseFloat(
           String(settings.exchangePositionCost ?? settings.positionCost ?? "0.1")
@@ -302,8 +290,6 @@ export class PseudoPositionManager {
         })
       })()
 
-      // Check if volume calculation succeeded and meets minimum requirements
-      console.log(`[v0] [PseudoPos] volume for ${params.symbol}: finalVolume=${volumeCalc?.finalVolume} reason=${volumeCalc?.adjustmentReason} entryPrice=${params.entryPrice}`)
       if (!volumeCalc.finalVolume || volumeCalc.finalVolume <= 0) {
         console.warn(
           `[v0] Cannot create position for ${params.symbol}: ` +

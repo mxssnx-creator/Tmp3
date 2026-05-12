@@ -173,7 +173,7 @@ export function QuickstartConnectionControls() {
   const handleSelect = useCallback(
     (connectionId: string) => {
       // Single-select: clicking a row replaces the current selection.
-      // No-op if the same row is clicked twice — we don't want to
+      // No-op if the same row is clicked twice ��� we don't want to
       // accidentally clear the selection (other dashboard panels expect
       // a non-null connection while the engine is running).
       if (!connectionId || connectionId === selectedConnectionId) {
@@ -547,7 +547,41 @@ export function QuickstartConnectionControls() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* ── Inline result chip — auto-dismisses after 6s ─────────────── */}
+      {/* ── Reconnect / re-arm engine ─────────────────────────────────── */}
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={reconnecting}
+        onClick={handleReconnect}
+        className="h-7 text-[11px] px-2 gap-1.5"
+        title="Clear cooldowns, heal flags, restart stopped engines, and re-arm the global coordinator."
+      >
+        {reconnecting ? (
+          <Loader2 className="w-3 h-3 animate-spin" />
+        ) : (
+          <RefreshCw className="w-3 h-3" />
+        )}
+        Reconnect
+      </Button>
+
+      {/* ── Inline result chips — auto-dismiss after 6s ───────────────── */}
+      {reconnectResult && (
+        <span
+          className={`flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded ${
+            reconnectResult.ok
+              ? "bg-green-100 dark:bg-green-950/30 text-green-700 dark:text-green-400"
+              : "bg-red-100 dark:bg-red-950/30 text-red-700 dark:text-red-400"
+          }`}
+          role="status"
+        >
+          {reconnectResult.ok ? (
+            <CheckCircle2 className="w-3 h-3" />
+          ) : (
+            <AlertCircle className="w-3 h-3" />
+          )}
+          {reconnectResult.message}
+        </span>
+      )}
       {resetResult && (
         <span
           className={`flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded ${
