@@ -30,3 +30,9 @@ yarn.lock
 # OS artifacts
 .DS_Store
 Thumbs.db
+
+# Root-level status/audit/checklist files (generated reports, never source)
+/*.txt
+/PRODUCTION_VERIFICATION_CHECKLIST.ts
+/SYSTEM_COMPLETE_VERIFICATION.ts
+/SYSTEM_VERIFICATION_CHECKLIST.ts
