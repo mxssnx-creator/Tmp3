@@ -177,7 +177,7 @@ export interface PositionContext {
   lastWins: number
   /** Number of losers among the last N closed */
   lastLosses: number
-  /** Total losers in the lookback window ��� gates DCA recovery variants */
+  /** Total losers in the lookback window ����� gates DCA recovery variants */
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
@@ -2096,8 +2096,14 @@ export class StrategyCoordinator {
         const last = await client.get(rlKey).catch(() => null)
         const now = Date.now()
         const lastTs = last ? parseInt(last as string, 10) : 0
+        // Rate-limit: fire at most once per 30 s.
+        // TTL = 35 s so the key expires before the next 30 s window opens —
+        // previously TTL=60 kept the key alive well past 30 s and would have
+        // blocked reconcile even after the window had elapsed. The cron
+        // (sync-live-positions) now skips connections whose engine is active,
+        // so this 30 s in-engine reconcile is the sole mechanism while running.
         if (!lastTs || now - lastTs > 30_000) {
-          await client.setex(rlKey, 60, String(now)).catch(() => {})
+          await client.setex(rlKey, 35, String(now)).catch(() => {})
           // Fire-and-forget: don't block the strategy flow on exchange IO.
           ;(async () => {
             try {
