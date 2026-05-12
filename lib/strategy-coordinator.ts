@@ -177,7 +177,7 @@ export interface PositionContext {
   lastWins: number
   /** Number of losers among the last N closed */
   lastLosses: number
-  /** Total losers in the lookback window — gates DCA recovery variants */
+  /** Total losers in the lookback window ��� gates DCA recovery variants */
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
@@ -1778,7 +1778,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────��──────────��──────��──────────────────────���────────
+  // ─── STAGE 4: LIVE ─────────����──────────��──────��──────────────────────���────────
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -2189,7 +2189,8 @@ export class StrategyCoordinator {
                   }),
                 })
                 return Boolean(posId)
-              } catch {
+              } catch (posErr) {
+                console.error(`[v0] [StrategyFlow] ${symbol} LIVE: createPosition error:`, posErr instanceof Error ? posErr.message : String(posErr))
                 return false
               }
             }),

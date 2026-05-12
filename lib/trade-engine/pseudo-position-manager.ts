@@ -254,6 +254,7 @@ export class PseudoPositionManager {
       )
 
       if (!canCreate) {
+        console.log(`[v0] [PseudoPos] canCreate=false for ${params.symbol} key=${configSetKey} side=${params.side}`)
         return null  // silent — one position per config set is expected, or direction cap reached
       }
 
@@ -302,6 +303,7 @@ export class PseudoPositionManager {
       })()
 
       // Check if volume calculation succeeded and meets minimum requirements
+      console.log(`[v0] [PseudoPos] volume for ${params.symbol}: finalVolume=${volumeCalc?.finalVolume} reason=${volumeCalc?.adjustmentReason} entryPrice=${params.entryPrice}`)
       if (!volumeCalc.finalVolume || volumeCalc.finalVolume <= 0) {
         console.warn(
           `[v0] Cannot create position for ${params.symbol}: ` +
