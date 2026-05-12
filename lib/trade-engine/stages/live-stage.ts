@@ -871,43 +871,30 @@ async function pollOrderFill(
     try {
       pollCount++
       const order = await connector.getOrder(symbol, orderId)
-      console.log(`[v0] [pollOrderFill] poll #${pollCount}: ${JSON.stringify(order)}`)
-      
       if (order) {
         lastStatus = order.status || order.orderStatus || "unknown"
-        
-        // Check for filled status (case-insensitive, handle various format: "filled", "FILLED", "Filled")
         const statusLower = String(lastStatus).toLowerCase().trim()
-        const isFilled = statusLower === "filled" || statusLower === "filled" || order.status === "FILLED"
-        
-        // Check for executed quantity/amount
+        const isFilled = statusLower === "filled" || order.status === "FILLED"
         const filledQty = order.filledQty || order.executedQty || order.cumQty || 0
         const filledPrice = order.filledPrice || order.avgPrice || 0
-        
-        console.log(`[v0] [pollOrderFill] status=${statusLower}, filledQty=${filledQty}, filledPrice=${filledPrice}, isFilled=${isFilled}`)
-        
+
         if (isFilled && filledQty > 0) {
-          console.log(`[v0] [pollOrderFill] ✓ Order filled: ${orderId}`)
           return {
             filled: true,
-            filledQty: filledQty,
+            filledQty,
             filledPrice: filledPrice || 0,
             status: "filled",
           }
         }
         if (statusLower === "cancelled" || statusLower === "canceled") {
-          console.log(`[v0] [pollOrderFill] ✗ Order cancelled: ${orderId}`)
           return { filled: false, filledQty: 0, filledPrice: 0, status: "cancelled" }
         }
-      } else {
-        console.log(`[v0] [pollOrderFill] poll #${pollCount}: no order data returned`)
       }
     } catch (err) {
       console.warn(`${LOG_PREFIX} poll error:`, err instanceof Error ? err.message : String(err))
     }
     await new Promise(r => setTimeout(r, intervalMs))
   }
-  console.log(`[v0] [pollOrderFill] Timeout after ${pollCount} polls, lastStatus=${lastStatus}`)
   return { filled: false, filledQty: 0, filledPrice: 0, status: lastStatus }
 }
 
@@ -1004,6 +991,11 @@ async function placeProtectionOrder(
       {
         reduceOnly: true,
         positionSide: positionDirection === "long" ? "LONG" : "SHORT",
+        // Default to one-way mode. The connector's 80014-retry path will
+        // promote to hedge-mode automatically if the account is actually
+        // in hedge mode — this avoids a redundant retry on the vast
+        // majority of one-way accounts.
+        hedgeMode: false,
       },
     )
     if (result?.success && (result.orderId || result.id)) {
@@ -2594,7 +2586,17 @@ async function orphanCloseExpiredPositions(
     for (const pos of expired) {
       summary.reconciled++
       const heldMin = Math.round((Date.now() - (pos.createdAt || pos.updatedAt || 0)) / 60000)
-      const exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || pos.entryPrice
+      // Same exit-price resolution chain as reconcileLivePositions:
+      // markPrice → averageExecutionPrice → Redis market_data → entryPrice
+      let exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || 0
+      if (exitPrice <= 0) {
+        try {
+          const mdHash = await client.hgetall(`market_data:${pos.symbol}`)
+          const mdPrice = parseFloat(String(mdHash?.lastPrice ?? mdHash?.price ?? mdHash?.close ?? "0"))
+          if (mdPrice > 0) exitPrice = mdPrice
+        } catch { /* ignore */ }
+      }
+      if (exitPrice <= 0) exitPrice = pos.entryPrice || 0
       const reason = connector ? "orphan_exchange_error" : "orphan_no_connector"
 
       console.warn(

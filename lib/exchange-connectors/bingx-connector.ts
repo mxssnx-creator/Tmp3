@@ -5,6 +5,7 @@ import * as crypto from "crypto"
 import {
   BaseExchangeConnector,
   type ExchangeConnectorResult,
+  type ExchangeOrder,
   type PlaceOrderOptions,
 } from "./base-connector"
 import { safeParseResponse } from "@/lib/safe-response-parser"
@@ -677,7 +678,34 @@ export class BingXConnector extends BaseExchangeConnector {
         return null
       }
 
-      return data.data
+      // Normalize the raw BingX order object to the ExchangeOrder interface
+      // so callers can rely on `filledQty`, `filledPrice`, and normalised
+      // `status` regardless of the underlying API version.
+      const raw = data.data
+      if (!raw) return null
+      const rawStatus = String(raw.status ?? raw.orderStatus ?? "").toUpperCase()
+      const normalizedStatus =
+        rawStatus === "FILLED"          ? "filled" :
+        rawStatus === "PARTIALLY_FILLED" ? "partially_filled" :
+        rawStatus === "CANCELED"         ? "cancelled" :
+        rawStatus === "CANCELLED"        ? "cancelled" :
+        rawStatus === "REJECTED"         ? "cancelled" :
+        rawStatus === "NEW"              ? "pending" :
+        rawStatus === "PENDING"          ? "pending" : "pending"
+
+      return {
+        orderId:     String(raw.orderId   ?? raw.clientOrderId ?? ""),
+        symbol:      String(raw.symbol    ?? ""),
+        side:        String(raw.side      ?? "").toLowerCase() as "buy" | "sell",
+        type:        "market",
+        quantity:    parseFloat(String(raw.origQty   ?? raw.quantity    ?? "0")),
+        price:       parseFloat(String(raw.price     ?? raw.avgPrice    ?? "0")),
+        status:      normalizedStatus as ExchangeOrder["status"],
+        filledQty:   parseFloat(String(raw.executedQty ?? raw.filledQty    ?? raw.cumQty ?? "0")),
+        filledPrice: parseFloat(String(raw.avgPrice    ?? raw.filledPrice  ?? "0")),
+        timestamp:   Number(raw.time       ?? raw.createTime ?? Date.now()),
+        updateTime:  Number(raw.updateTime ?? raw.time       ?? Date.now()),
+      }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to fetch order: ${errorMsg}`)
