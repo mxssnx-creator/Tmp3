@@ -59,28 +59,12 @@ interface VolumeCalculationResult {
 
 export class VolumeCalculator {
   /**
-   * Universal hard floor: the smallest USD notional we will ever attempt to
-   * place on an exchange when no specific minimum is known.
-   *
-   * $5 covers the documented minimums of every major venue (Binance $5,
-   * BingX $5, Bybit $1-$5, OKX $5, Bitget $5). Applied AFTER any per-pair
-   * `exchangeMinVolume` (from `settings:trading_pair:{symbol}`) so a known
-   * larger minimum (e.g. some altcoin pairs require $10+) still wins via
-   * `effectiveMin = max(exchangeMinVolume, universalMin)`.
-   *
-   * Previously set to $1, which caused BingX 101400 rejections on
-   * every altcoin pair whose minimum notional is ≥$2 (e.g. SAGA, SKYAI,
-   * DRIFT). The 101400 auto-correction handler in live-stage now also
-   * persists the exact per-pair minimum to `settings:trading_pair:{symbol}`
-   * so this floor is only the safety net for the very first order attempt.
+   * Universal hard floor: $3 notional covers BingX/Binance/Bybit/OKX minimums
+   * while remaining conservative for margin constraints. The 101400 auto-correction
+   * handler persists exact per-pair minimums to `settings:trading_pair:{symbol}`,
+   * so this floor is mainly the safety net for first-time pairs.
    */
-  /**
-   * Universal hard floor: $2 notional covers BingX/Binance/Bybit/OKX minimums
-   * ($1-$5 range) while remaining realistic for small accounts with margin
-   * constraints. Accounts with balances <$10k should configure a lower
-   * positionCost instead of relying solely on this floor.
-   */
-  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 2
+  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 3
 
   /**
    * Fetch account balance and compute the leverage safety cap.
