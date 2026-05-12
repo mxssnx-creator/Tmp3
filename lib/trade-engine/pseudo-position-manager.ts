@@ -39,10 +39,24 @@ export class PseudoPositionManager {
 
   // ── helpers ──────────────────────────────────────────────────────────
 
-  /** Redis set key that indexes every position id for this connection */
+  /** Redis set key that indexes every OPEN position id for this connection */
   private positionsSetKey(): string {
     return `pseudo_positions:${this.connectionId}`
   }
+
+  /**
+   * Redis set key that indexes position ids that have been CLOSED.
+   * Separate from positionsSetKey() which only tracks open positions.
+   * Used by getPositionContext() to read the closed-only window for
+   * Main-stage variant gating (prevLosses, lastWins/Losses, prevPosCount).
+   * Capped to CLOSED_INDEX_CAP newest entries via ltrim so it never
+   * grows unboundedly. TTL reset on each write.
+   */
+  private closedPositionsIndexKey(): string {
+    return `pseudo_positions:${this.connectionId}:closed_index`
+  }
+  private static readonly CLOSED_INDEX_CAP = 200
+  private static readonly CLOSED_INDEX_TTL = 7 * 24 * 60 * 60 // 7 days
 
   /**
    * Redis set key that indexes all currently-active configSetKeys for O(1) duplicate detection.
@@ -365,15 +379,23 @@ export class PseudoPositionManager {
         updated_at: new Date().toISOString(),
       }
 
-      await client.hset(this.positionKey(id), positionData)
-      await client.sadd(this.positionsSetKey(), id)
+      // ── Atomic pipeline for all creation-side index writes ───────────
+      // Previously these were 4 separate awaits. A crash or concurrent
+      // caller between any two of them left the index in a partial state
+      // (hash exists but isn't in positionsSetKey, or configSetKey isn't
+      // marked active). A single pipeline with exec() ensures all writes
+      // land atomically from Redis's perspective — or none do.
+      const createPipeline = client.multi()
+      createPipeline.hset(this.positionKey(id), positionData)
+      createPipeline.sadd(this.positionsSetKey(), id)
       // Register this configSetKey as active for O(1) duplicate detection on next creation
-      await client.sadd(this.activeConfigKeysSetKey(), configSetKey)
+      createPipeline.sadd(this.activeConfigKeysSetKey(), configSetKey)
       // P0-4: Register this position id into the per-direction set so
       // `canCreatePosition` can enforce the spec cap
       // (`maxActiveBasePseudoPositionsPerDirection`, default 1) via O(1)
       // SCARD on the very next call. Removed on close.
-      await client.sadd(this.activeByDirectionKey(params.side), id)
+      createPipeline.sadd(this.activeByDirectionKey(params.side), id)
+      await createPipeline.exec()
 
       console.log(`[v0] Created pseudo position ${id} for ${params.symbol} side=${params.side} vol=${volumeCalc.finalVolume}`)
 
@@ -584,6 +606,18 @@ export class PseudoPositionManager {
       }
       // 7-day TTL on the closed hash for operator forensics.
       pipeline.expire(this.positionKey(positionId), 604800)
+      // ── Closed-positions index write (P-CTX-1) ───────────────────────
+      // getPositionContext() in strategy-coordinator needs to read CLOSED
+      // positions to compute prevPosCount / prevLosses / lastWins / lastLosses
+      // for the Main-stage variant gates. These positions are removed from
+      // positionsSetKey() above, so without this separate closed index the
+      // context window is always empty and only the default variant runs.
+      // We store the positionId in a Redis list (LPUSH = newest first),
+      // capped to CLOSED_INDEX_CAP entries via LTRIM and with a 7-day TTL.
+      const closedIndexKey = this.closedPositionsIndexKey()
+      pipeline.lpush(closedIndexKey, positionId)
+      pipeline.ltrim(closedIndexKey, 0, PseudoPositionManager.CLOSED_INDEX_CAP - 1)
+      pipeline.expire(closedIndexKey, PseudoPositionManager.CLOSED_INDEX_TTL)
 
       // ── Continuous Set update (in same pipeline) ──────────────────
       // The realtime processor reads the HEAD of each strategy-config's

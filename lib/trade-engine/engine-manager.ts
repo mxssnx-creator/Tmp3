@@ -467,52 +467,21 @@ export class TradeEngineManager {
       // Ensure Redis is initialized before using it
       await initRedis()
       
-      // Initialize progression state in Redis if not exists
+      // ── Initialise / archive progression state ────────────────────────
+      // `archiveAndStartNewProgression` handles both cases:
+      //   • First start: creates a fresh hash with counters = 0.
+      //   • Restart / re-enable: stamps `ended_at` on the old hash,
+      //     snapshots it to `progression:{id}:history:{oldEpoch}` (7-day
+      //     TTL), then creates a clean new hash so this session's counters
+      //     start from zero. The `session_number` field increments so the
+      //     dashboard can show "Progression #N".
+      // This replaces the previous logic that silently preserved counters
+      // across restarts, making it impossible to distinguish sessions.
       try {
-        const client = getRedisClient()
-        const existingProgression = await client.hgetall(`progression:${this.connectionId}`)
-        const nowMs = Date.now()
-        if (!existingProgression || Object.keys(existingProgression).length === 0) {
-          // First time initialization - set all counters to 0 and stamp the
-          // canonical `started_at` epoch-ms. The stats route uses this for
-          // rolling-window rate calculations; absent it falls back to
-          // "now - 1h", which under-reports the very first hour after start.
-          await client.hset(`progression:${this.connectionId}`, {
-            cycles_completed: "0",
-            successful_cycles: "0",
-            failed_cycles: "0",
-            connection_id: this.connectionId,
-            last_update: new Date().toISOString(),
-            engine_started: "true",
-            started_at: String(nowMs),
-            // ── Generation marker (see `progression-lock.ts`) ──────
-            // Every start writes a new epoch so external observers
-            // (dashboard, stats route, log dialog) can detect a
-            // generation flip and discard cached per-run derived
-            // state. Strictly increasing across restarts because
-            // it's epoch-ms.
-            epoch: String(this.epoch),
-          })
-        } else {
-          // Engine restarted - preserve existing counters, only update metadata.
-          // BACKFILL the `started_at` field if missing (older deployments did
-          // not write it). We use HSETNX semantics manually so a present
-          // value (the original first-ever start) is never overwritten — the
-          // dashboard's "since first start" rates depend on this timestamp
-          // being monotonic across restarts.
-          const restartUpdate: Record<string, string> = {
-            last_update: new Date().toISOString(),
-            engine_started: "true",
-            // Refresh epoch on every restart. Counters survive (operator
-            // semantics require cumulative totals across restarts) but
-            // any per-run derived state on observers is invalidated.
-            epoch: String(this.epoch),
-          }
-          if (!existingProgression.started_at || !Number.isFinite(Number(existingProgression.started_at))) {
-            restartUpdate.started_at = String(nowMs)
-          }
-          await client.hset(`progression:${this.connectionId}`, restartUpdate)
-        }
+        await ProgressionStateManager.archiveAndStartNewProgression(
+          this.connectionId,
+          this.epoch,
+        )
       } catch (e) {
         console.warn("[v0] [Engine] Failed to init progression state:", e)
       }
@@ -899,10 +868,27 @@ export class TradeEngineManager {
     }
 
     this.isRunning = false
+    // Capture epoch before zeroing so endProgression can use it for the
+    // stale-stop guard (prevents a delayed stop() from closing a newer
+    // progression that already started in a different worker/restart).
+    const stoppingEpoch = this.epoch
     // Zero the epoch immediately so any in-flight callbacks bound to
     // this manager instance fail the `isCurrentGeneration` check and
     // bail out instead of writing into a stopped engine's state.
     this.epoch = 0
+
+    // ── Stamp ended_at on the canonical progression hash ──────────
+    // Must happen BEFORE lock release so the write is still gated by
+    // the epoch we own. Best-effort — engine stop must not block even
+    // if Redis is unavailable.
+    try {
+      await ProgressionStateManager.endProgression(this.connectionId, stoppingEpoch)
+    } catch (endErr) {
+      console.warn(
+        `[v0] [Engine ${this.connectionId}] endProgression failed (non-critical):`,
+        endErr instanceof Error ? endErr.message : String(endErr),
+      )
+    }
 
     // ── Release the cross-process progression lock ─────────────────
     // Compare-and-delete: never deletes a slot we no longer own.

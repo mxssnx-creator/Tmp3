@@ -211,7 +211,7 @@ export class IndicationEngine {
       current_price: entryPrice,
       profit_factor: 0,
       position_cost: positionCost,
-      status: "active",
+      status: "open",
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }

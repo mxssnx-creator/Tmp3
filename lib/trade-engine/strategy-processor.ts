@@ -133,8 +133,13 @@ export class StrategyProcessor {
           realLiveReady = result.passedEvaluation
         }
 
+        // MAIN fans out (more output than input), so label differs:
+        // BASE/REAL/LIVE: "N passed / M evaluated" (filter). MAIN: "N from M base" (fanout).
+        const stageLabel = result.type === "main"
+          ? `${result.passedEvaluation} Sets from ${result.totalCreated} base`
+          : `${result.passedEvaluation}/${result.totalCreated} Sets passed`
         console.log(
-          `[v0] [StrategyFlow] ${symbol} ${result.type.toUpperCase()}: ${result.passedEvaluation}/${result.totalCreated} Sets passed | ` +
+          `[v0] [StrategyFlow] ${symbol} ${result.type.toUpperCase()}: ${stageLabel} | ` +
           `PF=${result.avgProfitFactor.toFixed(2)} | DDT=${Math.round(result.avgDrawdownTime)}min`
         )
 

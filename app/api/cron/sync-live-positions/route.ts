@@ -7,18 +7,26 @@ export const dynamic = "force-dynamic"
 export const maxDuration = 60
 
 /**
- * Reconciles Redis-tracked live positions with each exchange.
+ * CRASH-RECOVERY / ENGINE-DOWN safety net for live positions.
  *
- * For every connection with live_trade=true, calls
- * `reconcileLivePositions(connId, connector)` which:
- *   - Refreshes mark price / liq price / unrealized PnL for positions still
- *     present on the exchange.
- *   - Marks positions missing from the exchange as "closed", computes realised
- *     PnL, moves them to the closed archive, increments win/close counters,
- *     and releases the per-symbol+direction lock so the engine can reopen.
+ * Purpose: reconcile positions for connections whose engine is NOT actively
+ * running. When the engine IS running, the strategy coordinator already calls
+ * `reconcileLivePositions` every 30 s (rate-limited, fire-and-forget from
+ * within the strategy processor tick) — adding a cron reconcile on top of
+ * that is redundant and doubles the exchange API calls.
  *
- * Safe to call frequently — the reconcile function issues a single batch
- * `getPositions()` per connection rather than per-symbol calls.
+ * This cron fires once per minute and skips any connection whose engine
+ * emitted a heartbeat within the last 90 seconds (`trade_engine_state.updated_at`).
+ * It only performs a full reconcile for connections that are:
+ *   a) marked live_trade=true (or have orphaned open positions), AND
+ *   b) whose engine has been silent for > 90 s (crashed / stopped / restarting).
+ *
+ * `reconcileLivePositions` per call:
+ *   - Detects positions missing from the exchange → marks closed, computes PnL,
+ *     archives the record, releases the position lock so the engine can reopen.
+ *   - Promotes `placed` positions to `open` if the exchange reports them filled.
+ *   - Places / heals missing SL/TP orders.
+ *   - Runs orphan-close sweep for positions exceeding max hold time.
  */
 export async function GET() {
   const started = Date.now()
@@ -95,6 +103,24 @@ export async function GET() {
         : false
 
       if (!isLiveTrade && !hasOpenPositions) {
+        summary.connectionsSkipped++
+        continue
+      }
+
+      // ── Engine-running guard ───────────────────────────────────────
+      // If the engine is actively running for this connection, the strategy
+      // coordinator's 30-second rate-limited reconcile already handles it.
+      // Skip here to avoid redundant exchange API calls and double-arming
+      // of SL/TP orders. We consider the engine "running" when its heartbeat
+      // (`trade_engine_state.updated_at`) is within the last 90 seconds.
+      const engineState = await client
+        .hgetall(`trade_engine_state:${connId}`)
+        .catch(() => ({} as Record<string, string>))
+      const lastUpdatedAt = engineState?.updated_at
+        ? new Date(engineState.updated_at).getTime()
+        : 0
+      const engineActiveRecently = Date.now() - lastUpdatedAt < 90_000
+      if (engineActiveRecently) {
         summary.connectionsSkipped++
         continue
       }

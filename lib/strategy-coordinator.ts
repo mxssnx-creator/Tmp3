@@ -177,7 +177,7 @@ export interface PositionContext {
   lastWins: number
   /** Number of losers among the last N closed */
   lastLosses: number
-  /** Total losers in the lookback window ��� gates DCA recovery variants */
+  /** Total losers in the lookback window ����� gates DCA recovery variants */
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
@@ -889,7 +889,16 @@ export class StrategyCoordinator {
     let reused = 0
 
     // ── 2. Variant profiles ─────────────────────────────────────────────
-    const activeVariants = this.selectActiveVariants(ctx)
+    // The `block` gate must fire when THIS symbol already has an open
+    // position — not when any symbol globally does. Patch continuousCount
+    // to the per-symbol open count so both gate evaluation and the `cont`
+    // axis in axisWindows reflect the per-symbol reality. All other
+    // ctx fields (prev, last, pause) remain global / shared as designed.
+    const symbolCtx: PositionContext = {
+      ...ctx,
+      continuousCount: ctx.perSymbolOpen[symbol] ?? 0,
+    }
+    const activeVariants = this.selectActiveVariants(symbolCtx)
 
     // Track the freshly-built `default` Main Set per Base so we can fan it
     // out into the operator-spec'd Position-Count Cartesian (prev × last ×
@@ -947,13 +956,14 @@ export class StrategyCoordinator {
         }
 
         // Cache miss — build a fresh related Set from this profile.
-        // We thread `ctx` through so the freshly-built Set carries an
+        // We thread `symbolCtx` through so the freshly-built Set carries an
         // accurate `axisWindows` snapshot (prev/last/cont/pause) for
-        // downstream stats dimensioning. Cached Sets keep the axis
-        // window from the cycle they were materialised in (this is the
-        // correct semantics — the gate that admitted them was based on
-        // *that* ctx, and we don't want to retroactively re-bucket).
-        const built = await this.buildVariantSet(baseSet, profile, metrics, maxEntries, ctx)
+        // downstream stats dimensioning. The `cont` axis uses the per-symbol
+        // open count (from symbolCtx) so Stats reflects the same reality as
+        // the block gate. Cached Sets keep the axis window from the cycle
+        // they were materialised in (this is the correct semantics — the gate
+        // that admitted them was based on *that* ctx).
+        const built = await this.buildVariantSet(baseSet, profile, metrics, maxEntries, symbolCtx)
         if (!built) continue
 
         // Propagate Base's trailingProfile to the freshly-built Main Set
@@ -1149,8 +1159,10 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:main:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:base:passed`, 86400),
       ]
-      if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", baseSets.length))
-      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", mainSets.length))
+      // strategies_main_total = cumulative Sets PRODUCED by MAIN (output count).
+      // strategies_main_evaluated = Base Sets that entered MAIN (input count).
+      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", mainSets.length))
+      if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", baseSets.length))
 
       // ── Main-stage COORDINATION metrics (per-cycle snapshot + cumulative) ─
       // These let the stats API answer the user's question "is the Main stage
@@ -1207,20 +1219,40 @@ export class StrategyCoordinator {
       for (const set of mainSets) {
         const aw = set.axisWindows
         if (!aw) continue
-        // Per-axis-N bucket (count of *Sets* that landed under each window)
+        // Resolve the direction for this axis Set. expandAxisSets stores
+        // it in `axisWindows.direction`; profile-variant and Base Sets
+        // use the top-level `set.direction` field.
+        const dir = aw.direction ?? set.direction   // "long" | "short"
+        const dirSuffix = dir ? `_${dir}` : ""
+        // Per-axis-N bucket — count of Sets per window (combined + direction-split)
         axisIncrements[`prev_${aw.prev}_sets`]  = (axisIncrements[`prev_${aw.prev}_sets`]  || 0) + 1
         axisIncrements[`last_${aw.last}_sets`]  = (axisIncrements[`last_${aw.last}_sets`]  || 0) + 1
         axisIncrements[`cont_${aw.cont}_sets`]  = (axisIncrements[`cont_${aw.cont}_sets`]  || 0) + 1
         axisIncrements[`pause_${aw.pause}_sets`] = (axisIncrements[`pause_${aw.pause}_sets`] || 0) + 1
-        // Per-axis-N entries — entries are the "Pos counts" the dashboard
-        // labels as "positions" inside each axis window (one per (size ×
-        // leverage × state) config the variant projected through).
+        if (dirSuffix) {
+          axisIncrements[`prev_${aw.prev}_sets${dirSuffix}`]  = (axisIncrements[`prev_${aw.prev}_sets${dirSuffix}`]  || 0) + 1
+          axisIncrements[`last_${aw.last}_sets${dirSuffix}`]  = (axisIncrements[`last_${aw.last}_sets${dirSuffix}`]  || 0) + 1
+          axisIncrements[`cont_${aw.cont}_sets${dirSuffix}`]  = (axisIncrements[`cont_${aw.cont}_sets${dirSuffix}`]  || 0) + 1
+          axisIncrements[`pause_${aw.pause}_sets${dirSuffix}`] = (axisIncrements[`pause_${aw.pause}_sets${dirSuffix}`] || 0) + 1
+        }
+        // Per-axis-N entries — "Pos counts" for each axis window, both
+        // combined and direction-split (so the dashboard can show long vs
+        // short pos-count contribution per window). entryCount is used
+        // because axis Sets carry `entries: []` (pure-metadata projections)
+        // while their position-count semantics are encoded in entryCount
+        // (= baseEC + cont per expandAxisSets spec).
         const ec = set.entryCount || 0
         if (ec > 0) {
           axisIncrements[`prev_${aw.prev}_pos`]   = (axisIncrements[`prev_${aw.prev}_pos`]   || 0) + ec
           axisIncrements[`last_${aw.last}_pos`]   = (axisIncrements[`last_${aw.last}_pos`]   || 0) + ec
           axisIncrements[`cont_${aw.cont}_pos`]   = (axisIncrements[`cont_${aw.cont}_pos`]   || 0) + ec
           axisIncrements[`pause_${aw.pause}_pos`] = (axisIncrements[`pause_${aw.pause}_pos`] || 0) + ec
+          if (dirSuffix) {
+            axisIncrements[`prev_${aw.prev}_pos${dirSuffix}`]   = (axisIncrements[`prev_${aw.prev}_pos${dirSuffix}`]   || 0) + ec
+            axisIncrements[`last_${aw.last}_pos${dirSuffix}`]   = (axisIncrements[`last_${aw.last}_pos${dirSuffix}`]   || 0) + ec
+            axisIncrements[`cont_${aw.cont}_pos${dirSuffix}`]   = (axisIncrements[`cont_${aw.cont}_pos${dirSuffix}`]   || 0) + ec
+            axisIncrements[`pause_${aw.pause}_pos${dirSuffix}`] = (axisIncrements[`pause_${aw.pause}_pos${dirSuffix}`] || 0) + ec
+          }
         }
       }
       for (const [field, n] of Object.entries(axisIncrements)) {
@@ -1629,8 +1661,10 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:main:passed`, 86400),
       ]
-      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", mainSets.length))
-      if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", realSets.length))
+      // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
+      // strategies_real_evaluated = Main Sets that entered REAL (input count).
+      if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
+      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", mainSets.length))
 
       // ── ACTIVE-NOW snapshot for Real stage ──────────────────────────
       // Mirrors the Base/Main pattern. The dashboard reads this hash and
@@ -1696,34 +1730,64 @@ export class StrategyCoordinator {
       //   last:  0..4    (last-N magnitude window)
       //   cont:  0..8    (open continuous positions)
       //   pause: 0..8    (last-N validation window)
-      // Each axis is keyed by its integer window value. We hincrby per
-      // window so multiple cycles accumulate into the dashboard's
-      // "Position-Counts Accumulation" tile.
-      const axisCounts: Record<"prev" | "last" | "cont" | "pause", Record<string, number>> = {
-        prev:  {},
-        last:  {},
-        cont:  {},
-        pause: {},
-      }
+      //
+      // Direction split: axis Sets are emitted in both `long` and `short`
+      // directions (CARTESIAN in expandAxisSets). Accumulation is keyed by
+      // direction so the dashboard can show pos-count distribution per
+      // direction relative to the base set config. Key format:
+      //   `strategy_axis_real:{conn}:{axis}:{dir}` → hash of { window → count }
+      //
+      // An undifferentiated (direction-combined) copy is ALSO written to
+      // `strategy_axis_real:{conn}:{axis}` so existing consumers that read
+      // only the combined key keep working without a migration.
+      type DirAxisCounts = Record<"prev" | "last" | "cont" | "pause", Record<string, number>>
+      const axisCounts:     DirAxisCounts = { prev: {}, last: {}, cont: {}, pause: {} }
+      const axisCountsLong: DirAxisCounts = { prev: {}, last: {}, cont: {}, pause: {} }
+      const axisCountsShort: DirAxisCounts = { prev: {}, last: {}, cont: {}, pause: {} }
+
       for (const set of realSets) {
         const aw = set.axisWindows
         if (!aw) continue
+        // Direction for this axis Set: axisWindows.direction (populated by
+        // expandAxisSets) if present, otherwise fall back to the Set's own
+        // top-level direction field.
+        const dir: "long" | "short" | undefined = aw.direction ?? (set.direction as "long" | "short" | undefined)
         for (const axis of ["prev", "last", "cont", "pause"] as const) {
           const w = aw[axis]
           if (typeof w !== "number") continue
           const key = String(w)
-          axisCounts[axis][key] = (axisCounts[axis][key] || 0) + 1
+          axisCounts[axis][key]      = (axisCounts[axis][key]      || 0) + 1
+          if (dir === "long")  axisCountsLong[axis][key]  = (axisCountsLong[axis][key]  || 0) + 1
+          if (dir === "short") axisCountsShort[axis][key] = (axisCountsShort[axis][key] || 0) + 1
         }
       }
       for (const axis of ["prev", "last", "cont", "pause"] as const) {
-        const aKey = `strategy_axis_real:${this.connectionId}:${axis}`
+        // Combined (direction-agnostic) — backwards-compatible key
+        const aKey      = `strategy_axis_real:${this.connectionId}:${axis}`
+        // Direction-split keys — per-spec granularity
+        const aKeyLong  = `strategy_axis_real:${this.connectionId}:${axis}:long`
+        const aKeyShort = `strategy_axis_real:${this.connectionId}:${axis}:short`
         let touched = false
         for (const [window, count] of Object.entries(axisCounts[axis])) {
           if (count <= 0) continue
           touched = true
           writes.push(client.hincrby(aKey, window, count))
         }
-        if (touched) writes.push(client.expire(aKey, 7 * 24 * 60 * 60))
+        let touchedLong = false
+        for (const [window, count] of Object.entries(axisCountsLong[axis])) {
+          if (count <= 0) continue
+          touchedLong = true
+          writes.push(client.hincrby(aKeyLong, window, count))
+        }
+        let touchedShort = false
+        for (const [window, count] of Object.entries(axisCountsShort[axis])) {
+          if (count <= 0) continue
+          touchedShort = true
+          writes.push(client.hincrby(aKeyShort, window, count))
+        }
+        if (touched)      writes.push(client.expire(aKey,      7 * 24 * 60 * 60))
+        if (touchedLong)  writes.push(client.expire(aKeyLong,  7 * 24 * 60 * 60))
+        if (touchedShort) writes.push(client.expire(aKeyShort, 7 * 24 * 60 * 60))
       }
 
       await Promise.all(writes)
@@ -1987,9 +2051,16 @@ export class StrategyCoordinator {
 
             for (const set of qualifying) {
               try {
-                const bestEntry = set.entries.reduce(
+                // Axis Sets are pure-metadata projections (entries=[]).
+                // Hydrate from the parent Real Set when entries is empty so
+                // the live execution path can still derive SL/TP from PF.
+                const effectiveEntries =
+                  set.entries.length > 0
+                    ? set.entries
+                    : (realSets.find((s) => s.setKey === set.parentSetKey)?.entries ?? [])
+                const bestEntry = effectiveEntries.reduce(
                   (best, e) => (e.profitFactor > best.profitFactor ? e : best),
-                  set.entries[0]
+                  effectiveEntries[0]
                 )
                 if (!bestEntry) continue
 
@@ -2075,8 +2146,14 @@ export class StrategyCoordinator {
         const last = await client.get(rlKey).catch(() => null)
         const now = Date.now()
         const lastTs = last ? parseInt(last as string, 10) : 0
+        // Rate-limit: fire at most once per 30 s.
+        // TTL = 35 s so the key expires before the next 30 s window opens —
+        // previously TTL=60 kept the key alive well past 30 s and would have
+        // blocked reconcile even after the window had elapsed. The cron
+        // (sync-live-positions) now skips connections whose engine is active,
+        // so this 30 s in-engine reconcile is the sole mechanism while running.
         if (!lastTs || now - lastTs > 30_000) {
-          await client.setex(rlKey, 60, String(now)).catch(() => {})
+          await client.setex(rlKey, 35, String(now)).catch(() => {})
           // Fire-and-forget: don't block the strategy flow on exchange IO.
           ;(async () => {
             try {
@@ -2145,9 +2222,16 @@ export class StrategyCoordinator {
           const creations = await Promise.all(
             qualifying.map(async (set) => {
               try {
-                const bestEntry = set.entries.reduce(
+                // Axis Sets are pure-metadata projections (entries=[]).
+                // Hydrate from the parent Real Set when entries is empty so
+                // the pseudo creation path can still derive SL/TP from PF.
+                const effectiveEntries =
+                  set.entries.length > 0
+                    ? set.entries
+                    : (realSets.find((s) => s.setKey === set.parentSetKey)?.entries ?? [])
+                const bestEntry = effectiveEntries.reduce(
                   (best, e) => (e.profitFactor > best.profitFactor ? e : best),
-                  set.entries[0],
+                  effectiveEntries[0],
                 )
                 if (!bestEntry) return false
 
@@ -2163,14 +2247,16 @@ export class StrategyCoordinator {
                 const profile = set.trailingProfile
                 const trailing = profile ? true : bestEntry.confidence >= 0.85
 
-                // Include the trailing tuple in the per-Set uniqueness
-                // key so each variant occupies its own slot. The
-                // per-direction cap in `canCreatePosition` still gates
-                // the total — only one Long + one Short open at a time.
-                const tagSuffix = profile
+                // Build a fully-qualified uniqueness key including TP, SL,
+                // direction and trailing so sets with the same indicationType
+                // and direction but different PF-derived TP/SL occupy distinct
+                // slots and are not collapsed into one active position.
+                const trailingSuffix = profile
                   ? `:t${Math.round(profile.startRatio * 100)}-${Math.round(profile.stopRatio * 100)}`
-                  : ""
-                const configSetKey = `${set.indicationType}:${set.direction}:${symbol}${tagSuffix}`
+                  : trailing ? `:tr1` : `:tr0`
+                const configSetKey =
+                  `${set.indicationType}:${set.direction}:${symbol}` +
+                  `:tp${tp.toFixed(2)}:sl${sl.toFixed(2)}${trailingSuffix}`
 
                 const posId = await posManager.createPosition({
                   symbol,
@@ -2188,15 +2274,21 @@ export class StrategyCoordinator {
                     trailingStepRatio: profile.stepRatio,
                   }),
                 })
-                return Boolean(posId)
+                return posId ? ("created" as const) : ("gated" as const)
               } catch (posErr) {
                 console.error(`[v0] [StrategyFlow] ${symbol} LIVE: createPosition error:`, posErr instanceof Error ? posErr.message : String(posErr))
-                return false
+                return "error" as const
               }
             }),
           )
-          const positionsCreated = creations.filter(Boolean).length
-          console.log(`[v0] [StrategyFlow] ${symbol} LIVE: Created/updated ${positionsCreated} pseudo positions for ${qualifying.length} Sets`)
+          const positionsCreated = creations.filter((r) => r === "created").length
+          const positionsGated   = creations.filter((r) => r === "gated").length
+          const positionErrors   = creations.filter((r) => r === "error").length
+          console.log(
+            `[v0] [StrategyFlow] ${symbol} LIVE: ${positionsCreated} new pseudo positions` +
+            ` (${positionsGated} gated/already-active, ${positionErrors} errors)` +
+            ` for ${qualifying.length} Sets`
+          )
         } else {
           console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: No entry price, skipping position creation`)
         }
@@ -2277,62 +2369,61 @@ export class StrategyCoordinator {
         perSymbolOpen[sym] = (perSymbolOpen[sym] ?? 0) + 1
       }
 
-      // For closed-window stats we read the pseudo-position index directly
-      // and only fetch hashes for positions NOT in the active set. This
-      // keeps the hot path O(active + window) rather than O(all history).
-      // A 24h lookback + max 50 recent closed positions is a good trade-off
-      // between signal quality and Redis load.
+      // ── P-CTX-1: Read from dedicated closed-positions index ──────────
+      // `closePosition()` in PseudoPositionManager removes the position id
+      // from the open-positions set (positionsSetKey) AND appends it to a
+      // dedicated Redis list `pseudo_positions:{id}:closed_index` (newest
+      // first, capped at CLOSED_INDEX_CAP). Reading that list here gives us
+      // a bounded, already-closed-only window without filtering active ids or
+      // issuing a full smembers on the global (open) set — which previously
+      // always returned 0 closed positions because closePosition() removes ids
+      // from the global set, starving all Main variant gates.
       const client = getRedisClient()
-      const setKey = `pseudo_positions:${this.connectionId}`
+      const closedIndexKey = `pseudo_positions:${this.connectionId}:closed_index`
       const lookbackMs = 24 * 60 * 60 * 1000
       const cutoff = now - lookbackMs
-      const WINDOW_CAP = 50
+      const WINDOW_CAP = 100 // read up to 100 newest closed ids from the list
 
       let prevPosCount = 0
       let prevLosses = 0
       const lastN: Array<{ closedAt: number; pnl: number }> = []
       try {
-        const allIds: string[] = (await client.smembers(setKey).catch(() => [])) || []
-        // Exclude active ids up-front so we don't double-read their hashes
-        const activeIdSet = new Set(active.map((p: any) => String(p.id || "")))
-        const closedIds = allIds.filter((id: string) => !activeIdSet.has(String(id)))
+        // LRANGE 0 WINDOW_CAP-1 fetches the newest WINDOW_CAP closed ids
+        // (LPUSH + LTRIM in closePosition keeps the list newest-first).
+        const closedIds: string[] = ((await client.lrange(closedIndexKey, 0, WINDOW_CAP - 1).catch(() => [])) || []) as string[]
 
-        // Fetch hashes in parallel — bounded to WINDOW_CAP * 2 to stay cheap
-        // when the connection has a huge historical archive.
-        const sampledIds = closedIds.slice(-WINDOW_CAP * 2)
-        const hashes = await Promise.all(
-          sampledIds.map(async (id) => {
-            try {
-              const h = await client.hgetall(`pseudo_position:${this.connectionId}:${id}`)
-              return h && Object.keys(h).length > 0 ? h : null
-            } catch {
-              return null
-            }
-          }),
-        )
+        // Pipelined HGETALL for all sampled ids — single round-trip.
+        const hashes = await (async () => {
+          if (closedIds.length === 0) return []
+          const pipeline = client.multi()
+          for (const id of closedIds) pipeline.hgetall(`pseudo_position:${this.connectionId}:${id}`)
+          const results = await pipeline.exec().catch(() => null)
+          if (!results) return []
+          return results.map((r: any) => {
+            const data = Array.isArray(r) ? r[1] : r
+            return data && typeof data === "object" && Object.keys(data).length > 0 ? data : null
+          })
+        })()
 
         for (const h of hashes) {
           if (!h) continue
           // ── P2-1: Strict closed-only gate ──────────────────────────────
-          // Main variant gating (prevLosses, lastWins, lastLosses,
-          // prevPosCount, lastPosCount) MUST be computed from closed
-          // pseudo positions ONLY. Previously this block used the
-          // `opened_at` value as a fallback for the close timestamp and
-          // read `h.pnl` blindly — both of which made floating open
-          // positions (their mark-to-market PnL) leak into the stats
-          // that drive fingerprint buckets and `selectActiveVariants`
-          // gates. Now we enforce three explicit conditions:
-          //   (1) `status === "closed"` — hard gate. Any other value
-          //       (open, pending, rejected, error, partial) is ignored.
-          //   (2) a valid numeric `closed_at` / `closedAt` within the
-          //       lookback window. `opened_at` is NO LONGER a fallback.
-          //   (3) a realized-pnl field (`realized_pnl` or `pnl` written
-          //       AT close) — not the live unrealised value.
+          // Positions in the closed_index are always closed by construction
+          // (closePosition writes to the index). We still enforce the
+          // status check as a defence against stale/corrupted rows.
           const status = String(h.status || "").toLowerCase()
           if (status !== "closed") continue
-          const closedAtRaw = h.closed_at ?? h.closedAt ?? 0
-          const closedAt = Number(closedAtRaw)
-          if (!Number.isFinite(closedAt) || closedAt <= 0) continue
+          const closedAtRaw = h.closed_at ?? h.closedAt ?? ""
+          // Parse ISO string ("2025-01-01T...") or numeric ms ("1735689600000").
+          const closedAtMs = (() => {
+            if (!closedAtRaw) return NaN
+            const n = Number(closedAtRaw)
+            if (Number.isFinite(n) && n > 1_000_000_000_000) return n  // already ms
+            const d = new Date(closedAtRaw as string).getTime()
+            return Number.isFinite(d) ? d : NaN
+          })()
+          if (!Number.isFinite(closedAtMs) || closedAtMs <= 0) continue
+          const closedAt = closedAtMs
           if (closedAt < cutoff) continue
           // Prefer `realized_pnl`; fall back to `pnl` only when the row
           // is marked closed (the closePosition pipeline writes `pnl`
@@ -2345,11 +2436,9 @@ export class StrategyCoordinator {
           lastN.push({ closedAt, pnl })
         }
         // Keep the 8 most recently closed for the "last-N" breakdown.
-        // Spec: Pause variant validates against the last 1-8 positions
-        // (step 1) — each lookback window N feeds one Pause sub-config.
-        // The remaining gates (`trailing.lastWins >= 2`, etc.) only ever
-        // need the top of this list, so the wider window is essentially
-        // free for them.
+        // The closed_index is already newest-first (LPUSH order), so
+        // sorting + truncating here normalises any edge-cases where TTL
+        // trimming or concurrent writes changed the ordering slightly.
         lastN.sort((a, b) => b.closedAt - a.closedAt)
         lastN.length = Math.min(lastN.length, 8)
       } catch { /* best-effort; fall through with zeros */ }
@@ -2736,13 +2825,15 @@ export class StrategyCoordinator {
     // Mirrors the spec's four position-count axes with the documented
     // step-1 windows (see StrategySet.axisWindows). When ctx is absent
     // (legacy diagnostic call paths) we emit zeros, signalling "no axis
-    // dimensioning available". The `last` axis encodes the *magnitude*
-    // of the most recent dimensional skew (max of wins or losses) so a
-    // single 0..4 figure suffices instead of two parallel counters.
+    // dimensioning available". The `last` axis encodes the total count
+    // of recently-closed positions (lastPosCount, capped at 4) — using
+    // the raw count rather than the directional skew keeps the axis
+    // semantics consistent with the pause axis (which also counts all
+    // recent closes) and avoids the two-counters vs one-counter mismatch.
     const axisWindows = ctx
       ? {
           prev:  Math.max(0, Math.min(12, ctx.prevPosCount)),
-          last:  Math.max(0, Math.min(4,  Math.max(ctx.lastWins, ctx.lastLosses))),
+          last:  Math.max(0, Math.min(4,  ctx.lastPosCount)),
           cont:  Math.max(0, Math.min(8,  ctx.continuousCount)),
           pause: Math.max(0, Math.min(8,  ctx.lastPosCount)),
         }

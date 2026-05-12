@@ -237,7 +237,7 @@ export class BasePseudoPositionManager {
         return false
       }
 
-      return basePos.status === "active"
+      return basePos.status === "open" || basePos.status === "active" // "active" kept for legacy Redis data
     } catch (error) {
       console.error("[v0] Error in canCreatePosition:", error)
       return false

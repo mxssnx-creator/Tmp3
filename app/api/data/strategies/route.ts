@@ -62,7 +62,7 @@ export async function GET(request: NextRequest) {
         current_price: 45000 + Math.random() * 5000,
         profit_factor: (Math.random() - 0.3) * 2,
         position_cost: 0.001,
-        status: "active" as const,
+        status: "open" as const,
         created_at: new Date(Date.now() - Math.random() * 7 * 24 * 60 * 60 * 1000).toISOString(),
         updated_at: new Date().toISOString(),
       }))

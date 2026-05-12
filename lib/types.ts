@@ -62,7 +62,7 @@ export interface PseudoPosition {
   current_price: number
   profit_factor: number
   position_cost: number
-  status: "active" | "closed"
+  status: "open" | "closed"
   created_at: string
   updated_at: string
   base_position_id?: string // Added link to base pseudo position
