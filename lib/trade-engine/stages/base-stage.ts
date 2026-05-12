@@ -19,7 +19,7 @@ export interface BasePosition {
   entryTime: number
   indicationSignal: "buy" | "sell" | "neutral"
   indicationStrength: number
-  status: "pending" | "active" | "closed"
+  status: "open" | "closed"
   sourceIndicationTimestamp: number
   createdAt: number
   updatedAt: number
@@ -76,7 +76,7 @@ export async function generateBasePositions(
           entryTime: Date.now(),
           indicationSignal: indication.signal,
           indicationStrength: indication.strength,
-          status: "pending",
+          status: "open",
           sourceIndicationTimestamp: indication.timestamp,
           createdAt: Date.now(),
           updatedAt: Date.now(),
@@ -103,7 +103,7 @@ export async function generateBasePositions(
           entryTime: Date.now(),
           indicationSignal: indication.signal,
           indicationStrength: indication.strength,
-          status: "pending",
+          status: "open",
           sourceIndicationTimestamp: indication.timestamp,
           createdAt: Date.now(),
           updatedAt: Date.now(),
@@ -272,7 +272,7 @@ export async function getBasePositionsByDirection(
  */
 export async function updateBasePositionStatus(
   positionId: string,
-  status: "pending" | "active" | "closed"
+  status: "open" | "closed"
 ): Promise<void> {
   await initRedis()
   const client = getRedisClient()

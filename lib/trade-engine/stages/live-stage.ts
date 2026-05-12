@@ -742,13 +742,26 @@ async function retry<T>(
         )
         return result
       }
+      // Min-order-size errors (code=101400) need a quantity correction, not
+      // more retries with the same qty. Short-circuit immediately so the
+      // caller's correction handler can run without waiting for 2 more attempts.
+      if (isMinOrderSizeError(result)) {
+        console.warn(
+          `${LOG_PREFIX} ${label} min-order-size error — stopping retry loop for quantity correction`,
+        )
+        return result
+      }
     } catch (err) {
       console.error(`${LOG_PREFIX} ${label} attempt ${attempt}/${maxAttempts} error:`, err)
-      // Thrown error variant — check the same predicate.
+      // Thrown error variant — check the same predicates.
       if (isNonRecoverableExchangeError(err)) {
         console.warn(
           `${LOG_PREFIX} ${label} non-recoverable error detected — skipping remaining ${maxAttempts - attempt} attempt(s)`,
         )
+        return { success: false, error: err instanceof Error ? err.message : String(err) } as unknown as T
+      }
+      if (isMinOrderSizeError(err)) {
+        console.warn(`${LOG_PREFIX} ${label} min-order-size error — stopping retry loop`)
         return { success: false, error: err instanceof Error ? err.message : String(err) } as unknown as T
       }
       lastResult = undefined as unknown as T
@@ -854,6 +867,44 @@ function isCircuitBreakerError(payload: unknown): boolean {
     /api orders? (?:are )?temporarily disabled/i.test(text) ||
     /large market fluctuations/i.test(text)
   )
+}
+
+/**
+ * Detect BingX code=101400 "minimum order amount" rejections.
+ * These mean the requested quantity is below the exchange-required minimum for
+ * the specific trading pair. The volume calculator will respect the stored
+ * min_order_size on the next cycle, so this is a transient failure that
+ * self-heals once the metadata is written to Redis.
+ */
+function isMinOrderSizeError(payload: unknown): boolean {
+  if (!payload) return false
+  let text = ""
+  if (typeof payload === "string") text = payload
+  else if (payload instanceof Error) text = payload.message
+  else if (typeof payload === "object") {
+    text = String((payload as Record<string, unknown>).error ?? (payload as Record<string, unknown>).message ?? "")
+  } else {
+    text = String(payload)
+  }
+  return /\bcode\s*=?\s*101400\b/.test(text) || /minimum order amount/i.test(text)
+}
+
+/**
+ * Parse the required minimum token quantity from a BingX 101400 error message.
+ * BingX message format: "The minimum order amount is 56.974 DRIFT."
+ * Returns undefined when the message does not match the expected format.
+ */
+function extractMinOrderQty(payload: unknown): number | undefined {
+  let text = ""
+  if (typeof payload === "string") text = payload
+  else if (payload instanceof Error) text = payload.message
+  else if (typeof payload === "object") {
+    text = String((payload as Record<string, unknown>).error ?? (payload as Record<string, unknown>).message ?? "")
+  }
+  const m = /minimum order amount is ([\d.]+)/i.exec(text)
+  if (!m) return undefined
+  const qty = parseFloat(m[1])
+  return Number.isFinite(qty) && qty > 0 ? qty : undefined
 }
 
 /**
@@ -1122,7 +1173,7 @@ async function updateProtectionOrders(
   const { desiredSl, desiredTp } = computeDesiredProtectionPrices(pos)
   const closeSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
 
-  // ── Quantity drift detection ──────────────────────────────────────────
+  // ── Quantity drift detection ──────────────────────────────────��───────
   // When more volume joins the position (delayed partial fills, accumulation
   // merges, post-fill sync detection) the SL/TP order on the exchange is
   // still armed for the *original* qty, leaving the delta unprotected.
@@ -1818,6 +1869,65 @@ export async function executeLivePosition(
       })
       await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
       return livePosition
+    }
+
+    // ── Exchange minimum order size enforcement (code=101400) ────────────
+    // BingX returns code=101400 when the order qty is below the pair's
+    // minimum. The error message includes the required minimum:
+    //   "The minimum order amount is 56.974 DRIFT."
+    //
+    // Strategy: parse + persist the minimum to Redis so every subsequent
+    // cycle produces the right qty from the volume calculator, then retry
+    // THIS order once with the corrected quantity so the signal fires now
+    // rather than waiting for the next cycle.
+    if (!orderResult?.success && isMinOrderSizeError(orderResult)) {
+      const requiredMin = extractMinOrderQty(orderResult)
+      if (requiredMin && requiredMin > 0) {
+        // Persist to Redis so the volume calculator respects it from now on.
+        try {
+          await initRedis()
+          const redis = getRedisClient()
+          const tpKey = `trading_pair:${realPosition.symbol}`
+          const existing = await redis.get(tpKey).catch(() => null)
+          const tpData = existing ? (() => { try { return JSON.parse(existing as string) } catch { return {} } })() : {}
+          tpData.min_order_size = String(requiredMin)
+          tpData.updated_at = Date.now()
+          await redis.set(tpKey, JSON.stringify(tpData))
+          console.log(
+            `${LOG_PREFIX} Stored min_order_size=${requiredMin} for ${realPosition.symbol} in Redis (was: ${existing ? "present" : "absent"})`
+          )
+        } catch (storeErr) {
+          console.warn(`${LOG_PREFIX} Failed to persist min_order_size for ${realPosition.symbol}:`, storeErr)
+        }
+
+        // Retry once with the required minimum quantity.
+        const correctedQty = Math.max(requiredMin * 1.01, requiredMin) // +1% buffer for rounding
+        console.log(
+          `${LOG_PREFIX} Retrying ${realPosition.symbol} with corrected qty=${correctedQty.toFixed(6)} (exchange min=${requiredMin})`
+        )
+        const minRetry: any = await retry(
+          () => exchangeConnector.placeOrder(
+            realPosition.symbol,
+            exchangeSide,
+            correctedQty,
+            undefined,
+            "market",
+            { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+          ),
+          (r: any) => !!r?.success && !!(r.orderId || r.id),
+          "placeOrder-minCorrection",
+          1
+        )
+        if (minRetry?.success && (minRetry.orderId || minRetry.id)) {
+          orderResult = minRetry
+          computedVolume = correctedQty // keep volume consistent for fill + SL/TP
+          console.log(
+            `${LOG_PREFIX} Min-size corrected order succeeded for ${realPosition.symbol}: orderId=${minRetry.orderId || minRetry.id}`
+          )
+        } else {
+          orderResult = minRetry ?? orderResult
+        }
+      }
     }
 
     if (!orderResult?.success || !(orderResult.orderId || orderResult.id)) {
