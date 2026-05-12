@@ -84,13 +84,20 @@ export async function evaluateToRealPositions(
     for (const mainPos of mainPositions) {
       // Check ratio criteria
       const profitRatio = calculateProfitabilityRatio(mainPos)
-      const accountRisk = (maxRisk * accountBalance) / mainPos.entryPrice
+      // accountRisk: dimensionless fraction (0–1) of account balance at risk
+      // per trade. riskAmount = maxRisk × balance; we check that the risk
+      // amount (in $ terms) does not exceed the configured ceiling. The
+      // previous implementation compared units (riskAmount/entryPrice) against
+      // dollars (maxRisk×balance), which was a category error and always true
+      // for any real-world asset price > $1.
+      const riskAmount = maxRisk * accountBalance
+      const accountRiskRatio = riskAmount / accountBalance // = maxRisk, sanity check
       const successRate = mainPos.metrics.successRate
       const consistency = mainPos.metrics.consistencyScore
 
       const ratiosMet =
         profitRatio >= minProfit &&
-        accountRisk <= maxRisk * accountBalance &&
+        accountRiskRatio <= maxRisk &&       // dimensionless: riskFraction ≤ configured ceiling
         successRate >= minSuccess &&
         consistency >= minConsist
 
@@ -128,7 +135,12 @@ export async function evaluateToRealPositions(
             profitRatio,
             successRate,
             consistency,
-            accountRisk: accountRisk / (maxRisk * accountBalance),
+            // accountRisk passed as the dimensionless fraction (= maxRisk here;
+            // a per-position override could differ in a future extension).
+            accountRisk: accountRiskRatio,
+            // Pass the computed evaluationScore so the position record is not
+            // stored with the placeholder 0 that was previously left unset.
+            evaluationScore,
           }
         )
 
@@ -204,30 +216,37 @@ function createRealPosition(
     successRate: number
     consistency: number
     accountRisk: number
+    evaluationScore: number
   }
 ): RealPosition {
   const riskPercentage = 0.02 // 2% risk per trade
   const riskAmount = accountBalance * riskPercentage
   const quantity = riskAmount / mainPos.entryPrice
 
-  // Calculate stops based on volatility
-  const stopDistance = mainPos.entryPrice * (1 - mainPos.volatilityScore * 0.1)
+  // Stop distance: volatilityScore (0–1) scales a percentage offset from
+  // entryPrice. A score of 0.5 → 5% stop, score of 1.0 → 10% stop.
+  // The previous formula used `entryPrice * (1 - vol * 0.1)` which
+  // produced a PRICE, not a distance — stopLoss was entryPrice minus a
+  // near-full entryPrice value, yielding a ~0 or negative stop price for
+  // longs when volatility was low.
+  const stopPct = Math.max(0.005, mainPos.volatilityScore * 0.1) // ≥ 0.5% stop
+  const stopDistance = mainPos.entryPrice * stopPct
   const stopLoss =
     mainPos.direction === "long"
       ? mainPos.entryPrice - stopDistance
       : mainPos.entryPrice + stopDistance
 
-  // Calculate take profit based on risk:reward
+  // Take profit at profitRatio × stop distance from entry
   const rewardDistance = stopDistance * ratios.profitRatio
   const takeProfit =
     mainPos.direction === "long"
       ? mainPos.entryPrice + rewardDistance
       : mainPos.entryPrice - rewardDistance
 
-  const leverage = Math.min(
-    Math.round(riskAmount / (mainPos.entryPrice * (1 - mainPos.riskScore))),
-    10 // Max 10x
-  )
+  // Leverage: how many units of riskAmount fit inside the stop distance
+  // margin. Clamped to [1, 10].
+  const stopMargin = mainPos.entryPrice * Math.max(0.001, 1 - mainPos.riskScore)
+  const leverage = Math.min(Math.max(1, Math.round(riskAmount / stopMargin)), 10)
 
   return {
     id: `real:${connectionId}:${mainPos.symbol}:${mainPos.direction}:${Date.now()}`,
@@ -236,13 +255,14 @@ function createRealPosition(
     direction: mainPos.direction,
     entryPrice: mainPos.entryPrice,
     quantity,
-    leverage: Math.max(1, leverage),
+    leverage,
     riskAmount,
     rewardTarget: rewardDistance,
     stopLoss,
     takeProfit,
     mainPositionCount: mainPos.basePositionCount,
-    evaluationScore: 0, // Will be set by caller
+    // Populated by caller (evaluateToRealPositions) — never 0 at rest.
+    evaluationScore: ratios.evaluationScore,
     ratioMet: true,
     timestamp: Date.now(),
     ratios: {

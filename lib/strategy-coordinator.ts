@@ -1219,20 +1219,40 @@ export class StrategyCoordinator {
       for (const set of mainSets) {
         const aw = set.axisWindows
         if (!aw) continue
-        // Per-axis-N bucket (count of *Sets* that landed under each window)
+        // Resolve the direction for this axis Set. expandAxisSets stores
+        // it in `axisWindows.direction`; profile-variant and Base Sets
+        // use the top-level `set.direction` field.
+        const dir = aw.direction ?? set.direction   // "long" | "short"
+        const dirSuffix = dir ? `_${dir}` : ""
+        // Per-axis-N bucket — count of Sets per window (combined + direction-split)
         axisIncrements[`prev_${aw.prev}_sets`]  = (axisIncrements[`prev_${aw.prev}_sets`]  || 0) + 1
         axisIncrements[`last_${aw.last}_sets`]  = (axisIncrements[`last_${aw.last}_sets`]  || 0) + 1
         axisIncrements[`cont_${aw.cont}_sets`]  = (axisIncrements[`cont_${aw.cont}_sets`]  || 0) + 1
         axisIncrements[`pause_${aw.pause}_sets`] = (axisIncrements[`pause_${aw.pause}_sets`] || 0) + 1
-        // Per-axis-N entries — entries are the "Pos counts" the dashboard
-        // labels as "positions" inside each axis window (one per (size ×
-        // leverage × state) config the variant projected through).
+        if (dirSuffix) {
+          axisIncrements[`prev_${aw.prev}_sets${dirSuffix}`]  = (axisIncrements[`prev_${aw.prev}_sets${dirSuffix}`]  || 0) + 1
+          axisIncrements[`last_${aw.last}_sets${dirSuffix}`]  = (axisIncrements[`last_${aw.last}_sets${dirSuffix}`]  || 0) + 1
+          axisIncrements[`cont_${aw.cont}_sets${dirSuffix}`]  = (axisIncrements[`cont_${aw.cont}_sets${dirSuffix}`]  || 0) + 1
+          axisIncrements[`pause_${aw.pause}_sets${dirSuffix}`] = (axisIncrements[`pause_${aw.pause}_sets${dirSuffix}`] || 0) + 1
+        }
+        // Per-axis-N entries — "Pos counts" for each axis window, both
+        // combined and direction-split (so the dashboard can show long vs
+        // short pos-count contribution per window). entryCount is used
+        // because axis Sets carry `entries: []` (pure-metadata projections)
+        // while their position-count semantics are encoded in entryCount
+        // (= baseEC + cont per expandAxisSets spec).
         const ec = set.entryCount || 0
         if (ec > 0) {
           axisIncrements[`prev_${aw.prev}_pos`]   = (axisIncrements[`prev_${aw.prev}_pos`]   || 0) + ec
           axisIncrements[`last_${aw.last}_pos`]   = (axisIncrements[`last_${aw.last}_pos`]   || 0) + ec
           axisIncrements[`cont_${aw.cont}_pos`]   = (axisIncrements[`cont_${aw.cont}_pos`]   || 0) + ec
           axisIncrements[`pause_${aw.pause}_pos`] = (axisIncrements[`pause_${aw.pause}_pos`] || 0) + ec
+          if (dirSuffix) {
+            axisIncrements[`prev_${aw.prev}_pos${dirSuffix}`]   = (axisIncrements[`prev_${aw.prev}_pos${dirSuffix}`]   || 0) + ec
+            axisIncrements[`last_${aw.last}_pos${dirSuffix}`]   = (axisIncrements[`last_${aw.last}_pos${dirSuffix}`]   || 0) + ec
+            axisIncrements[`cont_${aw.cont}_pos${dirSuffix}`]   = (axisIncrements[`cont_${aw.cont}_pos${dirSuffix}`]   || 0) + ec
+            axisIncrements[`pause_${aw.pause}_pos${dirSuffix}`] = (axisIncrements[`pause_${aw.pause}_pos${dirSuffix}`] || 0) + ec
+          }
         }
       }
       for (const [field, n] of Object.entries(axisIncrements)) {
@@ -1710,34 +1730,64 @@ export class StrategyCoordinator {
       //   last:  0..4    (last-N magnitude window)
       //   cont:  0..8    (open continuous positions)
       //   pause: 0..8    (last-N validation window)
-      // Each axis is keyed by its integer window value. We hincrby per
-      // window so multiple cycles accumulate into the dashboard's
-      // "Position-Counts Accumulation" tile.
-      const axisCounts: Record<"prev" | "last" | "cont" | "pause", Record<string, number>> = {
-        prev:  {},
-        last:  {},
-        cont:  {},
-        pause: {},
-      }
+      //
+      // Direction split: axis Sets are emitted in both `long` and `short`
+      // directions (CARTESIAN in expandAxisSets). Accumulation is keyed by
+      // direction so the dashboard can show pos-count distribution per
+      // direction relative to the base set config. Key format:
+      //   `strategy_axis_real:{conn}:{axis}:{dir}` → hash of { window → count }
+      //
+      // An undifferentiated (direction-combined) copy is ALSO written to
+      // `strategy_axis_real:{conn}:{axis}` so existing consumers that read
+      // only the combined key keep working without a migration.
+      type DirAxisCounts = Record<"prev" | "last" | "cont" | "pause", Record<string, number>>
+      const axisCounts:     DirAxisCounts = { prev: {}, last: {}, cont: {}, pause: {} }
+      const axisCountsLong: DirAxisCounts = { prev: {}, last: {}, cont: {}, pause: {} }
+      const axisCountsShort: DirAxisCounts = { prev: {}, last: {}, cont: {}, pause: {} }
+
       for (const set of realSets) {
         const aw = set.axisWindows
         if (!aw) continue
+        // Direction for this axis Set: axisWindows.direction (populated by
+        // expandAxisSets) if present, otherwise fall back to the Set's own
+        // top-level direction field.
+        const dir: "long" | "short" | undefined = aw.direction ?? (set.direction as "long" | "short" | undefined)
         for (const axis of ["prev", "last", "cont", "pause"] as const) {
           const w = aw[axis]
           if (typeof w !== "number") continue
           const key = String(w)
-          axisCounts[axis][key] = (axisCounts[axis][key] || 0) + 1
+          axisCounts[axis][key]      = (axisCounts[axis][key]      || 0) + 1
+          if (dir === "long")  axisCountsLong[axis][key]  = (axisCountsLong[axis][key]  || 0) + 1
+          if (dir === "short") axisCountsShort[axis][key] = (axisCountsShort[axis][key] || 0) + 1
         }
       }
       for (const axis of ["prev", "last", "cont", "pause"] as const) {
-        const aKey = `strategy_axis_real:${this.connectionId}:${axis}`
+        // Combined (direction-agnostic) — backwards-compatible key
+        const aKey      = `strategy_axis_real:${this.connectionId}:${axis}`
+        // Direction-split keys — per-spec granularity
+        const aKeyLong  = `strategy_axis_real:${this.connectionId}:${axis}:long`
+        const aKeyShort = `strategy_axis_real:${this.connectionId}:${axis}:short`
         let touched = false
         for (const [window, count] of Object.entries(axisCounts[axis])) {
           if (count <= 0) continue
           touched = true
           writes.push(client.hincrby(aKey, window, count))
         }
-        if (touched) writes.push(client.expire(aKey, 7 * 24 * 60 * 60))
+        let touchedLong = false
+        for (const [window, count] of Object.entries(axisCountsLong[axis])) {
+          if (count <= 0) continue
+          touchedLong = true
+          writes.push(client.hincrby(aKeyLong, window, count))
+        }
+        let touchedShort = false
+        for (const [window, count] of Object.entries(axisCountsShort[axis])) {
+          if (count <= 0) continue
+          touchedShort = true
+          writes.push(client.hincrby(aKeyShort, window, count))
+        }
+        if (touched)      writes.push(client.expire(aKey,      7 * 24 * 60 * 60))
+        if (touchedLong)  writes.push(client.expire(aKeyLong,  7 * 24 * 60 * 60))
+        if (touchedShort) writes.push(client.expire(aKeyShort, 7 * 24 * 60 * 60))
       }
 
       await Promise.all(writes)
