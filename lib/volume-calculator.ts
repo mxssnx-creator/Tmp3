@@ -74,7 +74,13 @@ export class VolumeCalculator {
    * persists the exact per-pair minimum to `settings:trading_pair:{symbol}`
    * so this floor is only the safety net for the very first order attempt.
    */
-  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 5
+  /**
+   * Universal hard floor: $2 notional covers BingX/Binance/Bybit/OKX minimums
+   * ($1-$5 range) while remaining realistic for small accounts with margin
+   * constraints. Accounts with balances <$10k should configure a lower
+   * positionCost instead of relying solely on this floor.
+   */
+  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 2
 
   /**
    * Fetch account balance and compute the leverage safety cap.
