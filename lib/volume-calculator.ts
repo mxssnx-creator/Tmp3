@@ -66,19 +66,17 @@ export class VolumeCalculator {
    * larger minimum (e.g. some altcoin pairs require $10) still wins.
    */
   /**
-   * Universal minimum notional value in USD.
+   * Universal minimum notional value in USD — the absolute floor used when
+   * NO per-pair `exchangeMinVolume` is known from Redis trading-pair metadata.
    *
-   * REVISED for the new spec where Position Limits + per-Direction caps
-   * are valid for STRATEGY BASE Sets ONLY (max 1 long + 1 short active
-   * at a time). Main and Real "calculate free" — they do NOT create new
-   * positions, only Set variants. So we no longer need the $15 floor
-   * that was sized for 300-position mode. $5 is the documented minimum
-   * across every major venue (Binance, BingX, Bybit, OKX, Bitget) and
-   * keeps live orders MINIMAL — which is what the operator wants:
-   * "ensure positions volume is minimalized ... keep enforcing minimal
-   * value." Per-pair `exchangeMinVolume` still wins when larger.
+   * Set to $1 (the lowest practical value). The per-pair exchange minimum
+   * always wins via `effectiveMin = max(exchangeMinVolume, universalMin)`
+   * in `calculatePositionVolume`, so the actual order will never be below
+   * what the exchange enforces for that specific pair. This constant is ONLY
+   * the "unknown pair" safety net — keeping it at $1 ensures quickstart
+   * positions are as minimal as legally allowed by the exchange.
    */
-  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 5
+  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 1
 
   /**
    * Fetch account balance and compute the leverage safety cap.
@@ -403,16 +401,16 @@ export class VolumeCalculator {
       // bundle (cleanup schedule, backup toggles) — so the operator's
       // saved leverage/cost never reached volume calculations.
       const settings = (await getAppSettings()) || {}
-      // Default position cost: 0.1% of balance per position (MINIMAL).
-      // Per spec: Strategy Base caps to 1 long + 1 short → max 2 active.
-      // Operator wants "positions volume is minimalized ... keep enforcing
-      // minimal value." With 0.1% cost on a $10K balance the math gives
-      // $10/position which then gets clamped UP to the universal $5 floor
-      // only if it would land below it. Using a small default keeps every
-      // live order at the smallest practical size; operators that want
-      // bigger sizing override `exchangePositionCost` explicitly.
+      // Default position cost: 0.02% of balance per position (ultra-minimal).
+      // With the new spec (Base capped at 1 long + 1 short), position budget
+      // is intentionally kept at the absolute floor. On a $10K balance:
+      //   0.02% → $2/position → clamped up to per-pair exchange minimum
+      // The per-pair `exchangeMinVolume` from trading-pair metadata always
+      // takes over as the hard floor in `calculatePositionVolume`, ensuring
+      // the order is never rejected for being too small. Operators who want
+      // larger sizing set `exchangePositionCost` explicitly in Settings.
       const positionCostPercent = parseFloat(
-        String(settings.exchangePositionCost ?? settings.positionCost ?? "0.1")
+        String(settings.exchangePositionCost ?? settings.positionCost ?? "0.02")
       )
       const positionCost = positionCostPercent / 100
 

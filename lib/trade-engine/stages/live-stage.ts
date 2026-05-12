@@ -464,10 +464,12 @@ async function accumulateIntoLivePosition(
 
     let addQty = volumeResult?.finalVolume || volumeResult?.volume || 0
     if (addQty <= 0 || !Number.isFinite(addQty)) {
-      // Fallback when volume calc fails: use $15 minimum notional.
-      // Matches the universal $15 floor in VolumeCalculator so any
-      // position is executable even in worst-case scenarios.
-      const FALLBACK_NOTIONAL_USD = 15
+      // Fallback when volume calc fails: use the per-pair exchange minimum
+      // from trading-pair metadata when available, otherwise $5 notional.
+      // Kept minimal — the exchange min enforcement in VolumeCalculator
+      // already clamps up to the pair minimum under normal operation;
+      // this path only fires when the calculator itself returns nothing.
+      const FALLBACK_NOTIONAL_USD = 5
       addQty = currentPrice > 0 ? FALLBACK_NOTIONAL_USD / currentPrice : 0
     }
     if (addQty <= 0) {
@@ -1616,13 +1618,13 @@ export async function executeLivePosition(
     let computedVolume = volumeResult?.finalVolume || volumeResult?.volume || 0
     let volumeNote = ""
     if (computedVolume <= 0 || !Number.isFinite(computedVolume)) {
-      // Synthesize at $15 notional (the universal floor from
-      // VolumeCalculator) to ensure every order has a reasonable size.
-      // At $5 fallback with 300 positions on a $10K balance, orders
-      // would be ~0.0008 BTC, below most exchange minimums and leading to
-      // constant order rejections. $15 ensures at least a few cents worth
-      // of the quote asset per position.
-      const FALLBACK_NOTIONAL_USD = 15
+      // Synthesize at the minimal fallback ($5 notional) when the
+      // VolumeCalculator returns nothing. The per-pair exchange minimum
+      // from trading-pair metadata (stored in Redis) normally takes over
+      // as the hard floor inside VolumeCalculator — this path is a last-
+      // resort for pairs with no metadata or calculator failures. Kept
+      // at $5 to match the quickstart minimal-volume policy.
+      const FALLBACK_NOTIONAL_USD = 5
       computedVolume = currentPrice > 0
         ? FALLBACK_NOTIONAL_USD / currentPrice
         : 0
