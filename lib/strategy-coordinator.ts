@@ -2313,65 +2313,48 @@ export class StrategyCoordinator {
         perSymbolOpen[sym] = (perSymbolOpen[sym] ?? 0) + 1
       }
 
-      // For closed-window stats we read the pseudo-position index directly
-      // and only fetch hashes for positions NOT in the active set. This
-      // keeps the hot path O(active + window) rather than O(all history).
-      // A 24h lookback + max 50 recent closed positions is a good trade-off
-      // between signal quality and Redis load.
+      // ── P-CTX-1: Read from dedicated closed-positions index ──────────
+      // `closePosition()` in PseudoPositionManager removes the position id
+      // from the open-positions set (positionsSetKey) AND appends it to a
+      // dedicated Redis list `pseudo_positions:{id}:closed_index` (newest
+      // first, capped at CLOSED_INDEX_CAP). Reading that list here gives us
+      // a bounded, already-closed-only window without filtering active ids or
+      // issuing a full smembers on the global (open) set — which previously
+      // always returned 0 closed positions because closePosition() removes ids
+      // from the global set, starving all Main variant gates.
       const client = getRedisClient()
-      const setKey = `pseudo_positions:${this.connectionId}`
+      const closedIndexKey = `pseudo_positions:${this.connectionId}:closed_index`
       const lookbackMs = 24 * 60 * 60 * 1000
       const cutoff = now - lookbackMs
-      const WINDOW_CAP = 50
+      const WINDOW_CAP = 100 // read up to 100 newest closed ids from the list
 
       let prevPosCount = 0
       let prevLosses = 0
       const lastN: Array<{ closedAt: number; pnl: number }> = []
       try {
-        const allIds: string[] = (await client.smembers(setKey).catch(() => [])) || []
-        // Exclude active ids up-front so we don't double-read their hashes
-        const activeIdSet = new Set(active.map((p: any) => String(p.id || "")))
-        const closedIds = allIds.filter((id: string) => !activeIdSet.has(String(id)))
+        // LRANGE 0 WINDOW_CAP-1 fetches the newest WINDOW_CAP closed ids
+        // (LPUSH + LTRIM in closePosition keeps the list newest-first).
+        const closedIds: string[] = ((await client.lrange(closedIndexKey, 0, WINDOW_CAP - 1).catch(() => [])) || []) as string[]
 
-        // Fetch hashes in parallel — bounded to WINDOW_CAP * 2 to stay cheap
-        // when the connection has a huge historical archive.
-        const sampledIds = closedIds.slice(-WINDOW_CAP * 2)
-        const hashes = await Promise.all(
-          sampledIds.map(async (id) => {
-            try {
-              const h = await client.hgetall(`pseudo_position:${this.connectionId}:${id}`)
-              return h && Object.keys(h).length > 0 ? h : null
-            } catch {
-              return null
-            }
-          }),
-        )
+        // Pipelined HGETALL for all sampled ids — single round-trip.
+        const hashes = await (async () => {
+          if (closedIds.length === 0) return []
+          const pipeline = client.multi()
+          for (const id of closedIds) pipeline.hgetall(`pseudo_position:${this.connectionId}:${id}`)
+          const results = await pipeline.exec().catch(() => null)
+          if (!results) return []
+          return results.map((r: any) => {
+            const data = Array.isArray(r) ? r[1] : r
+            return data && typeof data === "object" && Object.keys(data).length > 0 ? data : null
+          })
+        })()
 
         for (const h of hashes) {
           if (!h) continue
           // ── P2-1: Strict closed-only gate ──────────────────────────────
-          // Main variant gating (prevLosses, lastWins, lastLosses,
-          // prevPosCount, lastPosCount) MUST be computed from closed
-          // pseudo positions ONLY. Previously this block used the
-          // `opened_at` value as a fallback for the close timestamp and
-          // read `h.pnl` blindly — both of which made floating open
-          // positions (their mark-to-market PnL) leak into the stats
-          // that drive fingerprint buckets and `selectActiveVariants`
-          // gates. Now we enforce three explicit conditions:
-          //   (1) `status === "closed"` — hard gate. Any other value
-          //       (open, pending, rejected, error, partial) is ignored.
-          //   (2) a valid timestamp within the lookback window.
-          //       `closePosition()` writes `closed_at` as an ISO-8601
-          //       string (e.g. "2025-01-01T12:00:00.000Z") via
-          //       `new Date().toISOString()`. Older writers may have
-          //       stored a Unix-ms number. We handle BOTH: try
-          //       `new Date(raw).getTime()` first (works for both ISO
-          //       strings and numeric strings), with a direct
-          //       `Number()` fast-path as a fallback.
-          //       `opened_at` is NO LONGER a fallback — it is the
-          //       entry time, not the exit time.
-          //   (3) a realized-pnl field (`realized_pnl` or `pnl` written
-          //       AT close) — not the live unrealised value.
+          // Positions in the closed_index are always closed by construction
+          // (closePosition writes to the index). We still enforce the
+          // status check as a defence against stale/corrupted rows.
           const status = String(h.status || "").toLowerCase()
           if (status !== "closed") continue
           const closedAtRaw = h.closed_at ?? h.closedAt ?? ""
@@ -2397,11 +2380,9 @@ export class StrategyCoordinator {
           lastN.push({ closedAt, pnl })
         }
         // Keep the 8 most recently closed for the "last-N" breakdown.
-        // Spec: Pause variant validates against the last 1-8 positions
-        // (step 1) — each lookback window N feeds one Pause sub-config.
-        // The remaining gates (`trailing.lastWins >= 2`, etc.) only ever
-        // need the top of this list, so the wider window is essentially
-        // free for them.
+        // The closed_index is already newest-first (LPUSH order), so
+        // sorting + truncating here normalises any edge-cases where TTL
+        // trimming or concurrent writes changed the ordering slightly.
         lastN.sort((a, b) => b.closedAt - a.closedAt)
         lastN.length = Math.min(lastN.length, 8)
       } catch { /* best-effort; fall through with zeros */ }
