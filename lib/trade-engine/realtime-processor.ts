@@ -216,6 +216,33 @@ export class RealtimeProcessor {
    */
   async processRealtimeUpdates(): Promise<{ updates: number }> {
     try {
+      // ── CHECK: Settings dirty flag and reload if needed ────────────────────────
+      // When user updates connection settings via UI, a dirty flag is set.
+      // On the next realtime tick, we detect it and clear the flag so
+      // position management picks up new settings on next open/close.
+      try {
+        const client = getRedisClient()
+        const dirtyKey = `settings:dirty:${this.connectionId}`
+        const isDirty = await client.get(dirtyKey)
+        if (isDirty) {
+          // Clear the dirty flag
+          await client.del(dirtyKey)
+          
+          // Clear prev-set cache to force fresh context on next position update
+          this.prevSetCache.clear()
+          
+          console.log(
+            `[v0] [RealtimeProcessor] Settings reloaded for ${this.connectionId} - caches cleared`
+          )
+        }
+      } catch (settingsErr) {
+        // Non-critical - continue processing even if dirty check fails
+        console.warn(
+          `[v0] [RealtimeProcessor] Settings dirty check failed:`,
+          settingsErr instanceof Error ? settingsErr.message : String(settingsErr)
+        )
+      }
+
       // Advisory readiness flag — tells processPosition whether it's
       // safe to attach prev-set context. Never blocks Phase A work.
       const prehistoricReady = await this.isPrehistoricReady()

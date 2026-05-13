@@ -1375,6 +1375,29 @@ export class TradeEngineManager {
           return
         }
 
+        // ── CHECK: Settings dirty flag and reload if needed ────────────────────────
+        // When user updates connection settings via UI, a dirty flag is set.
+        // On the next indication tick, we detect it and clear the flag.
+        try {
+          const { getRedisClient } = await import("@/lib/redis-db")
+          const client = getRedisClient()
+          const dirtyKey = `settings:dirty:${this.connectionId}`
+          const isDirty = await client.get(dirtyKey)
+          if (isDirty) {
+            // Clear the dirty flag
+            await client.del(dirtyKey)
+            console.log(
+              `[v0] [IndicationProcessor] Settings reloaded for ${this.connectionId}`
+            )
+          }
+        } catch (settingsErr) {
+          // Non-critical - continue processing even if dirty check fails
+          console.warn(
+            `[v0] [IndicationProcessor] Settings dirty check failed:`,
+            settingsErr instanceof Error ? settingsErr.message : String(settingsErr)
+          )
+        }
+
         // ── Prehistoric gate (spec: realtime starts AFTER prehistoric done) ──
         // The indication tick evaluates sets that the prehistoric calculator
         // is busy filling. Running it on half-filled or empty sets pollutes
