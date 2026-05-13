@@ -141,7 +141,7 @@ async function fetchMostVolatileSymbols(
           priceChangePercent: Math.abs(parseFloat(t.sodUtc8 || "0")),
         }))
     }
-  } catch {
+  } catch (err) {
     // Silently handle - will use fallback below
   }
 
