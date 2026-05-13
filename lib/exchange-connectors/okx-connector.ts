@@ -20,9 +20,9 @@ export class OKXConnector extends BaseExchangeConnector {
     this.log(`Using endpoint: ${this.getBaseUrl()}`)
 
     // Don't make API calls with placeholder/invalid credentials
+    // Note: Don't check apiKey.length — valid credentials vary by exchange
     if (!this.credentials.apiKey || this.credentials.apiKey.includes("PLACEHOLDER") || 
-        !this.credentials.apiSecret || this.credentials.apiSecret.includes("PLACEHOLDER") ||
-        this.credentials.apiKey.length < 10) {
+        !this.credentials.apiSecret || this.credentials.apiSecret.includes("PLACEHOLDER")) {
       this.logError("Invalid or placeholder credentials - skipping API call")
       return {
         success: false,

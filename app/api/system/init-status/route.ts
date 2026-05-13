@@ -44,8 +44,9 @@ export async function GET(request: NextRequest) {
       const existingConn = await redisClient.hgetall("connection:bingx-x01")
       const existsInConnectionsSet = await redisClient.sismember("connections", "bingx-x01")
       // Only update if credentials are missing or different
+      // Note: Don't check api_key.length — valid credentials vary by exchange
        if (existsInConnectionsSet && existingConn && Object.keys(existingConn).length > 0 &&
-         (!existingConn.api_key || existingConn.api_key.length < 10 || existingConn.api_key !== bingxKey)) {
+         (!existingConn.api_key || existingConn.api_key !== bingxKey)) {
          const dashboardEnabled = existingConn?.is_enabled_dashboard === "1" || existingConn?.is_enabled_dashboard === "true"
          await redisClient.hset("connection:bingx-x01", {
            api_key: bingxKey,

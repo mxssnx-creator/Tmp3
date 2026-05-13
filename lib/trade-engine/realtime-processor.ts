@@ -764,7 +764,9 @@ export class RealtimeProcessor {
       if (!connection) return
       const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
       const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
-      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) return
+      // Paper-only if either key is empty. Do NOT check length — valid
+      // credentials vary by exchange (some are short, some long).
+      if (!apiKey || !apiSecret) return
 
       const { createExchangeConnector } = await import("@/lib/exchange-connectors")
       const connector = await createExchangeConnector(connection.exchange, {
@@ -890,7 +892,9 @@ export class RealtimeProcessor {
       }
       const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
       const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
-      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) {
+      // Paper-only if either key is empty. Do NOT check length — valid
+      // credentials vary by exchange (some are short, some long).
+      if (!apiKey || !apiSecret) {
         // Paper-only connection — nothing to sync against on the exchange
         // side. The simulated-position sweep above already handled all
         // close paths for paper trades, so we return silently here.

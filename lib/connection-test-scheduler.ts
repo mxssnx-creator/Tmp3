@@ -54,9 +54,9 @@ export async function testConnectionImmediate(
   console.log(`${LOG_PREFIX} Testing connection: ${connection.name} (${connection.exchange})`)
 
   try {
-    // Validate credentials exist
-    if (!connection.api_key || !connection.api_secret || 
-        connection.api_key.length < 10 || connection.api_secret.length < 10) {
+    // Validate credentials exist (but don't check length — valid credentials
+    // vary by exchange, some are short, some long)
+    if (!connection.api_key || !connection.api_secret) {
       throw new Error("Invalid or missing API credentials")
     }
 
