@@ -2098,6 +2098,22 @@ export class StrategyCoordinator {
                       consistencyRatio: set.avgConfidence,
                     },
                     status: "pending",
+                    // ── Set lineage propagation (Strategy → Real → Live) ──
+                    // `executeLivePosition` mirrors these onto the LivePosition
+                    // verbatim. Without them the executed live order carries
+                    // `setKey=undefined`, breaking:
+                    //   1. Post-trade stats grouping (PnL by Set Type)
+                    //   2. `accumulatedSetKeys` seeding — when a later signal
+                    //      accumulates into this open position the merged
+                    //      lineage starts from an empty array instead of the
+                    //      originating Set, losing the first leg's identity.
+                    //   3. The progression panel's Set-lineage badge.
+                    // The id already embeds setKey for log-grep, but the
+                    // structured fields are what downstream code reads.
+                    setKey:       set.setKey,
+                    parentSetKey: set.parentSetKey,
+                    setVariant:   set.variant,
+                    axisWindows:  set.axisWindows,
                   },
                   connector
                 )
@@ -2821,7 +2837,7 @@ export class StrategyCoordinator {
     const avgCnf = capped.reduce((s, e) => s + Number(e.confidence    || 0), 0) / capped.length
     const avgDDT = capped.reduce((s, e) => s + Number(e.drawdownTime  || 0), 0) / capped.length
 
-    // ── Axis-window snapshot for this Set ───────────────────────────────
+    // ── Axis-window snapshot for this Set ──���────────────────────────────
     // Mirrors the spec's four position-count axes with the documented
     // step-1 windows (see StrategySet.axisWindows). When ctx is absent
     // (legacy diagnostic call paths) we emit zeros, signalling "no axis
