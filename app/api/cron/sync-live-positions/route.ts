@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
 import { initRedis, getRedisClient, getAllConnections } from "@/lib/redis-db"
-import { reconcileLivePositions } from "@/lib/trade-engine/stages/live-stage"
+import { reconcileLivePositions, syncWithExchange } from "@/lib/trade-engine/stages/live-stage"
 import { exchangeConnectorFactory } from "@/lib/exchange-connectors/factory"
 
 export const dynamic = "force-dynamic"
@@ -134,6 +134,27 @@ export async function GET() {
           continue
         }
 
+        // 1. syncWithExchange first — discovers and adopts exchange-side
+        //    orphan positions (positions on the exchange not in our Redis
+        //    index) and arms default SL/TP on them. Critical fallback when
+        //    the engine is down: without this, orphan positions sit on the
+        //    exchange indefinitely with no protection orders and no close
+        //    path. `reconcileLivePositions` below cannot see them because
+        //    it iterates only Redis-tracked positions.
+        try {
+          await syncWithExchange(connId, connector)
+        } catch (syncErr) {
+          summary.errors++
+          console.warn(
+            `[SyncLivePositions] ${connId} sync (orphan adoption) error:`,
+            syncErr instanceof Error ? syncErr.message : String(syncErr),
+          )
+        }
+
+        // 2. reconcileLivePositions — full per-position reconcile against
+        //    the exchange. Detects externally-closed positions, promotes
+        //    `placed` → `open` on fill, heals SL/TP, and runs the orphan
+        //    expired-close sweep. Now includes positions adopted in (1).
         const result = await reconcileLivePositions(connId, connector)
         summary.positionsReconciled += result.reconciled
         summary.positionsClosed      += result.closed

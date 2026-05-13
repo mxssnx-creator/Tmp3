@@ -798,19 +798,37 @@ export class RealtimeProcessor {
     this.liveSyncInFlight = true
 
     try {
-      // Cheap gate: skip when no live positions are tracked. Saves a
-      // connector instantiation + getPosition fan-out on the common
-      // paper-only or idle case.
-      const client = getRedisClient()
-      const openCount = await client.llen(`live:positions:${this.connectionId}`).catch(() => 0)
-      if (!openCount || openCount <= 0) return
-
+      // ── REMOVED the prior LLEN short-circuit ────────────────────────
+      // The previous version short-circuited when `live:positions:{id}`
+      // LLEN returned 0. That looked like a sensible optimization but
+      // turned out to be the root cause of the operator's repeated
+      // "Live Positions not getting closed" complaint:
+      //
+      //   - Positions placed by the system in earlier runs / before a
+      //     savePosition LPUSH lost their TTL, OR positions opened by
+      //     the operator directly on the exchange, are NEVER in the
+      //     Redis open-index. With the LLEN guard, `syncWithExchange`
+      //     was therefore never invoked — so the orphan-adoption sweep
+      //     inside it (added below) never ran, and the exchange-side
+      //     positions stayed open indefinitely with no control orders.
+      //
+      // The cost of always calling `syncWithExchange` when there are
+      // zero tracked positions is one `getLivePositions` (cheap LRANGE)
+      // plus, every 5 s, one `getPositions()` exchange call inside the
+      // orphan-adoption sweep. Fine.
       const { getConnection } = await import("@/lib/redis-db")
       const connection = await getConnection(this.connectionId)
-      if (!connection) return
+      if (!connection) {
+        console.warn(`[v0] [Realtime] live sync skipped: no connection record for ${this.connectionId}`)
+        return
+      }
       const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
       const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
-      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) return
+      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) {
+        // Paper-only connection — nothing to sync against. Silent return
+        // (no log) because this fires every 5 s on paper accounts.
+        return
+      }
 
       const { createExchangeConnector } = await import("@/lib/exchange-connectors")
       const connector = await createExchangeConnector(connection.exchange, {
@@ -820,7 +838,10 @@ export class RealtimeProcessor {
         contractType: connection.contract_type,
         isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
       })
-      if (!connector) return
+      if (!connector) {
+        console.warn(`[v0] [Realtime] live sync skipped: createExchangeConnector returned null for ${this.connectionId}`)
+        return
+      }
 
       const { syncWithExchange } = await import("@/lib/trade-engine/stages/live-stage")
       await syncWithExchange(this.connectionId, connector)

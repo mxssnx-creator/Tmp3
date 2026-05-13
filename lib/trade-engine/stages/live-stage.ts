@@ -3225,11 +3225,179 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
     )
 
+    // ── Exchange-orphan adoption (P0 fix for "positions not closing") ──
+    // The user repeatedly reported live exchange positions that never get
+    // closed. Investigation showed the root cause: positions on the
+    // exchange that AREN'T in our Redis open-index are completely
+    // invisible to every close path (SL/TP cross, max-hold, reconcile,
+    // sync). They sit there forever with no control orders armed.
+    //
+    // This block runs BEFORE the early-return on `openPositions.length=0`
+    // so even a system with zero tracked positions still discovers and
+    // adopts exchange-side positions. Adopted positions get the
+    // connection's default SL/TP percentages applied via
+    // `updateProtectionOrders` on the next iteration of the per-position
+    // loop below, restoring full close-path coverage.
+    //
+    // Cheap when the exchange has no positions (one HTTP call returning
+    // empty array). The exchange call is gated by the realtime sync's
+    // 5-second throttle so it doesn't hammer the venue.
+    let adoptedCount = 0
+    if (exchangeConnector && typeof exchangeConnector.getPositions === "function") {
+      try {
+        const exchangePositions = (await exchangeConnector.getPositions().catch(() => [])) || []
+        if (Array.isArray(exchangePositions) && exchangePositions.length > 0) {
+          // Build a set of (symbol|direction) keys we already track in any
+          // status — including terminal ones — so we don't re-adopt a
+          // position that was just closed but the exchange hasn't yet
+          // reflected the close (a few-second lag is normal).
+          const normSym = (raw: string) => String(raw || "").toUpperCase().replace(/[-_]/g, "")
+          const trackedKeys = new Set<string>()
+          for (const p of allOpen) {
+            trackedKeys.add(`${normSym(p.symbol)}|${p.direction}`)
+          }
+          // Also pull recent closes (last 50) so a just-closed position
+          // doesn't bounce back as an orphan during the close-confirmation
+          // window. `getClosedLivePositions` reads the closed-archive list.
+          try {
+            const recentlyClosed = await getClosedLivePositions(connectionId, 50).catch(() => [] as LivePosition[])
+            for (const p of recentlyClosed) {
+              const closedAgoMs = Date.now() - (p.closedAt || 0)
+              // Within 60s of close — exchange may still report position
+              // until the close fill propagates. After that window, treat
+              // it as truly closed and orphan-adopt if it reappears.
+              if (closedAgoMs < 60_000) {
+                trackedKeys.add(`${normSym(p.symbol)}|${p.direction}`)
+              }
+            }
+          } catch { /* best-effort */ }
+
+          // Load default SL/TP percentages once for all adoptions.
+          let defaultSlPct = 1
+          let defaultTpPct = 2
+          try {
+            const tradingSettings = (await client.hgetall("settings:trading")) || {}
+            const slRaw = parseFloat(String((tradingSettings as any).default_stop_loss_percent ?? "1"))
+            const tpRaw = parseFloat(String((tradingSettings as any).default_take_profit_percent ?? "2"))
+            if (Number.isFinite(slRaw) && slRaw > 0) defaultSlPct = slRaw
+            if (Number.isFinite(tpRaw) && tpRaw > 0) defaultTpPct = tpRaw
+          } catch { /* use defaults */ }
+
+          for (const exPos of exchangePositions) {
+            try {
+              const rawSym = String(exPos.symbol || (exPos as any).Symbol || "")
+              const sym = normSym(rawSym)
+              if (!sym) continue
+              const size = Math.abs(parseFloat(String(exPos.size ?? (exPos as any).positionAmt ?? exPos.quantity ?? "0")))
+              if (!size || size <= 0) continue
+              // Determine direction. BingX returns "LONG"/"SHORT" in
+              // `positionSide`; some venues encode via signed size.
+              const sideRaw = String(
+                exPos.side ?? (exPos as any).positionSide ?? (parseFloat(String(exPos.size ?? "0")) < 0 ? "short" : "long"),
+              ).toLowerCase()
+              const direction: "long" | "short" =
+                sideRaw.includes("short") || sideRaw === "sell" ? "short" : "long"
+
+              const mapKey = `${sym}|${direction}`
+              if (trackedKeys.has(mapKey)) continue // already tracked
+              // ORPHAN — adopt it.
+              const entryPrice = parseFloat(
+                String(exPos.entryPrice ?? (exPos as any).avgPrice ?? exPos.markPrice ?? "0"),
+              ) || parseFloat(String(exPos.markPrice ?? "0")) || 0
+              if (!entryPrice || entryPrice <= 0) continue
+              const markPrice = parseFloat(String(exPos.markPrice ?? entryPrice)) || entryPrice
+              const leverage = Math.max(1, parseFloat(String(exPos.leverage ?? "1")) || 1)
+              const notional = size * entryPrice
+              const marginType: "cross" | "isolated" =
+                String(exPos.marginType ?? "isolated").toLowerCase().includes("cross") ? "cross" : "isolated"
+
+              const adoptedId = `live:${connectionId}:adopted:${sym}:${direction}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`
+              const adopted: LivePosition = {
+                id: adoptedId,
+                connectionId,
+                symbol: sym,
+                direction,
+                realPositionId: adoptedId, // self-reference — no Real-stage parent
+                quantity: size,
+                executedQuantity: size,
+                remainingQuantity: 0,
+                entryPrice,
+                averageExecutionPrice: entryPrice,
+                volumeUsd: notional,
+                leverage,
+                marginType,
+                stopLoss: defaultSlPct,
+                takeProfit: defaultTpPct,
+                assignedStopLoss: defaultSlPct,
+                assignedTakeProfit: defaultTpPct,
+                status: "open", // exchange confirms the fill — start in "open"
+                statusReason: "adopted_from_exchange",
+                fills: [
+                  {
+                    timestamp: Date.now(),
+                    quantity: size,
+                    price: entryPrice,
+                    fee: 0,
+                    feeAsset: "",
+                  },
+                ],
+                exchangeData: {
+                  markPrice,
+                  liquidationPrice: parseFloat(String(exPos.liquidationPrice ?? "0")) || undefined,
+                  unrealizedPnL: parseFloat(String(exPos.unrealizedProfit ?? exPos.unrealizedPnl ?? "0")) || undefined,
+                  syncedAt: Date.now(),
+                },
+                progression: [
+                  {
+                    step: "adopt",
+                    timestamp: Date.now(),
+                    success: true,
+                    details: `Adopted untracked exchange position size=${size} @ ${entryPrice} (default SL=${defaultSlPct}% TP=${defaultTpPct}%)`,
+                  },
+                ],
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+              } as LivePosition
+
+              await savePosition(adopted)
+              adoptedCount++
+              await incrementMetric(connectionId, "live_positions_adopted_count")
+              await logProgressionEvent(
+                connectionId,
+                "live_trading",
+                "warning",
+                `Adopted untracked exchange position ${sym} ${direction} — applying default SL=${defaultSlPct}% TP=${defaultTpPct}%`,
+                { positionId: adoptedId, size, entryPrice, markPrice, leverage },
+              )
+              // Push adopted position into openPositions so the per-position
+              // loop below arms SL/TP on it RIGHT NOW (don't wait for the
+              // next 5 s sync tick — the operator's stranded position
+              // needs protection immediately).
+              openPositions.push(adopted)
+            } catch (orphanErr) {
+              console.warn(
+                `${LOG_PREFIX} Orphan adoption failed:`,
+                orphanErr instanceof Error ? orphanErr.message : String(orphanErr),
+              )
+            }
+          }
+          if (adoptedCount > 0) {
+            console.log(`${LOG_PREFIX} Adopted ${adoptedCount} untracked exchange position(s) for ${connectionId}`)
+          }
+        }
+      } catch (sweepErr) {
+        console.warn(
+          `${LOG_PREFIX} Orphan sweep failed:`,
+          sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+        )
+      }
+    }
+
     if (openPositions.length === 0) {
       return
     }
 
-    console.log(`${LOG_PREFIX} Syncing ${openPositions.length} open/placed positions with exchange`)
+    console.log(`${LOG_PREFIX} Syncing ${openPositions.length} open/placed positions with exchange (adopted=${adoptedCount})`)
 
     for (const position of openPositions) {
       try {
