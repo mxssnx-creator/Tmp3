@@ -53,6 +53,23 @@ interface FlowThrottleEntry {
 // Map<`${connectionId}:${symbol}`, FlowThrottleEntry>
 const flowThrottle = new Map<string, FlowThrottleEntry>()
 
+/**
+ * Release all throttle entries for a connection — called from the
+ * engine's `stop()` path. Without this, a stopped engine's entries
+ * linger in the module-level map until the next process restart. For
+ * a single-tenant deployment that's negligible (≤ a few dozen entries),
+ * but for multi-tenant setups that bounce engines frequently it lets
+ * memory grow unbounded. Also guarantees that an immediate restart of
+ * the SAME connection starts with a clean slate so the very first
+ * tick after restart isn't accidentally gated by a stale fingerprint.
+ */
+export function clearFlowThrottleForConnection(connectionId: string): void {
+  const prefix = `${connectionId}:`
+  for (const key of flowThrottle.keys()) {
+    if (key.startsWith(prefix)) flowThrottle.delete(key)
+  }
+}
+
 export class StrategyProcessor {
   private connectionId: string
   // REMOVED: strategyCache - No caching, all calculations real-time
