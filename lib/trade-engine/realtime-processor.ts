@@ -28,6 +28,11 @@ import { StrategyConfigManager, type PseudoPosition } from "@/lib/strategy-confi
 // multiple processors (indication, strategy, realtime) share the same
 // warm entries.
 import { getMarketDataCached, prefetchMarketDataBatch } from "./market-data-cache"
+// Tunable cadences (heartbeat, live-sync) read at gate-evaluation time from
+// `settings:system`. See lib/engine-timings.ts. The `private static readonly`
+// constants below are kept as fallback defaults when the cache is empty on
+// cold start.
+import { getEngineTimings } from "@/lib/engine-timings"
 
 export class RealtimeProcessor {
   private connectionId: string
@@ -69,6 +74,24 @@ export class RealtimeProcessor {
   private lastHeartbeatAt = 0
   private lastPositionsCount = -1
   private static readonly HEARTBEAT_INTERVAL_MS = 1000
+
+  // ── Live-position exchange sync throttle ───────────────────────────────
+  // `syncWithExchange` from live-stage refreshes mark prices, places /
+  // heals SL/TP protection ("control") orders, detects SL/TP crosses and
+  // force-closes positions whose exchange-side stop failed to fire. It
+  // MUST run from the engine loop — without it, control orders are never
+  // healed and force-close-on-cross only fires via the 60s cron or the
+  // 30s strategy-coordinator reconcile (which itself only runs when a
+  // symbol reaches the Real-stage block). For sub-second SL/TP response
+  // the realtime tick has to drive it.
+  //
+  // Rate-limited to LIVE_SYNC_INTERVAL_MS so we don't hammer the exchange
+  // REST endpoint on every realtime tick (which can fire >1× per second
+  // under dense market data). Per-instance throttle is sufficient because
+  // the engine spawns one RealtimeProcessor per connectionId.
+  private lastLiveSyncAt = 0
+  private liveSyncInFlight = false
+  private static readonly LIVE_SYNC_INTERVAL_MS = 5_000
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -205,7 +228,12 @@ export class RealtimeProcessor {
       // preceding getSettings() unless the position count changed (which is
       // when we need to merge with the persisted state hash).
       const countChanged = count !== this.lastPositionsCount
-      const heartbeatDue = now - this.lastHeartbeatAt >= RealtimeProcessor.HEARTBEAT_INTERVAL_MS
+      // Read cadence from settings cache each tick — in-memory hit, no I/O.
+      // Falls back to the static default if the cache hasn't yet been
+      // populated (process cold start, < 1 ms after boot).
+      const heartbeatIntervalMs =
+        getEngineTimings().heartbeatIntervalMs || RealtimeProcessor.HEARTBEAT_INTERVAL_MS
+      const heartbeatDue = now - this.lastHeartbeatAt >= heartbeatIntervalMs
 
       if (countChanged || heartbeatDue) {
         const stateKey = `trade_engine_state:${this.connectionId}`
@@ -245,6 +273,17 @@ export class RealtimeProcessor {
           console.warn("[v0] [Realtime] Heartbeat write failed:", hbErr instanceof Error ? hbErr.message : String(hbErr))
         }
       }
+
+      // ── Live-position exchange sync (fire-and-forget, rate-limited) ──
+      // Drives SL/TP cross detection, protection-order healing, and
+      // mark-price refresh for all open LIVE positions on this connection.
+      // Independent of the pseudo-position pipeline below — we kick it
+      // off here BEFORE the count==0 early-return because the pseudo
+      // count may be 0 while live positions are still open (e.g. after
+      // all pseudo Sets closed but their live mirrors are still open
+      // on the exchange waiting for SL/TP). Throttled internally via
+      // `lastLiveSyncAt`.
+      void this.maybeRunLiveSync()
 
       if (count === 0) {
         return { updates: 0 }
@@ -741,6 +780,203 @@ export class RealtimeProcessor {
     } catch (err) {
       // Best-effort — never propagate.
       console.warn(`[v0] fireSyncLiveFromPseudo error for ${position?.id}:`, err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  /**
+   * Per-tick driver for `live-stage.syncWithExchange`. Refreshes mark
+   * prices, heals SL/TP protection orders, force-closes positions whose
+   * SL/TP level has been crossed, and arms protection for delayed fills.
+   *
+   * Throttled to LIVE_SYNC_INTERVAL_MS (5 s) so a fast realtime tick
+   * doesn't translate into multi-Hz exchange REST hits. Single-flight
+   * guarded so a slow exchange round-trip can't queue overlapping syncs.
+   * Fire-and-forget: errors are logged but never propagated to the tick
+   * loop — pseudo-position processing must continue regardless.
+   *
+   * No-op early-exit when:
+   *   - throttle window not yet elapsed
+   *   - a previous sync is still in flight
+   *   - the connection has no exchange credentials (paper-only)
+   *   - the global coordinator is paused (exchange ops skipped, simulated
+   *     positions still close via local SL/TP detection)
+   */
+  private async maybeRunLiveSync(): Promise<void> {
+    const now = Date.now()
+    if (this.liveSyncInFlight) return
+    // Read cadence from settings:system; static const is the fallback only
+    // until the engine-timings cache lands (~milliseconds after boot).
+    const liveSyncIntervalMs =
+      getEngineTimings().liveSyncIntervalMs || RealtimeProcessor.LIVE_SYNC_INTERVAL_MS
+    if (now - this.lastLiveSyncAt < liveSyncIntervalMs) return
+    this.lastLiveSyncAt = now
+    this.liveSyncInFlight = true
+
+    try {
+      // ── Always-run simulated-position sweep ─────────────────────────
+      // Runs BEFORE every early-return below (no connection record,
+      // missing API keys, connector failure) so simulated positions on
+      // paper-only / is_live_trade=false connections always get a
+      // close path on every realtime tick. The helper is fully
+      // self-contained and reads Redis market_data for prices, so it
+      // doesn't depend on the exchange connector being available.
+      //
+      // This is the single most important fix for the operator's
+      // recurring "Live Positions are Still not getting closed"
+      // complaint on paper-mode connections — every other close path
+      // was gated on having a working exchange connector, so paper
+      // simulated positions accumulated unboundedly.
+      //
+      // ALSO runs even when the global coordinator is paused — local
+      // SL/TP detection and position closing must continue regardless
+      // of pause state.
+      try {
+        const { processSimulatedPositions } = await import("@/lib/trade-engine/stages/live-stage")
+        await processSimulatedPositions(this.connectionId)
+      } catch (simErr) {
+        console.warn(
+          `[v0] [Realtime] processSimulatedPositions error for ${this.connectionId}:`,
+          simErr instanceof Error ? simErr.message : String(simErr),
+        )
+      }
+
+      // ── Check if coordinator is paused before exchange sync ──────────
+      // When paused, skip the exchange syncing (control order creation,
+      // orphan adoption, mark-price refresh) but KEEP the simulated-
+      // position sweep running above. When resumed, the next sync will
+      // rebuild control orders and catch up on mark prices.
+      try {
+        const { initRedis, getRedisClient } = await import("@/lib/redis-db")
+        await initRedis()
+        const client = getRedisClient()
+        const globalState = await client.hgetall("trade_engine:global")
+        if ((globalState as any)?.status === "paused") {
+          console.log(
+            `[v0] [Realtime] live sync skipped for ${this.connectionId}: coordinator is paused (simulated positions still closing locally)`,
+          )
+          return
+        }
+      } catch (pauseCheckErr) {
+        // Non-fatal pause check failure — proceed with sync anyway
+        console.warn(
+          `[v0] [Realtime] pause state check failed, proceeding with sync:`,
+          pauseCheckErr instanceof Error ? pauseCheckErr.message : String(pauseCheckErr),
+        )
+      }
+
+      // ── REMOVED the prior LLEN short-circuit ────────────────────────────
+      // The previous version short-circuited when `live:positions:{id}`
+      // LLEN returned 0. That looked like a sensible optimization but
+      // turned out to be the root cause of the operator's repeated
+      // "Live Positions not getting closed" complaint:
+      //
+      //   - Positions placed by the system in earlier runs / before a
+      //     savePosition LPUSH lost their TTL, OR positions opened by
+      //     the operator directly on the exchange, are NEVER in the
+      //     Redis open-index. With the LLEN guard, `syncWithExchange`
+      //     was therefore never invoked — so the orphan-adoption sweep
+      //     inside it (added below) never ran, and the exchange-side
+      //     positions stayed open indefinitely with no control orders.
+      //
+      // The cost of always calling `syncWithExchange` when there are
+      // zero tracked positions is one `getLivePositions` (cheap LRANGE)
+      // plus, every 5 s, one `getPositions()` exchange call inside the
+      // orphan-adoption sweep. Fine.
+      const { getConnection } = await import("@/lib/redis-db")
+      const connection = await getConnection(this.connectionId)
+      if (!connection) {
+        console.warn(`[v0] [Realtime] live sync skipped: no connection record for ${this.connectionId}`)
+        return
+      }
+      const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
+      const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
+      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) {
+        // Paper-only connection — nothing to sync against on the exchange
+        // side. The simulated-position sweep above already handled all
+        // close paths for paper trades, so we return silently here.
+        return
+      }
+
+      const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+      const connector = await createExchangeConnector(connection.exchange, {
+        apiKey,
+        apiSecret,
+        apiType: connection.api_type,
+        contractType: connection.contract_type,
+        isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
+      })
+      if (!connector) {
+        console.warn(`[v0] [Realtime] live sync skipped: createExchangeConnector returned null for ${this.connectionId}`)
+        return
+      }
+
+      const { syncWithExchange } = await import("@/lib/trade-engine/stages/live-stage")
+      await syncWithExchange(this.connectionId, connector)
+    } catch (err) {
+      console.warn(
+        `[v0] [Realtime] live syncWithExchange error for ${this.connectionId}:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    } finally {
+      this.liveSyncInFlight = false
+    }
+  }
+
+      // ── REMOVED the prior LLEN short-circuit ────────────────────────
+      // The previous version short-circuited when `live:positions:{id}`
+      // LLEN returned 0. That looked like a sensible optimization but
+      // turned out to be the root cause of the operator's repeated
+      // "Live Positions not getting closed" complaint:
+      //
+      //   - Positions placed by the system in earlier runs / before a
+      //     savePosition LPUSH lost their TTL, OR positions opened by
+      //     the operator directly on the exchange, are NEVER in the
+      //     Redis open-index. With the LLEN guard, `syncWithExchange`
+      //     was therefore never invoked — so the orphan-adoption sweep
+      //     inside it (added below) never ran, and the exchange-side
+      //     positions stayed open indefinitely with no control orders.
+      //
+      // The cost of always calling `syncWithExchange` when there are
+      // zero tracked positions is one `getLivePositions` (cheap LRANGE)
+      // plus, every 5 s, one `getPositions()` exchange call inside the
+      // orphan-adoption sweep. Fine.
+      const { getConnection } = await import("@/lib/redis-db")
+      const connection = await getConnection(this.connectionId)
+      if (!connection) {
+        console.warn(`[v0] [Realtime] live sync skipped: no connection record for ${this.connectionId}`)
+        return
+      }
+      const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
+      const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
+      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) {
+        // Paper-only connection — nothing to sync against on the exchange
+        // side. The simulated-position sweep above already handled all
+        // close paths for paper trades, so we return silently here.
+        return
+      }
+
+      const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+      const connector = await createExchangeConnector(connection.exchange, {
+        apiKey,
+        apiSecret,
+        apiType: connection.api_type,
+        contractType: connection.contract_type,
+        isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
+      })
+      if (!connector) {
+        console.warn(`[v0] [Realtime] live sync skipped: createExchangeConnector returned null for ${this.connectionId}`)
+        return
+      }
+
+      const { syncWithExchange } = await import("@/lib/trade-engine/stages/live-stage")
+      await syncWithExchange(this.connectionId, connector)
+    } catch (err) {
+      console.warn(
+        `[v0] [Realtime] live syncWithExchange error for ${this.connectionId}:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    } finally {
+      this.liveSyncInFlight = false
     }
   }
 

@@ -455,15 +455,58 @@ export class TradeEngine {
       const startDate = new Date(endDate.getTime() - effectiveHistoryDays * 24 * 60 * 60 * 1000)
 
       console.log(
-        `[v0] Loading ${effectiveHistoryDays} days of historical data from ${startDate.toISOString()} to ${endDate.toISOString()}`,
+        `[v0] Loading ${effectiveHistoryDays} days of historical data from ${startDate.toISOString()} to ${endDate.toISOString()} (parallel, concurrency=${Math.min(this.maxConcurrency, symbols.length)})`,
       )
 
-      for (const symbol of symbols) {
-        await this.indicationProcessor.processHistoricalIndications(symbol, startDate, endDate)
-        await this.strategyProcessor.processHistoricalStrategies(symbol, startDate, endDate)
+      // ── Parallel prehistoric processing ─────────────────────────────────
+      // Previously: nested sequential awaits — for every symbol the
+      // process waited for indications to finish before starting
+      // strategies, then moved to the next symbol. With N symbols and
+      // ~5d of 1s candles per symbol this serialised dozens of seconds
+      // of CPU+I/O that could run in parallel.
+      //
+      // Each symbol's pipeline is INDEPENDENT (different Redis
+      // keyspaces, different candles, different config-set state),
+      // so we fan them out with a bounded concurrency cap to avoid
+      // saturating Redis or the event loop. The cap mirrors the
+      // existing `maxConcurrency` used elsewhere in this engine
+      // (preset / main loops) so behaviour stays consistent.
+      const PREHISTORIC_CONCURRENCY = Math.max(
+        1,
+        Math.min(this.maxConcurrency || 8, symbols.length, 16),
+      )
+      let nextIdx = 0
+      const errors: Array<{ symbol: string; error: string }> = []
+      const worker = async (): Promise<void> => {
+        while (true) {
+          const i = nextIdx++
+          if (i >= symbols.length) return
+          const symbol = symbols[i]
+          try {
+            // For a single symbol, indications must produce the
+            // historical sets BEFORE strategies can consume them —
+            // strategy-processor reads `getHistoricalIndications`
+            // for the same symbol. So we keep them serial PER symbol
+            // but parallel ACROSS symbols, which is the correct
+            // dependency-respecting fan-out.
+            await this.indicationProcessor.processHistoricalIndications(symbol, startDate, endDate)
+            await this.strategyProcessor.processHistoricalStrategies(symbol, startDate, endDate)
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            errors.push({ symbol, error: msg })
+            console.error(`[v0] [Prehistoric] ${symbol} failed:`, msg)
+          }
+        }
       }
+      const workers: Promise<void>[] = []
+      for (let w = 0; w < PREHISTORIC_CONCURRENCY; w++) workers.push(worker())
+      await Promise.all(workers)
 
-      console.log("[v0] Prehistoric data loaded successfully")
+      if (errors.length > 0) {
+        console.warn(`[v0] Prehistoric data loaded with ${errors.length}/${symbols.length} symbol failures: ${errors.map((e) => e.symbol).join(", ")}`)
+      } else {
+        console.log(`[v0] Prehistoric data loaded successfully for ${symbols.length} symbols`)
+      }
     } catch (error) {
       console.error("[v0] Failed to load prehistoric data:", error)
       throw error

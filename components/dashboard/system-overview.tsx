@@ -205,6 +205,8 @@ export function SystemOverview() {
       case "healthy":
       case "working":
         return "bg-green-100 text-green-900 border-green-200"
+      case "paused":
+        return "bg-amber-100 text-amber-900 border-amber-200"
       case "idle":
       case "stopped":
         return "bg-gray-100 text-gray-600 border-gray-200"
@@ -229,6 +231,8 @@ export function SystemOverview() {
       case "healthy":
       case "working":
         return "border-l-green-500"
+      case "paused":
+        return "border-l-amber-500"
       case "idle":
       case "stopped":
         return "border-l-gray-400"

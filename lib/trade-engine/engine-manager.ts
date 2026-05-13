@@ -156,7 +156,7 @@ refreshCyclePauseMsAsync()
 import { getSettings, setSettings, getAllConnections, getRedisClient, initRedis, getSettingsVersionCachedSync, getAppSettings, getAppSetting, getSettingsVersion } from "@/lib/redis-db"
 import { DataSyncManager } from "@/lib/data-sync-manager"
 import { IndicationProcessor } from "./indication-processor-fixed"
-import { StrategyProcessor } from "./strategy-processor"
+import { StrategyProcessor, clearFlowThrottleForConnection } from "./strategy-processor"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { RealtimeProcessor } from "./realtime-processor"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
@@ -877,6 +877,13 @@ export class TradeEngineManager {
     // bail out instead of writing into a stopped engine's state.
     this.epoch = 0
 
+    // Drop module-level throttle entries for this connection. Without
+    // this, an immediate restart would inherit fingerprint state from
+    // the stopped engine and could delay the first productive tick by
+    // up to STRATEGY_FLOW_HARD_THROTTLE_MS. Also keeps the throttle
+    // map from growing unbounded across many engine bounces.
+    try { clearFlowThrottleForConnection(this.connectionId) } catch { /* best-effort */ }
+
     // ── Stamp ended_at on the canonical progression hash ──────────
     // Must happen BEFORE lock release so the write is still gated by
     // the epoch we own. Best-effort — engine stop must not block even
@@ -1484,10 +1491,29 @@ export class TradeEngineManager {
           // Fan-out all counter updates in parallel. The in-memory Redis
           // client services these in constant time; Promise.all minimises the
           // awaited round-trips per cycle compared to sequential awaits.
+          const nowMs = Date.now()
           const writes: Promise<any>[] = [
             client.hincrby(redisKey, "indication_cycle_count", 1),
             client.hincrby(redisKey, "frames_processed", 1),
             client.hset(redisKey, "symbols_processed", String(symbols.length)),
+            // Continuous "still alive" stamp on the progression hash so
+            // the dashboard's freshness indicator never goes stale while
+            // the engine is actively ticking. See same-pattern comment
+            // in the strategy tick below.
+            client.hset(redisKey, {
+              last_activity_at: String(nowMs),
+              last_indication_tick_at: String(nowMs),
+            }),
+            // ── Tick-level heartbeat for the stall watchdog ──
+            // See same-pattern comment in the strategy tick: writing
+            // `last_processor_heartbeat` from the tick itself prevents
+            // false-positive stalls caused by event-loop starvation of
+            // the 10 s `startHeartbeat` setInterval callback.
+            client.hset(`settings:trade_engine_state:${this.connectionId}`, {
+              status: "running",
+              last_processor_heartbeat: String(nowMs),
+              last_indication_run: new Date(nowMs).toISOString(),
+            }),
             client.expire(redisKey, 7 * 24 * 60 * 60),
           ]
           if (Object.keys(indicationTypeCounts).length > 0) {
@@ -1797,10 +1823,37 @@ export class TradeEngineManager {
           // pattern as the indication tick. Replacing the previous
           // sequential awaits saves multiple RTTs per cycle and lets us
           // include the per-symbol error fields in the same batch.
+          const nowMs = Date.now()
           const writes: Promise<any>[] = [
             client.hincrby(redisKey, "strategy_cycle_count", 1),
             client.hincrby(redisKey, "frames_processed", 1),
             client.hset(redisKey, "strategies_live_ready", String(liveReadyThisCycle)),
+            // ── Per-tick "still alive" stamps on the progression hash ──
+            // The dashboard reads `last_activity_at` to render a "fresh"
+            // indicator continuously, INDEPENDENT of whether this cycle
+            // produced strategies (the strategy flow may be throttled).
+            // Cheap single-field hset; no extra round trips because it
+            // joins the Promise.all batch.
+            client.hset(redisKey, {
+              last_activity_at: String(nowMs),
+              last_strategy_tick_at: String(nowMs),
+            }),
+            // ── CRITICAL: tick-level heartbeat for the stall watchdog ──
+            // The coordinator's stall watchdog reads
+            // `last_processor_heartbeat` from `settings:trade_engine_state:{id}`
+            // to decide whether to re-arm / restart this engine. Until
+            // now that field was ONLY written by the 10 s `setInterval`
+            // heartbeat in `startHeartbeat`. If event-loop pressure /
+            // a long GC pause / a slow tick delays the interval callback
+            // past 90 s the watchdog falsely declares a stall and
+            // restarts a perfectly-healthy engine. Writing the heartbeat
+            // from the tick itself ties liveness to ACTUAL processing
+            // activity — the only signal that actually matters.
+            client.hset(`settings:trade_engine_state:${this.connectionId}`, {
+              status: "running",
+              last_processor_heartbeat: String(nowMs),
+              last_strategy_run: new Date(nowMs).toISOString(),
+            }),
             client.expire(redisKey, 7 * 24 * 60 * 60),
           ]
           if (evaluatedThisCycle > 0) {
@@ -2467,7 +2520,7 @@ export class TradeEngineManager {
       try {
         ok = await extendProgressionLock(this.connectionId, this.lockHandle)
       } catch (err) {
-        // ── Transient-failure path ───────────────────────────────────
+        // ── Transient-failure path ────��──────────────────────────────
         // Network glitches, Redis pauses, and one-off serialization
         // errors must not kill the engine. Count the miss and wait
         // for the NEXT tick to confirm. Only escalate to a self-stop

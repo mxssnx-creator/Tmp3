@@ -1027,7 +1027,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
     if (didChange) createdOrUpdated++
   }
 
-  // ── Bootstrap the global engine status ────────────────────────────
+  // ── Bootstrap / re-assert the global engine status ────────────────
   // The auto-start monitor in `lib/trade-engine-auto-start.ts` only
   // attempts to start missing connection engines when
   // `trade_engine:global.status === "running"`. On a brand-new DB this
@@ -1036,34 +1036,69 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
   // in the UI. That is exactly the symptom reported in production:
   // "Low Counts, Low DB Activity, No really processings".
   //
-  // We bootstrap the hash to `running` ONLY when:
+  // We bootstrap the hash to `running` when:
   //   - at least one autoActive base connection is configured, AND
-  //   - the hash is currently empty OR carries no `status` field.
+  //   - EITHER the hash is empty / has no `status`,
+  //     OR the `operator_stopped` flag is NOT explicitly set to "1"
+  //       (i.e. the operator never pressed "Stop" via the dashboard).
   //
-  // We never overwrite an existing `status` (incl. `stopped`,
-  // `paused`, `error`) — those represent explicit operator state and
-  // must be preserved across reloads. This keeps the user's "Stop"
-  // button authoritative while solving the cold-boot dead-on-arrival
-  // problem.
+  // The `operator_stopped` flag is written by `POST /api/trade-engine/stop`
+  // when the user explicitly halts processing. Until that flag is set,
+  // the system self-heals back to `running` on every boot — solving the
+  // "engine never restarts after redeploy / snapshot restore" symptom
+  // while still respecting an explicit operator stop.
   const hasAutoActive = BASE_CONNECTION_CONFIG.some((c) => c.autoActive)
   if (hasAutoActive) {
     try {
-      const globalState = await client.hgetall("trade_engine:global")
-      const hasStatus =
-        globalState && typeof (globalState as any).status === "string" &&
-        (globalState as any).status.length > 0
-      if (!hasStatus) {
+      const globalState = (await client.hgetall("trade_engine:global")) as Record<string, string> | null
+      const currentStatus =
+        globalState && typeof globalState.status === "string" ? globalState.status : ""
+      const operatorStopped = globalState?.operator_stopped === "1" || globalState?.operator_stopped === "true"
+
+      // Three cases we want to bootstrap to "running":
+      //   (1) Hash is empty / no status field         → cold boot
+      //   (2) Status === "stopped" but not operator-stopped → crashed/redeploy
+      //   (3) Status === "" / "idle" / "error"        → recovery
+      //
+      // We DO honour:
+      //   - operator_stopped === "1"  → leave status as-is
+      //   - currentStatus === "paused" → leave (explicit pause)
+      const needsBootstrap =
+        !currentStatus ||
+        (currentStatus !== "running" && currentStatus !== "paused" && !operatorStopped)
+
+      if (needsBootstrap) {
         const nowIso = new Date().toISOString()
-        await client.hset("trade_engine:global", {
+        const updates: Record<string, string> = {
           status: "running",
           started_at: nowIso,
           bootstrapped_at: nowIso,
           bootstrapped_by: "ensureBaseConnections",
-        })
+        }
+        // Clear any stale stopped_at / error fields so the dashboard
+        // doesn't display contradictory info ("running, stopped 12s ago").
+        if (globalState?.stopped_at) updates.stopped_at = ""
+        if (globalState?.error_message) updates.error_message = ""
+        await client.hset("trade_engine:global", updates)
+        const reason = !currentStatus
+          ? "cold-boot"
+          : currentStatus === "stopped"
+          ? "post-redeploy resurrect"
+          : `recover from ${currentStatus}`
         console.log(
           `[v0] [Migrations] Bootstrapped trade_engine:global status=running ` +
-          `(autoActive base connections detected)`,
+            `(${reason}; autoActive base connection detected)`,
         )
+      } else if (operatorStopped) {
+        // Quiet diagnostic — operator-stopped is the expected sticky
+        // state after explicit halt; log once per process to confirm
+        // we honoured the flag.
+        if (!ensureBootstrapDiag.has("operator_stopped")) {
+          ensureBootstrapDiag.add("operator_stopped")
+          console.log(
+            `[v0] [Migrations] Honouring operator_stopped flag — engine remains ${currentStatus || "stopped"}`,
+          )
+        }
       }
     } catch (err) {
       // Non-critical: the auto-start monitor will retry on the next
@@ -1077,6 +1112,11 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
 
   return { createdOrUpdated, credentialsInjected }
 }
+
+// Per-process set of one-shot diagnostic messages already emitted by
+// `ensureBaseConnections`. Avoids log spam when migrations run on every
+// HTTP request due to module reload (HMR / cold-warm).
+const ensureBootstrapDiag = new Set<string>()
 
 /**
  * Run all pending migrations
@@ -1110,7 +1150,15 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
       }
 
       const ensured = await ensureBaseConnections(client)
-      console.log(`[v0] [Migrations] ✓ Already executed in this process; base ensured=${ensured.createdOrUpdated}, credentialsInjected=${ensured.credentialsInjected}`)
+      // Only log when something actually changed; otherwise the "ensured=0,
+      // credentialsInjected=0" line spams every HTTP request because the
+      // migration loader runs on every module reload (HMR / cold-warm).
+      if (ensured.createdOrUpdated > 0 || ensured.credentialsInjected > 0) {
+        console.log(
+          `[v0] [Migrations] ✓ Already executed in this process; ` +
+            `base ensured=${ensured.createdOrUpdated}, credentialsInjected=${ensured.credentialsInjected}`,
+        )
+      }
       return { success: true, message: "Already run in this process", version: finalVer }
     }
 
@@ -1132,10 +1180,21 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
     const pendingMigrations = migrations.filter((m) => m.version > currentVersion)
     
     if (pendingMigrations.length === 0) {
-      console.log(`[v0] [Migrations] Already at latest version ${finalVersion}`)
+      // Suppress the "already at latest" line after the first occurrence
+      // in this process — it fires on every module reload and contributes
+      // most of the log noise during normal operation.
+      if (!ensureBootstrapDiag.has("already_latest")) {
+        ensureBootstrapDiag.add("already_latest")
+        console.log(`[v0] [Migrations] Already at latest version ${finalVersion}`)
+      }
       const ensured = await ensureBaseConnections(client)
-      console.log(`[v0] [Migrations] ✓ Ensured ${ensured.createdOrUpdated} base connections; injected credentials for ${ensured.credentialsInjected}`)
-      
+      // Only log when something actually changed (see same-pattern note above).
+      if (ensured.createdOrUpdated > 0 || ensured.credentialsInjected > 0) {
+        console.log(
+          `[v0] [Migrations] ✓ Ensured ${ensured.createdOrUpdated} base connections; ` +
+            `injected credentials for ${ensured.credentialsInjected}`,
+        )
+      }
        await setMigrationsRun(true)
       return { success: true, message: `Already at latest version ${finalVersion}`, version: finalVersion }
     }

@@ -177,17 +177,20 @@ export class DatabaseFiller {
     try {
       const client = getRedisClient()
 
-      // Create symbol index
-      for (const symbol of symbols) {
-        await client.sadd(`engine:${this.connectionId}:symbols`, symbol)
-      }
-
-      // Create progression index
+      // Create symbol index — single SADD with variadic members so N
+      // symbols equals 1 Redis round-trip instead of N sequential
+      // awaits. Both ioredis and node-redis support `sadd(key, ...members)`.
+      const symbolKey = `engine:${this.connectionId}:symbols`
       const progressionKey = `engine:${this.connectionId}:progression`
-      await client.hset(progressionKey, {
-        symbolsCount: symbols.length.toString(),
-        lastUpdate: new Date().toISOString(),
-      })
+      await Promise.all([
+        symbols.length > 0
+          ? (client as any).sadd(symbolKey, ...symbols)
+          : Promise.resolve(0),
+        client.hset(progressionKey, {
+          symbolsCount: symbols.length.toString(),
+          lastUpdate: new Date().toISOString(),
+        }),
+      ])
 
       await this.logger.logSystem(`✓ Created indexes for ${symbols.length} symbols`)
     } catch (error) {

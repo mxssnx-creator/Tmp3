@@ -95,6 +95,7 @@ export async function GET(
       engineProgression,
       prehistoricSymbolCount,
       axisWindowsHashRaw,
+      ordersBySymbolRaw,
     ] = await Promise.all([
       client.hgetall(`progression:${connectionId}`).catch(() => null),
       client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
@@ -107,12 +108,20 @@ export async function GET(
       // `${axis}_${N}_pos` for axis ∈ {prev, last, cont, pause} and the
       // step-1 windows documented in StrategySet.axisWindows.
       client.hgetall(`axis_windows:${connectionId}`).catch(() => null),
+      // Per-symbol/direction order counters written by live-stage.ts via
+      // `incrementOrdersBySymbol`. Hash field layout is
+      // `{SYMBOL}:{direction}:{kind}` so a single HGETALL recovers the
+      // entire breakdown for the dashboard's "Orders BTCUSDT L:3 / S:2"
+      // chip strip. Stays in lock-step with the global
+      // `live_orders_placed_count` / `live_orders_filled_count` totals.
+      client.hgetall(`live_orders_by_symbol:${connectionId}`).catch(() => null),
     ])
 
     const progHash: Record<string, string>       = progHashRaw       || {}
     const prehistoricHash: Record<string, string> = prehistoricHashRaw || {}
     const realtimeHash: Record<string, string>   = realtimeHashRaw   || {}
     const axisWindowsHash: Record<string, string> = axisWindowsHashRaw || {}
+    const ordersBySymbolHash: Record<string, string> = ordersBySymbolRaw || {}
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
@@ -707,6 +716,18 @@ export async function GET(
       0,
     )
     const nowMsAgg = Date.now()
+    // Per-symbol position groupings (long/short + USD totals) — surfaced as
+    // `openPositions.live.bySymbol` so the dashboard can render
+    // "BTCUSDT L:2 S:1" chips beneath the Positions row. Source is the same
+    // `livePositionSetRelations` array used for the portfolio aggregates, so
+    // the per-symbol totals always reconcile with the global numbers.
+    const bySymbolMap = new Map<string, {
+      long: number
+      short: number
+      volumeUsd: number
+      marginUsd: number
+      unrealizedPnl: number
+    }>()
     for (const p of livePositionSetRelations) {
       liveAggTotalUnrealizedPnl += p.unrealizedPnl || 0
       liveAggTotalMarginUsd     += p.marginUsd || 0
@@ -722,6 +743,20 @@ export async function GET(
         liveAggNearLiquidation++
       }
       if (p.syncedAt > 0 && nowMsAgg - p.syncedAt > 60_000) liveAggStaleSync++
+
+      // Per-symbol roll-up
+      const sym = p.symbol || ""
+      if (sym) {
+        const e = bySymbolMap.get(sym) || {
+          long: 0, short: 0, volumeUsd: 0, marginUsd: 0, unrealizedPnl: 0,
+        }
+        if (p.direction === "long") e.long++
+        else if (p.direction === "short") e.short++
+        e.volumeUsd     += p.volumeUsd     || 0
+        e.marginUsd     += p.marginUsd     || 0
+        e.unrealizedPnl += p.unrealizedPnl || 0
+        bySymbolMap.set(sym, e)
+      }
     }
     liveAggTotalUnrealizedPnl = Math.round(liveAggTotalUnrealizedPnl * 100) / 100
     liveAggTotalMarginUsd     = Math.round(liveAggTotalMarginUsd * 100) / 100
@@ -729,6 +764,19 @@ export async function GET(
     const liveAggPortfolioRoiPct = liveAggTotalMarginUsd > 0
       ? Math.round((liveAggTotalUnrealizedPnl / liveAggTotalMarginUsd) * 10000) / 100
       : 0
+    // Frozen array for `openPositions.live.bySymbol`. Sorted so the symbol
+    // with the most open positions comes first — keeps the UI chip strip
+    // stable across polls.
+    const liveBySymbol = Array.from(bySymbolMap.entries())
+      .map(([symbol, v]) => ({
+        symbol,
+        long:          v.long,
+        short:         v.short,
+        volumeUsd:     Math.round(v.volumeUsd     * 100) / 100,
+        marginUsd:     Math.round(v.marginUsd     * 100) / 100,
+        unrealizedPnl: Math.round(v.unrealizedPnl * 100) / 100,
+      }))
+      .sort((a, b) => (b.long + b.short) - (a.long + a.short))
 
     const realtimeIsActive =
       realtimeIndicationCycles > 0 ||
@@ -752,10 +800,17 @@ export async function GET(
     const indCounts: Record<string, number> = {}
     await Promise.all(
       indTypes.map(async (type) => {
-        const fromHash  = n(progHash[`indications_${type}_count`])
-        const fromKey   = n(await client.get(`indications:${connectionId}:${type}:count`).catch(() => 0))
-        const fromEval  = n(await client.get(`indications:${connectionId}:${type}:evaluated`).catch(() => 0))
-        indCounts[type] = Math.max(fromHash, fromKey, fromEval)
+        // Both standalone keys are independent — issue the two GETs
+        // in parallel so each type contributes a single Redis RTT
+        // instead of two sequential awaits chained through the
+        // pipeline. With 6 types this halves the wall-time spent on
+        // per-type breakdown reads.
+        const fromHash = n(progHash[`indications_${type}_count`])
+        const [fromKey, fromEval] = await Promise.all([
+          client.get(`indications:${connectionId}:${type}:count`).catch(() => 0),
+          client.get(`indications:${connectionId}:${type}:evaluated`).catch(() => 0),
+        ])
+        indCounts[type] = Math.max(fromHash, n(fromKey), n(fromEval))
       })
     )
     const indTotal = Object.values(indCounts).reduce((s, v) => s + v, 0) || indicationsTotal
@@ -855,7 +910,14 @@ export async function GET(
         // Prefer the cross-symbol sum from strategies_active hash (already computed above).
         // For "live" there is no strategies_active entry, so fall back to the standalone key.
         const fromActive = (type !== "live") ? (activeStratByStage[type] || 0) : 0
-        const fromKey   = n(await client.get(`strategies:${connectionId}:${type}:count`).catch(() => 0))
+        // Issue both standalone-key reads in parallel — they're
+        // independent and previously chained as sequential awaits,
+        // doubling the per-stage wall time for no benefit.
+        const [fromKeyRaw, evalFromKeyRaw] = await Promise.all([
+          client.get(`strategies:${connectionId}:${type}:count`).catch(() => 0),
+          client.get(`strategies:${connectionId}:${type}:evaluated`).catch(() => 0),
+        ])
+        const fromKey = n(fromKeyRaw)
         // NOTE: strategies_{type}_total is a cumulative hincrby (grows every cycle × symbols).
         // It MUST NOT be used as the current count — prefer fromActive (cross-symbol live snapshot)
         // or fromKey (last-symbol standalone, 24h TTL). Fall back to 0 when both are absent so
@@ -863,11 +925,9 @@ export async function GET(
         stratCounts[type] = fromActive > 0 ? fromActive
                           : fromKey   > 0 ? fromKey
                           : 0
-
-        const evalFromKey  = n(await client.get(`strategies:${connectionId}:${type}:evaluated`).catch(() => 0))
         // Standalone key is last-symbol-wins current count. Cumulative hash field
         // (strategies_{type}_evaluated) is intentionally ignored here.
-        stratEvaluated[type] = evalFromKey
+        stratEvaluated[type] = n(evalFromKeyRaw)
       })
     )
     // ── Pipeline-aware "total strategies" ────────────────────────────────
@@ -1157,8 +1217,18 @@ export async function GET(
           .lrange(`live:positions:${connectionId}:closed`, 0, 199)
           .catch(() => [])) || []) as string[]
 
-        for (const id of closedIds) {
-          const raw = await client.get(`live:position:${id}`).catch(() => null)
+        // Fan-out the per-id GETs in parallel. Previously this was a
+        // sequential N round-trip loop on the /stats hot path — at 200
+        // ids that's 200 sequential awaits, which dominated /stats
+        // latency once the closed archive filled up. Parallel GET is
+        // safe: each id is independent, and the reads are followed by
+        // pure-CPU JSON parsing.
+        const rawList = await Promise.all(
+          closedIds.map((id) =>
+            client.get(`live:position:${id}`).catch(() => null),
+          ),
+        )
+        for (const raw of rawList) {
           if (!raw) continue
           try {
             const pos = JSON.parse(raw as string)
@@ -1249,13 +1319,19 @@ export async function GET(
     let stratWindow60m = 0
 
     try {
-      // ZRANGEBYSCORE on indications window zset (score = timestamp ms, value = count increment)
-      const ind5m  = await client.zrangebyscore(`indications:${connectionId}:window`,  ago5m,  "+inf").catch(() => [])
-      const ind60m = await client.zrangebyscore(`indications:${connectionId}:window`,  ago60m, "+inf").catch(() => [])
-      const str5m  = await client.zrangebyscore(`strategies:${connectionId}:window`,   ago5m,  "+inf").catch(() => [])
-      const str60m = await client.zrangebyscore(`strategies:${connectionId}:window`,   ago60m, "+inf").catch(() => [])
-      indWindow5m  = ind5m.length
-      indWindow60m = ind60m.length
+      // Issue all four ZRANGEBYSCORE reads in parallel — they are
+      // independent zsets and the previous serial chain added ~4 Redis
+      // round-trips of latency to every /stats poll for zero benefit.
+      // ZRANGEBYSCORE itself returns the matching members; we only need
+      // the count so `.length` is sufficient.
+      const [ind5m, ind60m, str5m, str60m] = await Promise.all([
+        client.zrangebyscore(`indications:${connectionId}:window`, ago5m,  "+inf").catch(() => [] as string[]),
+        client.zrangebyscore(`indications:${connectionId}:window`, ago60m, "+inf").catch(() => [] as string[]),
+        client.zrangebyscore(`strategies:${connectionId}:window`,  ago5m,  "+inf").catch(() => [] as string[]),
+        client.zrangebyscore(`strategies:${connectionId}:window`,  ago60m, "+inf").catch(() => [] as string[]),
+      ])
+      indWindow5m    = ind5m.length
+      indWindow60m   = ind60m.length
       stratWindow5m  = str5m.length
       stratWindow60m = str60m.length
     } catch { /* non-critical; fall back to zero */ }
@@ -1814,6 +1890,12 @@ export async function GET(
               staleSync:          liveAggStaleSync,
               consolidatedSetsTotal: liveAggConsolidatedSets,
             },
+            // Per-symbol position groupings (count of long/short positions +
+            // USD totals, sorted by descending size). Lets the dashboard
+            // render "BTCUSDT L:2 S:1" chips under the Positions row without
+            // re-deriving from `positions[]`. Empty array when no live
+            // positions exist.
+            bySymbol: liveBySymbol,
           },
           overall: {
             // Pipeline-health counters. Semantically distinct from
@@ -1890,6 +1972,45 @@ export async function GET(
           const wins   = n(progHash.live_wins_count)
           return closed > 0 ? Math.round((wins / closed) * 1000) / 10 : 0
         })(),
+        // Per-symbol/direction order counters — folds the
+        // `live_orders_by_symbol:{id}` HGETALL into an array of
+        // `{ symbol, long: { placed, filled }, short: { placed, filled } }`
+        // rows so the UI can render "BTCUSDT L:3/2 S:1/1" chips after the
+        // global totals. Empty array when no orders have been placed yet.
+        ordersBySymbol: (() => {
+          const map = new Map<string, {
+            long:  { placed: number; filled: number }
+            short: { placed: number; filled: number }
+          }>()
+          for (const [field, raw] of Object.entries(ordersBySymbolHash)) {
+            // Field format: `{SYMBOL}:{direction}:{kind}`. Direction must
+            // be one of long|short and kind one of placed|filled — anything
+            // else is treated as malformed and skipped.
+            const lastColon = field.lastIndexOf(":")
+            const midColon  = field.lastIndexOf(":", lastColon - 1)
+            if (lastColon < 0 || midColon < 0) continue
+            const symbol    = field.slice(0, midColon)
+            const direction = field.slice(midColon + 1, lastColon)
+            const kind      = field.slice(lastColon + 1)
+            if (!symbol) continue
+            if (direction !== "long" && direction !== "short") continue
+            if (kind !== "placed" && kind !== "filled") continue
+            const value = n(raw)
+            if (value <= 0) continue
+            const entry = map.get(symbol) || {
+              long:  { placed: 0, filled: 0 },
+              short: { placed: 0, filled: 0 },
+            }
+            entry[direction][kind] = value
+            map.set(symbol, entry)
+          }
+          return Array.from(map.entries())
+            .map(([symbol, v]) => ({ symbol, ...v }))
+            .sort((a, b) =>
+              (b.long.placed + b.short.placed + b.long.filled + b.short.filled) -
+              (a.long.placed + a.short.placed + a.long.filled + a.short.filled),
+            )
+        })(),
       },
 
       // Prehistoric processing metadata — range, timeframe, interval progress
@@ -1908,6 +2029,24 @@ export async function GET(
         message,
         lastUpdate,
         redisDbEntries,
+        // ── Progression identity (per session) ───────────────────────────
+        // The frontend uses these to detect whether a page refresh lands
+        // on the SAME progression session (same sessionNumber+epoch) or a
+        // NEW one (sessionNumber bumped by archiveAndStartNewProgression).
+        // When session changes the FE clears local cached UI state; when
+        // it stays the same, it KEEPS the current view (resumes mid-cycle).
+        // Both fields are written by `archiveAndStartNewProgression` on
+        // every engine start and survive every refresh because they live
+        // in the persisted `progression:{id}` hash.
+        sessionNumber: n(progHash.session_number) || 0,
+        epoch:         n(progHash.epoch) || 0,
+        startedAt:     n(progHash.started_at) || 0,
+        // `progressionId` is the stable per-session ID — `epoch:session`
+        // is unique across all sessions for this connection.
+        progressionId:
+          progHash.session_number && progHash.epoch
+            ? `${progHash.epoch}:${progHash.session_number}`
+            : "",
       },
 
       // Legacy flat fields kept for backward compat with existing components

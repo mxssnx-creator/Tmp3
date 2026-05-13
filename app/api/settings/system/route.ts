@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { getSettings, setSettings, bumpSettingsVersion, getAllConnections } from "@/lib/redis-db"
 import { notifySettingsChanged } from "@/lib/settings-coordinator"
+import { refreshEngineTimings } from "@/lib/engine-timings"
 
 /**
  * System-scoped settings bundle (rate limits, cleanup, backup toggles).
@@ -54,6 +55,13 @@ export async function PATCH(request: NextRequest) {
     const merged = { ...current, ...body }
 
     await writeMirroredSystem(merged)
+
+    // Force-refresh the in-process engine-timings cache so the next tick
+    // on THIS server (and the next cron sweep on a serverless instance)
+    // sees the new values without waiting for the 10 s TTL to expire.
+    // Multi-instance deploys still pick up changes on their own next
+    // refresh — that's the eventual-consistency window.
+    await refreshEngineTimings({ force: true }).catch(() => {})
 
     // Signal all running engines to recoordinate immediately with the new
     // system settings (prehistoric range, cleanup schedule, etc.).

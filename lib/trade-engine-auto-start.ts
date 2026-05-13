@@ -88,15 +88,84 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
       try {
         await initRedis()
         const monClient = getRedisClient()
-        const monGlobalState = await monClient.hgetall("trade_engine:global")
-        if (monGlobalState?.status !== "running") {
+        const monGlobalState = (await monClient.hgetall("trade_engine:global")) as Record<
+          string,
+          string
+        > | null
+
+        // CRITICAL FIX: re-assert "running" status when:
+        //   - a base connection is configured AND eligible (autoActive), AND
+        //   - the operator did NOT explicitly stop the engine
+        //     (operator_stopped="1" is the sticky veto flag), AND
+        //   - the global coordinator is NOT paused (paused status must be
+        //     honored — skip healing sweep when paused).
+        //
+        // Without this self-heal the engine stays "stopped" after a redeploy
+        // / snapshot restore — even though no operator ever clicked Stop —
+        // matching the reported "low counts, no progressions" symptom.
+        const operatorStopped =
+          monGlobalState?.operator_stopped === "1" || monGlobalState?.operator_stopped === "true"
+        const currentStatus = monGlobalState?.status || ""
+        const isPaused = currentStatus === "paused"
+
+        // ── Skip healing sweep if paused ─────────────────────────────────
+        // When the global coordinator is paused, the auto-start monitor
+        // must not restart engines or attempt to resurrect the coordinator.
+        // The pause state is an explicit user action that should be honored.
+        if (isPaused) {
           if (isStartup) {
             console.log(
-              "[v0] [AutoStart] Startup sweep skipped: global engine not running. " +
-              "Engines will be started by explicit user toggle.",
+              "[v0] [AutoStart] Startup sweep skipped: global coordinator is paused. " +
+                "Engine will resume when coordinator is resumed.",
             )
           }
           return
+        }
+
+        if (currentStatus !== "running") {
+          if (operatorStopped) {
+            if (isStartup) {
+              console.log(
+                "[v0] [AutoStart] Startup sweep skipped: operator-stopped state detected. " +
+                  "Engines remain stopped until operator clicks Start.",
+              )
+            }
+            return
+          }
+          // Auto-resurrect: write status=running and continue the sweep so
+          // the connection monitor can re-arm engines for autoActive base
+          // connections. This matches the bootstrap path in
+          // `redis-migrations.ts → ensureBaseConnections`.
+          for (const connId of BASE_CONNECTION_IDS) {
+            const exists = await monClient.hgetall(`connection:${connId}`).catch(() => null)
+            if (exists && Object.keys(exists).length > 0) {
+              const nowIso = new Date().toISOString()
+              await monClient.hset("trade_engine:global", {
+                status: "running",
+                started_at: nowIso,
+                bootstrapped_at: nowIso,
+                bootstrapped_by: "auto-start-monitor",
+              })
+              console.log(
+                `[v0] [AutoStart] Self-heal: resurrected trade_engine:global=running ` +
+                  `(was "${currentStatus || "empty"}"; base connection ${connId} present)`,
+              )
+              break
+            }
+          }
+          // Re-read after the potential write — if the bootstrap wasn't
+          // applicable (no base connections), bail out cleanly.
+          const reReadState = (await monClient.hgetall("trade_engine:global").catch(() => null)) as
+            | Record<string, string>
+            | null
+          if (reReadState?.status !== "running") {
+            if (isStartup) {
+              console.log(
+                "[v0] [AutoStart] Startup sweep skipped: global engine not running and no base connection to bootstrap.",
+              )
+            }
+            return
+          }
         }
 
         // ── Idempotent base-connection activation ───────────────────

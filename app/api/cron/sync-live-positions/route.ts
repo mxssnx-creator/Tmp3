@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server"
 import { initRedis, getRedisClient, getAllConnections } from "@/lib/redis-db"
-import { reconcileLivePositions } from "@/lib/trade-engine/stages/live-stage"
+import { reconcileLivePositions, syncWithExchange } from "@/lib/trade-engine/stages/live-stage"
 import { exchangeConnectorFactory } from "@/lib/exchange-connectors/factory"
+import { getEngineTimings, refreshEngineTimings, ENGINE_TIMING_BOUNDS } from "@/lib/engine-timings"
 
 export const dynamic = "force-dynamic"
 export const maxDuration = 60
@@ -9,51 +10,201 @@ export const maxDuration = 60
 /**
  * CRASH-RECOVERY / ENGINE-DOWN safety net for live positions.
  *
- * Purpose: reconcile positions for connections whose engine is NOT actively
- * running. When the engine IS running, the strategy coordinator already calls
- * `reconcileLivePositions` every 30 s (rate-limited, fire-and-forget from
- * within the strategy processor tick) — adding a cron reconcile on top of
- * that is redundant and doubles the exchange API calls.
+ * ──────────────────────────────────────────────────────────────────────
+ *  Why this file self-loops instead of relying on Vercel cron alone
+ * ──────────────────────────────────────────────────────────────────────
  *
- * This cron fires once per minute and skips any connection whose engine
- * emitted a heartbeat within the last 90 seconds (`trade_engine_state.updated_at`).
- * It only performs a full reconcile for connections that are:
- *   a) marked live_trade=true (or have orphaned open positions), AND
- *   b) whose engine has been silent for > 90 s (crashed / stopped / restarting).
+ *  Vercel cron's minimum schedule granularity is ONE MINUTE (`* * * * *`).
+ *  The operator wants 15-second cadence so an externally-closed position
+ *  (SL/TP fired, manual close) is reflected in Redis within ~15 s rather
+ *  than waiting up to 60 s for the next cron tick.
  *
- * `reconcileLivePositions` per call:
- *   - Detects positions missing from the exchange → marks closed, computes PnL,
- *     archives the record, releases the position lock so the engine can reopen.
- *   - Promotes `placed` positions to `open` if the exchange reports them filled.
- *   - Places / heals missing SL/TP orders.
- *   - Runs orphan-close sweep for positions exceeding max hold time.
+ *  Solution: each cron invocation runs *multiple* sweeps inside its
+ *  single 60-second `maxDuration` budget, sleeping `cronSyncIntervalSeconds`
+ *  (default 15 s) between sweeps. With a 15 s cadence each cron run
+ *  performs 4 sweeps (t=0, 15, 30, 45) and exits ~5 s before the next
+ *  Vercel cron fires.
+ *
+ *  Effective sync cadence = `cronSyncIntervalSeconds` (live-tunable from
+ *  /settings → System → Engine Timings → cron_sync_interval_seconds).
+ *  Setting it to 60 = legacy one-sweep-per-cron behaviour.
+ *
+ * ──────────────────────────────────────────────────────────────────────
+ *  What each sweep does
+ * ──────────────────────────────────────────────────────────────────────
+ *  Per connection (skipping any whose engine emitted a heartbeat in the
+ *  last 90 s — the engine itself reconciles every 5 s via the realtime
+ *  processor, so doubling up would burn rate limit):
+ *
+ *    1. syncWithExchange — discovers exchange-side orphan positions
+ *       (positions on the venue that aren't in our Redis index) and
+ *       adopts them so the close path can reach them. Also runs the new
+ *       externally-closed branch added in the v0_plans/comprehensive-
+ *       system-audit fixes — positions in Redis but no longer on the
+ *       exchange get finalised here too.
+ *
+ *    2. reconcileLivePositions — full per-position reconcile: detects
+ *       externally-closed, promotes placed→open on fill, heals SL/TP,
+ *       runs the max-hold orphan-close sweep.
+ *
+ * ──────────────────────────────────────────────────────────────────────
+ *  Overlap guard
+ * ──────────────────────────────────────────────────────────────────────
+ *  The atomic SET-NX lock (TTL = 65 s, slightly longer than maxDuration)
+ *  prevents two cron invocations from running concurrent sweeps. The
+ *  lock is EXTENDED on every sleep boundary so a slow exchange cannot
+ *  cause the lock to expire mid-flight and let a second invocation
+ *  start. On clean exit the lock is DELeted so the next minute's tick
+ *  can acquire immediately.
  */
+
+const LOCK_KEY = "cron:sync-live-positions:lock"
+const LOCK_TTL_SECONDS = 65 // > maxDuration so an expired lock implies real crash
+
+interface SweepSummary {
+  connectionsChecked: number
+  connectionsSkipped: number
+  positionsReconciled: number
+  positionsClosed: number
+  positionsUpdated: number
+  errors: number
+}
+
+function newSummary(): SweepSummary {
+  return {
+    connectionsChecked: 0,
+    connectionsSkipped: 0,
+    positionsReconciled: 0,
+    positionsClosed: 0,
+    positionsUpdated: 0,
+    errors: 0,
+  }
+}
+
+function mergeSummary(into: SweepSummary, from: SweepSummary): void {
+  into.connectionsChecked  += from.connectionsChecked
+  into.connectionsSkipped  += from.connectionsSkipped
+  into.positionsReconciled += from.positionsReconciled
+  into.positionsClosed     += from.positionsClosed
+  into.positionsUpdated    += from.positionsUpdated
+  into.errors              += from.errors
+}
+
+/**
+ * Run a single sweep across all live connections whose engine is idle.
+ * Pure function over the connection list — no locking, no sleeping.
+ */
+async function runOneSweep(): Promise<SweepSummary> {
+  const summary = newSummary()
+  await initRedis()
+  const client = getRedisClient()
+  const connections = await getAllConnections()
+
+  for (const conn of connections) {
+    const connId: string = conn.id || (conn as any).connection_id || (conn as any).connectionId
+    if (!connId) continue
+
+    const settings = await client
+      .hgetall(`connection:settings:${connId}`)
+      .catch(() => ({} as Record<string, string>))
+
+    const isLiveTrade =
+      settings?.live_trade === "true" ||
+      settings?.live_trade === "1" ||
+      (conn as any).live_trade === true ||
+      (conn as any).is_live_trade === "1" ||
+      (conn as any).is_live_trade === true ||
+      settings?.is_live_trade === "1"
+
+    // Even when isLiveTrade is false, reconcile any connection that has
+    // open positions tracked in Redis — quickstart-restored state etc.
+    const hasOpenPositions = !isLiveTrade
+      ? (await client.llen(`live:positions:${connId}`).catch(() => 0)) > 0
+      : false
+
+    if (!isLiveTrade && !hasOpenPositions) {
+      summary.connectionsSkipped++
+      continue
+    }
+
+    // Engine-running guard: realtime processor already reconciles every
+    // ~5 s via the live-sync path. Don't double-up here.
+    const engineState = await client
+      .hgetall(`trade_engine_state:${connId}`)
+      .catch(() => ({} as Record<string, string>))
+    const lastUpdatedAt = engineState?.updated_at
+      ? new Date(engineState.updated_at as string).getTime()
+      : 0
+    const engineActiveRecently = Date.now() - lastUpdatedAt < 90_000
+    if (engineActiveRecently) {
+      summary.connectionsSkipped++
+      continue
+    }
+
+    summary.connectionsChecked++
+
+    try {
+      const connector = await exchangeConnectorFactory.getOrCreateConnector(connId)
+      if (!connector) {
+        summary.connectionsSkipped++
+        continue
+      }
+
+      // 1. Orphan adoption + externally-closed detection.
+      try {
+        await syncWithExchange(connId, connector)
+      } catch (syncErr) {
+        summary.errors++
+        console.warn(
+          `[SyncLivePositions] ${connId} sync (orphan adoption) error:`,
+          syncErr instanceof Error ? syncErr.message : String(syncErr),
+        )
+      }
+
+      // 2. Full per-position reconcile.
+      const result = await reconcileLivePositions(connId, connector)
+      summary.positionsReconciled += result.reconciled
+      summary.positionsClosed     += result.closed
+      summary.positionsUpdated    += result.updated
+      summary.errors              += result.errors
+    } catch (connErr) {
+      summary.errors++
+      console.warn(
+        `[SyncLivePositions] ${connId} sync error:`,
+        connErr instanceof Error ? connErr.message : String(connErr),
+      )
+    }
+  }
+
+  return summary
+}
+
 export async function GET() {
   const started = Date.now()
   await initRedis()
   const client = getRedisClient()
 
-  // ── Overlap guard (atomic) ─────────────────────────────────────────
-  //
-  // Previous implementation:
-  //     await client.set(LOCK_KEY, "1")
-  //     await client.expire(LOCK_KEY, 55)
-  //
-  // — that pair is NOT a lock. `set` always succeeds and unconditionally
-  // overwrites the existing value, so two concurrent invocations both
-  // pass through and stack reconcile passes on top of each other. With a
-  // slow exchange API + large connection pool the second invocation can
-  // double-cancel orphan SL/TP orders and double-increment the
-  // `live_positions_closed_count` counter (the moved-marker dedup
-  // catches that one, but the wasted REST calls + log noise are real).
-  //
-  // We now use atomic `SET key value NX EX ttl`, which only succeeds
-  // when the key did not previously exist. When acquisition fails we
-  // return early with `skipped: true` — the next minute's tick will run
-  // normally. TTL = 55s so a crashed run can never permanently block
-  // the cron.
-  const LOCK_KEY = "cron:sync-live-positions:lock"
-  const acquired = await client.set(LOCK_KEY, String(started), { NX: true, EX: 55 })
+  // Refresh timings cache once at entry so this invocation sees the
+  // latest cron_sync_interval_seconds without having to wait for the
+  // 10s cache TTL.
+  await refreshEngineTimings({ force: true }).catch(() => {})
+
+  const timings = getEngineTimings()
+  // Clamp again defensively — UI already clamps but a hand-edited HSET
+  // could bypass that path.
+  const cadenceBounds = ENGINE_TIMING_BOUNDS.cronSyncIntervalSeconds
+  const intervalSec = Math.max(
+    cadenceBounds.min,
+    Math.min(cadenceBounds.max, timings.cronSyncIntervalSeconds || 15),
+  )
+  const intervalMs = intervalSec * 1000
+
+  // Atomic acquire — overlap guard. TTL slightly > maxDuration so a
+  // crashed invocation cannot permanently block subsequent runs.
+  const acquired = await client.set(LOCK_KEY, String(started), {
+    NX: true,
+    EX: LOCK_TTL_SECONDS,
+  })
   if (!acquired) {
     return NextResponse.json({
       ok: true,
@@ -63,96 +214,54 @@ export async function GET() {
     })
   }
 
-  const summary = {
-    connectionsChecked: 0,
-    connectionsSkipped: 0,
-    positionsReconciled: 0,
-    positionsClosed: 0,
-    positionsUpdated: 0,
-    errors: 0,
-  }
+  const total = newSummary()
+  let sweepCount = 0
 
   try {
-    const connections = await getAllConnections()
+    // Budget: stop new sweeps once we are within 5 s of maxDuration so
+    // the in-flight sweep has time to finish and the lock to release
+    // cleanly before Vercel kills the function.
+    // maxDuration is 60 s, headroom 5 s → wall budget 55 s.
+    const WALL_BUDGET_MS = 55_000
+    const deadline = started + WALL_BUDGET_MS
 
-    for (const conn of connections) {
-      const connId: string =
-        conn.id || conn.connection_id || conn.connectionId
-      if (!connId) continue
+    while (Date.now() < deadline) {
+      const sweepStarted = Date.now()
+      const result = await runOneSweep().catch((err) => {
+        console.warn("[SyncLivePositions] sweep failed:", err)
+        const errSummary = newSummary()
+        errSummary.errors = 1
+        return errSummary
+      })
+      mergeSummary(total, result)
+      sweepCount++
 
-      const settings = await client
-        .hgetall(`connection:settings:${connId}`)
-        .catch(() => ({} as Record<string, string>))
+      const sweepElapsed = Date.now() - sweepStarted
+      const sleepFor = Math.max(0, intervalMs - sweepElapsed)
+      const nextSweepStartsAt = Date.now() + sleepFor
 
-      const isLiveTrade =
-        settings?.live_trade === "true" ||
-        settings?.live_trade === "1" ||
-        (conn as any).live_trade === true ||
-        // Quickstart sets is_live_trade on the connection object directly.
-        (conn as any).is_live_trade === "1" ||
-        (conn as any).is_live_trade === true ||
-        settings?.is_live_trade === "1"
+      // If the next sweep would start past the deadline, exit cleanly
+      // rather than busy-sleeping into the kill window.
+      if (nextSweepStartsAt + 2_000 > deadline) break
 
-      // Even when isLiveTrade is false, reconcile any connection that has
-      // open positions tracked in Redis. This catches positions left over
-      // from a previous quickstart run whose snapshot was restored but
-      // the is_live_trade flag was not — the orders are still open on the
-      // exchange and must be closed.
-      const hasOpenPositions = !isLiveTrade
-        ? (await client.llen(`live:positions:${connId}`).catch(() => 0)) > 0
-        : false
+      // Extend the lock so it never expires mid-sleep.
+      await client.set(LOCK_KEY, String(Date.now()), {
+        XX: true,
+        EX: LOCK_TTL_SECONDS,
+      }).catch(() => {})
 
-      if (!isLiveTrade && !hasOpenPositions) {
-        summary.connectionsSkipped++
-        continue
-      }
-
-      // ── Engine-running guard ───────────────────────────────────────
-      // If the engine is actively running for this connection, the strategy
-      // coordinator's 30-second rate-limited reconcile already handles it.
-      // Skip here to avoid redundant exchange API calls and double-arming
-      // of SL/TP orders. We consider the engine "running" when its heartbeat
-      // (`trade_engine_state.updated_at`) is within the last 90 seconds.
-      const engineState = await client
-        .hgetall(`trade_engine_state:${connId}`)
-        .catch(() => ({} as Record<string, string>))
-      const lastUpdatedAt = engineState?.updated_at
-        ? new Date(engineState.updated_at).getTime()
-        : 0
-      const engineActiveRecently = Date.now() - lastUpdatedAt < 90_000
-      if (engineActiveRecently) {
-        summary.connectionsSkipped++
-        continue
-      }
-
-      summary.connectionsChecked++
-
-      try {
-        const connector = await exchangeConnectorFactory.getOrCreateConnector(connId)
-        if (!connector) {
-          summary.connectionsSkipped++
-          continue
-        }
-
-        const result = await reconcileLivePositions(connId, connector)
-        summary.positionsReconciled += result.reconciled
-        summary.positionsClosed      += result.closed
-        summary.positionsUpdated     += result.updated
-        summary.errors               += result.errors
-      } catch (connErr) {
-        summary.errors++
-        console.warn(
-          `[SyncLivePositions] ${connId} sync error:`,
-          connErr instanceof Error ? connErr.message : String(connErr),
-        )
-      }
+      // Sleep. Plain setTimeout — no abort signal needed because the
+      // surrounding function is single-tenant (lock holder).
+      await new Promise((resolve) => setTimeout(resolve, sleepFor))
     }
 
     await client.del(LOCK_KEY).catch(() => {})
     return NextResponse.json({
       ok: true,
+      sweepCount,
+      intervalSec,
       ms: Date.now() - started,
-      ...summary,
+      ...total,
     })
   } catch (err) {
     console.error("[SyncLivePositions] Fatal:", err)
@@ -160,9 +269,11 @@ export async function GET() {
     return NextResponse.json(
       {
         ok: false,
+        sweepCount,
+        intervalSec,
         error: err instanceof Error ? err.message : String(err),
         ms: Date.now() - started,
-        ...summary,
+        ...total,
       },
       { status: 500 },
     )
