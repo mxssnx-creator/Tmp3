@@ -2495,14 +2495,47 @@ export async function closeLivePosition(
       }
     }
 
-    // ── 2. Issue the close on the exchange ────────────────────────────
+    // ── 2. Issue the close on the exchange with retry logic ────────────
     let exchangeCloseSuccess = false
     if (exchangeConnector && typeof exchangeConnector.closePosition === "function") {
-      try {
-        const r = await exchangeConnector.closePosition(position.symbol, position.direction)
-        exchangeCloseSuccess = r?.success !== false
-      } catch (err) {
-        console.warn(`${LOG_PREFIX} Error closing on exchange:`, err)
+      const maxRetries = 3
+      const backoffMs = [1000, 2000, 4000]
+      
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          console.log(`${LOG_PREFIX} [v0] Attempting exchange close ${position.symbol} ${position.direction} (attempt ${attempt + 1}/${maxRetries})`)
+          const r = await exchangeConnector.closePosition(position.symbol, position.direction)
+          
+          // Validate response explicitly - don't accept undefined/null
+          if (r && typeof r === 'object' && r.success === true) {
+            exchangeCloseSuccess = true
+            console.log(`${LOG_PREFIX} [v0] Exchange close succeeded: ${position.symbol} ${position.direction}`)
+            break
+          } else if (r && typeof r === 'object' && r.success === false) {
+            console.warn(`${LOG_PREFIX} [v0] Exchange close failed: ${position.symbol} - ${r.error || 'unknown error'}`)
+            if (attempt < maxRetries - 1) {
+              await new Promise(resolve => setTimeout(resolve, backoffMs[attempt]))
+              continue
+            }
+          } else {
+            console.error(`${LOG_PREFIX} [v0] Exchange close returned invalid response:`, r)
+            if (attempt < maxRetries - 1) {
+              await new Promise(resolve => setTimeout(resolve, backoffMs[attempt]))
+              continue
+            }
+          }
+        } catch (err) {
+          console.error(`${LOG_PREFIX} [v0] Exchange close threw error (attempt ${attempt + 1}):`, err instanceof Error ? err.message : String(err))
+          if (attempt < maxRetries - 1) {
+            await new Promise(resolve => setTimeout(resolve, backoffMs[attempt]))
+            continue
+          }
+        }
+      }
+      
+      // Log final result
+      if (!exchangeCloseSuccess) {
+        console.error(`${LOG_PREFIX} [v0] FAILED to close position on exchange after ${maxRetries} attempts: ${position.symbol} ${position.direction}`)
       }
     }
 
@@ -2527,11 +2560,19 @@ export async function closeLivePosition(
     position.updatedAt = Date.now()
     position.realizedPnL = Math.round(pnl * 100) / 100
     position.closeReason = closeReason
+    
+    // Store exchange close result metadata for debugging/reconciliation
+    if (exchangeConnector) {
+      position.exchangeCloseAttempted = true
+      position.exchangeCloseSucceeded = exchangeCloseSuccess
+      position.exchangeClosedAt = exchangeCloseSuccess ? Date.now() : undefined
+    }
+    
     pushStep(
       position,
       "close",
       true,
-      `close @ ${closePrice} pnl=${pnl.toFixed(2)} roi=${roi.toFixed(2)}% reason=${closeReason}${exchangeConnector && !exchangeCloseSuccess ? " [exchange-close-uncertain]" : ""}`,
+      `close @ ${closePrice} pnl=${pnl.toFixed(2)} roi=${roi.toFixed(2)}% reason=${closeReason}${exchangeConnector && !exchangeCloseSuccess ? " [exchange-close-FAILED]" : ""}`,
     )
     // savePosition() handles index move + idempotent archival.
     // CHECK the moved-marker BEFORE savePosition() runs so we know
@@ -2544,11 +2585,12 @@ export async function closeLivePosition(
     const wasAlreadyClosed = await client.get(movedMarker).catch(() => null)
     await savePosition(position)
 
-    // ── 5. Release dedup lock + counters + audit log ──────────────�����──
+    // ── 5. Release dedup lock + counters + audit log ────────────────────
     await releaseLock(connectionId, position.symbol, position.direction)
     if (!wasAlreadyClosed) {
       await incrementMetric(connectionId, "live_positions_closed_count")
       if (pnl > 0) await incrementMetric(connectionId, "live_wins_count")
+      if (!exchangeCloseSuccess) await incrementMetric(connectionId, "live_positions_close_failed_count")
     }
 
     await logProgressionEvent(connectionId, "live_trading", "info", `Closed live position ${position.symbol}`, {
@@ -2560,9 +2602,11 @@ export async function closeLivePosition(
       averageEntry: avgEntry,
       leverage: lev,
       marginAtRisk: margin,
+      exchangeCloseSucceeded: exchangeCloseSuccess,
     })
 
-    console.log(`${LOG_PREFIX} Closed ${position.symbol} P&L=${pnl.toFixed(2)} ROI=${roi.toFixed(2)}% reason=${closeReason}`)
+    const closeStatus = exchangeCloseSuccess ? "SUCCEEDED" : "UNCERTAIN (DB-closed only)"
+    console.log(`${LOG_PREFIX} [v0] Closed ${position.symbol} ${position.direction} P&L=${pnl.toFixed(2)} ROI=${roi.toFixed(2)}% reason=${closeReason} exchange_close=${closeStatus}`)
 
     return position
   } catch (err) {

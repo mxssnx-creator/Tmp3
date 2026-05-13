@@ -149,6 +149,7 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     const { searchParams } = new URL(request.url)
     const connectionId = searchParams.get("connection_id")
     const closePrice = searchParams.get("close_price")
+    const closeReason = searchParams.get("close_reason") || "manual"
 
     if (!connectionId) {
       return NextResponse.json({ success: false, error: "connection_id required" }, { status: 400 })
@@ -157,36 +158,76 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     await initRedis()
     const client = getRedisClient()
 
-    // Get position for final calculation
+    // Get position for details and validation
     const position = await client.hgetall(`position:${connectionId}:${positionId}`)
     if (!position || Object.keys(position).length === 0) {
       return NextResponse.json({ success: false, error: "Position not found" }, { status: 404 })
     }
 
-    // Mark as closed
-    const finalPrice = closePrice ? parseFloat(closePrice) : parseFloat(position.current_price)
-    const entry = parseFloat(position.entry_price)
-    const qty = parseFloat(position.quantity)
+    console.log(`[v0] [PositionsAPI] DELETE: Closing position ${positionId} via API (reason: ${closeReason})`)
+
+    // Determine if this is a live position or pseudo position by checking for live-position markers
+    const isLivePosition = position.connectionId && (position.orderId || position.status === "filled")
+    
+    if (isLivePosition && closePrice) {
+      // For live positions with close price, use the live-stage close logic
+      try {
+        const { closeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
+        const closedPos = await closeLivePosition(
+          connectionId,
+          positionId,
+          parseFloat(closePrice),
+          undefined, // No connector for manual close - just update state
+          closeReason
+        )
+        
+        if (closedPos) {
+          console.log(`[v0] [PositionsAPI] Successfully closed live position via live-stage`)
+          return NextResponse.json({
+            success: true,
+            data: {
+              id: positionId,
+              status: "closed",
+              closeReason: closeReason,
+              final_pnl: closedPos.realizedPnL?.toFixed(2) || "0",
+            },
+          })
+        }
+      } catch (err) {
+        console.error(`[v0] [PositionsAPI] Failed to use live-stage close:`, err)
+        // Fall through to basic close
+      }
+    }
+
+    // Fallback: Basic close for pseudo positions or when live-stage unavailable
+    const finalPrice = closePrice ? parseFloat(closePrice) : parseFloat(position.current_price || "0")
+    const entry = parseFloat(position.entry_price || "0")
+    const qty = parseFloat(position.quantity || "0")
     const finalPnL = (finalPrice - entry) * qty
 
+    // Mark as closed with comprehensive metadata
     await client.hset(`position:${connectionId}:${positionId}`, {
       status: "closed",
       close_price: String(finalPrice),
       final_pnl: String(finalPnL.toFixed(2)),
+      close_reason: closeReason,
       closed_at: new Date().toISOString(),
+      closed_via: "api",
     })
 
     await logProgressionEvent(
       connectionId,
       "positions_api",
       "info",
-      `Closed position ${positionId}`,
-      { symbol: position.symbol, final_pnl: finalPnL }
+      `Closed position ${positionId} via API`,
+      { symbol: position.symbol, final_pnl: finalPnL, reason: closeReason }
     )
+
+    console.log(`[v0] [PositionsAPI] Closed position ${positionId}: PnL=${finalPnL.toFixed(2)} reason=${closeReason}`)
 
     return NextResponse.json({
       success: true,
-      data: { id: positionId, status: "closed", final_pnl: finalPnL.toFixed(2) },
+      data: { id: positionId, status: "closed", final_pnl: finalPnL.toFixed(2), close_reason: closeReason },
     })
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error)
