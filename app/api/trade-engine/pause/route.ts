@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
 import { getTradeEngine } from "@/lib/trade-engine"
-import { initRedis, getRedisClient } from "@/lib/redis-db"
+import { initRedis, getRedisClient, getActiveConnectionsForEngine } from "@/lib/redis-db"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic"
 /**
  * POST /api/trade-engine/pause
  * Pause the Global Trade Engine Coordinator
- * Pauses all trading operations across all connections and marks Main Connections as "Paused"
+ * Pauses all trading operations across all connections and marks Main Connections + Progressions as "Paused"
  */
 export async function POST() {
   try {
@@ -43,6 +43,30 @@ export async function POST() {
     } catch (err) {
       console.warn("[v0] Failed to update Main Connections state:", err instanceof Error ? err.message : String(err))
       // Non-fatal: continue even if connection state update fails
+    }
+
+    // ── Pause all active progressions ──────────────────────────────────
+    // Mark every active progression as paused so they stop accepting new
+    // work cycles and can be resumed independently later. Store the pause
+    // timestamp so the progression stats endpoint can detect pause duration.
+    try {
+      const activeConnections = await getActiveConnectionsForEngine()
+      const progressionIds = activeConnections.map((c) => c.id)
+      
+      for (const progId of progressionIds) {
+        await client.hset(`progression:${progId}`, {
+          status: "paused",
+          paused_at: new Date().toISOString(),
+          paused_by: "global_coordinator",
+        })
+      }
+      
+      if (progressionIds.length > 0) {
+        console.log(`[v0] Paused ${progressionIds.length} progressions`)
+      }
+    } catch (err) {
+      console.warn("[v0] Failed to pause progressions:", err instanceof Error ? err.message : String(err))
+      // Non-fatal: continue even if progression pause fails
     }
     
     console.log("[v0] Global Trade Engine Coordinator paused via API")
