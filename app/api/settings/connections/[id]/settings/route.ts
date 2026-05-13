@@ -172,7 +172,7 @@ export async function PATCH(
     // See same-pattern comment in PUT handler above for rationale.
     const changedFields = Object.keys(settings)
     if (changedFields.length > 0) {
-      await notifySettingsChanged(id, ["connection_settings"])
+      await notifySettingsChanged(id, ["connection_settings"], { connection_settings: current }, { connection_settings: merged })
       try {
         const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
         const coordinator = getGlobalTradeEngineCoordinator()

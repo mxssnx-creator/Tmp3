@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { getIndications, saveIndication } from "@/lib/redis-db"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -32,6 +33,19 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
         config: ind,
       }
       await saveIndication({ ...indication, connection_id: id })
+    }
+
+    // Notify engine of indications change
+    try {
+      await notifySettingsChanged(id, ["indications"])
+      const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+      const coordinator = getGlobalTradeEngineCoordinator()
+      await coordinator.applyPendingChangesNow(id)
+    } catch (applyErr) {
+      console.warn(
+        `[v0] [Indications] coordinator recoordination failed for ${id}:`,
+        applyErr instanceof Error ? applyErr.message : String(applyErr),
+      )
     }
 
     return NextResponse.json({ success: true })
