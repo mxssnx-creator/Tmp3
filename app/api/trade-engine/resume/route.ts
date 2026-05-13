@@ -83,6 +83,62 @@ export async function POST() {
       console.warn("[v0] Failed to resume progressions:", err instanceof Error ? err.message : String(err))
       // Non-fatal: continue even if progression resume fails
     }
+
+    // ── Rebuild control orders for all open live positions ───────────────
+    // When the coordinator was paused, `syncWithExchange` was skipped and
+    // no control orders (SL/TP) were created or healed. Now that we're
+    // resuming, kick off a sync immediately on each connection to restore
+    // protection orders and catch up on mark prices. Fire-and-forget so
+    // the API returns quickly even if this takes a moment.
+    try {
+      const { initRedis: reInitRedis, getRedisClient: reGetClient } = await import("@/lib/redis-db")
+      await reInitRedis()
+      const reClient = reGetClient()
+      
+      // Get all main connections and trigger immediate live sync
+      const connections = await reClient.smembers(`engine:connections:main`) || []
+      console.log(`[v0] Triggering control order rebuild for ${connections.length} connections`)
+      
+      // Use fire-and-forget Promise.all to kick off syncs without waiting
+      void Promise.all(
+        connections.map(async (connId: string) => {
+          try {
+            const { getConnection } = await import("@/lib/redis-db")
+            const connection = await getConnection(connId)
+            if (!connection) return
+            
+            const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
+            const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
+            if (!apiKey || !apiSecret) return // Paper-only connection
+            
+            const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+            const connector = await createExchangeConnector(connection.exchange, {
+              apiKey,
+              apiSecret,
+              apiType: connection.api_type,
+              contractType: connection.contract_type,
+              isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
+            })
+            if (!connector) return
+            
+            const { syncWithExchange } = await import("@/lib/trade-engine/stages/live-stage")
+            await syncWithExchange(connId, connector)
+            console.log(`[v0] Control orders rebuilt for connection ${connId}`)
+          } catch (syncErr) {
+            console.warn(
+              `[v0] Failed to rebuild control orders for ${connId}:`,
+              syncErr instanceof Error ? syncErr.message : String(syncErr),
+            )
+          }
+        }),
+      ).catch(() => {}) // Swallow errors from the fire-and-forget
+    } catch (err) {
+      console.warn(
+        "[v0] Failed to trigger control order rebuild:",
+        err instanceof Error ? err.message : String(err),
+      )
+      // Non-fatal: continue even if rebuild trigger fails
+    }
     
     console.log("[v0] Global Trade Engine Coordinator resumed via API")
 
