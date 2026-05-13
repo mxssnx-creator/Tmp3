@@ -4,7 +4,7 @@ import { useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { AlertCircle, CheckCircle2, XCircle, Play, RefreshCw, Loader2 } from "lucide-react"
+import { AlertCircle, CheckCircle2, XCircle, Play, RefreshCw, Loader2, Send } from "lucide-react"
 
 interface TestResult {
   testName: string
@@ -28,11 +28,29 @@ interface TestReport {
   }
 }
 
+interface PlacedOrder {
+  orderId: string
+  symbol: string
+  side: string
+  quantity: number
+  leverage: number
+  timestamp: number
+  success: boolean
+}
+
 export default function OrderTestingPage() {
   const [connectionId, setConnectionId] = useState("bingx-x01")
   const [loading, setLoading] = useState(false)
   const [report, setReport] = useState<TestReport | null>(null)
   const [error, setError] = useState<string | null>(null)
+  
+  // Quick order placement state
+  const [placingOrder, setPlacingOrder] = useState(false)
+  const [orderSymbol, setOrderSymbol] = useState("BTC/USDT")
+  const [orderSide, setOrderSide] = useState<"buy" | "sell">("buy")
+  const [leverage, setLeverage] = useState(20)
+  const [volume, setVolume] = useState(0.001)
+  const [placedOrders, setPlacedOrders] = useState<PlacedOrder[]>([])
 
   const runTests = async () => {
     setLoading(true)
@@ -57,6 +75,50 @@ export default function OrderTestingPage() {
     }
   }
 
+  const placeOrderWithMaxLeverageMinVolume = async () => {
+    setPlacingOrder(true)
+    setError(null)
+    try {
+      const response = await fetch("/api/testing/place-order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          connectionId,
+          symbol: orderSymbol,
+          side: orderSide,
+          quantity: volume,
+          leverage,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+      }
+
+      const result = await response.json()
+      
+      if (result.success) {
+        const newOrder: PlacedOrder = {
+          orderId: result.orderId || "N/A",
+          symbol: orderSymbol,
+          side: orderSide,
+          quantity: volume,
+          leverage,
+          timestamp: Date.now(),
+          success: true,
+        }
+        setPlacedOrders([newOrder, ...placedOrders])
+        setError(null)
+      } else {
+        setError(result.error || "Failed to place order")
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unknown error")
+    } finally {
+      setPlacingOrder(false)
+    }
+  }
+
   const getStatusIcon = (success: boolean) => {
     return success ? (
       <CheckCircle2 className="w-5 h-5 text-green-600" />
@@ -72,10 +134,127 @@ export default function OrderTestingPage() {
         <p className="text-gray-600 mt-2">Comprehensive testing for order placement, cancellation, and lifecycle management</p>
       </div>
 
+      <Card className="border-blue-200 bg-blue-50">
+        <CardHeader>
+          <CardTitle className="text-blue-900">Quick Order Placement</CardTitle>
+          <CardDescription>Place orders with max leverage and minimal volume</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="text-sm font-medium">Connection ID</label>
+              <input
+                type="text"
+                value={connectionId}
+                onChange={(e) => setConnectionId(e.target.value)}
+                placeholder="bingx-x01"
+                className="w-full px-3 py-2 border border-gray-300 rounded-md mt-1"
+                disabled={placingOrder}
+              />
+            </div>
+            <div>
+              <label className="text-sm font-medium">Symbol</label>
+              <input
+                type="text"
+                value={orderSymbol}
+                onChange={(e) => setOrderSymbol(e.target.value)}
+                placeholder="BTC/USDT"
+                className="w-full px-3 py-2 border border-gray-300 rounded-md mt-1"
+                disabled={placingOrder}
+              />
+            </div>
+            <div>
+              <label className="text-sm font-medium">Side</label>
+              <select
+                value={orderSide}
+                onChange={(e) => setOrderSide(e.target.value as "buy" | "sell")}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md mt-1"
+                disabled={placingOrder}
+              >
+                <option value="buy">Buy</option>
+                <option value="sell">Sell</option>
+              </select>
+            </div>
+            <div>
+              <label className="text-sm font-medium">Leverage: {leverage}x</label>
+              <input
+                type="range"
+                min="1"
+                max="125"
+                value={leverage}
+                onChange={(e) => setLeverage(Number(e.target.value))}
+                className="w-full mt-1"
+                disabled={placingOrder}
+              />
+              <div className="text-xs text-gray-600 mt-1">Min volume will adjust leverage if needed</div>
+            </div>
+            <div>
+              <label className="text-sm font-medium">Volume (Coins): {volume}</label>
+              <input
+                type="number"
+                value={volume}
+                onChange={(e) => setVolume(Number(e.target.value))}
+                step="0.0001"
+                min="0.0001"
+                max="1"
+                className="w-full px-3 py-2 border border-gray-300 rounded-md mt-1"
+                disabled={placingOrder}
+              />
+            </div>
+            <div className="flex items-end">
+              <Button
+                onClick={placeOrderWithMaxLeverageMinVolume}
+                disabled={placingOrder}
+                className="w-full gap-2 bg-blue-600 hover:bg-blue-700"
+              >
+                {placingOrder ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Placing...
+                  </>
+                ) : (
+                  <>
+                    <Send className="w-4 h-4" />
+                    Place Order
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {placedOrders.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Placed Orders</CardTitle>
+            <CardDescription>{placedOrders.length} order(s) placed</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-3">
+              {placedOrders.map((order, idx) => (
+                <div key={idx} className="border border-gray-200 rounded-lg p-3 bg-gray-50">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="font-semibold text-sm">{order.symbol} - {order.side.toUpperCase()}</p>
+                      <p className="text-xs text-gray-600">
+                        Qty: {order.quantity} | Leverage: {order.leverage}x | Order ID: {order.orderId}
+                      </p>
+                      <p className="text-xs text-gray-500">{new Date(order.timestamp).toLocaleTimeString()}</p>
+                    </div>
+                    <CheckCircle2 className="w-5 h-5 text-green-600" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle>Test Configuration</CardTitle>
-          <CardDescription>Select connection and run tests</CardDescription>
+          <CardDescription>Select connection and run comprehensive tests</CardDescription>
         </CardHeader>
         <CardContent className="flex gap-4 items-end">
           <div className="flex-1">
