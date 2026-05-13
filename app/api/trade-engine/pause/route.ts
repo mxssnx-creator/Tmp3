@@ -22,8 +22,18 @@ export async function POST() {
 
     await coordinator.pause()
     
-    // Update Redis global state
-    await client.hset("trade_engine:global", { status: "paused", paused_at: new Date().toISOString() })
+    // ── Update Redis global state to "paused" ─────────────────────────
+    // Store the current status as previous_status so resume can restore
+    // the exact state (was it running, stopped, etc. before pause?)
+    const currentGlobalState = await client.hgetall("trade_engine:global").catch(() => ({}))
+    const previousStatus = (currentGlobalState as any).status || "stopped"
+    
+    await client.hset("trade_engine:global", { 
+      status: "paused", 
+      paused_at: new Date().toISOString(),
+      previous_status: previousStatus,
+    })
+    console.log(`[v0] Global status paused (was: ${previousStatus})`)
     
     // ── Set all Main Connections to "Paused" state ──────────────────
     // When the global coordinator is paused, all enabled Main Connections
@@ -74,6 +84,7 @@ export async function POST() {
     return NextResponse.json({
       success: true,
       message: "Trade engine paused successfully",
+      status: "paused",
     })
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error"

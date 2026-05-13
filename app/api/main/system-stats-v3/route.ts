@@ -97,19 +97,27 @@ export async function GET() {
     const presetTradeEnabled = presetTradeConnections.length > 0
     
     // Main Engine status: running when main_enabled, regardless of live/preset
-    const mainStatus = mainEnabled 
+    const mainStatusBeforePause = mainEnabled 
       ? "running" 
       : "stopped"
     
     // Live Trade status: independent - running when enabled
-    const liveTradeStatus = liveTradeEnabled
+    const liveTradeStatusBeforePause = liveTradeEnabled
       ? "running"
       : "stopped"
     
     // Preset status: independent - running when enabled  
-    const presetStatus = presetTradeEnabled
+    const presetStatusBeforePause = presetTradeEnabled
       ? "running"
       : "stopped"
+    
+    // ── Override all statuses if global coordinator is paused ──────────
+    // When globalStatus === "paused", all engine statuses (main, live,
+    // preset) become "paused" as well. This ensures the UI consistently
+    // shows the pause state across all engine tiers.
+    const mainStatus = globalStatus === "paused" ? "paused" : mainStatusBeforePause
+    const liveTradeStatus = globalStatus === "paused" ? "paused" : liveTradeStatusBeforePause
+    const presetStatus = globalStatus === "paused" ? "paused" : presetStatusBeforePause
     
     // Connections with valid credentials (can actually trade)
     const connectionsWithCredentials = baseConnections.filter((c: any) => hasConnectionCredentials(c, 10))
