@@ -5,9 +5,10 @@
  * - Waits for last progression to finish before starting new one
  * - Timeout = IntervalTime × 5
  * - Monitors interval system health
+ * - Respects global coordinator pause state
  */
 
-import { getSettings, setSettings } from "./redis-db"
+import { getSettings, setSettings, getRedisClient, initRedis } from "./redis-db"
 
 export interface IntervalConfig {
   intervalTime: number // in seconds
@@ -85,6 +86,22 @@ export class IntervalProgressionManager {
     console.log(`[v0] Starting interval ${indicationType} for ${connectionId} (${config.intervalTime}s)`)
 
     const intervalId = setInterval(async () => {
+      // ── Check if coordinator is paused ─────────────────────────────────
+      // Skip the iteration if the global coordinator is in paused state.
+      // This prevents progressions from running when the system is paused.
+      try {
+        await initRedis()
+        const client = getRedisClient()
+        const globalState = await client.hgetall("trade_engine:global").catch(() => ({}))
+        if ((globalState as any).status === "paused") {
+          // Silently skip — progression will resume when coordinator resumes
+          return
+        }
+      } catch (err) {
+        console.warn(`[v0] [${indicationType}] Failed to check pause state, skipping iteration for safety`)
+        return
+      }
+
       // Check if progression is locked
       if (this.progressionLocks.get(lockKey)) {
         console.log(`[v0] [${indicationType}] Progression still running, skipping iteration`)

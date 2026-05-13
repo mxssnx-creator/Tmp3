@@ -604,10 +604,28 @@ export class GlobalTradeEngineCoordinator {
   /**
    * Start engines for connections that should be running but don't have engines
    * Does NOT stop engines - leaves that to explicit user actions via dashboard toggles
+   * Respects pause state - does not start engines when coordinator is paused
    */
   async startMissingEngines(connections: any[]): Promise<number> {
     try {
       console.log("[v0] [Coordinator] === START MISSING ENGINES ===")
+
+      // ── Check if coordinator is paused ─────────────────────────────────
+      // If the global coordinator is paused, don't start any engines.
+      // They will resume when the coordinator is resumed.
+      const { getRedisClient, initRedis } = await import("@/lib/redis-db")
+      try {
+        await initRedis()
+        const client = getRedisClient()
+        const globalState = await client.hgetall("trade_engine:global")
+        if ((globalState as any)?.status === "paused") {
+          console.log("[v0] [Coordinator] Skipping startMissingEngines - coordinator is paused")
+          return 0
+        }
+      } catch (err) {
+        console.warn("[v0] [Coordinator] Could not check pause state:", err instanceof Error ? err.message : String(err))
+        // Continue anyway - non-critical
+      }
 
       // Self-heal: make sure the watchdog and metrics tracker are armed
       // before we start any new engines (otherwise any stalls on
@@ -619,10 +637,8 @@ export class GlobalTradeEngineCoordinator {
       // legitimately be (re-)started.
       this.pruneZombieManagers()
 
-      const { initRedis, getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
+      const { getAssignedAndEnabledConnections, getAllConnections } = await import("@/lib/redis-db")
       const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
-      
-      await initRedis()
       const enabledIds = new Set(connections.map(c => c.id))
       // Only count managers whose engine is actually running, not zombie Map entries from stale closures
       const runningIds = new Set(

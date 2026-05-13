@@ -96,7 +96,9 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
         // CRITICAL FIX: re-assert "running" status when:
         //   - a base connection is configured AND eligible (autoActive), AND
         //   - the operator did NOT explicitly stop the engine
-        //     (operator_stopped="1" is the sticky veto flag).
+        //     (operator_stopped="1" is the sticky veto flag), AND
+        //   - the global coordinator is NOT paused (paused status must be
+        //     honored — skip healing sweep when paused).
         //
         // Without this self-heal the engine stays "stopped" after a redeploy
         // / snapshot restore — even though no operator ever clicked Stop —
@@ -104,6 +106,21 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
         const operatorStopped =
           monGlobalState?.operator_stopped === "1" || monGlobalState?.operator_stopped === "true"
         const currentStatus = monGlobalState?.status || ""
+        const isPaused = currentStatus === "paused"
+
+        // ── Skip healing sweep if paused ─────────────────────────────────
+        // When the global coordinator is paused, the auto-start monitor
+        // must not restart engines or attempt to resurrect the coordinator.
+        // The pause state is an explicit user action that should be honored.
+        if (isPaused) {
+          if (isStartup) {
+            console.log(
+              "[v0] [AutoStart] Startup sweep skipped: global coordinator is paused. " +
+                "Engine will resume when coordinator is resumed.",
+            )
+          }
+          return
+        }
 
         if (currentStatus !== "running") {
           if (operatorStopped) {
