@@ -272,11 +272,37 @@ async function testMarketOrderPlacement(
 ): Promise<TestResult> {
   const start = Date.now()
   try {
-    // Get a popular symbol
-    const symbol = "BTC/USDT"
-    const minQty = 0.0001 // Minimum typical quantity
+    // Get balances first to check if sufficient funds
+    const connResult = await connector.testConnection()
+    const balance = parseFloat(connResult.balance || "0")
     
-    const result = await connector.placeOrder(symbol, "buy", minQty, 0, "market")
+    if (balance < 10) {
+      return {
+        testName: "Market Order Placement",
+        success: false,
+        duration: Date.now() - start,
+        details: `Insufficient balance: ${balance} (need >= 10 USDT for test)`,
+        error: "Low balance - cannot place test order",
+      }
+    }
+
+    // Use small quantity for test order
+    const symbol = "BTC/USDT"
+    const minQty = 0.0001
+    
+    let result
+    try {
+      result = await connector.placeOrder(symbol, "buy", minQty, 0, "market")
+    } catch (orderErr) {
+      // If order fails, capture the error
+      return {
+        testName: "Market Order Placement",
+        success: false,
+        duration: Date.now() - start,
+        details: `Failed to place market order for ${symbol}`,
+        error: orderErr instanceof Error ? orderErr.message : "Order placement failed",
+      }
+    }
 
     if (!result || !result.orderId) {
       return {
@@ -284,7 +310,7 @@ async function testMarketOrderPlacement(
         success: false,
         duration: Date.now() - start,
         details: `Failed to place market order for ${symbol}`,
-        error: "No order ID returned",
+        error: "No order ID returned - possible balance issue or API error",
       }
     }
 
