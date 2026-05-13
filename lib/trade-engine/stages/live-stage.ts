@@ -2498,13 +2498,19 @@ export async function closeLivePosition(
     // ── 2. Issue the close on the exchange with retry logic ────────────
     let exchangeCloseSuccess = false
     if (exchangeConnector && typeof exchangeConnector.closePosition === "function") {
-      const maxRetries = 3
-      const backoffMs = [1000, 2000, 4000]
+      const maxRetries = 2
+      const backoffMs = [500, 1000]
       
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
           console.log(`${LOG_PREFIX} [v0] Attempting exchange close ${position.symbol} ${position.direction} (attempt ${attempt + 1}/${maxRetries})`)
-          const r = await exchangeConnector.closePosition(position.symbol, position.direction)
+          
+          // Timeout for exchange close - don't block forever
+          const closePromise = exchangeConnector.closePosition(position.symbol, position.direction)
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Exchange close timeout after 3s')), 3000)
+          )
+          const r = await Promise.race([closePromise, timeoutPromise])
           
           // Validate response explicitly - don't accept undefined/null
           if (r && typeof r === 'object' && r.success === true) {
