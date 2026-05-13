@@ -3243,9 +3243,16 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // empty array). The exchange call is gated by the realtime sync's
     // 5-second throttle so it doesn't hammer the venue.
     let adoptedCount = 0
+    // Hoisted out of the orphan-adoption block so the per-position sync
+    // loop below can build a (symbol|direction)→exchangePos map from the
+    // SAME single batch fetch, instead of issuing N getPosition(symbol)
+    // calls (which on hedge-mode accounts returned positions[0] regardless
+    // of direction — clobbering markPrice across long/short legs and
+    // never detecting external closures).
+    let exchangePositions: any[] = []
     if (exchangeConnector && typeof exchangeConnector.getPositions === "function") {
       try {
-        const exchangePositions = (await exchangeConnector.getPositions().catch(() => [])) || []
+        exchangePositions = (await exchangeConnector.getPositions().catch(() => [])) || []
         if (Array.isArray(exchangePositions) && exchangePositions.length > 0) {
           // Build a set of (symbol|direction) keys we already track in any
           // status — including terminal ones — so we don't re-adopt a
@@ -3399,18 +3406,142 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
 
     console.log(`${LOG_PREFIX} Syncing ${openPositions.length} open/placed positions with exchange (adopted=${adoptedCount})`)
 
+    // ── Build a direction-keyed exchange-position map (P0 fix) ────────
+    // Previously the per-position loop called `getPosition(position.symbol)`
+    // which on hedge-mode accounts returns `positions[0]` for the symbol
+    // — regardless of whether the caller wanted LONG or SHORT. That meant:
+    //   * If user had LONG only, `positions[0]` was LONG → fine.
+    //   * If user had SHORT only, `positions[0]` was SHORT → fine.
+    //   * If user had BOTH (hedge), `positions[0]` was always the one
+    //     BingX returned first → markPrice cross-contamination between
+    //     the two legs AND no way to detect when one leg externally
+    //     closed (the other leg's data masked the close).
+    //   * If user had NONE (closed externally), `getPositions(symbol)`
+    //     could still return a flat zero-size entry, making
+    //     `if (exchangePos)` truthy and silently keeping the Redis record
+    //     "open" forever — the operator's repeated "Live Positions are
+    //     still not getting closed" complaint.
+    //
+    // Now: we already fetched the full positions array up top for orphan
+    // adoption. Reuse it to build a `(symbol|direction) → exchangePos` map
+    // with size>0 filter applied, same shape `reconcileLivePositions`
+    // uses. One batch fetch covers both adoption AND per-position sync.
+    const normSym = (raw: string) => String(raw || "").toUpperCase().replace(/[-_]/g, "")
+    const exchangeMap = new Map<string, any>()
+    for (const ep of exchangePositions) {
+      const sym = normSym(String(ep.symbol || (ep as any).Symbol || ""))
+      if (!sym) continue
+      const size = Math.abs(parseFloat(String(ep.size ?? (ep as any).positionAmt ?? ep.quantity ?? "0")))
+      if (!size || size <= 0) continue // skip flat / zero-size entries
+      const sideRaw = String(
+        ep.side ?? (ep as any).positionSide ?? (parseFloat(String(ep.size ?? "0")) < 0 ? "short" : "long"),
+      ).toLowerCase()
+      const direction: "long" | "short" =
+        sideRaw.includes("short") || sideRaw === "sell" ? "short" : "long"
+      exchangeMap.set(`${sym}|${direction}`, ep)
+    }
+
     for (const position of openPositions) {
       try {
-        const exchangePos = await exchangeConnector.getPosition(position.symbol)
+        const mapKey = `${normSym(position.symbol)}|${position.direction}`
+        const exchangePos = exchangeMap.get(mapKey)
         if (exchangePos) {
+          // Mirror reconcileLivePositions' field extraction so both paths
+          // produce structurally identical exchangeData. Previously this
+          // path stored raw strings under `markPrice` (no parseFloat) so
+          // downstream `Number(position.exchangeData?.markPrice ?? 0)` —
+          // while correct for plain numeric strings — silently coerced
+          // BingX's occasional null/empty-string returns to 0, gating
+          // the SL/TP cross check.
+          const markPrice = parseFloat(String(exchangePos.markPrice ?? exchangePos.indexPrice ?? exchangePos.lastPrice ?? "0")) || 0
+          const liqPrice  = parseFloat(String(exchangePos.liquidationPrice ?? exchangePos.liqPrice ?? "0")) || 0
+          const uPnl      = parseFloat(String(exchangePos.unrealizedProfit ?? exchangePos.unrealisedPnl ?? exchangePos.unrealizedPnl ?? "0")) || 0
           position.exchangeData = {
+            ...position.exchangeData,
             marginType: (exchangePos as any).marginType,
-            markPrice: (exchangePos as any).markPrice,
-            liquidationPrice: (exchangePos as any).liquidationPrice,
-            unrealizedPnl: (exchangePos as any).unrealizedPnl,
-            roi: (exchangePos as any).roi,
+            markPrice: markPrice || position.exchangeData?.markPrice,
+            liquidationPrice: liqPrice || position.exchangeData?.liquidationPrice,
+            unrealizedPnL: uPnl || position.exchangeData?.unrealizedPnL,
+            syncedAt: Date.now(),
           }
           position.updatedAt = Date.now()
+        } else if (
+          // ── Externally-closed branch (THE missing close path) ──────
+          // Exchange no longer reports the (symbol|direction) we have
+          // tracked — the position closed externally (SL/TP fired, manual
+          // close on the BingX UI, liquidation, etc.). Previously this
+          // branch did not exist in `syncWithExchange`, so the realtime
+          // tick path never detected external closures — only the 30 s-
+          // throttled coordinator reconcile did. Operators on a healthy
+          // engine therefore saw positions sit as "open" in Redis for up
+          // to a full reconcile window after they were actually closed,
+          // and on engines where the 30 s reconcile got skipped (rate-
+          // limit drift, strategy flow error, coordinator pause) the
+          // positions sat OPEN indefinitely.
+          //
+          // We only act when the entry definitely existed on the
+          // exchange at SOME point — i.e. status is anything past
+          // "placed" (open / filled / partially_filled with executed qty).
+          // Positions still in "placed" status with no fill yet might
+          // legitimately not show up on the exchange (the entry order is
+          // still resting on the book, not a position). Those continue
+          // to be promoted via the "Delayed-fill" block above when the
+          // entry order does fill.
+          position.executedQuantity > 0 &&
+          (position.status === "open" ||
+            position.status === "filled" ||
+            position.status === "partially_filled")
+        ) {
+          // Resolve exit price using the same 4-step fallback chain
+          // reconcileLivePositions uses, so PnL is honest whether the
+          // exchange returned markPrice in the closing batch, we kept a
+          // markPrice from the previous tick, the symbol's market_data
+          // hash has fresh ticks, or we fall back to entryPrice.
+          let exitPrice = position.exchangeData?.markPrice || position.averageExecutionPrice || 0
+          if (exitPrice <= 0) {
+            try {
+              const mdHash = await client.hgetall(`market_data:${position.symbol}`)
+              const mdPrice = parseFloat(String(mdHash?.lastPrice ?? mdHash?.price ?? mdHash?.close ?? "0"))
+              if (mdPrice > 0) exitPrice = mdPrice
+            } catch { /* fall through */ }
+          }
+          if (exitPrice <= 0) exitPrice = position.entryPrice || 0
+
+          console.log(
+            `${LOG_PREFIX} EXTERNALLY-CLOSED detected for ${position.symbol} ${position.direction} (id=${position.id}) — finalising in Redis`,
+          )
+          await logProgressionEvent(
+            connectionId,
+            "live_trading",
+            "info",
+            `Position ${position.symbol} no longer on exchange — closing in Redis (sync)`,
+            {
+              positionId: position.id,
+              exitPrice,
+              executedQuantity: position.executedQuantity,
+              direction: position.direction,
+            },
+          )
+          // closeLivePosition does the full terminal-state pipeline:
+          // best-effort exchange close (no-op when already gone), cancel
+          // orphan SL/TP, compute PnL/ROI, archive, release lock,
+          // increment counters. Reason "exchange_externally_closed"
+          // distinguishes it in the audit trail from cross-fires.
+          try {
+            await closeLivePosition(
+              connectionId,
+              position.id,
+              exitPrice,
+              exchangeConnector,
+              "exchange_externally_closed",
+            )
+          } catch (closeErr) {
+            console.warn(
+              `${LOG_PREFIX} externally-closed close error for ${position.id}:`,
+              closeErr instanceof Error ? closeErr.message : String(closeErr),
+            )
+          }
+          continue // closeLivePosition persisted terminal state — skip per-position setex
         }
 
         // ── Delayed-fill SL/TP arming ─────────────────────────���───────
