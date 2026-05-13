@@ -27,8 +27,34 @@ import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { SystemLogger } from "@/lib/system-logger"
 import type { RealPosition } from "./real-stage"
+import { getEngineTimings } from "@/lib/engine-timings"
 
 const LOG_PREFIX = "[v0] [LivePositionStage]"
+
+/**
+ * Resolve the maximum live-position hold time (ms) before force-close.
+ *
+ * Precedence:
+ *   1. `settings:system.max_position_hold_ms` (UI-tunable, live)
+ *   2. `process.env.MAX_POSITION_HOLD_MS`     (deploy-time override)
+ *   3. 4 hours                                (hard default)
+ *
+ * Returning `0` disables the force-close entirely (positions held
+ * indefinitely). All call sites already early-return when this is `<= 0`.
+ *
+ * Hot-path safe: pure cache read, no I/O.
+ */
+function resolveMaxHoldMs(): number {
+  const fromSettings = getEngineTimings().maxPositionHoldMs
+  if (fromSettings === 0) return 0                                    // explicit disable
+  if (Number.isFinite(fromSettings) && fromSettings > 0) return fromSettings
+  const envRaw = process.env.MAX_POSITION_HOLD_MS
+  if (envRaw !== undefined && envRaw !== "") {
+    const envNum = Number(envRaw)
+    if (Number.isFinite(envNum) && envNum >= 0) return envNum
+  }
+  return 4 * 60 * 60 * 1000
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -2783,8 +2809,8 @@ async function orphanCloseExpiredPositions(
   connectionId: string,
   connector: any,
   summary: { reconciled: number; closed: number; errors: number; updated: number },
-): Promise<void> {
-  const MAX_HOLD_TIME_MS = Number(process.env.MAX_POSITION_HOLD_MS ?? 4 * 60 * 60 * 1000)
+  ): Promise<void> {
+  const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
   if (MAX_HOLD_TIME_MS <= 0) return
 
   try {
@@ -3038,9 +3064,9 @@ export async function reconcileLivePositions(
             continue // close already persisted by helper
           }
 
-          // ── Max-hold-time safety closer (reconcile path) ────────────
-          const MAX_HOLD_TIME_MS = Number(process.env.MAX_POSITION_HOLD_MS ?? 4 * 60 * 60 * 1000)
-          const openedAt = pos.createdAt || pos.updatedAt || 0
+  // ── Max-hold-time safety closer (reconcile path) ────────────
+  const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
+  const openedAt = pos.createdAt || pos.updatedAt || 0
           const heldMs = Date.now() - openedAt
           if (
             MAX_HOLD_TIME_MS > 0 &&
@@ -3627,8 +3653,10 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         // network issue, illiquid gap, operator manual cancel), the
         // position will not be held indefinitely.
         //
-        // Default: 4 hours. Override via env MAX_POSITION_HOLD_MS.
-        const MAX_HOLD_TIME_MS = Number(process.env.MAX_POSITION_HOLD_MS ?? 4 * 60 * 60 * 1000)
+  // Default: 4 hours. Live override via /settings → System →
+  // Engine Timings → max_position_hold_ms (or deploy-time
+  // MAX_POSITION_HOLD_MS env var). 0 = disabled.
+  const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
         const openedAt = position.createdAt || position.updatedAt || 0
         const heldMs = Date.now() - openedAt
         if (

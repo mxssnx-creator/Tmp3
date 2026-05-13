@@ -18,6 +18,11 @@ import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { StrategyCoordinator } from "@/lib/strategy-coordinator"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { trackStrategyStats } from "@/lib/statistics-tracker"
+// Strategy-flow throttle values are read live from `settings:system`. The
+// module-level constants below remain as defaults — used when the
+// engine-timings cache is empty (process cold start) or holds an invalid
+// value that fails the clamp.
+import { getEngineTimings } from "@/lib/engine-timings"
 
 // ── Per-(connection,symbol) strategy-flow throttle ─────────────────────
 // PROBLEM: the engine strategy timer fires every DEFAULT_CYCLE_PAUSE_MS
@@ -162,12 +167,19 @@ export class StrategyProcessor {
       const prev = flowThrottle.get(throttleKey)
       if (prev) {
         const elapsed = now - prev.lastRunAt
+        // Read live throttle values from settings:system at gate-eval
+        // time (cheap in-memory cache hit). Settings updates from the
+        // UI take effect within ~10 s without restart.
+        const _t = getEngineTimings()
+        const HARD_THROTTLE_MS = _t.strategyFlowHardThrottleMs || STRATEGY_FLOW_HARD_THROTTLE_MS
+        const MIN_INTERVAL_MS  = _t.strategyFlowMinIntervalMs  || STRATEGY_FLOW_MIN_INTERVAL_MS
+        const MAX_INTERVAL_MS  = _t.strategyFlowMaxIntervalMs  || STRATEGY_FLOW_MAX_INTERVAL_MS
         // Hard throttle: never re-run within HARD_THROTTLE_MS, period.
-        if (elapsed < STRATEGY_FLOW_HARD_THROTTLE_MS) {
+        if (elapsed < HARD_THROTTLE_MS) {
           return { strategiesEvaluated: 0, liveReady: 0 }
         }
         // Within MIN_INTERVAL: only re-run if fingerprint changed.
-        if (elapsed < STRATEGY_FLOW_MIN_INTERVAL_MS) {
+        if (elapsed < MIN_INTERVAL_MS) {
           const fingerprintUnchanged =
             prev.lastIndicationCount === validIndications.length &&
             prev.lastLatestTimestamp === latestIndicationTs
@@ -177,7 +189,7 @@ export class StrategyProcessor {
         }
         // Past MIN_INTERVAL but under MAX_INTERVAL: also require
         // fingerprint change. Past MAX_INTERVAL: always run (heartbeat).
-        if (elapsed < STRATEGY_FLOW_MAX_INTERVAL_MS) {
+        if (elapsed < MAX_INTERVAL_MS) {
           const fingerprintUnchanged =
             prev.lastIndicationCount === validIndications.length &&
             prev.lastLatestTimestamp === latestIndicationTs

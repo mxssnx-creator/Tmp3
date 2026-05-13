@@ -28,6 +28,11 @@ import { StrategyConfigManager, type PseudoPosition } from "@/lib/strategy-confi
 // multiple processors (indication, strategy, realtime) share the same
 // warm entries.
 import { getMarketDataCached, prefetchMarketDataBatch } from "./market-data-cache"
+// Tunable cadences (heartbeat, live-sync) read at gate-evaluation time from
+// `settings:system`. See lib/engine-timings.ts. The `private static readonly`
+// constants below are kept as fallback defaults when the cache is empty on
+// cold start.
+import { getEngineTimings } from "@/lib/engine-timings"
 
 export class RealtimeProcessor {
   private connectionId: string
@@ -223,7 +228,12 @@ export class RealtimeProcessor {
       // preceding getSettings() unless the position count changed (which is
       // when we need to merge with the persisted state hash).
       const countChanged = count !== this.lastPositionsCount
-      const heartbeatDue = now - this.lastHeartbeatAt >= RealtimeProcessor.HEARTBEAT_INTERVAL_MS
+      // Read cadence from settings cache each tick — in-memory hit, no I/O.
+      // Falls back to the static default if the cache hasn't yet been
+      // populated (process cold start, < 1 ms after boot).
+      const heartbeatIntervalMs =
+        getEngineTimings().heartbeatIntervalMs || RealtimeProcessor.HEARTBEAT_INTERVAL_MS
+      const heartbeatDue = now - this.lastHeartbeatAt >= heartbeatIntervalMs
 
       if (countChanged || heartbeatDue) {
         const stateKey = `trade_engine_state:${this.connectionId}`
@@ -793,7 +803,11 @@ export class RealtimeProcessor {
   private async maybeRunLiveSync(): Promise<void> {
     const now = Date.now()
     if (this.liveSyncInFlight) return
-    if (now - this.lastLiveSyncAt < RealtimeProcessor.LIVE_SYNC_INTERVAL_MS) return
+    // Read cadence from settings:system; static const is the fallback only
+    // until the engine-timings cache lands (~milliseconds after boot).
+    const liveSyncIntervalMs =
+      getEngineTimings().liveSyncIntervalMs || RealtimeProcessor.LIVE_SYNC_INTERVAL_MS
+    if (now - this.lastLiveSyncAt < liveSyncIntervalMs) return
     this.lastLiveSyncAt = now
     this.liveSyncInFlight = true
 
