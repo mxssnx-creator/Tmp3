@@ -72,13 +72,13 @@ export function SettingsEditorDialog({
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
                     <Label>Main Engine Interval (ms)</Label>
-                    <span className="text-sm font-medium">{settings.mainEngineIntervalMs || 1000}ms</span>
+                    <span className="text-sm font-medium">{settings.mainEngineIntervalMs || 700}ms</span>
                   </div>
                   <Slider
                     min={100}
                     max={5000}
                     step={100}
-                    value={[settings.mainEngineIntervalMs || 1000]}
+                    value={[settings.mainEngineIntervalMs || 700]}
                     onValueChange={([value]) => onSettingChange("mainEngineIntervalMs", value)}
                   />
                   <p className="text-xs text-muted-foreground">
