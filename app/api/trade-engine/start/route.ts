@@ -80,10 +80,17 @@ export async function POST(request: NextRequest) {
     const client = getRedisClient()
     
     // Set global state in Redis (write-through to Upstash via persistent key prefix)
+    // CRITICAL: clear `operator_stopped` so the migration bootstrap stops
+    // honouring a prior explicit halt. Without this, a subsequent module
+    // reload would re-respect the stop flag and refuse to bootstrap
+    // engines, even though the operator just pressed Start.
     await client.hset("trade_engine:global", { 
       status: "running", 
       started_at: new Date().toISOString(),
-      coordinator_ready: "true"
+      coordinator_ready: "true",
+      operator_stopped: "0",
+      operator_stopped_at: "",
+      stopped_at: "",
     })
     
     console.log("[v0] [Trade Engine] Global Coordinator state saved to Redis + Upstash: status=running")

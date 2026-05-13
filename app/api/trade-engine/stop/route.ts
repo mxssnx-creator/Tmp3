@@ -91,10 +91,18 @@ export async function POST(request: NextRequest) {
       const totalPaused = new Set([...pausedConnections, ...pausedPresetConnections]).size
       
       // 4. Set global state in Redis (write-through to Upstash)
+      // CRITICAL: also write `operator_stopped="1"` so the migration
+      // bootstrap (`ensureBaseConnections` in lib/redis-migrations.ts)
+      // honours this explicit halt across module reloads / redeploys.
+      // Without this flag the next module reload would resurrect
+      // status="running" and the auto-start monitor would re-arm the
+      // engines the operator just stopped.
       await client.hset("trade_engine:global", { 
         status: "stopped", 
         stopped_at: new Date().toISOString(),
         coordinator_ready: "false",
+        operator_stopped: "1",
+        operator_stopped_at: new Date().toISOString(),
         paused_main_count: String(pausedConnections.length),
         paused_preset_count: String(pausedPresetConnections.length),
       })

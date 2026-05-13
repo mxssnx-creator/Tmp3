@@ -1908,6 +1908,24 @@ export async function GET(
         message,
         lastUpdate,
         redisDbEntries,
+        // ── Progression identity (per session) ───────────────────────────
+        // The frontend uses these to detect whether a page refresh lands
+        // on the SAME progression session (same sessionNumber+epoch) or a
+        // NEW one (sessionNumber bumped by archiveAndStartNewProgression).
+        // When session changes the FE clears local cached UI state; when
+        // it stays the same, it KEEPS the current view (resumes mid-cycle).
+        // Both fields are written by `archiveAndStartNewProgression` on
+        // every engine start and survive every refresh because they live
+        // in the persisted `progression:{id}` hash.
+        sessionNumber: n(progHash.session_number) || 0,
+        epoch:         n(progHash.epoch) || 0,
+        startedAt:     n(progHash.started_at) || 0,
+        // `progressionId` is the stable per-session ID — `epoch:session`
+        // is unique across all sessions for this connection.
+        progressionId:
+          progHash.session_number && progHash.epoch
+            ? `${progHash.epoch}:${progHash.session_number}`
+            : "",
       },
 
       // Legacy flat fields kept for backward compat with existing components

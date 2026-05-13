@@ -79,15 +79,48 @@ export async function PUT(
 
     // Notify engine of settings change AND fast-path apply so operators
     // don't have to wait for the next 3 s watcher tick.
+    //
+    // CRITICAL COMPREHENSIVE FIX: after the fast-path apply, ALSO ask
+    // the coordinator to (re-)start any missing engines using the
+    // freshly-updated connection record. This handles the case where:
+    //   1. Operator edits credentials in the dialog → "restart" classed.
+    //   2. Operator toggles dashboard enabled / changes intervals →
+    //      "reload" classed but engine may have been stopped earlier.
+    //
+    // Without this second step, hot-reload only fires when the engine
+    // is ALREADY running. Operators who saved settings while the engine
+    // was stopped (or after a crash) saw "settings saved" but no actual
+    // restart, exactly matching the report "Changing main connections
+    // settings through settings dialog does not do take affection".
     const changedFields = detectChangedFields(connection, updated)
     if (changedFields.length > 0) {
       await notifySettingsChanged(id, changedFields, connection, updated)
       try {
         const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
-        await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
+        const coordinator = getGlobalTradeEngineCoordinator()
+        // Step 1 — fast-path apply for already-running engines.
+        await coordinator.applyPendingChangesNow(id)
+
+        // Step 2 — recoordinate: ensure the engine for this connection
+        // is running if it should be (assigned + enabled + main mode).
+        // `startMissingEngines` is idempotent — a running engine is
+        // left alone, a stopped-but-should-be-running engine is
+        // (re)started with the latest settings/config snapshot.
+        const { isConnectionMainProcessing, hasConnectionCredentials, isTruthyFlag } = await import(
+          "@/lib/connection-state-utils"
+        )
+        const shouldRun =
+          isConnectionMainProcessing(updated) &&
+          (hasConnectionCredentials(updated, 5, true) ||
+            isTruthyFlag((updated as any).is_predefined) ||
+            isTruthyFlag((updated as any).is_testnet) ||
+            isTruthyFlag((updated as any).demo_mode))
+        if (shouldRun) {
+          await coordinator.startMissingEngines([updated])
+        }
       } catch (applyErr) {
         console.warn(
-          `[v0] [Settings PUT] applyPendingChangesNow failed for ${id}:`,
+          `[v0] [Settings PUT] coordinator recoordination failed for ${id}:`,
           applyErr instanceof Error ? applyErr.message : String(applyErr),
         )
       }
@@ -135,16 +168,34 @@ export async function PATCH(
 
     await updateConnection(id, updated)
 
-    // Notify engine of settings change AND fast-path apply.
+    // Notify engine of settings change AND fast-path apply + recoordinate.
+    // See same-pattern comment in PUT handler above for rationale.
     const changedFields = Object.keys(settings)
     if (changedFields.length > 0) {
       await notifySettingsChanged(id, ["connection_settings"])
       try {
         const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
-        await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
+        const coordinator = getGlobalTradeEngineCoordinator()
+        await coordinator.applyPendingChangesNow(id)
+
+        // Recoordinate (idempotent) so a connection that was stopped
+        // when the operator saved nested settings actually restarts
+        // with the new connection_settings JSON applied.
+        const { isConnectionMainProcessing, hasConnectionCredentials, isTruthyFlag } = await import(
+          "@/lib/connection-state-utils"
+        )
+        const shouldRun =
+          isConnectionMainProcessing(updated) &&
+          (hasConnectionCredentials(updated, 5, true) ||
+            isTruthyFlag((updated as any).is_predefined) ||
+            isTruthyFlag((updated as any).is_testnet) ||
+            isTruthyFlag((updated as any).demo_mode))
+        if (shouldRun) {
+          await coordinator.startMissingEngines([updated])
+        }
       } catch (applyErr) {
         console.warn(
-          `[v0] [Settings PATCH] applyPendingChangesNow failed for ${id}:`,
+          `[v0] [Settings PATCH] coordinator recoordination failed for ${id}:`,
           applyErr instanceof Error ? applyErr.message : String(applyErr),
         )
       }
