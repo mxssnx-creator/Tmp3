@@ -105,12 +105,14 @@ export class BingXConnector extends BaseExchangeConnector {
    */
   private toBingXSymbol(symbol: string): string {
     if (!symbol) return symbol
+    // Remove existing slash format (normalize to no-slash first)
+    let normalized = symbol.replace(/\//g, "")
     // Already hyphenated → nothing to do.
-    if (symbol.includes("-")) return symbol
+    if (normalized.includes("-")) return normalized
     // Spot still uses the plain BTCUSDT format on BingX.
-    if (this.credentials.apiType === "spot") return symbol
+    if (this.credentials.apiType === "spot") return normalized
 
-    const upper = symbol.toUpperCase()
+    const upper = normalized.toUpperCase()
     // Handle common quote assets; insert a dash before the quote.
     const quotes = ["USDT", "USDC", "BTC", "ETH", "USD"]
     for (const quote of quotes) {
