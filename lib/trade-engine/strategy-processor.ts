@@ -19,6 +19,40 @@ import { StrategyCoordinator } from "@/lib/strategy-coordinator"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { trackStrategyStats } from "@/lib/statistics-tracker"
 
+// ── Per-(connection,symbol) strategy-flow throttle ─────────────────────
+// PROBLEM: the engine strategy timer fires every DEFAULT_CYCLE_PAUSE_MS
+// (50 ms). Each tick calls `processStrategy(symbol)` for every watched
+// symbol. With indications growing by ~4 per cycle, the strategy flow
+// was re-evaluating the SAME 1000+ indications and re-creating the SAME
+// 1605 Main sets ~20× per second per symbol — burning CPU, flooding
+// logs, and (under multi-symbol watchlists) saturating Redis with
+// redundant Set writes.
+//
+// FIX: gate `processStrategy` per (connectionId,symbol). Skip the
+// expensive flow when:
+//   - the indication fingerprint (count + latest-timestamp) is unchanged
+//     AND less than STRATEGY_FLOW_MIN_INTERVAL_MS has elapsed since the
+//     last run, OR
+//   - less than STRATEGY_FLOW_HARD_THROTTLE_MS has elapsed since the last
+//     run (even if fingerprint changed — protects against pathological
+//     indication generators that bump the timestamp every tick).
+//
+// We still let the heartbeat run on STRATEGY_FLOW_MAX_INTERVAL_MS even
+// when fingerprint is unchanged so the dashboard "last run" telemetry
+// stays fresh and stale-set-cleanup runs periodically.
+const STRATEGY_FLOW_MIN_INTERVAL_MS = 1_500  // when fingerprint changed
+const STRATEGY_FLOW_HARD_THROTTLE_MS = 750   // absolute minimum gap
+const STRATEGY_FLOW_MAX_INTERVAL_MS = 15_000 // heartbeat re-run
+
+interface FlowThrottleEntry {
+  lastRunAt: number          // wall-clock ms of last successful run
+  lastIndicationCount: number
+  lastLatestTimestamp: number
+}
+
+// Map<`${connectionId}:${symbol}`, FlowThrottleEntry>
+const flowThrottle = new Map<string, FlowThrottleEntry>()
+
 export class StrategyProcessor {
   private connectionId: string
   // REMOVED: strategyCache - No caching, all calculations real-time
@@ -86,6 +120,66 @@ export class StrategyProcessor {
         ).catch(() => { /* non-critical */ })
         return { strategiesEvaluated: 0, liveReady: 0 }
       }
+
+      // ── Throttle gate ────────────────────────────────────────────────
+      // Compute a cheap fingerprint of the indication set: (count, most
+      // recent timestamp). If unchanged from the last run AND we're
+      // inside the min-interval window, skip the expensive flow. This
+      // prevents the 20×/sec re-evaluation feedback loop documented in
+      // the module header above. The flow still runs on:
+      //   - first call for this (conn, symbol)
+      //   - fingerprint change (new indications arrived)
+      //   - heartbeat (STRATEGY_FLOW_MAX_INTERVAL_MS elapsed)
+      // and is ALWAYS gated by STRATEGY_FLOW_HARD_THROTTLE_MS regardless
+      // of fingerprint changes (protects against pathological generators
+      // that bump the timestamp every tick).
+      const throttleKey = `${this.connectionId}:${symbol}`
+      const now = Date.now()
+      const latestIndicationTs = validIndications.reduce(
+        (max, ind) => {
+          const t = Number(ind?.timestamp ?? 0)
+          return Number.isFinite(t) && t > max ? t : max
+        },
+        0,
+      )
+      const prev = flowThrottle.get(throttleKey)
+      if (prev) {
+        const elapsed = now - prev.lastRunAt
+        // Hard throttle: never re-run within HARD_THROTTLE_MS, period.
+        if (elapsed < STRATEGY_FLOW_HARD_THROTTLE_MS) {
+          return { strategiesEvaluated: 0, liveReady: 0 }
+        }
+        // Within MIN_INTERVAL: only re-run if fingerprint changed.
+        if (elapsed < STRATEGY_FLOW_MIN_INTERVAL_MS) {
+          const fingerprintUnchanged =
+            prev.lastIndicationCount === validIndications.length &&
+            prev.lastLatestTimestamp === latestIndicationTs
+          if (fingerprintUnchanged) {
+            return { strategiesEvaluated: 0, liveReady: 0 }
+          }
+        }
+        // Past MIN_INTERVAL but under MAX_INTERVAL: also require
+        // fingerprint change. Past MAX_INTERVAL: always run (heartbeat).
+        if (elapsed < STRATEGY_FLOW_MAX_INTERVAL_MS) {
+          const fingerprintUnchanged =
+            prev.lastIndicationCount === validIndications.length &&
+            prev.lastLatestTimestamp === latestIndicationTs
+          if (fingerprintUnchanged) {
+            return { strategiesEvaluated: 0, liveReady: 0 }
+          }
+        }
+      }
+      // Reserve the slot BEFORE the await so concurrent ticks for the
+      // same (conn,symbol) — possible if two engines somehow share a
+      // processor or HMR replays the timer — don't both fall through
+      // the gate. We update again on completion to record real data,
+      // but this provisional write is enough to keep concurrent callers
+      // throttled.
+      flowThrottle.set(throttleKey, {
+        lastRunAt: now,
+        lastIndicationCount: validIndications.length,
+        lastLatestTimestamp: latestIndicationTs,
+      })
 
       console.log(`[v0] [StrategyFlow] ${symbol}: Starting progressive evaluation with ${validIndications.length}/${indications.length} valid indications`)
 
