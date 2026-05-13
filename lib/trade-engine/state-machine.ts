@@ -164,12 +164,19 @@ export class TradeEngineStateMachine {
         await positionTracker.recordPosition(localPos)
       }
 
-      // Evaluate signals for each symbol
+      // Evaluate signals for each symbol IN PARALLEL — each symbol's
+      // signal evaluation is independent (its own price stream + its
+      // own indicator state) so there's no reason to serialise. Bug
+      // fix: dense symbol baskets (e.g. 10+ symbols) used to multiply
+      // exchange-API latency by N because of the awaited for-loop.
+      // `allSettled` keeps a single symbol's failure from aborting
+      // the rest of the cycle — errors are already logged inside
+      // `evaluateAndTrade`.
       this.state = "evaluating"
 
-      for (const symbol of this.config.symbols) {
-        await this.evaluateAndTrade(symbol, connector)
-      }
+      await Promise.allSettled(
+        this.config.symbols.map((symbol) => this.evaluateAndTrade(symbol, connector)),
+      )
 
       this.state = "monitoring"
     } catch (error) {

@@ -800,10 +800,17 @@ export async function GET(
     const indCounts: Record<string, number> = {}
     await Promise.all(
       indTypes.map(async (type) => {
-        const fromHash  = n(progHash[`indications_${type}_count`])
-        const fromKey   = n(await client.get(`indications:${connectionId}:${type}:count`).catch(() => 0))
-        const fromEval  = n(await client.get(`indications:${connectionId}:${type}:evaluated`).catch(() => 0))
-        indCounts[type] = Math.max(fromHash, fromKey, fromEval)
+        // Both standalone keys are independent — issue the two GETs
+        // in parallel so each type contributes a single Redis RTT
+        // instead of two sequential awaits chained through the
+        // pipeline. With 6 types this halves the wall-time spent on
+        // per-type breakdown reads.
+        const fromHash = n(progHash[`indications_${type}_count`])
+        const [fromKey, fromEval] = await Promise.all([
+          client.get(`indications:${connectionId}:${type}:count`).catch(() => 0),
+          client.get(`indications:${connectionId}:${type}:evaluated`).catch(() => 0),
+        ])
+        indCounts[type] = Math.max(fromHash, n(fromKey), n(fromEval))
       })
     )
     const indTotal = Object.values(indCounts).reduce((s, v) => s + v, 0) || indicationsTotal
@@ -903,7 +910,14 @@ export async function GET(
         // Prefer the cross-symbol sum from strategies_active hash (already computed above).
         // For "live" there is no strategies_active entry, so fall back to the standalone key.
         const fromActive = (type !== "live") ? (activeStratByStage[type] || 0) : 0
-        const fromKey   = n(await client.get(`strategies:${connectionId}:${type}:count`).catch(() => 0))
+        // Issue both standalone-key reads in parallel — they're
+        // independent and previously chained as sequential awaits,
+        // doubling the per-stage wall time for no benefit.
+        const [fromKeyRaw, evalFromKeyRaw] = await Promise.all([
+          client.get(`strategies:${connectionId}:${type}:count`).catch(() => 0),
+          client.get(`strategies:${connectionId}:${type}:evaluated`).catch(() => 0),
+        ])
+        const fromKey = n(fromKeyRaw)
         // NOTE: strategies_{type}_total is a cumulative hincrby (grows every cycle × symbols).
         // It MUST NOT be used as the current count — prefer fromActive (cross-symbol live snapshot)
         // or fromKey (last-symbol standalone, 24h TTL). Fall back to 0 when both are absent so
@@ -911,11 +925,9 @@ export async function GET(
         stratCounts[type] = fromActive > 0 ? fromActive
                           : fromKey   > 0 ? fromKey
                           : 0
-
-        const evalFromKey  = n(await client.get(`strategies:${connectionId}:${type}:evaluated`).catch(() => 0))
         // Standalone key is last-symbol-wins current count. Cumulative hash field
         // (strategies_{type}_evaluated) is intentionally ignored here.
-        stratEvaluated[type] = evalFromKey
+        stratEvaluated[type] = n(evalFromKeyRaw)
       })
     )
     // ── Pipeline-aware "total strategies" ────────────────────────────────
@@ -1205,8 +1217,18 @@ export async function GET(
           .lrange(`live:positions:${connectionId}:closed`, 0, 199)
           .catch(() => [])) || []) as string[]
 
-        for (const id of closedIds) {
-          const raw = await client.get(`live:position:${id}`).catch(() => null)
+        // Fan-out the per-id GETs in parallel. Previously this was a
+        // sequential N round-trip loop on the /stats hot path — at 200
+        // ids that's 200 sequential awaits, which dominated /stats
+        // latency once the closed archive filled up. Parallel GET is
+        // safe: each id is independent, and the reads are followed by
+        // pure-CPU JSON parsing.
+        const rawList = await Promise.all(
+          closedIds.map((id) =>
+            client.get(`live:position:${id}`).catch(() => null),
+          ),
+        )
+        for (const raw of rawList) {
           if (!raw) continue
           try {
             const pos = JSON.parse(raw as string)
@@ -1297,13 +1319,19 @@ export async function GET(
     let stratWindow60m = 0
 
     try {
-      // ZRANGEBYSCORE on indications window zset (score = timestamp ms, value = count increment)
-      const ind5m  = await client.zrangebyscore(`indications:${connectionId}:window`,  ago5m,  "+inf").catch(() => [])
-      const ind60m = await client.zrangebyscore(`indications:${connectionId}:window`,  ago60m, "+inf").catch(() => [])
-      const str5m  = await client.zrangebyscore(`strategies:${connectionId}:window`,   ago5m,  "+inf").catch(() => [])
-      const str60m = await client.zrangebyscore(`strategies:${connectionId}:window`,   ago60m, "+inf").catch(() => [])
-      indWindow5m  = ind5m.length
-      indWindow60m = ind60m.length
+      // Issue all four ZRANGEBYSCORE reads in parallel — they are
+      // independent zsets and the previous serial chain added ~4 Redis
+      // round-trips of latency to every /stats poll for zero benefit.
+      // ZRANGEBYSCORE itself returns the matching members; we only need
+      // the count so `.length` is sufficient.
+      const [ind5m, ind60m, str5m, str60m] = await Promise.all([
+        client.zrangebyscore(`indications:${connectionId}:window`, ago5m,  "+inf").catch(() => [] as string[]),
+        client.zrangebyscore(`indications:${connectionId}:window`, ago60m, "+inf").catch(() => [] as string[]),
+        client.zrangebyscore(`strategies:${connectionId}:window`,  ago5m,  "+inf").catch(() => [] as string[]),
+        client.zrangebyscore(`strategies:${connectionId}:window`,  ago60m, "+inf").catch(() => [] as string[]),
+      ])
+      indWindow5m    = ind5m.length
+      indWindow60m   = ind60m.length
       stratWindow5m  = str5m.length
       stratWindow60m = str60m.length
     } catch { /* non-critical; fall back to zero */ }

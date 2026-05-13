@@ -57,28 +57,36 @@ async function seedMarketData() {
     SOLUSDT: 180,
   }
 
-  for (const symbol of symbols) {
-    const base = basePrices[symbol] ?? 100
-    for (let i = 0; i < 20; i += 1) {
-      const variation = base * 0.02
-      const close = base + (Math.random() - 0.5) * variation
-      // Spec §7: pre-startup seeds 1s placeholders so the engine has
-      // *something* under the canonical key before the real loader
-      // runs. Timestamps step at 1s instead of 60s.
-      await saveMarketData(symbol, "1s", {
-        symbol,
-        exchange: "bybit",
-        interval: "1s",
-        price: close,
-        open: base,
-        high: base + variation,
-        low: base - variation,
-        close,
-        volume: Math.random() * 1_000_000,
-        timestamp: new Date(Date.now() - (20 - i) * 1_000).toISOString(),
+  // ── Parallel seeding ────────────────────────────────────────────
+  // Every (symbol, tick) write is independent. Previously this was a
+  // nested for-loop with 6 × 20 = 120 sequential awaits — easily a
+  // full second of pointless serialisation on every startup. Fan
+  // out everything in a single Promise.all so the placeholder seed
+  // lands on Redis as one parallel batch.
+  await Promise.all(
+    symbols.flatMap((symbol) => {
+      const base = basePrices[symbol] ?? 100
+      return Array.from({ length: 20 }, (_v, i) => {
+        const variation = base * 0.02
+        const close = base + (Math.random() - 0.5) * variation
+        // Spec §7: pre-startup seeds 1s placeholders so the engine has
+        // *something* under the canonical key before the real loader
+        // runs. Timestamps step at 1s instead of 60s.
+        return saveMarketData(symbol, "1s", {
+          symbol,
+          exchange: "bybit",
+          interval: "1s",
+          price: close,
+          open: base,
+          high: base + variation,
+          low: base - variation,
+          close,
+          volume: Math.random() * 1_000_000,
+          timestamp: new Date(Date.now() - (20 - i) * 1_000).toISOString(),
+        })
       })
-    }
-  }
+    }),
+  )
   console.log("[v0] [PreStartup] seedMarketData: seeded placeholder prices for", symbols.length, "symbols")
 }
 

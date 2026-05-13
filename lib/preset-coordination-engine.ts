@@ -226,17 +226,37 @@ export class PresetCoordinationEngine {
   private async calculateCoordinationResults(): Promise<void> {
     console.log("[v0] Calculating coordination results...")
 
-    for (const configSet of this.configurationSets) {
-      try {
-        const symbols = await this.getSymbolsForConfigSet(configSet)
-
-        for (const symbol of symbols) {
-          await this.calculateConfigSetResults(configSet, symbol)
+    // ── Per-config-set fan-out ─────────────────────────────────────────
+    // ConfigurationSets are independent — each writes to its own
+    // result keyspace — so iterate them in parallel. Within a single
+    // configSet we still fan out across symbols with a bounded
+    // concurrency cap (MAX_CONCURRENT_SYMBOLS), matching the pattern
+    // used in `loadHistoricalDataIfNeeded` above. This turns the
+    // previous O(configSets × symbols) sequential chain into a
+    // bounded-parallel fan-out that scales with hardware/Redis
+    // capacity instead of with the size of the basket.
+    await Promise.all(
+      this.configurationSets.map(async (configSet) => {
+        try {
+          const symbols = await this.getSymbolsForConfigSet(configSet)
+          const batches = this.createBatches(symbols, this.MAX_CONCURRENT_SYMBOLS)
+          for (const batch of batches) {
+            await Promise.all(
+              batch.map((symbol) =>
+                this.calculateConfigSetResults(configSet, symbol).catch((err) => {
+                  console.error(
+                    `[v0] calculateConfigSetResults failed for set=${configSet.id} symbol=${symbol}:`,
+                    err instanceof Error ? err.message : String(err),
+                  )
+                }),
+              ),
+            )
+          }
+        } catch (error) {
+          console.error(`[v0] Failed to calculate results for config set ${configSet.id}:`, error)
         }
-      } catch (error) {
-        console.error(`[v0] Failed to calculate results for config set ${configSet.id}:`, error)
-      }
-    }
+      }),
+    )
 
     console.log("[v0] Coordination results calculation complete")
   }
