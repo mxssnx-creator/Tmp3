@@ -187,7 +187,7 @@ export default function OrderTestingPage() {
                 <strong>Test Suite:</strong> Comprehensive order lifecycle testing including market orders, limit orders, stop loss orders, control order creation/cancellation, and position management.
               </p>
               <p>
-                <strong>Minimum Balance:</strong> Tests adapt to available balance. Market orders require >= 10 USDT. Tests use minimal quantities to work with low balances.
+                <strong>Minimum Balance:</strong> Tests adapt to available balance. Market orders require {`>= 10`} USDT. Tests use minimal quantities to work with low balances.
               </p>
               <p>
                 <strong>Exchange Support:</strong> Full support for BingX, Bybit, Binance, OKX, Pionex, OrangeX - each with native order types and features.
