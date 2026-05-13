@@ -1345,4 +1345,196 @@ export class BingXConnector extends BaseExchangeConnector {
       return null
     }
   }
+
+  /**
+   * ─────────────────────────────────────────────────────────────────
+   * BINGX API SKILLS - Official implementation
+   * Source: https://github.com/BingX-API/api-ai-skills
+   * ─────────────────────────────────────────────────────────────────
+   */
+
+  /**
+   * bingx-swap-market: Query perpetual futures market data
+   * 
+   * Returns market data for USDT-M perpetual futures including:
+   * - Price information (bid, ask, last price)
+   * - Depth (order book)
+   * - Klines (candle data)
+   * - Funding rate
+   * - Open interest
+   * 
+   * @param symbol - Trading pair (e.g., "BTC-USDT", "ETH-USDT")
+   * @returns Market data object
+   */
+  async getSwapMarketData(symbol: string): Promise<any> {
+    try {
+      this.log(`[bingx-swap-market] Fetching market data for ${symbol}`)
+      
+      const baseUrl = this.getBaseUrl()
+      const bingxSymbol = this.toBingXSymbol(symbol)
+      
+      // Get current ticker data
+      const tickerEndpoint = `/openApi/swap/v3/public/ticker?symbol=${bingxSymbol}`
+      const tickerResponse = await this.rateLimitedFetch(`${baseUrl}${tickerEndpoint}`)
+      
+      if (!tickerResponse.ok) {
+        throw new Error(`Failed to fetch ticker: HTTP ${tickerResponse.status}`)
+      }
+      
+      const tickerData = await tickerResponse.json()
+      
+      if (!this.isBingXSuccess(tickerData.code)) {
+        throw new Error(`API Error: ${tickerData.msg || 'Unknown error'}`)
+      }
+      
+      const ticker = Array.isArray(tickerData.data) ? tickerData.data[0] : tickerData.data
+      
+      this.log(`✓ Market data fetched for ${symbol}: price=${ticker?.lastPrice}, 24h change=${ticker?.priceChangePercent}%`)
+      
+      return {
+        success: true,
+        symbol: bingxSymbol,
+        lastPrice: Number.parseFloat(ticker?.lastPrice || "0"),
+        bidPrice: Number.parseFloat(ticker?.bidPrice || "0"),
+        askPrice: Number.parseFloat(ticker?.askPrice || "0"),
+        high24h: Number.parseFloat(ticker?.high24h || "0"),
+        low24h: Number.parseFloat(ticker?.low24h || "0"),
+        volume24h: Number.parseFloat(ticker?.volume || "0"),
+        quoteVolume24h: Number.parseFloat(ticker?.quoteVolume || "0"),
+        priceChangePercent: Number.parseFloat(ticker?.priceChangePercent || "0"),
+        fundingRate: Number.parseFloat(ticker?.fundingRate || "0"),
+        openInterest: Number.parseFloat(ticker?.openInterest || "0"),
+        timestamp: Date.now(),
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`[bingx-swap-market] Failed to fetch market data: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * bingx-swap-trade: Perpetual futures trading operations
+   * 
+   * Execute trading operations on USDT-M perpetual futures:
+   * - Place orders (market, limit, stop-loss, take-profit)
+   * - Cancel orders
+   * - Set leverage
+   * - Set margin mode (isolated/cross)
+   * - Manage position mode (one-way/hedge)
+   * 
+   * @param operation - Type of trading operation
+   * @param params - Operation-specific parameters
+   * @returns Trade operation result
+   */
+  async executeSwapTrade(operation: string, params: Record<string, any>): Promise<any> {
+    try {
+      this.log(`[bingx-swap-trade] Executing ${operation} with params: ${JSON.stringify(params).substring(0, 200)}`)
+      
+      switch (operation) {
+        case "placeOrder":
+          return await this.placeOrder(
+            params.symbol,
+            params.side || "buy",
+            params.quantity,
+            params.price,
+            params.type || "limit",
+            params.options
+          )
+        
+        case "cancelOrder":
+          return await this.cancelOrder(params.symbol, params.orderId)
+        
+        case "setLeverage":
+          return await this.setLeverage(params.symbol, params.leverage)
+        
+        case "setMarginType":
+          return await this.setMarginType(params.symbol, params.marginType)
+        
+        case "setPositionMode":
+          return await this.setPositionMode(params.hedgeMode)
+        
+        default:
+          throw new Error(`Unknown operation: ${operation}`)
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`[bingx-swap-trade] Failed to execute ${operation}: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * bingx-swap-account: Query perpetual futures account information
+   * 
+   * Retrieve account data for USDT-M perpetual trading:
+   * - Account balance
+   * - Positions information
+   * - Open orders
+   * - Commission rates
+   * - Fund flow history
+   * 
+   * @param dataType - Type of account data to retrieve ("balance", "positions", "orders", "all")
+   * @returns Account information
+   */
+  async getSwapAccountInfo(dataType: string = "all"): Promise<any> {
+    try {
+      this.log(`[bingx-swap-account] Fetching account info: ${dataType}`)
+      
+      const result: any = {
+        success: true,
+        dataType,
+        timestamp: Date.now(),
+      }
+      
+      if (dataType === "balance" || dataType === "all") {
+        const balance = await this.getBalance()
+        if (balance.success) {
+          result.balance = {
+            total: balance.balance,
+            btcPrice: balance.btcPrice,
+            balances: balance.balances,
+          }
+          this.log(`✓ Balance: ${balance.balance.toFixed(4)} USDT`)
+        } else {
+          result.balanceError = balance.error
+        }
+      }
+      
+      if (dataType === "positions" || dataType === "all") {
+        const positions = await this.getPositions()
+        if (positions && Array.isArray(positions)) {
+          result.positions = positions
+          this.log(`✓ Positions: ${positions.length} open`)
+        } else {
+          result.positionsError = "Failed to fetch positions"
+        }
+      }
+      
+      if (dataType === "orders" || dataType === "all") {
+        const orders = await this.getOpenOrders()
+        if (orders && Array.isArray(orders)) {
+          result.openOrders = orders
+          this.log(`✓ Open Orders: ${orders.length}`)
+        } else {
+          result.ordersError = "Failed to fetch orders"
+        }
+      }
+      
+      return result
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`[bingx-swap-account] Failed to fetch account info: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
 }
