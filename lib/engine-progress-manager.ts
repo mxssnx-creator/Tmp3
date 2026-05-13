@@ -94,6 +94,40 @@ export interface EngineProgressState {
     main: StrategyStageMetrics
     real: StrategyStageMetrics
   }
+  // Batch operations metrics (NEW)
+  batchOperationMetrics: {
+    totalBatches: number
+    successfulBatches: number
+    failedBatches: number
+    totalOrdersPlaced: number
+    totalOrdersFailed: number
+    totalOrdersCancelled: number
+    lastBatchTime: string | null
+    avgBatchSize: number
+  }
+  // Close operations metrics (NEW)
+  closeOperationMetrics: {
+    totalClosures: number
+    automatedCloses: number
+    manualCloses: number
+    bulkCloses: number
+    closeSuccessRate: number
+    lastCloseTime: string | null
+  }
+  // Order query metrics (NEW)
+  orderQueryMetrics: {
+    totalQueries: number
+    queryTypes: Record<string, number>
+    lastQueryTime: string | null
+    cacheSizeBytes: number
+  }
+  // Safety metrics (NEW)
+  safetyMetrics: {
+    killSwitchesActivated: number
+    killSwitchesTriggered: number
+    emergencyCloseCount: number
+    lastKillSwitchTime: string | null
+  }
   // Per-symbol progress
   symbols: Record<string, SymbolProgress>
   // Errors
@@ -151,6 +185,40 @@ export class EngineProgressManager {
         base: { stage: 'base', setsCount: 0, evaluated: 0, passed: 0, failed: 0, passRate: 0, avgProfitFactor: 0, avgDrawdownTime: 0, avgPosEvalReal: 0 },
         main: { stage: 'main', setsCount: 0, evaluated: 0, passed: 0, failed: 0, passRate: 0, avgProfitFactor: 0, avgDrawdownTime: 0, avgPosEvalReal: 0 },
         real: { stage: 'real', setsCount: 0, evaluated: 0, passed: 0, failed: 0, passRate: 0, avgProfitFactor: 0, avgDrawdownTime: 0, avgPosEvalReal: 0 },
+      },
+      // NEW: Batch operation metrics
+      batchOperationMetrics: {
+        totalBatches: 0,
+        successfulBatches: 0,
+        failedBatches: 0,
+        totalOrdersPlaced: 0,
+        totalOrdersFailed: 0,
+        totalOrdersCancelled: 0,
+        lastBatchTime: null,
+        avgBatchSize: 0,
+      },
+      // NEW: Close operation metrics
+      closeOperationMetrics: {
+        totalClosures: 0,
+        automatedCloses: 0,
+        manualCloses: 0,
+        bulkCloses: 0,
+        closeSuccessRate: 0,
+        lastCloseTime: null,
+      },
+      // NEW: Order query metrics
+      orderQueryMetrics: {
+        totalQueries: 0,
+        queryTypes: {},
+        lastQueryTime: null,
+        cacheSizeBytes: 0,
+      },
+      // NEW: Safety metrics
+      safetyMetrics: {
+        killSwitchesActivated: 0,
+        killSwitchesTriggered: 0,
+        emergencyCloseCount: 0,
+        lastKillSwitchTime: null,
       },
       symbols: {},
       errors: [],
@@ -480,6 +548,80 @@ export class EngineProgressManager {
 
   getErrorCount(): number {
     return this.state.errors.length
+  }
+
+  // ============================================
+  // Batch Operations Tracking (NEW)
+  // ============================================
+
+  async recordBatchOperation(ordersPlaced: number, ordersFailed: number, success: boolean): Promise<void> {
+    const metrics = this.state.batchOperationMetrics
+    metrics.totalBatches++
+    if (success) {
+      metrics.successfulBatches++
+    } else {
+      metrics.failedBatches++
+    }
+    metrics.totalOrdersPlaced += ordersPlaced
+    metrics.totalOrdersFailed += ordersFailed
+    metrics.lastBatchTime = new Date().toISOString()
+    metrics.avgBatchSize = (metrics.totalOrdersPlaced + metrics.totalOrdersFailed) / metrics.totalBatches
+    this.addLog('info', `Batch operation: ${ordersPlaced} placed, ${ordersFailed} failed`)
+    await this.saveState()
+  }
+
+  // ============================================
+  // Close Operations Tracking (NEW)
+  // ============================================
+
+  async recordCloseOperation(automated: boolean, bulk: boolean = false): Promise<void> {
+    const metrics = this.state.closeOperationMetrics
+    metrics.totalClosures++
+    if (automated) {
+      metrics.automatedCloses++
+    } else {
+      metrics.manualCloses++
+    }
+    if (bulk) {
+      metrics.bulkCloses++
+    }
+    metrics.lastCloseTime = new Date().toISOString()
+    metrics.closeSuccessRate = (metrics.totalClosures - metrics.totalOrdersFailed) / metrics.totalClosures
+    this.addLog('info', `Close operation: ${automated ? 'automated' : 'manual'}${bulk ? ' (bulk)' : ''}`)
+    await this.saveState()
+  }
+
+  // ============================================
+  // Order Query Tracking (NEW)
+  // ============================================
+
+  async recordOrderQuery(queryType: string): Promise<void> {
+    const metrics = this.state.orderQueryMetrics
+    metrics.totalQueries++
+    metrics.queryTypes[queryType] = (metrics.queryTypes[queryType] || 0) + 1
+    metrics.lastQueryTime = new Date().toISOString()
+    this.addLog('info', `Order query: ${queryType}`)
+    await this.saveState()
+  }
+
+  // ============================================
+  // Safety Metrics Tracking (NEW)
+  // ============================================
+
+  async recordKillSwitchActivation(): Promise<void> {
+    const metrics = this.state.safetyMetrics
+    metrics.killSwitchesActivated++
+    metrics.lastKillSwitchTime = new Date().toISOString()
+    this.addLog('warn', `Kill switch activated`)
+    await this.saveState()
+  }
+
+  async recordKillSwitchTrigger(): Promise<void> {
+    const metrics = this.state.safetyMetrics
+    metrics.killSwitchesTriggered++
+    metrics.emergencyCloseCount++
+    this.addLog('warn', `Kill switch triggered - emergency close executed`)
+    await this.saveState()
   }
 
   // ============================================

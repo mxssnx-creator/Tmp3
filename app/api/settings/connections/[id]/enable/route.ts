@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
 import { initRedis, getConnection, updateConnection } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 /**
  * POST /api/settings/connections/[id]/enable
@@ -92,6 +93,37 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       "info",
       { is_enabled: shouldEnable },
     )
+
+    // Notify engine of enable/disable change and apply immediately
+    try {
+      await notifySettingsChanged(id, ["is_enabled"], { is_enabled: connection.is_enabled }, { is_enabled: updatedConnection.is_enabled })
+      const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+      const coordinator = getGlobalTradeEngineCoordinator()
+      
+      if (shouldEnable) {
+        // Engine should start if conditions are met
+        const { isConnectionMainProcessing, hasConnectionCredentials, isTruthyFlag } = await import(
+          "@/lib/connection-state-utils"
+        )
+        const canRun =
+          isConnectionMainProcessing(updatedConnection) &&
+          (hasConnectionCredentials(updatedConnection, 5, true) ||
+            isTruthyFlag((updatedConnection as any).is_predefined) ||
+            isTruthyFlag((updatedConnection as any).is_testnet) ||
+            isTruthyFlag((updatedConnection as any).demo_mode))
+        if (canRun) {
+          await coordinator.startMissingEngines([updatedConnection])
+        }
+      } else {
+        // Engine should stop if it was running
+        await coordinator.applyPendingChangesNow(id)
+      }
+    } catch (applyErr) {
+      console.warn(
+        `[v0] [Enable] coordinator recoordination failed for ${id}:`,
+        applyErr instanceof Error ? applyErr.message : String(applyErr),
+      )
+    }
 
     return NextResponse.json({
       success: true,

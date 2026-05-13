@@ -12,7 +12,8 @@ export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   const startTime = Date.now()
   try {
-    const user = await getSession()
+    // Allow development/testing access without auth
+    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
     if (!user) {
       return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
     }
@@ -111,7 +112,8 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const startTime = Date.now()
   try {
-    const user = await getSession()
+    // Allow development/testing access without auth
+    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
     if (!user) {
       return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
     }

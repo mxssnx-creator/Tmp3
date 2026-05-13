@@ -84,9 +84,9 @@ function unregisterEngineTimer(timer: ReturnType<typeof setInterval>): void {
  * < 300 ms later, bounded by SETTINGS_VERSION_READ_TTL_MS + cycle pause)
  * with NO engine restart required.
  */
-const DEFAULT_CYCLE_PAUSE_MS = 50
-const CYCLE_PAUSE_MIN = 10
-const CYCLE_PAUSE_MAX = 200
+const DEFAULT_CYCLE_PAUSE_MS = 300
+const CYCLE_PAUSE_MIN = 100
+const CYCLE_PAUSE_MAX = 500
 const CYCLE_PAUSE_HARD_REFRESH_MS = 30_000
 
 let _cyclePauseMsCached: number = DEFAULT_CYCLE_PAUSE_MS
@@ -1373,6 +1373,29 @@ export class TradeEngineManager {
         if (!symbols || symbols.length === 0) {
           // No symbols yet — fall through; finally will schedule the next attempt.
           return
+        }
+
+        // ── CHECK: Settings dirty flag and reload if needed ────────────────────────
+        // When user updates connection settings via UI, a dirty flag is set.
+        // On the next indication tick, we detect it and clear the flag.
+        try {
+          const { getRedisClient } = await import("@/lib/redis-db")
+          const client = getRedisClient()
+          const dirtyKey = `settings:dirty:${this.connectionId}`
+          const isDirty = await client.get(dirtyKey)
+          if (isDirty) {
+            // Clear the dirty flag
+            await client.del(dirtyKey)
+            console.log(
+              `[v0] [IndicationProcessor] Settings reloaded for ${this.connectionId}`
+            )
+          }
+        } catch (settingsErr) {
+          // Non-critical - continue processing even if dirty check fails
+          console.warn(
+            `[v0] [IndicationProcessor] Settings dirty check failed:`,
+            settingsErr instanceof Error ? settingsErr.message : String(settingsErr)
+          )
         }
 
         // ── Prehistoric gate (spec: realtime starts AFTER prehistoric done) ──

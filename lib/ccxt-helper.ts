@@ -144,13 +144,8 @@ export function validateCCXTCredentials(config: CCXTConnectionConfig): { valid: 
     errors.push("API Secret is required")
   }
 
-  if (config.apiKey && config.apiKey.length < 10) {
-    errors.push("API Key appears to be too short")
-  }
-
-  if (config.apiSecret && config.apiSecret.length < 10) {
-    errors.push("API Secret appears to be too short")
-  }
+  // Note: Don't validate credential length — valid credentials vary by exchange.
+  // Removed checks for apiKey.length < 10 and apiSecret.length < 10.
 
   return {
     valid: errors.length === 0,

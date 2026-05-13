@@ -92,6 +92,34 @@ export class StrategyProcessor {
     try {
       await initRedis()
       
+      // ── CHECK: Settings dirty flag and reload if needed ────────────────────────
+      // When user updates connection settings via UI, a dirty flag is set.
+      // On the next processor tick, we detect it and reload the configuration
+      // so engine immediately reflects the new settings.
+      try {
+        const { getRedisClient } = await import("@/lib/redis-db")
+        const client = getRedisClient()
+        const dirtyKey = `settings:dirty:${this.connectionId}`
+        const isDirty = await client.get(dirtyKey)
+        if (isDirty) {
+          // Clear the dirty flag
+          await client.del(dirtyKey)
+          
+          // Clear flow throttle cache so next cycle re-evaluates immediately
+          clearFlowThrottleForConnection(this.connectionId)
+          
+          console.log(
+            `[v0] [StrategyProcessor] Settings reloaded for ${this.connectionId} - flow throttle cleared, will re-evaluate next cycle`
+          )
+        }
+      } catch (settingsErr) {
+        // Non-critical - continue processing even if dirty check fails
+        console.warn(
+          `[v0] [StrategyProcessor] Settings dirty check failed:`,
+          settingsErr instanceof Error ? settingsErr.message : String(settingsErr)
+        )
+      }
+      
       // If no indications passed, retrieve from Redis (populated by indication processor)
       if (!indications || indications.length === 0) {
         indications = await this.getActiveIndications(symbol)

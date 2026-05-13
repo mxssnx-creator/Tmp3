@@ -350,6 +350,300 @@ export class TradeExecutionOrchestrator {
   }
 
   /**
+   * Execute close-all signal - closes all open positions for a symbol or globally
+   * Uses the new closeAllPositions API for efficiency
+   */
+  async executeCloseAllSignal(connectionId: string, symbol?: string): Promise<TradeExecutionResult> {
+    const startTime = Date.now()
+
+    try {
+      this.log(`Executing close-all signal${symbol ? ` for ${symbol}` : " globally"}`)
+
+      const connector = ExchangeConnectorFactory.getConnector(connectionId)
+      if (!connector) {
+        throw new Error(`Connector not found for ${connectionId}`)
+      }
+
+      // Use new API method for efficient bulk close
+      const result = await connector.executeSwapTrade("closeAllPositions", { symbol })
+
+      if (!result.success) {
+        throw new Error(result.error || "Failed to close all positions")
+      }
+
+      const closedPositions = result.success || []
+      this.log(`✓ Closed ${closedPositions.length} positions${symbol ? ` for ${symbol}` : " globally"}`)
+
+      // Update database
+      const positions = await dbCoordinator.getPositions(connectionId)
+      for (const [sym, pos] of Object.entries(positions)) {
+        if (!symbol || sym === symbol) {
+          await dbCoordinator.storePosition(connectionId, sym, {
+            ...pos,
+            status: "closed",
+            updated_at: new Date().toISOString(),
+          })
+        }
+      }
+
+      const duration = Date.now() - startTime
+      return {
+        success: true,
+        details: `Closed ${closedPositions.length} positions in ${duration}ms`,
+      }
+    } catch (err) {
+      const duration = Date.now() - startTime
+      this.error(`Close-all signal failed after ${duration}ms: ${err}`)
+      return {
+        success: false,
+        error: String(err),
+      }
+    }
+  }
+
+  /**
+   * Execute batch buy signals - places multiple orders efficiently using batchPlaceOrders
+   */
+  async executeBatchBuySignals(
+    connectionId: string,
+    signals: Array<{ symbol: string; signal: SignalEvaluation }>
+  ): Promise<Array<TradeExecutionResult>> {
+    const startTime = Date.now()
+
+    try {
+      if (signals.length === 0) {
+        return []
+      }
+
+      this.log(`Executing batch buy signals for ${signals.length} symbols`)
+
+      const connector = ExchangeConnectorFactory.getConnector(connectionId)
+      if (!connector) {
+        throw new Error(`Connector not found for ${connectionId}`)
+      }
+
+      // Get balance once
+      const balance = await connector.getBalance()
+      if (!balance.success) {
+        throw new Error(`Failed to fetch balance: ${balance.error}`)
+      }
+
+      // Build order array
+      const orders = []
+      const resultMap: Record<string, TradeExecutionResult> = {}
+
+      for (const { symbol, signal } of signals) {
+        const size = await this.calculatePositionSize(connectionId, balance.balance, null)
+
+        if (size > 0) {
+          orders.push({
+            symbol,
+            side: "buy",
+            quantity: size,
+            type: "market",
+          })
+
+          resultMap[symbol] = {
+            success: false,
+            size,
+          }
+        } else {
+          resultMap[symbol] = {
+            success: false,
+            error: "Position size too small",
+          }
+        }
+      }
+
+      if (orders.length === 0) {
+        this.log("No valid orders to place in batch")
+        return Object.values(resultMap)
+      }
+
+      // Use new API method for efficient batch placement (max 5 per call)
+      const batchSize = 5
+      const allResults: Array<any> = []
+
+      for (let i = 0; i < orders.length; i += batchSize) {
+        const batch = orders.slice(i, Math.min(i + batchSize, orders.length))
+        const result = await connector.executeSwapTrade("batchPlaceOrders", { orders: batch })
+
+        if (result.success && result.orders) {
+          allResults.push(...result.orders)
+        }
+
+        if (result.errors) {
+          this.error(`Batch ${Math.floor(i / batchSize) + 1} had errors: ${JSON.stringify(result.errors)}`)
+        }
+      }
+
+      // Update results and database
+      for (const order of allResults) {
+        const symbol = order.symbol || ""
+        if (resultMap[symbol]) {
+          resultMap[symbol].success = true
+          resultMap[symbol].orderId = order.orderId
+          resultMap[symbol].entryPrice = order.price
+
+          // Store in database
+          await dbCoordinator.storeOrder(connectionId, order.orderId, {
+            id: order.orderId,
+            connectionId,
+            symbol,
+            side: "buy",
+            quantity: order.quantity,
+            price: order.price,
+            status: "pending",
+            createdAt: new Date().toISOString(),
+          })
+
+          await dbCoordinator.storePosition(connectionId, symbol, {
+            id: `pos_${Date.now()}`,
+            connectionId,
+            symbol,
+            side: "long",
+            size: order.quantity,
+            entryPrice: order.price,
+            currentPrice: order.price,
+            unrealizedPnl: 0,
+            leverage: 1,
+            status: "open",
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+        }
+      }
+
+      const duration = Date.now() - startTime
+      const successCount = Object.values(resultMap).filter(r => r.success).length
+      this.log(`✓ Batch buy signals executed in ${duration}ms: ${successCount}/${signals.length} successful`)
+
+      return Object.values(resultMap)
+    } catch (err) {
+      const duration = Date.now() - startTime
+      this.error(`Batch buy signals failed after ${duration}ms: ${err}`)
+
+      return signals.map(s => ({
+        success: false,
+        error: String(err),
+      }))
+    }
+  }
+
+  /**
+   * Execute bulk order cancellation
+   */
+  async executeBulkCancelSignal(
+    connectionId: string,
+    symbol: string,
+    orderIds: string[]
+  ): Promise<TradeExecutionResult> {
+    const startTime = Date.now()
+
+    try {
+      this.log(`Executing bulk cancel for ${orderIds.length} orders on ${symbol}`)
+
+      const connector = ExchangeConnectorFactory.getConnector(connectionId)
+      if (!connector) {
+        throw new Error(`Connector not found for ${connectionId}`)
+      }
+
+      // Use new API method for efficient batch cancellation
+      const result = await connector.executeSwapTrade("batchCancelOrders", { symbol, orderIds })
+
+      if (!result.success) {
+        throw new Error(result.error || "Failed to cancel orders")
+      }
+
+      const successCount = result.success?.length || 0
+      const failedCount = result.failed?.length || 0
+
+      this.log(`✓ Cancelled ${successCount} orders, ${failedCount} failed`)
+
+      const duration = Date.now() - startTime
+      return {
+        success: true,
+        details: `Cancelled ${successCount}/${orderIds.length} orders in ${duration}ms`,
+      }
+    } catch (err) {
+      const duration = Date.now() - startTime
+      this.error(`Bulk cancel failed after ${duration}ms: ${err}`)
+      return {
+        success: false,
+        error: String(err),
+      }
+    }
+  }
+
+  /**
+   * Query open orders for a symbol
+   */
+  async queryOpenOrders(connectionId: string, symbol: string): Promise<Array<any>> {
+    try {
+      const connector = ExchangeConnectorFactory.getConnector(connectionId)
+      if (!connector) {
+        throw new Error(`Connector not found for ${connectionId}`)
+      }
+
+      const result = await connector.executeSwapTrade("getOpenOrders", { symbol })
+
+      if (!result.success) {
+        this.error(`Failed to query open orders: ${result.error}`)
+        return []
+      }
+
+      return result.orders || []
+    } catch (err) {
+      this.error(`Query open orders failed: ${err}`)
+      return []
+    }
+  }
+
+  /**
+   * Set kill switch for automatic order cancellation after timeout
+   */
+  async setEmergencyKillSwitch(connectionId: string, timeoutSeconds: number): Promise<TradeExecutionResult> {
+    const startTime = Date.now()
+
+    try {
+      if (timeoutSeconds < 10 || timeoutSeconds > 120) {
+        throw new Error("Timeout must be between 10 and 120 seconds")
+      }
+
+      this.log(`Setting kill switch with ${timeoutSeconds}s timeout`)
+
+      const connector = ExchangeConnectorFactory.getConnector(connectionId)
+      if (!connector) {
+        throw new Error(`Connector not found for ${connectionId}`)
+      }
+
+      const result = await connector.executeSwapTrade("setKillSwitch", {
+        type: "ACTIVATE",
+        timeOut: timeoutSeconds,
+      })
+
+      if (!result.success) {
+        throw new Error(result.error || "Failed to set kill switch")
+      }
+
+      const duration = Date.now() - startTime
+      this.log(`✓ Kill switch activated: ${result.status} (trigger: ${result.triggerTime}ms)`)
+
+      return {
+        success: true,
+        details: `Kill switch active for ${timeoutSeconds}s`,
+      }
+    } catch (err) {
+      const duration = Date.now() - startTime
+      this.error(`Kill switch failed after ${duration}ms: ${err}`)
+      return {
+        success: false,
+        error: String(err),
+      }
+    }
+  }
+
+  /**
    * Calculate position size based on risk and available balance
    */
   private async calculatePositionSize(connectionId: string, availableBalance: number, existingPosition: any): Promise<number> {

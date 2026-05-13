@@ -102,6 +102,7 @@ export async function getConnectionSettings(connectionId: string): Promise<Conne
 
 /**
  * Update settings for a specific connection
+ * Also invalidates caches and notifies processors to reload configuration
  */
 export async function updateConnectionSettings(
   connectionId: string,
@@ -123,6 +124,43 @@ export async function updateConnectionSettings(
     
     // Save to Redis
     await client.set(key, JSON.stringify(updated))
+    
+    // ── CRITICAL: Invalidate all related caches ──────────────────────────────
+    // When settings change, we need to:
+    // 1. Clear any cached config in strategy processors
+    // 2. Notify the engine to reload settings
+    // 3. Force a config refresh on next tick
+    
+    try {
+      // Mark settings as dirty - processors should reload on next cycle
+      await client.set(`settings:dirty:${connectionId}`, "1", { EX: 300 }) // 5 min TTL
+      
+      // Clear any cached advanced configs for this connection
+      await client.del(`cached_config:${connectionId}`)
+      
+      // Invalidate strategy processor cache
+      await client.del(`strategy_processor_cache:${connectionId}`)
+      
+      // Force engine to reload connection state
+      const connKey = `connection:${connectionId}`
+      const connData = await client.hgetall(connKey)
+      if (connData && Object.keys(connData).length > 0) {
+        // Update last_settings_update timestamp to trigger engine refresh
+        await client.hset(connKey, {
+          last_settings_update: new Date().toISOString(),
+        })
+      }
+      
+      console.log(
+        `[v0] [Settings] Invalidated caches and marked dirty for ${connectionId} - processors will reload on next cycle`
+      )
+    } catch (cacheErr) {
+      console.warn(
+        `[v0] [Settings] Cache invalidation warning for ${connectionId}:`,
+        cacheErr instanceof Error ? cacheErr.message : String(cacheErr)
+      )
+      // Non-fatal - settings are saved even if cache invalidation fails
+    }
     
     return updated
   } catch (error) {

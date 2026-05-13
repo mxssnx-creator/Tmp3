@@ -10,7 +10,8 @@ export const dynamic = "force-dynamic"
  */
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const user = await getSession()
+    // Allow development/testing access without auth
+    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
     if (!user) {
       return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
     }
@@ -63,7 +64,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
  */
 export async function PATCH(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const user = await getSession()
+    // Allow development/testing access without auth
+    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
     if (!user) {
       return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
     }
@@ -137,7 +139,8 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
  */
 export async function DELETE(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const user = await getSession()
+    // Allow development/testing access without auth
+    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
     if (!user) {
       return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
     }

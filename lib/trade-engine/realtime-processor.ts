@@ -216,6 +216,33 @@ export class RealtimeProcessor {
    */
   async processRealtimeUpdates(): Promise<{ updates: number }> {
     try {
+      // ── CHECK: Settings dirty flag and reload if needed ────────────────────────
+      // When user updates connection settings via UI, a dirty flag is set.
+      // On the next realtime tick, we detect it and clear the flag so
+      // position management picks up new settings on next open/close.
+      try {
+        const client = getRedisClient()
+        const dirtyKey = `settings:dirty:${this.connectionId}`
+        const isDirty = await client.get(dirtyKey)
+        if (isDirty) {
+          // Clear the dirty flag
+          await client.del(dirtyKey)
+          
+          // Clear prev-set cache to force fresh context on next position update
+          this.prevSetCache.clear()
+          
+          console.log(
+            `[v0] [RealtimeProcessor] Settings reloaded for ${this.connectionId} - caches cleared`
+          )
+        }
+      } catch (settingsErr) {
+        // Non-critical - continue processing even if dirty check fails
+        console.warn(
+          `[v0] [RealtimeProcessor] Settings dirty check failed:`,
+          settingsErr instanceof Error ? settingsErr.message : String(settingsErr)
+        )
+      }
+
       // Advisory readiness flag — tells processPosition whether it's
       // safe to attach prev-set context. Never blocks Phase A work.
       const prehistoricReady = await this.isPrehistoricReady()
@@ -764,7 +791,9 @@ export class RealtimeProcessor {
       if (!connection) return
       const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
       const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
-      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) return
+      // Paper-only if either key is empty. Do NOT check length — valid
+      // credentials vary by exchange (some are short, some long).
+      if (!apiKey || !apiSecret) return
 
       const { createExchangeConnector } = await import("@/lib/exchange-connectors")
       const connector = await createExchangeConnector(connection.exchange, {
@@ -890,65 +919,9 @@ export class RealtimeProcessor {
       }
       const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
       const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
-      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) {
-        // Paper-only connection — nothing to sync against on the exchange
-        // side. The simulated-position sweep above already handled all
-        // close paths for paper trades, so we return silently here.
-        return
-      }
-
-      const { createExchangeConnector } = await import("@/lib/exchange-connectors")
-      const connector = await createExchangeConnector(connection.exchange, {
-        apiKey,
-        apiSecret,
-        apiType: connection.api_type,
-        contractType: connection.contract_type,
-        isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
-      })
-      if (!connector) {
-        console.warn(`[v0] [Realtime] live sync skipped: createExchangeConnector returned null for ${this.connectionId}`)
-        return
-      }
-
-      const { syncWithExchange } = await import("@/lib/trade-engine/stages/live-stage")
-      await syncWithExchange(this.connectionId, connector)
-    } catch (err) {
-      console.warn(
-        `[v0] [Realtime] live syncWithExchange error for ${this.connectionId}:`,
-        err instanceof Error ? err.message : String(err),
-      )
-    } finally {
-      this.liveSyncInFlight = false
-    }
-  }
-
-      // ── REMOVED the prior LLEN short-circuit ────────────────────────
-      // The previous version short-circuited when `live:positions:{id}`
-      // LLEN returned 0. That looked like a sensible optimization but
-      // turned out to be the root cause of the operator's repeated
-      // "Live Positions not getting closed" complaint:
-      //
-      //   - Positions placed by the system in earlier runs / before a
-      //     savePosition LPUSH lost their TTL, OR positions opened by
-      //     the operator directly on the exchange, are NEVER in the
-      //     Redis open-index. With the LLEN guard, `syncWithExchange`
-      //     was therefore never invoked — so the orphan-adoption sweep
-      //     inside it (added below) never ran, and the exchange-side
-      //     positions stayed open indefinitely with no control orders.
-      //
-      // The cost of always calling `syncWithExchange` when there are
-      // zero tracked positions is one `getLivePositions` (cheap LRANGE)
-      // plus, every 5 s, one `getPositions()` exchange call inside the
-      // orphan-adoption sweep. Fine.
-      const { getConnection } = await import("@/lib/redis-db")
-      const connection = await getConnection(this.connectionId)
-      if (!connection) {
-        console.warn(`[v0] [Realtime] live sync skipped: no connection record for ${this.connectionId}`)
-        return
-      }
-      const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
-      const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
-      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) {
+      // Paper-only if either key is empty. Do NOT check length — valid
+      // credentials vary by exchange (some are short, some long).
+      if (!apiKey || !apiSecret) {
         // Paper-only connection — nothing to sync against on the exchange
         // side. The simulated-position sweep above already handled all
         // close paths for paper trades, so we return silently here.

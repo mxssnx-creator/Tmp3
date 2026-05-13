@@ -1,5 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { sql } from "@/lib/db"
+import { initRedis, getConnection } from "@/lib/redis-db"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 // PATCH /api/settings/connections/[id]/preset-type - Assign preset type to connection
 export async function PATCH(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -26,6 +28,37 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
           updated_at = CURRENT_TIMESTAMP
       WHERE id = ${id}
     `
+
+    // Notify engine of preset type change
+    try {
+      await initRedis()
+      const connection = await getConnection(id)
+      await notifySettingsChanged(id, ["preset_type_id"])
+      const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+      const coordinator = getGlobalTradeEngineCoordinator()
+      await coordinator.applyPendingChangesNow(id)
+      
+      // Recoordinate engine if needed
+      if (connection) {
+        const { isConnectionMainProcessing, hasConnectionCredentials, isTruthyFlag } = await import(
+          "@/lib/connection-state-utils"
+        )
+        const shouldRun =
+          isConnectionMainProcessing(connection) &&
+          (hasConnectionCredentials(connection, 5, true) ||
+            isTruthyFlag((connection as any).is_predefined) ||
+            isTruthyFlag((connection as any).is_testnet) ||
+            isTruthyFlag((connection as any).demo_mode))
+        if (shouldRun) {
+          await coordinator.startMissingEngines([connection])
+        }
+      }
+    } catch (applyErr) {
+      console.warn(
+        `[v0] [PresetType] coordinator recoordination failed for ${id}:`,
+        applyErr instanceof Error ? applyErr.message : String(applyErr),
+      )
+    }
 
     return NextResponse.json({ success: true })
   } catch (error) {

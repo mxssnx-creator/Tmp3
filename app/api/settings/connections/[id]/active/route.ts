@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
 import { initRedis, getConnection, updateConnection } from "@/lib/redis-db"
+import { notifySettingsChanged } from "@/lib/settings-coordinator"
 
 // POST - Add connection to active connections (set is_enabled_dashboard flag)
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -31,6 +32,33 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     const logMsg = `[v0] [ActiveConnection] ✓ ENABLED: ${connection.name} (${connectionId}) | Exchange: ${connection.exchange} | Base: ${["bybit", "bingx", "pionex", "orangex", "binance", "okx"].includes((connection.exchange || "").toLowerCase())}`
     console.log(logMsg)
     await SystemLogger.logConnection("Dashboard: Enabled active connection", connectionId, "info")
+
+    // Notify engine of dashboard activation and recoordinate
+    try {
+      await notifySettingsChanged(connectionId, ["is_enabled_dashboard", "is_assigned"])
+      const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+      const coordinator = getGlobalTradeEngineCoordinator()
+      await coordinator.applyPendingChangesNow(connectionId)
+      
+      // Start engine if it should be running
+      const { isConnectionMainProcessing, hasConnectionCredentials, isTruthyFlag } = await import(
+        "@/lib/connection-state-utils"
+      )
+      const shouldRun =
+        isConnectionMainProcessing(updatedConnection) &&
+        (hasConnectionCredentials(updatedConnection, 5, true) ||
+          isTruthyFlag((updatedConnection as any).is_predefined) ||
+          isTruthyFlag((updatedConnection as any).is_testnet) ||
+          isTruthyFlag((updatedConnection as any).demo_mode))
+      if (shouldRun) {
+        await coordinator.startMissingEngines([updatedConnection])
+      }
+    } catch (applyErr) {
+      console.warn(
+        `[v0] [ActiveConnection POST] coordinator recoordination failed for ${connectionId}:`,
+        applyErr instanceof Error ? applyErr.message : String(applyErr),
+      )
+    }
 
     return NextResponse.json({
       success: true,
@@ -77,6 +105,19 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     const logMsg = `[v0] [ActiveConnection] ✗ REMOVED: ${connection.name} (${connectionId}) | Exchange: ${connection.exchange}`
     console.log(logMsg)
     await SystemLogger.logConnection("Dashboard: Removed active connection", connectionId, "info")
+
+    // Notify engine of removal from dashboard
+    try {
+      await notifySettingsChanged(connectionId, ["is_enabled_dashboard", "is_assigned"])
+      const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+      const coordinator = getGlobalTradeEngineCoordinator()
+      await coordinator.applyPendingChangesNow(connectionId)
+    } catch (applyErr) {
+      console.warn(
+        `[v0] [ActiveConnection DELETE] coordinator recoordination failed for ${connectionId}:`,
+        applyErr instanceof Error ? applyErr.message : String(applyErr),
+      )
+    }
 
     return NextResponse.json({
       success: true,
