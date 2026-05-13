@@ -509,15 +509,34 @@ export function ActiveConnectionCard({
           avgHoldTimeLive:     sd.live?.avgDrawdownTime || 0, // minutes
           avgPosEvalReal:      sd.real?.avgPosEvalReal  || 0,
           avgPosEvalLive:      sd.live?.avgPosEvalReal  || 0, // ROI fraction
-          // Evaluated / passed counts from per-stage detail
-          baseEvaluated:    sd.base?.evaluated   || (strat.base || 0),
-          basePassed:       sd.base?.passed       || (strat.main || 0),
-          mainEvaluated:    sd.main?.evaluated   || (strat.main || 0),
-          mainPassed:       sd.main?.passed       || (strat.real || 0),
-          realEvaluated:    sd.real?.evaluated   || (strat.real || 0),
-          realPassed:       sd.real?.passed       || (strat.real || 0),
-          liveEvaluated:    sd.live?.evaluated   || 0,  // orders placed
-          livePassed:       sd.live?.passed      || 0,  // orders filled
+          // ── Evaluated / passed counts (per-stage, NO cross-tier mixing) ──
+          // Bug history: previous implementation cross-fell-back per stage,
+          // e.g. `basePassed || (strat.main || 0)` meant "if Base has no
+          // explicit `passed` counter, use the CURRENT Main set count as a
+          // proxy for `things that passed gating into the next tier`."
+          // That premise is broken on two axes:
+          //   1. `evaluated`/`passed` are CUMULATIVE per-cycle counters,
+          //      while `strat.*` are CURRENT live set counts — temporal
+          //      mismatch that produces wild values after set decay/bloom.
+          //   2. Falling back to the NEXT tier's count regularly yielded
+          //      `passed > evaluated` (mathematically impossible), e.g.
+          //      "Main 1.9K sets, eval 2/6 pass" where the 6 was actually
+          //      `strat.real`, not anything that Main itself passed.
+          // Fix: each tier reads ONLY its own counters from `sd.<tier>.*`.
+          // We also switch `||` → `??` so a legitimate `0` is not treated
+          // as "missing" and the display shows real zeros honestly.
+          // The display-side clamp `passed = min(passed, evaluated)` below
+          // is a final safety net against any backend invariant breakage.
+          baseEvaluated:    Math.max(0, sd.base?.evaluated ?? 0),
+          basePassed:       Math.max(0, Math.min(sd.base?.passed ?? 0, sd.base?.evaluated ?? Number.POSITIVE_INFINITY)),
+          mainEvaluated:    Math.max(0, sd.main?.evaluated ?? 0),
+          mainPassed:       Math.max(0, Math.min(sd.main?.passed ?? 0, sd.main?.evaluated ?? Number.POSITIVE_INFINITY)),
+          realEvaluated:    Math.max(0, sd.real?.evaluated ?? 0),
+          realPassed:       Math.max(0, Math.min(sd.real?.passed ?? 0, sd.real?.evaluated ?? Number.POSITIVE_INFINITY)),
+          // Live: `evaluated` = orders placed, `passed` = orders filled.
+          // Same clamp keeps `filled ≤ placed`.
+          liveEvaluated:    Math.max(0, sd.live?.evaluated ?? 0),
+          livePassed:       Math.max(0, Math.min(sd.live?.passed ?? 0, sd.live?.evaluated ?? Number.POSITIVE_INFINITY)),
           countPosEvalReal: sd.real?.countPosEval || 0,
           countPosEvalLive: sd.live?.countPosEval || 0,
           liveTotalPnl:     sd.live?.totalPnl    || 0,
