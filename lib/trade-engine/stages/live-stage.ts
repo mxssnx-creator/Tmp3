@@ -270,6 +270,37 @@ async function incrementMetric(connectionId: string, field: string, by = 1): Pro
   }
 }
 
+/**
+ * Bumps a per-symbol/direction order counter on the
+ * `live_orders_by_symbol:{connectionId}` hash. Field naming is
+ * `{SYMBOL}:{direction}:{kind}` so a single HGETALL on the stats
+ * endpoint recovers the full per-symbol breakdown for the dashboard's
+ * "Orders BTCUSDT L:3 / S:2" chip strip.
+ *
+ * `kind` is one of "placed" | "filled". Stays in lock-step with the
+ * existing global `live_orders_placed_count` / `live_orders_filled_count`
+ * counters so totals reconcile across the two views.
+ */
+async function incrementOrdersBySymbol(
+  connectionId: string,
+  symbol: string,
+  direction: "long" | "short",
+  kind: "placed" | "filled",
+): Promise<void> {
+  if (!symbol || !direction) return
+  try {
+    const client = getRedisClient()
+    const key = `live_orders_by_symbol:${connectionId}`
+    const field = `${symbol}:${direction}:${kind}`
+    await Promise.all([
+      client.hincrby(key, field, 1),
+      client.expire(key, 7 * 24 * 60 * 60),
+    ])
+  } catch {
+    /* non-critical */
+  }
+}
+
 async function fetchCurrentPrice(symbol: string): Promise<number> {
   try {
     const client = getRedisClient()
@@ -558,6 +589,7 @@ async function accumulateIntoLivePosition(
     // `live_orders_accumulated_count` still tracks accumulation as
     // a separate metric for operators who want to break it out.
     await incrementMetric(connectionId, "live_orders_placed_count")
+    await incrementOrdersBySymbol(connectionId, symbol, existing.direction, "placed")
 
     // ── 3. Poll the new fill ──────────────────────────────────────────
     const fill = await pollOrderFill(exchangeConnector, symbol, addOrderId)
@@ -630,6 +662,7 @@ async function accumulateIntoLivePosition(
       `+${newFillQty.toFixed(6)} @ ${newFillPrice.toFixed(8)} → totalQty=${totalQty.toFixed(6)} avgEntry=${newAvg.toFixed(8)} accCount=${existing.accumulationCount}`,
     )
     await incrementMetric(connectionId, "live_orders_filled_count")
+    await incrementOrdersBySymbol(connectionId, symbol, existing.direction, "filled")
     await incrementMetric(connectionId, "live_orders_accumulated_count")
     await incrementMetric(connectionId, "live_volume_usd_total", Math.round(newNotional))
     // ── Used-balance (margin) counter ──────────────────────────────
@@ -2001,6 +2034,7 @@ export async function executeLivePosition(
     livePosition.status = "placed"
     pushStep(livePosition, "place_order", true, `orderId=${livePosition.orderId}`)
     await incrementMetric(connectionId, "live_orders_placed_count")
+    await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "placed")
     // Successful placement — reset the margin error consecutive-failure counter
     // so the backoff resets to the shortest cooldown on the next failure.
     marginErrorCooldownByConnection.delete(connectionId)
@@ -2087,6 +2121,7 @@ export async function executeLivePosition(
       livePosition.status = livePosition.remainingQuantity <= 0.000001 ? "filled" : "partially_filled"
       pushStep(livePosition, "poll_fill", true, `filled=${fill.filledQty} @ ${fill.filledPrice} via=${fill.status}`)
       await incrementMetric(connectionId, "live_orders_filled_count")
+      await incrementOrdersBySymbol(connectionId, realPosition.symbol, realPosition.direction, "filled")
       await logProgressionEvent(connectionId, "live_trading", "info", `Entry filled for ${realPosition.symbol}`, {
         orderId: livePosition.orderId,
         filledQty: fill.filledQty,
@@ -2982,6 +3017,7 @@ export async function reconcileLivePositions(
               pos.updatedAt = Date.now()
               justFilled = true
               await incrementMetric(connectionId, "live_orders_filled_count")
+              await incrementOrdersBySymbol(connectionId, pos.symbol, pos.direction, "filled")
             }
 
             // Layer 2: try getOrder() for more precise data and to catch rejections.
@@ -3002,6 +3038,7 @@ export async function reconcileLivePositions(
                   if (!justFilled) {
                     justFilled = true
                     await incrementMetric(connectionId, "live_orders_filled_count")
+                    await incrementOrdersBySymbol(connectionId, pos.symbol, pos.direction, "filled")
                   }
                 } else if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
                   // Entry order was cancelled/rejected — close the position record.
@@ -3591,6 +3628,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               position.updatedAt = Date.now()
               justFilled = true
               await incrementMetric(connectionId, "live_orders_filled_count")
+              await incrementOrdersBySymbol(connectionId, position.symbol, position.direction, "filled")
               await logProgressionEvent(
                 connectionId,
                 "live_trading",

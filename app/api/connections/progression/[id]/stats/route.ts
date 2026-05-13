@@ -95,6 +95,7 @@ export async function GET(
       engineProgression,
       prehistoricSymbolCount,
       axisWindowsHashRaw,
+      ordersBySymbolRaw,
     ] = await Promise.all([
       client.hgetall(`progression:${connectionId}`).catch(() => null),
       client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
@@ -107,12 +108,20 @@ export async function GET(
       // `${axis}_${N}_pos` for axis ∈ {prev, last, cont, pause} and the
       // step-1 windows documented in StrategySet.axisWindows.
       client.hgetall(`axis_windows:${connectionId}`).catch(() => null),
+      // Per-symbol/direction order counters written by live-stage.ts via
+      // `incrementOrdersBySymbol`. Hash field layout is
+      // `{SYMBOL}:{direction}:{kind}` so a single HGETALL recovers the
+      // entire breakdown for the dashboard's "Orders BTCUSDT L:3 / S:2"
+      // chip strip. Stays in lock-step with the global
+      // `live_orders_placed_count` / `live_orders_filled_count` totals.
+      client.hgetall(`live_orders_by_symbol:${connectionId}`).catch(() => null),
     ])
 
     const progHash: Record<string, string>       = progHashRaw       || {}
     const prehistoricHash: Record<string, string> = prehistoricHashRaw || {}
     const realtimeHash: Record<string, string>   = realtimeHashRaw   || {}
     const axisWindowsHash: Record<string, string> = axisWindowsHashRaw || {}
+    const ordersBySymbolHash: Record<string, string> = ordersBySymbolRaw || {}
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
@@ -707,6 +716,18 @@ export async function GET(
       0,
     )
     const nowMsAgg = Date.now()
+    // Per-symbol position groupings (long/short + USD totals) — surfaced as
+    // `openPositions.live.bySymbol` so the dashboard can render
+    // "BTCUSDT L:2 S:1" chips beneath the Positions row. Source is the same
+    // `livePositionSetRelations` array used for the portfolio aggregates, so
+    // the per-symbol totals always reconcile with the global numbers.
+    const bySymbolMap = new Map<string, {
+      long: number
+      short: number
+      volumeUsd: number
+      marginUsd: number
+      unrealizedPnl: number
+    }>()
     for (const p of livePositionSetRelations) {
       liveAggTotalUnrealizedPnl += p.unrealizedPnl || 0
       liveAggTotalMarginUsd     += p.marginUsd || 0
@@ -722,6 +743,20 @@ export async function GET(
         liveAggNearLiquidation++
       }
       if (p.syncedAt > 0 && nowMsAgg - p.syncedAt > 60_000) liveAggStaleSync++
+
+      // Per-symbol roll-up
+      const sym = p.symbol || ""
+      if (sym) {
+        const e = bySymbolMap.get(sym) || {
+          long: 0, short: 0, volumeUsd: 0, marginUsd: 0, unrealizedPnl: 0,
+        }
+        if (p.direction === "long") e.long++
+        else if (p.direction === "short") e.short++
+        e.volumeUsd     += p.volumeUsd     || 0
+        e.marginUsd     += p.marginUsd     || 0
+        e.unrealizedPnl += p.unrealizedPnl || 0
+        bySymbolMap.set(sym, e)
+      }
     }
     liveAggTotalUnrealizedPnl = Math.round(liveAggTotalUnrealizedPnl * 100) / 100
     liveAggTotalMarginUsd     = Math.round(liveAggTotalMarginUsd * 100) / 100
@@ -729,6 +764,19 @@ export async function GET(
     const liveAggPortfolioRoiPct = liveAggTotalMarginUsd > 0
       ? Math.round((liveAggTotalUnrealizedPnl / liveAggTotalMarginUsd) * 10000) / 100
       : 0
+    // Frozen array for `openPositions.live.bySymbol`. Sorted so the symbol
+    // with the most open positions comes first — keeps the UI chip strip
+    // stable across polls.
+    const liveBySymbol = Array.from(bySymbolMap.entries())
+      .map(([symbol, v]) => ({
+        symbol,
+        long:          v.long,
+        short:         v.short,
+        volumeUsd:     Math.round(v.volumeUsd     * 100) / 100,
+        marginUsd:     Math.round(v.marginUsd     * 100) / 100,
+        unrealizedPnl: Math.round(v.unrealizedPnl * 100) / 100,
+      }))
+      .sort((a, b) => (b.long + b.short) - (a.long + a.short))
 
     const realtimeIsActive =
       realtimeIndicationCycles > 0 ||
@@ -1814,6 +1862,12 @@ export async function GET(
               staleSync:          liveAggStaleSync,
               consolidatedSetsTotal: liveAggConsolidatedSets,
             },
+            // Per-symbol position groupings (count of long/short positions +
+            // USD totals, sorted by descending size). Lets the dashboard
+            // render "BTCUSDT L:2 S:1" chips under the Positions row without
+            // re-deriving from `positions[]`. Empty array when no live
+            // positions exist.
+            bySymbol: liveBySymbol,
           },
           overall: {
             // Pipeline-health counters. Semantically distinct from
@@ -1889,6 +1943,45 @@ export async function GET(
           const closed = n(progHash.live_positions_closed_count)
           const wins   = n(progHash.live_wins_count)
           return closed > 0 ? Math.round((wins / closed) * 1000) / 10 : 0
+        })(),
+        // Per-symbol/direction order counters — folds the
+        // `live_orders_by_symbol:{id}` HGETALL into an array of
+        // `{ symbol, long: { placed, filled }, short: { placed, filled } }`
+        // rows so the UI can render "BTCUSDT L:3/2 S:1/1" chips after the
+        // global totals. Empty array when no orders have been placed yet.
+        ordersBySymbol: (() => {
+          const map = new Map<string, {
+            long:  { placed: number; filled: number }
+            short: { placed: number; filled: number }
+          }>()
+          for (const [field, raw] of Object.entries(ordersBySymbolHash)) {
+            // Field format: `{SYMBOL}:{direction}:{kind}`. Direction must
+            // be one of long|short and kind one of placed|filled — anything
+            // else is treated as malformed and skipped.
+            const lastColon = field.lastIndexOf(":")
+            const midColon  = field.lastIndexOf(":", lastColon - 1)
+            if (lastColon < 0 || midColon < 0) continue
+            const symbol    = field.slice(0, midColon)
+            const direction = field.slice(midColon + 1, lastColon)
+            const kind      = field.slice(lastColon + 1)
+            if (!symbol) continue
+            if (direction !== "long" && direction !== "short") continue
+            if (kind !== "placed" && kind !== "filled") continue
+            const value = n(raw)
+            if (value <= 0) continue
+            const entry = map.get(symbol) || {
+              long:  { placed: 0, filled: 0 },
+              short: { placed: 0, filled: 0 },
+            }
+            entry[direction][kind] = value
+            map.set(symbol, entry)
+          }
+          return Array.from(map.entries())
+            .map(([symbol, v]) => ({ symbol, ...v }))
+            .sort((a, b) =>
+              (b.long.placed + b.short.placed + b.long.filled + b.short.filled) -
+              (a.long.placed + a.short.placed + a.long.filled + a.short.filled),
+            )
         })(),
       },
 

@@ -212,6 +212,33 @@ export function ActiveConnectionCard({
     realOpen: number
     liveOpenPositions: number
     liveVolumeUsd: number
+    // ── Per-symbol roll-ups (live exchange) ─────────────────────
+    // `liveBySymbol`     — open positions grouped by symbol/direction.
+    //                       Source: `openPositions.live.bySymbol` from /stats.
+    // `liveOrdersBySymbol` — cumulative placed/filled orders grouped by
+    //                       symbol/direction. Source: `liveExecution.ordersBySymbol`.
+    // Both surface in the Realtime Execution panel as "BTCUSDT L:2 S:1"
+    // chip strips so the operator can read the per-symbol breakdown
+    // without opening the positions dialog.
+    liveBySymbol: Array<{
+      symbol: string
+      long: number
+      short: number
+      volumeUsd: number
+      marginUsd: number
+      unrealizedPnl: number
+    }>
+    liveOrdersBySymbol: Array<{
+      symbol: string
+      long:  { placed: number; filled: number }
+      short: { placed: number; filled: number }
+    }>
+    // ── Portfolio-wide live aggregate (single canonical source) ─
+    // Mirrored from `openPositions.live.aggregate.*`. Used for the
+    // PnL / ROI labels in the Realtime Execution panel so the values
+    // never diverge across render sites.
+    liveAggUnrealizedPnl: number
+    liveAggPortfolioRoiPct: number
     // Prehistoric metadata
     rangeDays: number
     timeframeSeconds: number
@@ -578,6 +605,16 @@ export function ActiveConnectionCard({
           liveVolumeUsd:         Number(data?.openPositions?.live?.marginUsd)
                                    || Number(data?.openPositions?.live?.volumeUsd)
                                    || 0,
+          // Per-symbol roll-ups (see type declaration above).
+          liveBySymbol:          Array.isArray(data?.openPositions?.live?.bySymbol)
+                                   ? data.openPositions.live.bySymbol
+                                   : [],
+          liveOrdersBySymbol:    Array.isArray(data?.liveExecution?.ordersBySymbol)
+                                   ? data.liveExecution.ordersBySymbol
+                                   : [],
+          // Portfolio-wide live aggregate — canonical PnL / ROI sources.
+          liveAggUnrealizedPnl:    Number(data?.openPositions?.live?.aggregate?.totalUnrealizedPnl) || 0,
+          liveAggPortfolioRoiPct:  Number(data?.openPositions?.live?.aggregate?.portfolioRoiPct)   || 0,
           rangeDays:               pm.rangeDays              || 1,
           timeframeSeconds:        pm.timeframeSeconds        || 1,
           intervalsProcessed:      pm.intervalsProcessed      || 0,
@@ -966,26 +1003,49 @@ export function ActiveConnectionCard({
             </div>
           </CardHeader>
 
-          {/* Per-connection stats row — shown whenever active with data, even in idle/stopped phases */}
+          {/* Per-connection stats row — shown whenever active with data, even in idle/stopped phases.
+              Layout: Symbols | Cycles | Pseudo|Live. Indications / Strategies / Sets moved to the
+              Realtime Execution panel where they belong semantically (live ticking data, not
+              connection-level overview). The Symbols tile here surfaces the prehistoric backfill
+              progress so the operator can read both the realtime tick count AND backfill coverage
+              at a glance, even when the engine is paused. */}
           {connection.isActive && liveStats && (phase === "idle" || phase === "stopped" || phase === "disabled") && (
             <CardContent className="pt-0 pb-2 px-4">
               <div className="flex items-center gap-3 flex-wrap pt-1 border-t border-border/40">
-                {[
-                  { label: "Cycles",    value: liveStats.indicationCycles },
-                  { label: "Ind.",      value: liveStats.indications },
-                  { label: "Strat.",    value: liveStats.strategies },
-                  {
+                {(() => {
+                  const symbolsProcessed = progression?.prehistoricProgress?.symbolsProcessed ?? 0
+                  const symbolsTotal     = progression?.prehistoricProgress?.symbolsTotal     ?? 0
+                  const tiles: Array<{ label: string; value: string | number; title?: string }> = []
+                  if (symbolsProcessed > 0 || symbolsTotal > 0) {
+                    tiles.push({
+                      label: "Symbols",
+                      value: symbolsTotal > 0 ? `${symbolsProcessed}/${symbolsTotal}` : symbolsProcessed,
+                      title: "Prehistoric backfill coverage — symbols processed vs total.",
+                    })
+                  }
+                  tiles.push({
+                    label: "Cycles",
+                    value: liveStats.indicationCycles,
+                    title: "Realtime indication processor ticks since engine start.",
+                  })
+                  tiles.push({
                     label: (prehistoricStats?.liveOpenPositions ?? 0) > 0 ? "Live" : "Pseudo",
                     value: liveStats.positions,
-                  },
-                ].map(({ label, value }) => (
-                  <div key={label} className="flex items-center gap-1 text-[10px]">
-                    <span className="text-muted-foreground">{label}</span>
-                    <span className="font-semibold tabular-nums">
-                      {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
-                    </span>
-                  </div>
-                ))}
+                    title: (prehistoricStats?.liveOpenPositions ?? 0) > 0
+                      ? "Open exchange positions (live)."
+                      : "Open pseudo positions (evaluation stage).",
+                  })
+                  return tiles.map(({ label, value, title }) => (
+                    <div key={label} className="flex items-center gap-1 text-[10px]" title={title}>
+                      <span className="text-muted-foreground">{label}</span>
+                      <span className="font-semibold tabular-nums">
+                        {typeof value === "number" && value >= 1000
+                          ? `${(value / 1000).toFixed(1)}K`
+                          : value}
+                      </span>
+                    </div>
+                  ))
+                })()}
               </div>
             </CardContent>
           )}
@@ -1008,25 +1068,45 @@ export function ActiveConnectionCard({
                   </p>
                 )}
 
-                {/* Per-connection engine stats — always shown when connection is active */}
+                {/* Per-connection engine stats — always shown when connection is active.
+                    Layout matches the idle variant: Symbols | Cycles | Pseudo|Live.
+                    Indications / Strategies / Sets live in the Realtime Execution panel. */}
                 {liveStats && phase !== "prehistoric_data" && (
                   <div className="flex items-center gap-3 mt-1.5 flex-wrap">
-                    {[
-                      { label: "Cycles",    value: liveStats.indicationCycles },
-                      { label: "Ind.",      value: liveStats.indications },
-                      { label: "Strat.",    value: liveStats.strategies },
-                      {
+                    {(() => {
+                      const symbolsProcessed = progression?.prehistoricProgress?.symbolsProcessed ?? 0
+                      const symbolsTotal     = progression?.prehistoricProgress?.symbolsTotal     ?? 0
+                      const tiles: Array<{ label: string; value: string | number; title?: string }> = []
+                      if (symbolsProcessed > 0 || symbolsTotal > 0) {
+                        tiles.push({
+                          label: "Symbols",
+                          value: symbolsTotal > 0 ? `${symbolsProcessed}/${symbolsTotal}` : symbolsProcessed,
+                          title: "Prehistoric backfill coverage — symbols processed vs total.",
+                        })
+                      }
+                      tiles.push({
+                        label: "Cycles",
+                        value: liveStats.indicationCycles,
+                        title: "Realtime indication processor ticks since engine start.",
+                      })
+                      tiles.push({
                         label: (prehistoricStats?.liveOpenPositions ?? 0) > 0 ? "Live" : "Pseudo",
                         value: liveStats.positions,
-                      },
-                    ].map(({ label, value }) => (
-                      <div key={label} className="flex items-center gap-1 text-[10px]">
-                        <span className="text-muted-foreground">{label}</span>
-                        <span className="font-semibold tabular-nums">
-                          {value >= 1000 ? `${(value / 1000).toFixed(1)}K` : value}
-                        </span>
-                      </div>
-                    ))}
+                        title: (prehistoricStats?.liveOpenPositions ?? 0) > 0
+                          ? "Open exchange positions (live)."
+                          : "Open pseudo positions (evaluation stage).",
+                      })
+                      return tiles.map(({ label, value, title }) => (
+                        <div key={label} className="flex items-center gap-1 text-[10px]" title={title}>
+                          <span className="text-muted-foreground">{label}</span>
+                          <span className="font-semibold tabular-nums">
+                            {typeof value === "number" && value >= 1000
+                              ? `${(value / 1000).toFixed(1)}K`
+                              : value}
+                          </span>
+                        </div>
+                      ))
+                    })()}
                   </div>
                 )}
 
@@ -1055,13 +1135,26 @@ export function ActiveConnectionCard({
                         {prehistoricStats.pseudoOpen}
                       </span>
                     </div>
+                    {/* Real count — clamped so it never reads 0 while Live > 0.
+                        Live positions cannot exist without an upstream Real
+                        promotion having occurred, so when the real-stage scan
+                        returns 0 but the exchange has N live positions we
+                        surface N here instead. This was the "pseudo 5, real 0
+                        while there are some" bug: real-stage's
+                        `evaluateToRealPositions()` only runs on Main→Real
+                        promotion ticks, leaving the realOpen counter at 0
+                        between ticks while live positions are still alive. */}
                     <div
                       className="flex items-center gap-1"
-                      title="Main→Real promotions awaiting mirror into exchange orders — count only."
+                      title={
+                        prehistoricStats.realOpen >= prehistoricStats.liveOpenPositions
+                          ? "Main→Real validated promotions awaiting mirror into exchange orders — count only."
+                          : "Currently live exchange positions traced back to their upstream Real promotion (Real scan is between ticks)."
+                      }
                     >
                       <span className="text-muted-foreground">Real</span>
                       <span className="font-semibold text-emerald-700 dark:text-emerald-400 tabular-nums">
-                        {prehistoricStats.realOpen}
+                        {Math.max(prehistoricStats.realOpen, prehistoricStats.liveOpenPositions)}
                       </span>
                     </div>
                     <div
@@ -1431,14 +1524,25 @@ export function ActiveConnectionCard({
                         the historic backfill content (symbols/candles/
                         intervals + indications + strategy stages) keeps the
                         amber theme above; below this divider the realtime
-                        engine pulse (live orders, fills, wins, USDT) is
+                        engine pulse (Ind / Strat / Sets, Positions per
+                        symbol, Orders per symbol, PnL / WR / USDT) is
                         re-themed in blue.
+
+                        Show gate (broadened): visible whenever the
+                        realtime processor is actively ticking — not just
+                        once an exchange order has been placed. This is
+                        the panel that surfaces Ind / Strat / Sets, so it
+                        must appear during pure pseudo/real evaluation
+                        runs too.
 
                         The inner status chips deliberately keep their
                         semantic colours (green for fills/wins, amber for
                         rejected, red for failed/PnL-loss) so the operator
                         can still read outcome quality at a glance. */}
-                    {prehistoricStats && (
+                    {prehistoricStats && liveStats && (
+                      phase === "realtime" ||
+                      phase === "live_trading" ||
+                      liveStats.indicationCycles > 0 ||
                       prehistoricStats.liveOrdersPlaced > 0 ||
                       prehistoricStats.liveOrdersSimulated > 0 ||
                       prehistoricStats.livePositionsCreated > 0
@@ -1467,7 +1571,114 @@ export function ActiveConnectionCard({
                           )}
                         </div>
 
-                        {/* Orders row */}
+                        {/* ── Indications / Strategies / Sets sub-row ──
+                            Moved here from the connection overview row so
+                            "what's processing right now" stays scoped to
+                            the realtime panel. Each tile reads from a
+                            single canonical source — `liveStats.{ind|strat}`
+                            (already wired to `activeProgressing.*.total.sets`
+                            with cumulative fall-throughs) and the
+                            per-stage `breakdown.strategies.real` for the
+                            Sets total (= Real-stage validated set count,
+                            the canonical "strategies total"). */}
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px]">
+                          <span
+                            className="text-muted-foreground"
+                            title="Indications currently being produced by the realtime processor (active sets × types). Use the cumulative number in the historic block above for lifetime totals."
+                          >
+                            Ind. <span className="text-foreground font-semibold tabular-nums">
+                              {liveStats.indications >= 1000 ? `${(liveStats.indications / 1000).toFixed(1)}K` : liveStats.indications}
+                            </span>
+                          </span>
+                          <span
+                            className="text-muted-foreground"
+                            title="Strategies actively evaluating this cycle (sourced from activeProgressing.strategies.total.sets, with cumulative breakdown fall-through)."
+                          >
+                            Strat. <span className="text-foreground font-semibold tabular-nums">
+                              {liveStats.strategies >= 1000 ? `${(liveStats.strategies / 1000).toFixed(1)}K` : liveStats.strategies}
+                            </span>
+                          </span>
+                          <span
+                            className="text-muted-foreground"
+                            title="Validated Real-stage Sets — the canonical 'strategies total' (cumulative). Real is the cascade-filter terminus; downstream Live mirrors a subset of these Sets."
+                          >
+                            Sets <span className="text-foreground font-semibold tabular-nums">
+                              {prehistoricStats.stratReal >= 1000 ? `${(prehistoricStats.stratReal / 1000).toFixed(1)}K` : prehistoricStats.stratReal}
+                            </span>
+                          </span>
+                          {liveStats.indicationCycles > 0 && (
+                            <span
+                              className="ml-auto text-muted-foreground"
+                              title="Indication processor ticks since engine start."
+                            >
+                              Cycles <span className="text-foreground font-semibold tabular-nums">
+                                {liveStats.indicationCycles >= 1000 ? `${(liveStats.indicationCycles / 1000).toFixed(1)}K` : liveStats.indicationCycles}
+                              </span>
+                            </span>
+                          )}
+                        </div>
+
+                        {/* ── Positions row (per-symbol, long/short) ────
+                            Reads from `openPositions.live.bySymbol`
+                            (sorted by descending position count).
+                            Shows a totals chip at the front and per-symbol
+                            chips after. Direction is conveyed by L/S
+                            tokens to keep the strip compact. */}
+                        {(prehistoricStats.liveBySymbol.length > 0 || prehistoricStats.liveOpenPositions > 0) && (
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px]">
+                            <span
+                              className="text-muted-foreground"
+                              title="Open exchange positions grouped by symbol. L=long, S=short."
+                            >
+                              Positions <span className="text-foreground font-semibold tabular-nums">
+                                {prehistoricStats.liveOpenPositions}
+                              </span>
+                            </span>
+                            {(() => {
+                              const longTotal  = prehistoricStats.liveBySymbol.reduce((s, e) => s + e.long,  0)
+                              const shortTotal = prehistoricStats.liveBySymbol.reduce((s, e) => s + e.short, 0)
+                              return (longTotal + shortTotal) > 0 ? (
+                                <span className="text-muted-foreground">
+                                  <span className="text-green-600 dark:text-green-400 font-semibold tabular-nums">L:{longTotal}</span>
+                                  {" / "}
+                                  <span className="text-red-500 font-semibold tabular-nums">S:{shortTotal}</span>
+                                </span>
+                              ) : null
+                            })()}
+                            {prehistoricStats.liveBySymbol.slice(0, 6).map((e) => (
+                              <span
+                                key={e.symbol}
+                                className="text-muted-foreground"
+                                title={
+                                  `${e.symbol} — ${e.long} long, ${e.short} short. ` +
+                                  `Margin $${e.marginUsd.toFixed(2)}, unrealized ${e.unrealizedPnl >= 0 ? "+" : ""}$${e.unrealizedPnl.toFixed(2)}.`
+                                }
+                              >
+                                <span className="font-mono text-foreground">{e.symbol}</span>
+                                {e.long > 0 && (
+                                  <> <span className="text-green-600 dark:text-green-400 font-semibold tabular-nums">L:{e.long}</span></>
+                                )}
+                                {e.short > 0 && (
+                                  <> <span className="text-red-500 font-semibold tabular-nums">S:{e.short}</span></>
+                                )}
+                              </span>
+                            ))}
+                            {prehistoricStats.liveBySymbol.length > 6 && (
+                              <span className="text-muted-foreground">
+                                +{prehistoricStats.liveBySymbol.length - 6} more
+                              </span>
+                            )}
+                          </div>
+                        )}
+
+                        {/* ── Orders row (totals + per-symbol breakdown) ──
+                            Multiple orders can land on the same symbol/
+                            direction (accumulations). The per-symbol chip
+                            strip reads `liveExecution.ordersBySymbol`
+                            (placed/filled) so the operator can see how
+                            many distinct exchange orders the realtime
+                            processor has fired for each pair. Falls back
+                            to global totals only when the array is empty. */}
                         <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px]">
                           <span className="text-muted-foreground">
                             Orders <span className="text-foreground font-semibold tabular-nums">
@@ -1502,9 +1713,6 @@ export function ActiveConnectionCard({
                               </span>
                             </span>
                           )}
-                          {/* Accumulated entries — Real-stage Set signals merged
-                              into existing exchange positions (avoids duplicate
-                              orders for the same symbol/direction). */}
                           {prehistoricStats.liveOrdersAccumulated > 0 && (
                             <span
                               className="text-muted-foreground"
@@ -1524,36 +1732,103 @@ export function ActiveConnectionCard({
                           )}
                         </div>
 
-                        {/* Positions row */}
+                        {/* Per-symbol order chips (e.g. BTCUSDT L:3/2 S:1/1
+                            = 3 long placed of which 2 filled, 1 short
+                            placed of which 1 filled). Only renders when
+                            the server reported per-symbol data. */}
+                        {prehistoricStats.liveOrdersBySymbol.length > 0 && (
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px]">
+                            <span className="text-muted-foreground text-[9px] uppercase tracking-wide">By symbol</span>
+                            {prehistoricStats.liveOrdersBySymbol.slice(0, 6).map((o) => (
+                              <span
+                                key={o.symbol}
+                                className="text-muted-foreground"
+                                title={
+                                  `${o.symbol} — ` +
+                                  `long ${o.long.placed} placed / ${o.long.filled} filled, ` +
+                                  `short ${o.short.placed} placed / ${o.short.filled} filled.`
+                                }
+                              >
+                                <span className="font-mono text-foreground">{o.symbol}</span>
+                                {(o.long.placed + o.long.filled) > 0 && (
+                                  <> <span className="text-green-600 dark:text-green-400 font-semibold tabular-nums">L:{o.long.placed}/{o.long.filled}</span></>
+                                )}
+                                {(o.short.placed + o.short.filled) > 0 && (
+                                  <> <span className="text-red-500 font-semibold tabular-nums">S:{o.short.placed}/{o.short.filled}</span></>
+                                )}
+                              </span>
+                            ))}
+                            {prehistoricStats.liveOrdersBySymbol.length > 6 && (
+                              <span className="text-muted-foreground">
+                                +{prehistoricStats.liveOrdersBySymbol.length - 6} more
+                              </span>
+                            )}
+                          </div>
+                        )}
+
+                        {/* PnL / WR / PF / ROI row — single canonical
+                            sources only (no cross-stage summation):
+                              PnL  = openPositions.live.aggregate.totalUnrealizedPnl (open) + strategyDetail.live.totalPnl (realised)
+                              WR   = liveExecution.winRate
+                              PF   = strategyDetail.live.avgProfitFactor
+                              ROI  = openPositions.live.aggregate.portfolioRoiPct (open) + strategyDetail.live.avgPosEvalReal (avg realised)
+                        */}
                         <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px]">
-                          <span className="text-muted-foreground">
-                            Positions <span className="text-foreground font-semibold tabular-nums">
-                              {prehistoricStats.livePositionsCreated}
+                          <span
+                            className="text-muted-foreground"
+                            title="Total realised PnL across all closed live positions (strategyDetail.live.totalPnl)."
+                          >
+                            PnL <span className={`font-semibold tabular-nums ${prehistoricStats.liveTotalPnl > 0 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveTotalPnl < 0 ? "text-red-500" : "text-foreground"}`}>
+                              {prehistoricStats.liveTotalPnl >= 0 ? "+" : ""}${prehistoricStats.liveTotalPnl.toFixed(2)}
                             </span>
                           </span>
-                          {/* Only show closed count when positions were actually created in
-                              this session — avoids the reconcile-sweep artifact where the
-                              sweep detects exchange positions from a previous session as
-                              "closed" before any new position was created, producing the
-                              confusing "Positions 0 closed 6" display. */}
-                          {prehistoricStats.livePositionsClosed > 0 && prehistoricStats.livePositionsCreated > 0 && (
-                            <span className="text-muted-foreground">
-                              closed <span className="text-foreground font-semibold tabular-nums">
-                                {prehistoricStats.livePositionsClosed}
-                              </span>
-                            </span>
-                          )}
-                          {prehistoricStats.liveWins > 0 && (
-                            <span className="text-muted-foreground">
-                              wins <span className="text-green-600 dark:text-green-400 font-semibold tabular-nums">
-                                {prehistoricStats.liveWins}
+                          {prehistoricStats.liveAggUnrealizedPnl !== 0 && (
+                            <span
+                              className="text-muted-foreground"
+                              title="Unrealised PnL across all currently-open live positions (openPositions.live.aggregate.totalUnrealizedPnl)."
+                            >
+                              open <span className={`font-semibold tabular-nums ${prehistoricStats.liveAggUnrealizedPnl > 0 ? "text-green-600 dark:text-green-400" : "text-red-500"}`}>
+                                {prehistoricStats.liveAggUnrealizedPnl >= 0 ? "+" : ""}${prehistoricStats.liveAggUnrealizedPnl.toFixed(2)}
                               </span>
                             </span>
                           )}
                           {prehistoricStats.liveWinRate > 0 && (
-                            <span className="text-muted-foreground">
-                              WR <span className={`font-semibold ${prehistoricStats.liveWinRate >= 60 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveWinRate >= 40 ? "text-amber-600 dark:text-amber-400" : "text-red-500"}`}>
+                            <span
+                              className="text-muted-foreground"
+                              title="Win rate across closed live positions — wins / closed (liveExecution.winRate)."
+                            >
+                              WR <span className={`font-semibold tabular-nums ${prehistoricStats.liveWinRate >= 60 ? "text-green-600 dark:text-green-400" : prehistoricStats.liveWinRate >= 40 ? "text-amber-600 dark:text-amber-400" : "text-red-500"}`}>
                                 {prehistoricStats.liveWinRate.toFixed(1)}%
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.avgProfitFactorLive > 0 && (
+                            <span
+                              className="text-muted-foreground"
+                              title="Profit factor on the live tier — sum(+PnL) / |sum(-PnL)| across closed live positions (strategyDetail.live.avgProfitFactor)."
+                            >
+                              PF <span className={`font-semibold tabular-nums ${prehistoricStats.avgProfitFactorLive >= 1.4 ? "text-green-600 dark:text-green-400" : prehistoricStats.avgProfitFactorLive >= 1 ? "text-foreground" : "text-red-500"}`}>
+                                {prehistoricStats.avgProfitFactorLive.toFixed(2)}
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.liveAggPortfolioRoiPct !== 0 && (
+                            <span
+                              className="text-muted-foreground"
+                              title="Portfolio ROI — unrealised PnL / committed margin across all currently-open live positions."
+                            >
+                              ROI live <span className={`font-semibold tabular-nums ${prehistoricStats.liveAggPortfolioRoiPct > 0 ? "text-green-600 dark:text-green-400" : "text-red-500"}`}>
+                                {prehistoricStats.liveAggPortfolioRoiPct >= 0 ? "+" : ""}{prehistoricStats.liveAggPortfolioRoiPct.toFixed(2)}%
+                              </span>
+                            </span>
+                          )}
+                          {prehistoricStats.avgPosEvalLive !== 0 && (
+                            <span
+                              className="text-muted-foreground"
+                              title="Average ROI per closed live position (strategyDetail.live.avgPosEvalReal, stored as fraction)."
+                            >
+                              ROI avg <span className={`font-semibold tabular-nums ${prehistoricStats.avgPosEvalLive > 0 ? "text-green-600 dark:text-green-400" : "text-red-500"}`}>
+                                {prehistoricStats.avgPosEvalLive >= 0 ? "+" : ""}{(prehistoricStats.avgPosEvalLive * 100).toFixed(2)}%
                               </span>
                             </span>
                           )}
@@ -1573,6 +1848,38 @@ export function ActiveConnectionCard({
                             </span>
                           )}
                         </div>
+
+                        {/* ── Positions lifecycle row (created/closed/wins) ──
+                            Kept separate from the "Positions per symbol"
+                            row above so the per-symbol chips don't get
+                            mixed up with lifetime lifecycle counters. */}
+                        {(prehistoricStats.livePositionsCreated > 0 || prehistoricStats.liveWins > 0) && (
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px]">
+                            <span className="text-muted-foreground">
+                              Created <span className="text-foreground font-semibold tabular-nums">
+                                {prehistoricStats.livePositionsCreated}
+                              </span>
+                            </span>
+                            {/* Only show closed count when positions were actually created in
+                                this session — avoids the reconcile-sweep artifact where the
+                                sweep detects exchange positions from a previous session as
+                                "closed" before any new position was created. */}
+                            {prehistoricStats.livePositionsClosed > 0 && prehistoricStats.livePositionsCreated > 0 && (
+                              <span className="text-muted-foreground">
+                                closed <span className="text-foreground font-semibold tabular-nums">
+                                  {prehistoricStats.livePositionsClosed}
+                                </span>
+                              </span>
+                            )}
+                            {prehistoricStats.liveWins > 0 && (
+                              <span className="text-muted-foreground">
+                                wins <span className="text-green-600 dark:text-green-400 font-semibold tabular-nums">
+                                  {prehistoricStats.liveWins}
+                                </span>
+                              </span>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )}
 
