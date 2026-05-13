@@ -92,6 +92,9 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
           connectionId,
         }))
 
+    // Fetch progression hash to get accurate stage counts from strategy-coordinator
+    const progHashForSetCounts = (await client.hgetall(`progression_lifecycle:${connectionId}`).catch(() => ({}))) || {}
+
     const [
       prehistoricSymbolsSet,
       prehistoricDataKeys,
@@ -107,9 +110,13 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     ] = await Promise.all([
       client.scard(`prehistoric:${connectionId}:symbols`).catch(() => 0),
       countKeys(client, [`prehistoric:${connectionId}:*`, `market_data:${connectionId}:*`]),
-      countKeys(client, [`sets:${connectionId}:base:*`, `pseudo_positions:${connectionId}:base:*`]),
-      countKeys(client, [`sets:${connectionId}:main:*`, `pseudo_positions:${connectionId}:main:*`]),
-      countKeys(client, [`sets:${connectionId}:real:*`, `pseudo_positions:${connectionId}:real:*`]),
+      // Base stage count from progression hash — sets promoted by Base stage
+      toNumber((progHashForSetCounts as Record<string, string>).strategies_base_total || "0"),
+      // Main stage count from progression hash — sets fanned out by Main stage
+      toNumber((progHashForSetCounts as Record<string, string>).strategies_main_total || "0"),
+      // Real stage count comes from progression hash (strategies_real_total), NOT Redis key count.
+      // This is the authoritative source set by strategy-coordinator when Real stage evaluates.
+      toNumber((progHashForSetCounts as Record<string, string>).strategies_real_total || "0"),
       toNumber(await client.get(`indications:${connectionId}:direction:evaluated`).catch(() => 0)),
       toNumber(await client.get(`indications:${connectionId}:move:evaluated`).catch(() => 0)),
       toNumber(await client.get(`indications:${connectionId}:active:evaluated`).catch(() => 0)),
