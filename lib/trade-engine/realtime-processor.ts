@@ -70,6 +70,24 @@ export class RealtimeProcessor {
   private lastPositionsCount = -1
   private static readonly HEARTBEAT_INTERVAL_MS = 1000
 
+  // ── Live-position exchange sync throttle ───────────────────────────────
+  // `syncWithExchange` from live-stage refreshes mark prices, places /
+  // heals SL/TP protection ("control") orders, detects SL/TP crosses and
+  // force-closes positions whose exchange-side stop failed to fire. It
+  // MUST run from the engine loop — without it, control orders are never
+  // healed and force-close-on-cross only fires via the 60s cron or the
+  // 30s strategy-coordinator reconcile (which itself only runs when a
+  // symbol reaches the Real-stage block). For sub-second SL/TP response
+  // the realtime tick has to drive it.
+  //
+  // Rate-limited to LIVE_SYNC_INTERVAL_MS so we don't hammer the exchange
+  // REST endpoint on every realtime tick (which can fire >1× per second
+  // under dense market data). Per-instance throttle is sufficient because
+  // the engine spawns one RealtimeProcessor per connectionId.
+  private lastLiveSyncAt = 0
+  private liveSyncInFlight = false
+  private static readonly LIVE_SYNC_INTERVAL_MS = 5_000
+
   constructor(connectionId: string) {
     this.connectionId = connectionId
     this.positionManager = new PseudoPositionManager(connectionId)
@@ -245,6 +263,17 @@ export class RealtimeProcessor {
           console.warn("[v0] [Realtime] Heartbeat write failed:", hbErr instanceof Error ? hbErr.message : String(hbErr))
         }
       }
+
+      // ── Live-position exchange sync (fire-and-forget, rate-limited) ──
+      // Drives SL/TP cross detection, protection-order healing, and
+      // mark-price refresh for all open LIVE positions on this connection.
+      // Independent of the pseudo-position pipeline below — we kick it
+      // off here BEFORE the count==0 early-return because the pseudo
+      // count may be 0 while live positions are still open (e.g. after
+      // all pseudo Sets closed but their live mirrors are still open
+      // on the exchange waiting for SL/TP). Throttled internally via
+      // `lastLiveSyncAt`.
+      void this.maybeRunLiveSync()
 
       if (count === 0) {
         return { updates: 0 }
@@ -741,6 +770,67 @@ export class RealtimeProcessor {
     } catch (err) {
       // Best-effort — never propagate.
       console.warn(`[v0] fireSyncLiveFromPseudo error for ${position?.id}:`, err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  /**
+   * Per-tick driver for `live-stage.syncWithExchange`. Refreshes mark
+   * prices, heals SL/TP protection orders, force-closes positions whose
+   * SL/TP level has been crossed, and arms protection for delayed fills.
+   *
+   * Throttled to LIVE_SYNC_INTERVAL_MS (5 s) so a fast realtime tick
+   * doesn't translate into multi-Hz exchange REST hits. Single-flight
+   * guarded so a slow exchange round-trip can't queue overlapping syncs.
+   * Fire-and-forget: errors are logged but never propagated to the tick
+   * loop — pseudo-position processing must continue regardless.
+   *
+   * No-op early-exit when:
+   *   - throttle window not yet elapsed
+   *   - a previous sync is still in flight
+   *   - the connection has no exchange credentials (paper-only)
+   *   - there are no open live positions (cheap Redis LLEN check)
+   */
+  private async maybeRunLiveSync(): Promise<void> {
+    const now = Date.now()
+    if (this.liveSyncInFlight) return
+    if (now - this.lastLiveSyncAt < RealtimeProcessor.LIVE_SYNC_INTERVAL_MS) return
+    this.lastLiveSyncAt = now
+    this.liveSyncInFlight = true
+
+    try {
+      // Cheap gate: skip when no live positions are tracked. Saves a
+      // connector instantiation + getPosition fan-out on the common
+      // paper-only or idle case.
+      const client = getRedisClient()
+      const openCount = await client.llen(`live:positions:${this.connectionId}`).catch(() => 0)
+      if (!openCount || openCount <= 0) return
+
+      const { getConnection } = await import("@/lib/redis-db")
+      const connection = await getConnection(this.connectionId)
+      if (!connection) return
+      const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
+      const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
+      if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) return
+
+      const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+      const connector = await createExchangeConnector(connection.exchange, {
+        apiKey,
+        apiSecret,
+        apiType: connection.api_type,
+        contractType: connection.contract_type,
+        isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
+      })
+      if (!connector) return
+
+      const { syncWithExchange } = await import("@/lib/trade-engine/stages/live-stage")
+      await syncWithExchange(this.connectionId, connector)
+    } catch (err) {
+      console.warn(
+        `[v0] [Realtime] live syncWithExchange error for ${this.connectionId}:`,
+        err instanceof Error ? err.message : String(err),
+      )
+    } finally {
+      this.liveSyncInFlight = false
     }
   }
 
