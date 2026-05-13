@@ -359,6 +359,31 @@ export async function POST(request: Request) {
      // Step 3: QuickStart must assign + enable connection flow
      console.log(`${LOG_PREFIX}: [3/4] Updating connection state...`)
      
+     // ── Quickstart minimal-volume default ──────────────────────────
+     // QuickStart is intended to be a safe, low-risk way for an operator
+     // to dip a toe in: real exchange orders, but the SMALLEST possible
+     // notional per order. We pin `live_volume_factor` to the minimum
+     // allowed by `VolumeCalculator.calculatePositionVolume` (it clamps
+     // the factor to `[0.1, 10]` — anything ≤ 0.1 becomes 0.1).
+     //
+     // With factor=0.1, the Main-engine path scales the computed volume
+     // down 10× and then the per-pair `exchangeMinVolume` floor (or the
+     // universal $5 notional fallback) clamps it back UP — so the final
+     // order size is GUARANTEED to be the exchange's hard minimum.
+     // That's the smallest legal order the venue will accept; you
+     // cannot go below it without an immediate rejection.
+     //
+     // Why this is the right knob (vs `exchangePositionCost`):
+     //   - `exchangePositionCost` is a GLOBAL app-settings field that
+     //     would affect every connection. We only want to scope this
+     //     to the connection the operator just quick-started.
+     //   - `live_volume_factor` is a PER-CONNECTION override that the
+     //     calculator already honours via
+     //     `VolumeCalculator.resolveLiveEngine` (preferred over global).
+     //
+     // Operator can adjust this later via per-connection Live Volume
+     // Factor slider in Settings (range 0.1×–10×) once they're happy
+     // with how the engine is behaving.
      const updated = {
        ...connection,
        // Explicit quickstart assignment/enabling for engine processing.
@@ -374,6 +399,10 @@ export async function POST(request: Request) {
        is_active: "1",
        is_live_trade: "1",
        active_symbols: JSON.stringify(symbols),
+       // Force minimal per-order volume on every quickstart enable.
+       // Stored as a string because that's how the rest of the
+       // connection hash is encoded (parseFloat in volume-calculator).
+       live_volume_factor: "0.1",
        last_test_status: testPassed ? "success" : "failed",
        last_test_balance: testBalance,
        last_test_at: new Date().toISOString(),
@@ -381,7 +410,21 @@ export async function POST(request: Request) {
      }
      
      await updateConnection(connectionId, updated)
-     console.log(`${LOG_PREFIX}: [3/4] Connection state updated (assigned+enabled for quickstart).`)
+     console.log(`${LOG_PREFIX}: [3/4] Connection state updated (assigned+enabled, live_volume_factor=0.1 → exchange-minimum orders).`)
+     // Surface the minimal-volume policy in the progression log so the
+     // operator can confirm in the UI exactly which sizing knob was
+     // applied. Helpful when debugging "why are my orders so small?".
+     await logProgressionEvent(
+       connectionId,
+       "quickstart_minimal_volume",
+       "info",
+       "QuickStart applied minimal-volume policy: live_volume_factor=0.1 (exchange-minimum orders)",
+       {
+         live_volume_factor: "0.1",
+         note:
+           "Per-connection override. Order size will be clamped UP to the per-pair exchange minimum (or the universal $5 notional floor). Adjust via Settings → Connection → Live Volume Factor (0.1×–10×) when ready to scale.",
+       },
+     )
     
     // ALSO store in trade_engine_state for engine to find.
     // IMPORTANT: record the user-selected symbol count under
