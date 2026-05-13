@@ -4,8 +4,7 @@ import { useState, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Spinner } from "@/components/ui/spinner"
-import { AlertCircle, CheckCircle2, XCircle, Play, RefreshCw } from "lucide-react"
+import { AlertCircle, CheckCircle2, XCircle, Play, RefreshCw, Loader2 } from "lucide-react"
 
 interface TestResult {
   testName: string
@@ -93,7 +92,7 @@ export default function OrderTestingPage() {
           <Button onClick={runTests} disabled={loading} className="gap-2">
             {loading ? (
               <>
-                <Spinner className="w-4 h-4" />
+                <Loader2 className="w-4 h-4 animate-spin" />
                 Testing...
               </>
             ) : (
