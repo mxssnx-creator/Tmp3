@@ -113,6 +113,11 @@ const testingItems: Array<{
     icon: FlaskConical,
   },
   {
+    title: "Order Testing",
+    href: "/testing/orders",
+    icon: Activity,
+  },
+  {
     title: "Engine",
     href: "/testing/engine",
     icon: Activity,
