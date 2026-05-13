@@ -531,6 +531,7 @@ export async function POST(request: Request) {
             // Wipe progression-accumulator fields and stale prehistoric
             // completion markers (per-connection only — other connections unaffected).
             client.del(`prehistoric:${connectionId}:done`),
+            client.del(`prehistoric:${connectionId}:symbols`), // Clear old processed symbols set
             client.hdel(`prehistoric:${connectionId}`,
               "is_complete",
               "completed_at",
