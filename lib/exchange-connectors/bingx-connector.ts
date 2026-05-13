@@ -1435,6 +1435,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`[bingx-swap-trade] Executing ${operation} with params: ${JSON.stringify(params).substring(0, 200)}`)
       
       switch (operation) {
+        // ─────── Order Placement ──────────
         case "placeOrder":
           return await this.placeOrder(
             params.symbol,
@@ -1445,9 +1446,42 @@ export class BingXConnector extends BaseExchangeConnector {
             params.options
           )
         
+        case "batchPlaceOrders":
+          return await this.batchPlaceOrders(params.orders)
+        
+        // ─────── Order Cancellation ──────────
         case "cancelOrder":
           return await this.cancelOrder(params.symbol, params.orderId)
         
+        case "batchCancelOrders":
+          return await this.batchCancelOrders(params.symbol, params.orderIds)
+        
+        case "cancelAllOrders":
+          return await this.cancelAllOrders(params.symbol, params.type)
+        
+        case "setKillSwitch":
+          return await this.setKillSwitch(params.type, params.timeOut)
+        
+        // ─────── Position Management ──────────
+        case "closePosition":
+          return await this.closePosition(params.symbol, params.positionSide)
+        
+        case "closePositionById":
+          return await this.closePositionById(params.positionId)
+        
+        case "closeAllPositions":
+          return await this.closeAllPositions(params.symbol)
+        
+        case "adjustIsolatedMargin":
+          return await this.adjustIsolatedMargin(
+            params.symbol,
+            params.amount,
+            params.type,
+            params.positionSide,
+            params.positionId
+          )
+        
+        // ─────── Leverage & Mode Settings ──────────
         case "setLeverage":
           return await this.setLeverage(params.symbol, params.leverage)
         
@@ -1457,12 +1491,760 @@ export class BingXConnector extends BaseExchangeConnector {
         case "setPositionMode":
           return await this.setPositionMode(params.hedgeMode)
         
+        case "getMarginMode":
+          return await this.getMarginMode(params.symbol)
+        
+        // ─────── Query Operations ──────────
+        case "getOpenOrder":
+          return await this.getOpenOrder(params.symbol, params.orderId, params.clientOrderId)
+        
+        case "getOrder":
+          return await this.getOrder(params.symbol, params.orderId, params.clientOrderId)
+        
+        case "getOpenOrders":
+          return await this.getOpenOrders(params.symbol, params.type)
+        
+        case "getOrderHistory":
+          return await this.getOrderHistory(
+            params.symbol,
+            params.currency,
+            params.orderId,
+            params.startTime,
+            params.endTime,
+            params.limit
+          )
+        
+        case "getForceOrders":
+          return await this.getForceOrders(
+            params.symbol,
+            params.currency,
+            params.autoCloseType,
+            params.startTime,
+            params.endTime,
+            params.limit
+          )
+        
+        case "getTradeHistory":
+          return await this.getTradeHistory(
+            params.tradingUnit,
+            params.startTs,
+            params.endTs,
+            params.orderId,
+            params.currency
+          )
+        
         default:
           throw new Error(`Unknown operation: ${operation}`)
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`[bingx-swap-trade] Failed to execute ${operation}: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Close all open positions
+   * 
+   * Official API: POST /openApi/swap/v2/trade/closeAllPositions
+   * Rate limit: 5/s per UID; 2/s per IP
+   * 
+   * @param symbol - Optional: specific symbol to close positions for
+   * @returns Success status and list of closed position IDs
+   */
+  async closeAllPositions(symbol?: string): Promise<{ success: boolean; success?: string[]; failed?: any[]; error?: string }> {
+    try {
+      this.log(`[API] Closing all positions${symbol ? ` for ${symbol}` : ""}`)
+      
+      const params: Record<string, any> = {
+        timestamp: Date.now(),
+      }
+      
+      if (symbol) {
+        params.symbol = this.toBingXSymbol(symbol)
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/closeAllPositions?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      this.log(`✓ Closed ${data.data?.success?.length || 0} positions`)
+      return {
+        success: true,
+        success: data.data?.success || [],
+        failed: data.data?.failed || [],
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to close all positions: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Close a position by positionId
+   * 
+   * Official API: POST /openApi/swap/v1/trade/closePosition
+   * Rate limit: 5/s per UID; 2/s per IP
+   * 
+   * More efficient than closePosition() as it uses direct API endpoint
+   * 
+   * @param positionId - Position ID to close
+   * @returns Order ID generated and position ID
+   */
+  async closePositionById(positionId: string): Promise<{ success: boolean; orderId?: string; positionId?: string; error?: string }> {
+    try {
+      this.log(`[API] Closing position by ID: ${positionId}`)
+      
+      const params: Record<string, any> = {
+        positionId,
+        timestamp: Date.now(),
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v1/trade/closePosition?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const orderId = String(data.data?.orderId || data.data?.orderID || "")
+      const closedPositionId = String(data.data?.positionId || "")
+      
+      this.log(`✓ Position closed with order ID: ${orderId}`)
+      return {
+        success: true,
+        orderId,
+        positionId: closedPositionId,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to close position by ID: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Batch place multiple orders
+   * 
+   * Official API: POST /openApi/swap/v2/trade/batchOrders
+   * Rate limit: 5/s per UID; 3/s per IP
+   * 
+   * @param orders - Array of order objects (max 5 per request)
+   * @returns Array of placed orders and any failed orders
+   */
+  async batchPlaceOrders(orders: Array<{
+    symbol: string
+    side: "buy" | "sell"
+    type?: "market" | "limit"
+    quantity: number
+    price?: number
+    options?: PlaceOrderOptions
+  }>): Promise<{ success: boolean; orders?: any[]; errors?: any[]; error?: string }> {
+    try {
+      if (!Array.isArray(orders) || orders.length === 0) {
+        throw new Error("Orders must be a non-empty array")
+      }
+      
+      if (orders.length > 5) {
+        throw new Error("Maximum 5 orders per batch request")
+      }
+      
+      this.log(`[API] Batch placing ${orders.length} orders`)
+      
+      // Build individual order params
+      const batchOrders = orders.map(order => {
+        const isSpot = this.credentials.apiType === "spot"
+        const bingxSymbol = this.toBingXSymbol(order.symbol)
+        const roundedQty = Math.round((order.quantity) * 1e6) / 1e6
+        const qtyStr = roundedQty.toFixed(6).replace(/\.?0+$/, "")
+        
+        const orderObj: Record<string, any> = {
+          symbol: bingxSymbol,
+          side: order.side.toUpperCase(),
+          type: (order.type === "market" ? "MARKET" : "LIMIT"),
+          quantity: qtyStr,
+        }
+        
+        if (order.price && order.type !== "market") {
+          const priceRounded = Math.round(order.price * 1e8) / 1e8
+          orderObj.price = priceRounded.toFixed(8).replace(/\.?0+$/, "")
+        }
+        
+        if (!isSpot && order.options?.hedgeMode !== false) {
+          orderObj.positionSide = order.options?.positionSide || (order.side === "buy" ? "LONG" : "SHORT")
+        }
+        
+        return orderObj
+      })
+      
+      const params: Record<string, any> = {
+        batchOrders: JSON.stringify(batchOrders),
+        timestamp: Date.now(),
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/batchOrders?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const placedOrders = data.data?.orders || []
+      const failedOrders = data.data?.errors || []
+      
+      this.log(`✓ Batch orders: ${placedOrders.length} placed, ${failedOrders.length} failed`)
+      return {
+        success: true,
+        orders: placedOrders,
+        errors: failedOrders,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to batch place orders: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Batch cancel multiple orders
+   * 
+   * Official API: DELETE /openApi/swap/v2/trade/batchOrders
+   * Rate limit: 5/s per UID; 3/s per IP
+   * 
+   * @param symbol - Trading pair
+   * @param orderIds - Array of order IDs to cancel (max 10)
+   * @returns Arrays of successfully cancelled and failed orders
+   */
+  async batchCancelOrders(symbol: string, orderIds: string[]): Promise<{ success: boolean; success?: any[]; failed?: any[]; error?: string }> {
+    try {
+      if (!Array.isArray(orderIds) || orderIds.length === 0) {
+        throw new Error("Order IDs must be a non-empty array")
+      }
+      
+      if (orderIds.length > 10) {
+        throw new Error("Maximum 10 orders per batch cancel")
+      }
+      
+      this.log(`[API] Batch cancelling ${orderIds.length} orders for ${symbol}`)
+      
+      const bingxSymbol = this.toBingXSymbol(symbol)
+      const params: Record<string, any> = {
+        symbol: bingxSymbol,
+        orderIdList: JSON.stringify(orderIds.map(id => Number(id))),
+        timestamp: Date.now(),
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/batchOrders?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "DELETE",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const succeeded = data.data?.success || []
+      const failed = data.data?.failed || []
+      
+      this.log(`✓ Batch cancel: ${succeeded.length} cancelled, ${failed.length} failed`)
+      return {
+        success: true,
+        success: succeeded,
+        failed: failed,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to batch cancel orders: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Cancel all open orders for a symbol
+   * 
+   * Official API: DELETE /openApi/swap/v2/trade/allOpenOrders
+   * Rate limit: 5/s per UID; 2/s per IP
+   * 
+   * @param symbol - Optional: specific symbol, or omit to cancel all orders
+   * @param type - Optional: order type filter (LIMIT, MARKET, STOP_MARKET, etc.)
+   * @returns Arrays of cancelled and failed orders
+   */
+  async cancelAllOrders(symbol?: string, type?: string): Promise<{ success: boolean; success?: any[]; failed?: any[]; error?: string }> {
+    try {
+      this.log(`[API] Cancelling all open orders${symbol ? ` for ${symbol}` : ""}${type ? ` (type: ${type})` : ""}`)
+      
+      const params: Record<string, any> = {
+        timestamp: Date.now(),
+      }
+      
+      if (symbol) {
+        params.symbol = this.toBingXSymbol(symbol)
+      }
+      
+      if (type) {
+        params.type = type
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/allOpenOrders?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "DELETE",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const succeeded = data.data?.success || []
+      const failed = data.data?.failed || []
+      
+      this.log(`✓ Cancelled all orders: ${succeeded.length} cancelled, ${failed.length} failed`)
+      return {
+        success: true,
+        success: succeeded,
+        failed: failed,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to cancel all orders: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Set kill switch (cancel all after timeout)
+   * 
+   * Official API: POST /openApi/swap/v2/trade/cancelAllAfter
+   * Rate limit: 1/s per UID; 2/s per IP
+   * 
+   * Automatically cancels all open orders after timeout (useful for network protection)
+   * 
+   * @param type - "ACTIVATE" or "CLOSE"
+   * @param timeOut - Timeout in seconds (10-120)
+   * @returns Trigger time and status
+   */
+  async setKillSwitch(type: "ACTIVATE" | "CLOSE", timeOut?: number): Promise<{ success: boolean; triggerTime?: number; status?: string; error?: string }> {
+    try {
+      if (type === "ACTIVATE" && (!timeOut || timeOut < 10 || timeOut > 120)) {
+        throw new Error("timeOut must be between 10 and 120 seconds for ACTIVATE")
+      }
+      
+      this.log(`[API] Setting kill switch: ${type}${timeOut ? ` (${timeOut}s)` : ""}`)
+      
+      const params: Record<string, any> = {
+        type,
+        timestamp: Date.now(),
+      }
+      
+      if (timeOut) {
+        params.timeOut = timeOut
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/cancelAllAfter?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const triggerTime = data.data?.triggerTime || 0
+      const status = data.data?.status || "UNKNOWN"
+      
+      this.log(`✓ Kill switch ${type}: ${status}`)
+      return {
+        success: true,
+        triggerTime,
+        status,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to set kill switch: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Adjust isolated margin for a position
+   * 
+   * Official API: POST /openApi/swap/v2/trade/positionMargin
+   * Rate limit: 2/s per UID; 2/s per IP
+   * 
+   * @param symbol - Trading pair
+   * @param amount - Amount in USDT
+   * @param type - 1 to increase, 2 to decrease
+   * @param positionSide - Optional: LONG or SHORT
+   * @param positionId - Optional: position ID (used in separate isolated mode)
+   * @returns Adjustment result
+   */
+  async adjustIsolatedMargin(
+    symbol: string,
+    amount: number,
+    type: 1 | 2,
+    positionSide?: "LONG" | "SHORT",
+    positionId?: string
+  ): Promise<{ success: boolean; symbol?: string; amount?: number; type?: number; error?: string }> {
+    try {
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error("Amount must be a positive number")
+      }
+      
+      if (type !== 1 && type !== 2) {
+        throw new Error("Type must be 1 (increase) or 2 (decrease)")
+      }
+      
+      this.log(`[API] Adjusting margin for ${symbol}: ${type === 1 ? "+" : "-"}${amount} USDT`)
+      
+      const params: Record<string, any> = {
+        symbol: this.toBingXSymbol(symbol),
+        amount,
+        type,
+        timestamp: Date.now(),
+      }
+      
+      if (positionSide) {
+        params.positionSide = positionSide
+      }
+      
+      if (positionId) {
+        params.positionId = positionId
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/positionMargin?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "POST",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      this.log(`✓ Margin adjusted for ${symbol}`)
+      return {
+        success: true,
+        symbol: data.data?.symbol,
+        amount: data.data?.amount,
+        type: data.data?.type,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to adjust margin: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Get margin mode for a symbol
+   * 
+   * Official API: GET /openApi/swap/v2/trade/marginType
+   * Rate limit: 2/s per UID; 2/s per IP
+   * 
+   * @param symbol - Trading pair
+   * @returns Margin mode (ISOLATED or CROSSED)
+   */
+  async getMarginMode(symbol: string): Promise<{ success: boolean; marginType?: string; error?: string }> {
+    try {
+      this.log(`[API] Querying margin mode for ${symbol}`)
+      
+      const params: Record<string, any> = {
+        symbol: this.toBingXSymbol(symbol),
+        timestamp: Date.now(),
+      }
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "GET",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      const marginType = data.data?.marginType || "UNKNOWN"
+      this.log(`✓ Margin mode: ${marginType}`)
+      return {
+        success: true,
+        marginType,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to get margin mode: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Get single open order
+   * 
+   * Official API: GET /openApi/swap/v2/trade/openOrder
+   * Rate limit: 5/s per UID; 2/s per IP
+   */
+  async getOpenOrder(
+    symbol: string,
+    orderId?: string,
+    clientOrderId?: string
+  ): Promise<{ success: boolean; order?: any; error?: string }> {
+    try {
+      const params: Record<string, any> = {
+        symbol: this.toBingXSymbol(symbol),
+        timestamp: Date.now(),
+      }
+      
+      if (orderId) params.orderId = orderId
+      if (clientOrderId) params.clientOrderId = clientOrderId
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/openOrder?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "GET",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      return {
+        success: true,
+        order: data.data,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to get open order: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Get order details (any status)
+   * 
+   * Official API: GET /openApi/swap/v2/trade/order
+   * Rate limit: 30/s per UID; 2/s per IP
+   */
+  async getOrder(
+    symbol: string,
+    orderId?: string,
+    clientOrderId?: string
+  ): Promise<{ success: boolean; order?: any; error?: string }> {
+    try {
+      const params: Record<string, any> = {
+        symbol: this.toBingXSymbol(symbol),
+        timestamp: Date.now(),
+      }
+      
+      if (orderId) params.orderId = orderId
+      if (clientOrderId) params.clientOrderId = clientOrderId
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/order?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "GET",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      return {
+        success: true,
+        order: data.data,
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to get order: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Get force liquidation/ADL orders
+   * 
+   * Official API: GET /openApi/swap/v2/trade/forceOrders
+   * Rate limit: 10/s per UID; 2/s per IP
+   */
+  async getForceOrders(
+    symbol?: string,
+    currency?: string,
+    autoCloseType?: "LIQUIDATION" | "ADL",
+    startTime?: number,
+    endTime?: number,
+    limit?: number
+  ): Promise<{ success: boolean; orders?: any[]; error?: string }> {
+    try {
+      const params: Record<string, any> = {
+        timestamp: Date.now(),
+      }
+      
+      if (symbol) params.symbol = this.toBingXSymbol(symbol)
+      if (currency) params.currency = currency
+      if (autoCloseType) params.autoCloseType = autoCloseType
+      if (startTime) params.startTime = startTime
+      if (endTime) params.endTime = endTime
+      if (limit) params.limit = limit
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/forceOrders?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "GET",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      return {
+        success: true,
+        orders: Array.isArray(data.data) ? data.data : [],
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to get force orders: ${errorMsg}`)
+      return {
+        success: false,
+        error: errorMsg,
+      }
+    }
+  }
+
+  /**
+   * Get trade fill history
+   * 
+   * Official API: GET /openApi/swap/v2/trade/allFillOrders
+   * Rate limit: 5/s per UID; 2/s per IP
+   */
+  async getTradeHistory(
+    tradingUnit: string,
+    startTs: number,
+    endTs: number,
+    orderId?: string,
+    currency?: string
+  ): Promise<{ success: boolean; trades?: any[]; error?: string }> {
+    try {
+      const params: Record<string, any> = {
+        tradingUnit,
+        startTs,
+        endTs,
+        timestamp: Date.now(),
+      }
+      
+      if (orderId) params.orderId = orderId
+      if (currency) params.currency = currency
+      
+      const { signature, queryString: signedQs } = this.signParams(params)
+      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/allFillOrders?${signedQs}&signature=${signature}`
+      
+      const response = await this.rateLimitedFetch(url, {
+        method: "GET",
+        headers: { "X-BX-APIKEY": this.credentials.apiKey },
+      })
+      
+      const data = await response.json()
+      
+      if (!this.isBingXSuccess(data.code)) {
+        throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
+      }
+      
+      return {
+        success: true,
+        trades: Array.isArray(data.data) ? data.data : [],
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.logError(`✗ Failed to get trade history: ${errorMsg}`)
       return {
         success: false,
         error: errorMsg,
