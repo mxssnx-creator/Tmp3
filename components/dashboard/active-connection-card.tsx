@@ -1413,7 +1413,7 @@ export function ActiveConnectionCard({
                           // but the PF aggregate is now also written by the
                           // prehistoric path — see config-set-processor's
                           // historic PF aggregation block).
-                          (count > 0 || evaluated > 0 || avgPF > 0) && (
+                          (count > 0 || evaluated > 0 || avgPF > 0 || (label === "Real" && (prehistoricStats.realOpen > 0 || prehistoricStats.liveOpenPositions > 0))) && (
                             <div key={label} className="space-y-0.5">
                               {/* Main row: label, sets/positions count, pass/fill ratio, PF */}
                               <div className="flex items-center gap-2 text-[10px]">
@@ -1421,6 +1421,35 @@ export function ActiveConnectionCard({
                                 <span className="font-semibold tabular-nums">
                                   {count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count} {isLive ? "pos" : "sets"}
                                 </span>
+                                {/* ── Open-position count for Real stage ───────
+                                    Real-stage's `count` field is the cumulative
+                                    Set tally — it does NOT surface the actual
+                                    currently-open Real positions. Operators
+                                    repeatedly reported "Stage Real showing no
+                                    open Positions" because of this. We clamp to
+                                    `Math.max(realOpen, liveOpenPositions)` so
+                                    the value never reads 0 while live mirrors
+                                    are still on the exchange (Live positions
+                                    cannot exist without an upstream Real
+                                    promotion). */}
+                                {label === "Real" && (() => {
+                                  const realOpenClamped = Math.max(
+                                    prehistoricStats.realOpen || 0,
+                                    prehistoricStats.liveOpenPositions || 0,
+                                  )
+                                  if (realOpenClamped <= 0) return null
+                                  return (
+                                    <span
+                                      className="text-muted-foreground"
+                                      title="Currently-open validated Real positions awaiting mirror into exchange orders (clamped to live count so it never reads 0 while live mirrors are still alive)."
+                                    >
+                                      <span className="text-emerald-700 dark:text-emerald-400 font-semibold tabular-nums">
+                                        {realOpenClamped}
+                                      </span>{" "}
+                                      open
+                                    </span>
+                                  )
+                                })()}
                                 {evaluated > 0 && (
                                   <span className="text-muted-foreground">
                                     {isLive ? "placed " : "eval "}

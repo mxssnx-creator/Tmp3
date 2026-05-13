@@ -812,6 +812,29 @@ export class RealtimeProcessor {
     this.liveSyncInFlight = true
 
     try {
+      // ── Always-run simulated-position sweep ─────────────────────────
+      // Runs BEFORE every early-return below (no connection record,
+      // missing API keys, connector failure) so simulated positions on
+      // paper-only / is_live_trade=false connections always get a
+      // close path on every realtime tick. The helper is fully
+      // self-contained and reads Redis market_data for prices, so it
+      // doesn't depend on the exchange connector being available.
+      //
+      // This is the single most important fix for the operator's
+      // recurring "Live Positions are Still not getting closed"
+      // complaint on paper-mode connections — every other close path
+      // was gated on having a working exchange connector, so paper
+      // simulated positions accumulated unboundedly.
+      try {
+        const { processSimulatedPositions } = await import("@/lib/trade-engine/stages/live-stage")
+        await processSimulatedPositions(this.connectionId)
+      } catch (simErr) {
+        console.warn(
+          `[v0] [Realtime] processSimulatedPositions error for ${this.connectionId}:`,
+          simErr instanceof Error ? simErr.message : String(simErr),
+        )
+      }
+
       // ── REMOVED the prior LLEN short-circuit ────────────────────────
       // The previous version short-circuited when `live:positions:{id}`
       // LLEN returned 0. That looked like a sensible optimization but
@@ -839,8 +862,9 @@ export class RealtimeProcessor {
       const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
       const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
       if (!apiKey || !apiSecret || apiKey.length < 10 || apiSecret.length < 10) {
-        // Paper-only connection — nothing to sync against. Silent return
-        // (no log) because this fires every 5 s on paper accounts.
+        // Paper-only connection — nothing to sync against on the exchange
+        // side. The simulated-position sweep above already handled all
+        // close paths for paper trades, so we return silently here.
         return
       }
 
