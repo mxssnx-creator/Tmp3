@@ -160,6 +160,7 @@ import { StrategyProcessor, clearFlowThrottleForConnection } from "./strategy-pr
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { RealtimeProcessor } from "./realtime-processor"
 import { runIndStratCycle } from "./shared-ind-strat-pipeline"
+import { IndicationSetsProcessor } from "@/lib/indication-sets-processor"
 import { getEngineTimings } from "@/lib/engine-timings"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { loadMarketDataForEngine } from "@/lib/market-data-loader"
@@ -1041,7 +1042,7 @@ export class TradeEngineManager {
           prehistoric_data_error: err instanceof Error ? err.message : String(err),
           updated_at: new Date().toISOString(),
         })
-        // ── Error-path phase advance ───────────────────────────────────
+        // ── Error-path phase advance ────────────────────���──────────────
         // Even on prehistoric failure, force the gate open so the engine
         // doesn't appear "stuck at prehistoric_data" forever. The
         // realtime processor's Phase A (TP/SL on open positions) still
@@ -2655,22 +2656,16 @@ export class TradeEngineManager {
           appSettings?.prehistoric_range_hours ?? appSettings?.prehistoricRangeHours ?? 8,
         )
         const rangeHours = Math.max(1, Math.min(50, Number.isFinite(rawHours) ? rawHours : 8))
-        const end = new Date()
-        const start = new Date(end.getTime() - rangeHours * 60 * 60 * 1000)
+        const windowEndMs = Date.now()
+        const windowStartMs = windowEndMs - rangeHours * 60 * 60 * 1000
 
-        // ── Load historical candles BEFORE the pipeline runs ─────────────
-        // `processHistoricalIndications` reads `market_data:{symbol}:candles`
-        // (and `:1s` / `:1m` envelopes) to drive the Set-fill loop. On a
-        // cold start that key may be empty until `loadMarketDataForEngine`
-        // populates it. Calling the loader here on every cycle guarantees:
-        //
-        //   • First-pass after engine boot has fresh data (no empty Sets).
-        //   • Subsequent cycles extend the candle window as new bars close
-        //     on the exchange — so Sets continuously absorb new market
-        //     activity, exactly as the spec demands.
-        //
-        // The loader is internally rate-limited and idempotent — calling
-        // it back-to-back is cheap when nothing has changed.
+        // ── Step A: Bulk-load market data ONCE per cycle ─────────────────
+        // The loader writes the canonical `market_data:{symbol}:candles`
+        // JSON array (1 s bars over the look-back window) plus the `:1s`
+        // envelope. We call it once for the full symbol list, then iterate
+        // the loaded candles in Step B — exactly as the spec demands:
+        // "load marketdata at once for specific range then process by its
+        // timeframe interval."
         try {
           const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
           await loadMarketDataForEngine(symbols)
@@ -2679,28 +2674,133 @@ export class TradeEngineManager {
             `[v0] [PrehistoricProgression] Market-data load warning:`,
             loadErr instanceof Error ? loadErr.message : String(loadErr),
           )
-          // Non-fatal — continue to the pipeline. If candles are still
-          // missing, `processHistoricalIndications` will log NO DATA and
-          // skip the symbol gracefully.
+          // Non-fatal — the per-symbol replay below will log NO DATA and
+          // skip any symbol whose candle key is still empty.
         }
 
-        const pipelineDeps = {
-          indication: this.indicationProcessor,
-          strategy: this.strategyProcessor,
-          realtime: this.realtimeProcessor,
-          historicalWindow: { start, end },
+        // ── Step B: Per-symbol step-by-step replay ───────────────────────
+        // For each symbol, walk the loaded candles from the per-symbol
+        // checkpoint forward at the data's native timeframe interval
+        // (1 s — that's what the loader writes), and call the SAME shared
+        // pipeline the Realtime Progression uses, once per candle, with
+        // `asOfMs` set to that candle's timestamp.
+        //
+        // Cross-cycle checkpointing: `prehistoric:checkpoint:{connId}:{symbol}`
+        // stores the timestamp of the last replayed candle. On the next
+        // cycle we resume from there, so the loop only ever replays NEW
+        // candles (the freshly-loaded tail) — not the entire range every
+        // pass. This makes back-to-back cycles cheap once the catch-up
+        // phase completes.
+        //
+        // Per-cycle safety cap: MAX_REPLAY_STEPS_PER_SYMBOL bounds the
+        // work each symbol can do in one cycle, so a cold start with a
+        // 50-hour range (180 000 candles) doesn't monopolize the event
+        // loop. The remaining candles replay on subsequent cycles.
+        const MAX_REPLAY_STEPS_PER_SYMBOL = 500
+        const client = getRedisClient()
+
+        const replayOneSymbol = async (
+          symbol: string,
+        ): Promise<{ symbol: string; stepsReplayed: number; indications: number; strategies: number; durationMs: number; error?: string }> => {
+          const symStart = Date.now()
+          try {
+            // Load candles for this symbol (the same key the indication
+            // processor's getHistoricalCandles reads).
+            const candlesRaw = await client.get(`market_data:${symbol}:candles`)
+            if (!candlesRaw) {
+              return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
+            }
+            const candles: any[] = JSON.parse(
+              typeof candlesRaw === "string" ? candlesRaw : JSON.stringify(candlesRaw),
+            )
+            if (!Array.isArray(candles) || candles.length === 0) {
+              return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
+            }
+
+            // Resolve resume point. On the very first cycle (no checkpoint)
+            // we start at the configured window's start so we don't skip
+            // backward bars; on subsequent cycles we resume strictly
+            // after the last replayed timestamp.
+            const ckptKey = `prehistoric:checkpoint:${connId}:${symbol}`
+            const ckptRaw = await client.get(ckptKey).catch(() => null)
+            const ckpt = ckptRaw ? Number(ckptRaw) : windowStartMs
+            const resumeFrom = Number.isFinite(ckpt) ? ckpt : windowStartMs
+
+            // Filter to candles strictly newer than the checkpoint AND
+            // within the look-back window. Ascending order is preserved.
+            const pending = candles
+              .filter((c: any) => {
+                const ts = Number(c?.timestamp ?? c?.t ?? 0)
+                return Number.isFinite(ts) && ts > resumeFrom && ts <= windowEndMs
+              })
+              .sort((a: any, b: any) => Number(a?.timestamp ?? 0) - Number(b?.timestamp ?? 0))
+
+            if (pending.length === 0) {
+              return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
+            }
+
+            // Cap per-cycle work so cold starts don't starve the loop.
+            const steps = pending.slice(0, MAX_REPLAY_STEPS_PER_SYMBOL)
+
+            // One shared sets processor for the whole symbol so we don't
+            // pay the per-step allocation tax.
+            const setsProcessor = new IndicationSetsProcessor(connId)
+
+            let indicationsTotal = 0
+            let strategiesTotal = 0
+            let lastReplayedTs = resumeFrom
+
+            for (const candle of steps) {
+              if (!this.isRunning) break
+              const asOfMs = Number(candle?.timestamp ?? candle?.t ?? 0)
+              if (!Number.isFinite(asOfMs)) continue
+
+              // SAME pipeline the Realtime Progression uses — single
+              // source of indication + strategy logic for both modes.
+              const stepResult = await runIndStratCycle(connId, symbol, "historical", {
+                indication: this.indicationProcessor,
+                strategy: this.strategyProcessor,
+                realtime: this.realtimeProcessor,
+                asOfMs,
+                asOfCandle: candle,
+                setsProcessor,
+              })
+              indicationsTotal += stepResult.indicationCount
+              strategiesTotal += stepResult.strategiesEvaluated
+              lastReplayedTs = asOfMs
+            }
+
+            // Persist the new checkpoint so the next cycle resumes at
+            // `lastReplayedTs + 1`. 7-day TTL — long enough to survive
+            // a weekend restart, short enough that a cleared symbol set
+            // self-recovers without manual key cleanup.
+            if (lastReplayedTs > resumeFrom) {
+              await client
+                .set(ckptKey, String(lastReplayedTs), { EX: 7 * 24 * 60 * 60 })
+                .catch(() => { /* non-critical */ })
+            }
+
+            return {
+              symbol,
+              stepsReplayed: steps.length,
+              indications: indicationsTotal,
+              strategies: strategiesTotal,
+              durationMs: Date.now() - symStart,
+            }
+          } catch (err) {
+            return {
+              symbol,
+              stepsReplayed: 0,
+              indications: 0,
+              strategies: 0,
+              durationMs: Date.now() - symStart,
+              error: err instanceof Error ? err.message : String(err),
+            }
+          }
         }
 
         const results = await withCycleDeadline(
-          mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, (symbol) =>
-            runIndStratCycle(connId, symbol, "historical", pipelineDeps).catch((err) => {
-              console.error(
-                `[v0] [PrehistoricProgression] Error for ${symbol}:`,
-                err instanceof Error ? err.message : String(err),
-              )
-              return null
-            }),
-          ),
+          mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, replayOneSymbol),
           `Engine ${connId} prehistoric-progression`,
         )
 
@@ -2742,26 +2842,50 @@ export class TradeEngineManager {
         }
 
         // Cycle telemetry — surfaces the loop's heartbeat to the dashboard.
+        // Now reports replay-step totals so operators can see real per-cycle
+        // work (e.g. "1 200 steps replayed across 12 symbols, 340 indications,
+        // 18 strategies") instead of an opaque cycle count.
+        const stepsTotal = results.reduce(
+          (acc: number, r: any) => acc + (Number(r?.stepsReplayed) || 0),
+          0,
+        )
+        const indTotal = results.reduce(
+          (acc: number, r: any) => acc + (Number(r?.indications) || 0),
+          0,
+        )
+        const stratTotal = results.reduce(
+          (acc: number, r: any) => acc + (Number(r?.strategies) || 0),
+          0,
+        )
+        const successCount = results.filter((r: any) => r && !r.error).length
         try {
-          const client = getRedisClient()
+          const telemetryClient = getRedisClient()
           const progKey = `progression:${connId}`
           const nowMs = Date.now()
-          const successCount = results.filter((r: any) => r && !r.error).length
           await Promise.all([
-            client.hincrby(progKey, "prehistoric_progression_cycles", 1),
-            client.hset(progKey, {
+            telemetryClient.hincrby(progKey, "prehistoric_progression_cycles", 1),
+            telemetryClient.hincrby(progKey, "prehistoric_replay_steps_total", stepsTotal),
+            telemetryClient.hincrby(progKey, "prehistoric_indications_total", indTotal),
+            telemetryClient.hincrby(progKey, "prehistoric_strategies_total", stratTotal),
+            telemetryClient.hset(progKey, {
               prehistoric_progression_last_cycle_at: String(nowMs),
               prehistoric_progression_last_cycle_ms: String(duration),
               prehistoric_progression_last_symbols: String(successCount),
+              prehistoric_progression_last_steps: String(stepsTotal),
+              prehistoric_progression_last_indications: String(indTotal),
+              prehistoric_progression_last_strategies: String(stratTotal),
             }),
-            client.expire(progKey, 7 * 24 * 60 * 60),
+            telemetryClient.expire(progKey, 7 * 24 * 60 * 60),
           ])
         } catch { /* non-critical */ }
 
-        // Throttled cycle log — every 50 cycles to avoid stdout flooding.
-        if (cycleCount === 1 || cycleCount % 50 === 0) {
+        // Throttled cycle log — every 50 cycles to avoid stdout flooding,
+        // plus an unconditional log on cycle 1 and whenever a cycle does
+        // non-trivial work (>0 steps), so operators see catch-up progress
+        // without having to wait for the 50-cycle boundary.
+        if (cycleCount === 1 || cycleCount % 50 === 0 || stepsTotal > 0) {
           console.log(
-            `[v0] [PrehistoricProgression] cycle=${cycleCount} symbols=${symbols.length} duration=${duration}ms range=${rangeHours}h`,
+            `[v0] [PrehistoricProgression] cycle=${cycleCount} symbols=${symbols.length} steps=${stepsTotal} indications=${indTotal} strategies=${stratTotal} duration=${duration}ms range=${rangeHours}h`,
           )
         }
       } catch (err) {
