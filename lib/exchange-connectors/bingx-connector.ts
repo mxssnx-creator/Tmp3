@@ -128,6 +128,51 @@ export class BingXConnector extends BaseExchangeConnector {
     return code === 0 || code === "0"
   }
 
+  /**
+   * Safe JSON parse that preserves orderId precision.
+   *
+   * BingX (and Binance) emit order IDs as JSON NUMBERS up to ~19 digits
+   * long, well beyond `Number.MAX_SAFE_INTEGER` (16 digits, max
+   * 9007199254740991). The default `response.json()` parses them as
+   * IEEE-754 doubles, silently losing the last 1-3 digits — e.g.
+   * `2055068855617294300` becomes the nearest representable double
+   * `2055068855617294336`. The cancellation pipeline then targets an
+   * orderId that doesn't exist on the venue, producing the observed
+   * `code=109400 "order not exist"`.
+   *
+   * Fix: read the body as text and quote-wrap every numeric value
+   * associated with an ID-bearing field BEFORE JSON.parse, so the IDs
+   * survive as strings. We deliberately target a curated whitelist of
+   * field names (orderId, orderID, id, clientOrderId, transactId,
+   * positionId) rather than every long number — prices/quantities are
+   * always safely within double precision and we want to keep them as
+   * numbers for ergonomic arithmetic at call sites.
+   */
+  private async safeJson(response: Response): Promise<any> {
+    const text = await response.text()
+    if (!text) return {}
+    // (?<="orderId":\s*) lookbehind then a bare numeric (one or more
+    // digits, possibly negative) → wrap in quotes. `g` so every
+    // occurrence in arrays is handled. Anchored on the next char so we
+    // don't accidentally wrap already-quoted strings (the negative
+    // lookahead `(?!")` is implicit because the regex requires a digit
+    // immediately after the colon-whitespace).
+    const idFields = ["orderId", "orderID", "id", "clientOrderId", "transactId", "positionId"]
+    const pattern = new RegExp(
+      `("(?:${idFields.join("|")})"\\s*:\\s*)(-?\\d+)(\\s*[,}\\]])`,
+      "g",
+    )
+    const safeText = text.replace(pattern, '$1"$2"$3')
+    try {
+      return JSON.parse(safeText)
+    } catch {
+      // If the regex transform broke parsing for an unexpected payload
+      // shape, fall back to the unmodified text — better to lose ID
+      // precision than to fail the whole response.
+      return JSON.parse(text)
+    }
+  }
+
   getCapabilities(): string[] {
     return ["futures", "perpetual_futures", "leverage", "hedge_mode", "cross_margin"]
   }
@@ -446,7 +491,7 @@ export class BingXConnector extends BaseExchangeConnector {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         // Special-case: 109400 "In the Hedge mode, the 'ReduceOnly' field
@@ -466,7 +511,7 @@ export class BingXConnector extends BaseExchangeConnector {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
-          const roRetryData = await roRetryResp.json()
+          const roRetryData = await this.safeJson(roRetryResp)
           if (this.isBingXSuccess(roRetryData.code)) {
             const info = roRetryData.data?.order || roRetryData.data || {}
             const id = info.orderId || info.id || roRetryData.data?.orderId
@@ -496,7 +541,7 @@ export class BingXConnector extends BaseExchangeConnector {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
-          const retryData = await retryResp.json()
+          const retryData = await this.safeJson(retryResp)
           if (this.isBingXSuccess(retryData.code)) {
             const info = retryData.data?.order || retryData.data || {}
             const id = info.orderId || info.id || retryData.data?.orderId
@@ -613,7 +658,7 @@ export class BingXConnector extends BaseExchangeConnector {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       // Same one-way retry logic as `placeOrder`: BingX returns 80014 when
       // a hedge-mode positionSide is sent to a one-way account.
@@ -636,7 +681,7 @@ export class BingXConnector extends BaseExchangeConnector {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
-          const retryData2 = await retryResp2.json()
+          const retryData2 = await this.safeJson(retryResp2)
           if (this.isBingXSuccess(retryData2.code)) {
             const info2 = retryData2.data?.order || retryData2.data || {}
             return {
@@ -660,7 +705,7 @@ export class BingXConnector extends BaseExchangeConnector {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
-          const retryData = await retryResp.json()
+          const retryData = await this.safeJson(retryResp)
           if (this.isBingXSuccess(retryData.code)) {
             const info = retryData.data?.order || retryData.data || {}
             const id = info.orderId || info.id || retryData.data?.orderId
@@ -712,7 +757,7 @@ export class BingXConnector extends BaseExchangeConnector {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -751,7 +796,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return null
@@ -814,7 +859,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -853,7 +898,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -909,7 +954,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -958,7 +1003,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1041,7 +1086,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1077,7 +1122,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1110,7 +1155,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -1119,7 +1164,7 @@ export class BingXConnector extends BaseExchangeConnector {
       return Array.isArray(data.data) ? data.data : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
-      this.logError(`✗ Failed to fetch transfer history: ${errorMsg}`)
+      this.logError(`�� Failed to fetch transfer history: ${errorMsg}`)
       return []
     }
   }
@@ -1148,7 +1193,7 @@ export class BingXConnector extends BaseExchangeConnector {
           method: "POST",
           headers: { "X-BX-APIKEY": this.credentials.apiKey },
         })
-        const data = await response.json()
+        const data = await this.safeJson(response)
         return { side, ok: this.isBingXSuccess(data.code), data }
       }
 
@@ -1198,7 +1243,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         // Margin-type-unchanged is not a real error on BingX; ignore code 101404.
@@ -1236,7 +1281,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1278,7 +1323,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (data.code !== 0 && data.code !== "0") {
         return null
@@ -1351,7 +1396,7 @@ export class BingXConnector extends BaseExchangeConnector {
         return null
       }
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (data.code !== 0 && data.code !== "0") {
         // Silently return null to avoid log flooding
@@ -1651,7 +1696,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1701,7 +1746,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1793,7 +1838,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1855,7 +1900,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1914,7 +1959,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1976,7 +2021,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2055,7 +2100,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2104,7 +2149,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2154,7 +2199,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2202,7 +2247,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2256,7 +2301,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2308,7 +2353,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
