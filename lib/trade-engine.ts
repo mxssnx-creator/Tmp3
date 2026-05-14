@@ -934,8 +934,8 @@ export class GlobalTradeEngineCoordinator {
       let stateSnapshot: Record<string, boolean> = {}
       try {
         const client = getRedisClient()
-        const globalState = await client.hgetall("trade_engine:global").catch(() => ({}))
-        if (globalState.engine_state_snapshot) {
+        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+        if (globalState && globalState.engine_state_snapshot) {
           stateSnapshot = JSON.parse(globalState.engine_state_snapshot)
           console.log("[v0] [Coordinator] Restored engine state snapshot from pause")
         }

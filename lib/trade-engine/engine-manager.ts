@@ -1350,8 +1350,8 @@ export class TradeEngineManager {
       // Check pause state before executing cycle
       try {
         const client = getRedisClient()
-        const globalState = await client.hgetall("trade_engine:global").catch(() => ({}))
-        if ((globalState as any).status === "paused") {
+        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+        if (globalState && globalState.status === "paused") {
           // Engine paused - reschedule but skip processing
           scheduleNext(false)
           return
@@ -1759,8 +1759,8 @@ export class TradeEngineManager {
       // Check pause state before executing cycle
       try {
         const client = getRedisClient()
-        const globalState = await client.hgetall("trade_engine:global").catch(() => ({}))
-        if ((globalState as any).status === "paused") {
+        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+        if (globalState && globalState.status === "paused") {
           // Engine paused - reschedule but skip processing
           scheduleNext(false)
           return

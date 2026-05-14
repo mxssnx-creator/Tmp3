@@ -2567,13 +2567,6 @@ export async function closeLivePosition(
     position.realizedPnL = Math.round(pnl * 100) / 100
     position.closeReason = closeReason
     
-    // Store exchange close result metadata for debugging/reconciliation
-    if (exchangeConnector) {
-      position.exchangeCloseAttempted = true
-      position.exchangeCloseSucceeded = exchangeCloseSuccess
-      position.exchangeClosedAt = exchangeCloseSuccess ? Date.now() : undefined
-    }
-    
     pushStep(
       position,
       "close",
