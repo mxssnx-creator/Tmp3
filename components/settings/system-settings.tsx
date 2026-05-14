@@ -38,6 +38,7 @@ interface EngineSettings {
 interface EngineTimings {
   cronSyncIntervalSeconds: number
   liveSyncIntervalMs: number
+  liveSyncPauseMs: number
   heartbeatIntervalMs: number
   strategyFlowMinIntervalMs: number
   strategyFlowHardThrottleMs: number
@@ -52,7 +53,8 @@ interface EngineTimings {
 // blank — operator sees the actual defaults the engine will use.
 const DEFAULT_TIMINGS: EngineTimings = {
   cronSyncIntervalSeconds:   15,
-  liveSyncIntervalMs:        5_000,
+  liveSyncIntervalMs:          200,
+  liveSyncPauseMs:              50,
   heartbeatIntervalMs:       1_000,
   strategyFlowMinIntervalMs: 1_500,
   strategyFlowHardThrottleMs:  750,
@@ -70,8 +72,12 @@ const TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; max: number; uni
     help: "Sub-minute sync cadence. The cron handler self-loops inside each 60s Vercel invocation, sleeping this many seconds between sweeps. 15s = 4 sweeps/min.",
   },
   liveSyncIntervalMs: {
-    min: 500, max: 60_000, unit: "ms", live: true,
-    help: "Realtime processor's exchange-sync throttle. Lower = faster external-close detection but more REST calls.",
+    min: 100, max: 60_000, unit: "ms", live: true,
+    help: "Realtime processor's exchange-sync cadence (start-to-start). Default 200 ms matches the live exchange-positions update rate. Lower = faster close-on-SL/TP detection but more REST calls; min 100 ms.",
+  },
+  liveSyncPauseMs: {
+    min: 10, max: 200, unit: "ms", live: true,
+    help: "Breath after each completed sync cycle before the next can fire — mirrors the main progression cyclePauseMs pattern. Ensures previous sync's Redis writes / control-order placements are durable before the next sync reads.",
   },
   heartbeatIntervalMs: {
     min: 250, max: 30_000, unit: "ms", live: true,
@@ -146,6 +152,7 @@ export function SystemSettings() {
           }
           read("cron_sync_interval_seconds",    "cronSyncIntervalSeconds")
           read("live_sync_interval_ms",         "liveSyncIntervalMs")
+          read("live_sync_pause_ms",            "liveSyncPauseMs")
           read("heartbeat_interval_ms",         "heartbeatIntervalMs")
           read("strategy_flow_min_interval_ms", "strategyFlowMinIntervalMs")
           read("strategy_flow_hard_throttle_ms","strategyFlowHardThrottleMs")
@@ -188,6 +195,7 @@ export function SystemSettings() {
           body: JSON.stringify({
             cron_sync_interval_seconds:    timings.cronSyncIntervalSeconds,
             live_sync_interval_ms:         timings.liveSyncIntervalMs,
+            live_sync_pause_ms:            timings.liveSyncPauseMs,
             heartbeat_interval_ms:         timings.heartbeatIntervalMs,
             strategy_flow_min_interval_ms: timings.strategyFlowMinIntervalMs,
             strategy_flow_hard_throttle_ms:timings.strategyFlowHardThrottleMs,

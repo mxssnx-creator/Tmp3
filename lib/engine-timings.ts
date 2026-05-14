@@ -36,8 +36,21 @@ export interface EngineTimings {
   // ── Realtime-processor close path throttle ────────────────────────────
   // `RealtimeProcessor.maybeRunLiveSync()` is gated by this. Lower =
   // faster close-on-SL/TP detection but more REST calls to the exchange.
-  // 5000 ms is the historical default.
+  // Default 200 ms — matches the live exchange-positions update cadence
+  // so SL/TP cross detection and protection-order healing run in lock-
+  // step with the freshest price data the venue gives us.
   liveSyncIntervalMs: number
+
+  // ── Pause AFTER a completed live sync ─────────────────────────────────
+  // Defence-in-depth on top of the single-flight guard. Once a sync
+  // cycle has fully completed (every per-position branch, every protection
+  // order placement / cancel, every Redis write), we wait this many ms
+  // before the next sync can be triggered. Mirrors the `cyclePauseMs`
+  // pattern used by the main progression cycle (see engine-manager.ts):
+  // each cycle runs to completion → short breath → next cycle. Range
+  // 10–200 ms, default 50 ms. Prevents back-to-back syncs starving the
+  // event loop on a slow exchange API while keeping close latency low.
+  liveSyncPauseMs: number
 
   // ── Realtime tick heartbeat throttle ──────────────────────────────────
   // How often the engine-state heartbeat (Redis `trade_engine_state:*`)
@@ -73,7 +86,12 @@ export interface EngineTimings {
 
 export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   cronSyncIntervalSeconds:   15,
-  liveSyncIntervalMs:        5_000,
+  // Tuned for sub-second close response — was 5_000 ms, lowered to match
+  // the live exchange-positions cadence (~200 ms). Combined with the
+  // `liveSyncPauseMs` post-cycle breath this gives ~5 close-path sweeps
+  // per second while still letting each sweep finish cleanly.
+  liveSyncIntervalMs:          200,
+  liveSyncPauseMs:              50,
   heartbeatIntervalMs:       1_000,
   strategyFlowMinIntervalMs: 1_500,
   strategyFlowHardThrottleMs:  750,
@@ -88,7 +106,12 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
 // would silence the dashboard's "engine alive" indicator).
 export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; max: number }> = {
   cronSyncIntervalSeconds:   { min: 5,           max: 60                  },
-  liveSyncIntervalMs:        { min: 500,         max: 60_000              },
+  // Lower bound 100 ms — anything faster than the exchange's own price
+  // tick is wasted REST calls. Upper bound retained at 60 s for
+  // operators who explicitly want a quiet REST footprint on paper-only
+  // setups.
+  liveSyncIntervalMs:        { min: 100,         max: 60_000              },
+  liveSyncPauseMs:           { min: 10,          max: 200                 },
   heartbeatIntervalMs:       { min: 250,         max: 30_000              },
   strategyFlowMinIntervalMs: { min: 250,         max: 60_000              },
   strategyFlowHardThrottleMs:{ min: 100,         max: 30_000              },
@@ -103,6 +126,7 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
 const REDIS_KEY_MAP: Record<keyof EngineTimings, string[]> = {
   cronSyncIntervalSeconds:    ["cron_sync_interval_seconds",    "cronSyncIntervalSeconds"],
   liveSyncIntervalMs:         ["live_sync_interval_ms",         "liveSyncIntervalMs"],
+  liveSyncPauseMs:            ["live_sync_pause_ms",            "liveSyncPauseMs"],
   heartbeatIntervalMs:        ["heartbeat_interval_ms",         "heartbeatIntervalMs"],
   strategyFlowMinIntervalMs:  ["strategy_flow_min_interval_ms", "strategyFlowMinIntervalMs"],
   strategyFlowHardThrottleMs: ["strategy_flow_hard_throttle_ms","strategyFlowHardThrottleMs"],

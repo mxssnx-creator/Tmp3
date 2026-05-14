@@ -85,13 +85,29 @@ export class RealtimeProcessor {
   // symbol reaches the Real-stage block). For sub-second SL/TP response
   // the realtime tick has to drive it.
   //
-  // Rate-limited to LIVE_SYNC_INTERVAL_MS so we don't hammer the exchange
-  // REST endpoint on every realtime tick (which can fire >1× per second
-  // under dense market data). Per-instance throttle is sufficient because
-  // the engine spawns one RealtimeProcessor per connectionId.
-  private lastLiveSyncAt = 0
+  // Rate-limited to settings.liveSyncIntervalMs (default 200 ms, matches
+  // the live exchange-positions update cadence). Per-instance throttle is
+  // sufficient because the engine spawns one RealtimeProcessor per
+  // connectionId.
+  //
+  // Two timestamps + a single-flight flag = three independent gates:
+  //   1. `liveSyncInFlight`         — never start a sync while one is
+  //                                   already running (handles slow REST
+  //                                   round-trips during a tick storm).
+  //   2. `lastLiveSyncStartedAt`    — enforce the target cadence
+  //                                   (start-to-start = liveSyncIntervalMs).
+  //   3. `lastLiveSyncCompletedAt`  — enforce a post-completion breath
+  //                                   (completion-to-start = liveSyncPauseMs).
+  //
+  // Mirrors the main progression cycle pattern in engine-manager.ts: each
+  // cycle runs to full completion → short pause → next cycle. The pause
+  // guarantees downstream Redis writes / control-order placements made
+  // by the previous sync are fully durable before the next sync reads.
+  private lastLiveSyncStartedAt = 0
+  private lastLiveSyncCompletedAt = 0
   private liveSyncInFlight = false
-  private static readonly LIVE_SYNC_INTERVAL_MS = 5_000
+  private static readonly LIVE_SYNC_INTERVAL_MS = 200
+  private static readonly LIVE_SYNC_PAUSE_MS = 50
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -832,13 +848,36 @@ export class RealtimeProcessor {
    */
   private async maybeRunLiveSync(): Promise<void> {
     const now = Date.now()
+    // ── Gate 1: single-flight ─────────────────────────────────────────
+    // Never start a sync while another is in progress. A slow REST
+    // round-trip during a tick storm must NOT queue overlapping syncs;
+    // they would race on the same per-position Redis state.
     if (this.liveSyncInFlight) return
-    // Read cadence from settings:system; static const is the fallback only
-    // until the engine-timings cache lands (~milliseconds after boot).
+
+    // Read cadence + pause from settings:system; static consts are the
+    // fallback only until the engine-timings cache lands (~milliseconds
+    // after boot).
+    const timings = getEngineTimings()
     const liveSyncIntervalMs =
-      getEngineTimings().liveSyncIntervalMs || RealtimeProcessor.LIVE_SYNC_INTERVAL_MS
-    if (now - this.lastLiveSyncAt < liveSyncIntervalMs) return
-    this.lastLiveSyncAt = now
+      timings.liveSyncIntervalMs || RealtimeProcessor.LIVE_SYNC_INTERVAL_MS
+    const liveSyncPauseMs =
+      (typeof timings.liveSyncPauseMs === "number" ? timings.liveSyncPauseMs : RealtimeProcessor.LIVE_SYNC_PAUSE_MS)
+
+    // ── Gate 2: target cadence (start-to-start) ───────────────────────
+    // Enforce the configured interval between sync STARTS. Drives the
+    // close-detection cadence (default 200 ms = 5 sweeps/sec).
+    if (now - this.lastLiveSyncStartedAt < liveSyncIntervalMs) return
+
+    // ── Gate 3: post-completion breath ────────────────────────────────
+    // After the previous sync finished, wait `liveSyncPauseMs` before
+    // the next can start. Mirrors the main progression cycle's 50 ms
+    // breath — gives the event loop room and ensures downstream Redis
+    // writes from the previous sync are observable to the next one.
+    // On the very first tick `lastLiveSyncCompletedAt` is 0, so this
+    // gate is a no-op (now - 0 >> pauseMs).
+    if (now - this.lastLiveSyncCompletedAt < liveSyncPauseMs) return
+
+    this.lastLiveSyncStartedAt = now
     this.liveSyncInFlight = true
 
     try {
@@ -949,6 +988,10 @@ export class RealtimeProcessor {
         err instanceof Error ? err.message : String(err),
       )
     } finally {
+      // Stamp completion FIRST so the post-completion pause gate measures
+      // from real "work done" rather than "lock released" — these are the
+      // same instant here, but ordering this explicitly documents intent.
+      this.lastLiveSyncCompletedAt = Date.now()
       this.liveSyncInFlight = false
     }
   }
