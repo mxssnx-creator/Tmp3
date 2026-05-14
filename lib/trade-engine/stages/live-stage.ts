@@ -2478,9 +2478,22 @@ export async function executeLivePosition(
       const { desiredSl: slPrice, desiredTp: tpPrice } =
         computeDesiredProtectionPrices(livePosition)
 
-      livePosition.stopLossPrice = slPrice
-      livePosition.takeProfitPrice = tpPrice
-
+      // DO NOT pre-stamp the desired prices onto livePosition before the
+      // exchange confirms placement. The original code set
+      //   livePosition.stopLossPrice = slPrice
+      //   livePosition.takeProfitPrice = tpPrice
+      // BEFORE awaiting the placement promises. When a placement failed
+      // the recorded price still equaled the desired price, so
+      // `priceDrifted(stored, desired)` returned false on the next
+      // reconcile tick and the loop never retried the failed leg —
+      // leaving the live position exposed without protection until the
+      // operator's price moved >0.25%, sometimes for the lifetime of
+      // the trade.
+      //
+      // The new contract: stored price is the LAST CONFIRMED armed price
+      // for that leg. A failed placement leaves it at 0, which
+      // `priceDrifted(0, desired)` correctly classifies as "needs arming"
+      // on the next reconcile pass.
       const [slOrderId, tpOrderId] = await Promise.all([
         slPrice > 0
           ? placeProtectionOrder(
@@ -2506,13 +2519,49 @@ export async function executeLivePosition(
           : Promise.resolve(null),
       ])
 
-      if (slOrderId) livePosition.stopLossOrderId = slOrderId
-      if (tpOrderId) livePosition.takeProfitOrderId = tpOrderId
+      if (slOrderId) {
+        livePosition.stopLossOrderId = slOrderId
+        livePosition.stopLossPrice = slPrice
+      } else if (slPrice > 0) {
+        // Surface the protection gap loudly so operators and the
+        // dashboard see it; the next reconcile will retry.
+        console.error(
+          `${LOG_PREFIX} INITIAL StopLoss placement FAILED for ${realPosition.symbol} — position is LIVE without SL until next reconcile tick`,
+        )
+        await logProgressionEvent(
+          connectionId,
+          "live_trading",
+          "error",
+          `StopLoss NOT placed for ${realPosition.symbol} — reconcile will retry`,
+          { livePositionId: livePosition.id, desiredSl: slPrice, executedQty: livePosition.executedQuantity },
+        )
+        pushStep(livePosition, "place_stop_loss", false, `initial SL placement failed @ ${slPrice}`)
+      }
+      if (tpOrderId) {
+        livePosition.takeProfitOrderId = tpOrderId
+        livePosition.takeProfitPrice = tpPrice
+      } else if (tpPrice > 0) {
+        console.error(
+          `${LOG_PREFIX} INITIAL TakeProfit placement FAILED for ${realPosition.symbol} — position is LIVE without TP until next reconcile tick`,
+        )
+        await logProgressionEvent(
+          connectionId,
+          "live_trading",
+          "error",
+          `TakeProfit NOT placed for ${realPosition.symbol} — reconcile will retry`,
+          { livePositionId: livePosition.id, desiredTp: tpPrice, executedQty: livePosition.executedQuantity },
+        )
+        pushStep(livePosition, "place_take_profit", false, `initial TP placement failed @ ${tpPrice}`)
+      }
       // Record the qty SL/TP were armed for so the next reconcile
       // pass can detect quantity drift (delayed partial fills,
       // accumulation merges) and re-arm. Without this the drift
       // detector in `updateProtectionOrders` would see an undefined
       // baseline and re-arm on every cycle even when nothing changed.
+      //
+      // Only set when at least one leg succeeded — otherwise the next
+      // reconcile would treat the position as "armed for current qty"
+      // and never retry the failed legs because qtyDrifted is false.
       if (slOrderId || tpOrderId) {
         livePosition.protectionArmedQuantity = livePosition.executedQuantity
       }
