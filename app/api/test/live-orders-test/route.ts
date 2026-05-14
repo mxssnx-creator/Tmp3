@@ -5,6 +5,45 @@ import type { ExchangeConnection } from "@/lib/types"
 
 const LOG_PREFIX = "[v0] [LiveOrdersTest]"
 
+/**
+ * Normalize an exchange-native symbol to the canonical ccxt slash form
+ * (BASE/QUOTE) that every connector's `placeOrder` / `placeStopOrder` /
+ * `cancelOrder` API contract expects.
+ *
+ * `connector.getPositions()` returns symbols in EXCHANGE-NATIVE form,
+ * which varies by venue. Passing that raw value to the order-placement
+ * methods causes silent rejections that surface as "No order ID returned"
+ * — the exact failure mode observed for the SL test against BingX.
+ *
+ * Handled input forms (covers all venues currently wired in
+ * lib/exchange-connectors):
+ *   "BTC/USDT"           → "BTC/USDT"   already canonical
+ *   "BTC/USDT:USDT"      → "BTC/USDT"   ccxt perpetual settle-suffix
+ *   "BTC-USDT"           → "BTC/USDT"   BingX / OrangeX dashed
+ *   "BTC-USDT-SWAP"      → "BTC/USDT"   OKX perpetual swap marker
+ *   "BTCUSDT"            → "BTC/USDT"   Binance / Bybit compact
+ *
+ * Falls back to the input untouched for unrecognized formats so the
+ * downstream error surface stays informative ("invalid symbol XYZ" is
+ * more useful than silently mangling a one-off venue's format).
+ */
+function toCanonicalSymbol(raw: string): string {
+  if (!raw) return raw
+  // Strip ccxt's "/SETTLE" perpetual suffix and OKX's "-SWAP" marker first.
+  let s = raw.split(":")[0].replace(/-SWAP$/i, "")
+  if (s.includes("/")) return s
+  if (s.includes("-")) return s.replace("-", "/")
+  // Compact form — split on the longest matching known quote currency.
+  // Ordered longest-first so "USDT" wins over "USD" for "BTCUSDT".
+  const quotes = ["USDT", "USDC", "BUSD", "TUSD", "DAI", "USD", "BTC", "ETH"]
+  for (const q of quotes) {
+    if (s.endsWith(q) && s.length > q.length) {
+      return `${s.slice(0, -q.length)}/${q}`
+    }
+  }
+  return s
+}
+
 interface TestResult {
   testName: string
   success: boolean
@@ -379,8 +418,15 @@ async function testStopLossOrder(
     const slPrice = position.entryPrice * 0.95 // 5% below entry
     const quantity = position.contracts * 0.1 // Close 10% of position
 
+    const slSymbol = toCanonicalSymbol(position.symbol)
+    if (slSymbol !== position.symbol) {
+      console.log(
+        `${LOG_PREFIX} Normalized SL symbol: "${position.symbol}" → "${slSymbol}"`,
+      )
+    }
+
     const result = await connector.placeStopOrder(
-      position.symbol,
+      slSymbol,
       "sell",
       quantity,
       slPrice,
@@ -392,8 +438,8 @@ async function testStopLossOrder(
         testName: "Stop Loss Order",
         success: false,
         duration: Date.now() - start,
-        details: `Failed to place SL order for ${position.symbol}`,
-        error: "No order ID returned",
+        details: `Failed to place SL order for ${slSymbol} (raw="${position.symbol}")`,
+        error: result?.error || "No order ID returned",
       }
     }
 
@@ -578,11 +624,20 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
     const tpPrice = position.entryPrice * 1.10 // 10% above entry
     const quantity = Math.min(position.contracts * 0.1, 0.001) // Small qty
 
-    console.log(`${LOG_PREFIX} Creating control orders for ${position.symbol}`)
-    
+    // Same exchange-native → ccxt-slash conversion as testStopLossOrder;
+    // both placement AND the subsequent cancelOrder() MUST use the
+    // canonical symbol — connectors key their pending-order map on it.
+    const lifecycleSymbol = toCanonicalSymbol(position.symbol)
+    if (lifecycleSymbol !== position.symbol) {
+      console.log(
+        `${LOG_PREFIX} Normalized lifecycle symbol: "${position.symbol}" → "${lifecycleSymbol}"`,
+      )
+    }
+    console.log(`${LOG_PREFIX} Creating control orders for ${lifecycleSymbol}`)
+
     // Try to place SL order
     const slResult = await connector.placeStopOrder(
-      position.symbol,
+      lifecycleSymbol,
       position.side === "long" ? "sell" : "buy",
       quantity,
       slPrice,
@@ -592,7 +647,7 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
     if (slResult && slResult.orderId) {
       // Now try to cancel it to test cancel functionality
       try {
-        const cancelResult = await connector.cancelOrder(position.symbol, slResult.orderId)
+        const cancelResult = await connector.cancelOrder(lifecycleSymbol, slResult.orderId)
         if (cancelResult.success) {
           return {
             testName: "Control Order Lifecycle",
