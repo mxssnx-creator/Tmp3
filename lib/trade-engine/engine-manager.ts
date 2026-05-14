@@ -160,6 +160,7 @@ import { StrategyProcessor, clearFlowThrottleForConnection } from "./strategy-pr
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { RealtimeProcessor } from "./realtime-processor"
 import { runIndStratCycle } from "./shared-ind-strat-pipeline"
+import { getEngineTimings } from "@/lib/engine-timings"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { loadMarketDataForEngine } from "@/lib/market-data-loader"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
@@ -373,7 +374,7 @@ export class TradeEngineManager {
   private lockExtendTimer?: NodeJS.Timeout
 
   /**
-   * ── Live settings-reload bus ───────────────────────────────��─────
+   * ── Live settings-reload bus ───────────────────────────────���─────
    *
    * When connection settings change (e.g. operator edits indication
    * thresholds, volume factor, presets, etc.) the API handler writes
@@ -1598,6 +1599,17 @@ export class TradeEngineManager {
           const nowMs = Date.now()
           const writes: Promise<any>[] = [
             client.hincrby(redisKey, "indication_cycle_count", 1),
+            // ── Realtime Progression cycle counter (three-progression refactor) ──
+            // The legacy `realtime_cycle_count` field used to be incremented
+            // inside `startRealtimeProcessor`'s per-position loop. That loop
+            // was repurposed into the LivePositions Progression, which writes
+            // its own `live_positions_cycle_count`. The dashboard's
+            // `realtime` / `realtimeLive` tiles still read this field, so we
+            // must keep it updated — and the canonical "realtime cycle" is
+            // now THIS loop (shared ind+pseudo+strat pipeline per symbol).
+            // One hincrby per Realtime Progression cycle matches the legacy
+            // semantics: one cycle = one full per-symbol fan-out.
+            client.hincrby(redisKey, "realtime_cycle_count", 1),
             client.hincrby(redisKey, "frames_processed", 1),
             client.hset(redisKey, "symbols_processed", String(symbols.length)),
             // Continuous "still alive" stamp on the progression hash so
@@ -1787,8 +1799,13 @@ export class TradeEngineManager {
       try {
         if (this.strategyTimer) unregisterEngineTimer(this.strategyTimer)
       } catch { /* stale handle is fine */ }
-      this.strategyTimer = setTimeout(heartbeatTick, HEARTBEAT_INTERVAL_MS)
-      registerEngineTimer(this.strategyTimer)
+      // Capture in a local const so TS keeps the non-undefined narrowing
+      // across the property assignment + register call. Reading `this.strategyTimer`
+      // back after assignment widens to `Timeout | undefined` because
+      // control-flow analysis doesn't track property writes through `this`.
+      const t = setTimeout(heartbeatTick, HEARTBEAT_INTERVAL_MS)
+      this.strategyTimer = t
+      registerEngineTimer(t)
     }
     heartbeatTick()
     return
@@ -2096,9 +2113,14 @@ export class TradeEngineManager {
       }
     }
 
-    // Kick off the first cycle immediately.
-    this.strategyTimer = setTimeout(tick, 0)
-    registerEngineTimer(this.strategyTimer)
+    // Kick off the first cycle immediately. Capture in a local const so
+    // TS keeps the non-undefined narrowing across the property assignment
+    // + register call.
+    {
+      const t = setTimeout(tick, 0)
+      this.strategyTimer = t
+      registerEngineTimer(t)
+    }
   }
 
   /**
@@ -2277,9 +2299,13 @@ export class TradeEngineManager {
       registerEngineTimer(this.realtimeTimer)
     }
 
-    // Kick off the first cycle immediately.
-    this.realtimeTimer = setTimeout(tickLivePositions, 0)
-    registerEngineTimer(this.realtimeTimer)
+    // Kick off the first cycle immediately. See narrowing note in
+    // startStrategyProcessor for why we capture in a local const.
+    {
+      const t = setTimeout(tickLivePositions, 0)
+      this.realtimeTimer = t
+      registerEngineTimer(t)
+    }
     return
     // ── Legacy body preserved as unreachable reference ───────────────────
     // eslint-disable-next-line @typescript-eslint/no-unreachable-code-error
@@ -2482,10 +2508,13 @@ export class TradeEngineManager {
     // report "gated" (prehistoric still running) and re-poll on
     // PREHISTORIC_WAIT_POLL_MS, or run a full cycle if prehistoric is
     // already complete.
-    this.realtimeTimer = setTimeout(tick, 0)
-    
-    // Register timer for cleanup on module reload
-    registerEngineTimer(this.realtimeTimer)
+    // Local-const capture for TS narrowing — see startStrategyProcessor.
+    {
+      const t = setTimeout(tick, 0)
+      this.realtimeTimer = t
+      // Register timer for cleanup on module reload
+      registerEngineTimer(t)
+    }
   }
 
   /**

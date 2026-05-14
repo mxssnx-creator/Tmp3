@@ -68,6 +68,16 @@ const DEFAULT_TIMINGS: EngineTimings = {
   lockExtendIntervalMs:     15_000,
   maxPositionHoldMs:    4 * 60 * 60 * 1000,
   progressionBufferFlushMs:  3_000,
+  // Three-progression defaults. NOTE: per the no-pause refactor, the
+  // Prehistoric loop ignores its interval/pause fields at runtime and
+  // always cycles back-to-back via setTimeout(_, 0). The fields are
+  // surfaced here so operators see what was historically configured,
+  // but edits to them have no effect on the running engine.
+  prehistoricIntervalMs:     1_000,
+  prehistoricCyclePauseMs:      50,
+  realtimeIntervalMs:        1_000,
+  realtimeCyclePauseMs:         50,
+  livePositionsCyclePauseMs:    50,
 }
 
 // Mirror of `ENGINE_TIMING_BOUNDS`. The API clamps server-side too;
@@ -112,6 +122,32 @@ const TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; max: number; uni
   progressionBufferFlushMs: {
     min: 500, max: 60_000, unit: "ms", live: false,
     help: "Progression log buffer flushes after this interval OR when it hits 50 entries. Restart engine to apply.",
+  },
+  // ── Three-progression tunables ────────────────────────────────────────
+  // Important: the Prehistoric loop runs continuously back-to-back per
+  // the architectural spec — its interval/pause fields below are kept
+  // for back-compat but are NO-OPS at runtime. The UI flags them as
+  // read-only via `live: false` so operators can see the historical
+  // value without being misled into thinking edits take effect.
+  prehistoricIntervalMs: {
+    min: 200, max: 60_000, unit: "ms", live: false,
+    help: "(no-op) Prehistoric Progression runs continuously back-to-back; this field is kept for back-compat only. The historical-Set processor's per-timeframe last_calc_at gate is the real throttle.",
+  },
+  prehistoricCyclePauseMs: {
+    min: 10, max: 500, unit: "ms", live: false,
+    help: "(no-op) Prehistoric loop has no inter-cycle pause; the next cycle is scheduled on the next event-loop tick.",
+  },
+  realtimeIntervalMs: {
+    min: 200, max: 60_000, unit: "ms", live: true,
+    help: "Realtime Progression start-to-start cadence — drives the shared ind+pseudo+strat pipeline per symbol.",
+  },
+  realtimeCyclePauseMs: {
+    min: 10, max: 500, unit: "ms", live: true,
+    help: "Breath after each Realtime cycle completes. Lower = tighter cadence, higher CPU; higher = quieter.",
+  },
+  livePositionsCyclePauseMs: {
+    min: 10, max: 200, unit: "ms", live: true,
+    help: "Breath after each LivePositions sync (exchange mark price + SL/TP cross + protection orders). Default 50 ms gives the 200 ms cadence a comfortable margin.",
   },
 }
 

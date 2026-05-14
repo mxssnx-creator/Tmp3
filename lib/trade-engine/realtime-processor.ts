@@ -272,6 +272,13 @@ export class RealtimeProcessor {
           client.hset(progKey, {
             pseudo_positions_last_update_at: new Date().toISOString(),
             pseudo_positions_last_symbol: symbol,
+            // Dashboard back-compat: the stats route surfaces
+            // `pseudo_positions_last_count` as the `lastBatchSize`
+            // tile. Under the per-symbol shared pipeline each call IS
+            // a "batch" (one symbol's open positions), so we write the
+            // symbol's own count here. Operators reading the tile
+            // interpret it as "positions touched in the most recent cycle".
+            pseudo_positions_last_count: String(positions.length),
           }),
           client.expire(progKey, 7 * 24 * 60 * 60),
         ])
