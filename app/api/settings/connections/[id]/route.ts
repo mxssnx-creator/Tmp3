@@ -2,7 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
 import { getConnection, updateConnection, deleteConnection, initRedis } from "@/lib/redis-db"
 import { ConnectionDataArchive } from "@/lib/connection-data-archive"
-import { notifySettingsChanged, detectChangedFields } from "@/lib/settings-coordinator"
+import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -150,24 +150,14 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
 
     await updateConnection(id, updatedConnection)
 
-    // Notify running engines about the change AND fast-path apply it
-    // in-process so operators see the new behavior on the very next
-    // engine cycle instead of waiting up to one watcher tick (~3s).
-    const changedFields = detectChangedFields(connection, updatedConnection)
-    if (changedFields.length > 0) {
-      const changeEvent = await notifySettingsChanged(id, changedFields, connection, updatedConnection)
-      console.log(`[v0] Connection patched: ${id}, change type: ${changeEvent.changeType}, fields: [${changedFields.join(",")}]`)
-      try {
-        const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
-        await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
-      } catch (applyErr) {
-        // Non-fatal — the watcher will pick it up within 3s.
-        console.warn(
-          `[v0] [PATCH] applyPendingChangesNow failed for ${id} (watcher will retry):`,
-          applyErr instanceof Error ? applyErr.message : String(applyErr),
-        )
-      }
-    }
+    // Full propagation: notify + fast-path apply + recoordinate
+    // (start the engine if it now should run, stop if it now shouldn't,
+    // hot-reload if it already is). See lib/connection-recoordinator.ts
+    // for the full rationale — this single call replaces the three
+    // separate steps that previously diverged across handlers.
+    await recoordinateAfterSettingsChange(id, connection, updatedConnection, {
+      logTag: "PATCH /connections/[id]",
+    })
 
     await SystemLogger.logConnection(`Connection patched successfully`, id, "info")
 
@@ -230,22 +220,12 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
 
     await updateConnection(id, updatedConnection)
 
-    // Notify running engines about the change AND fast-path apply it
-    // in-process (see PATCH above for rationale).
-    const changedFields = detectChangedFields(connection, updatedConnection)
-    if (changedFields.length > 0) {
-      const changeEvent = await notifySettingsChanged(id, changedFields, connection, updatedConnection)
-      console.log(`[v0] Connection updated: ${id}, change type: ${changeEvent.changeType}, fields: [${changedFields.join(",")}]`)
-      try {
-        const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
-        await getGlobalTradeEngineCoordinator().applyPendingChangesNow(id)
-      } catch (applyErr) {
-        console.warn(
-          `[v0] [PUT] applyPendingChangesNow failed for ${id} (watcher will retry):`,
-          applyErr instanceof Error ? applyErr.message : String(applyErr),
-        )
-      }
-    }
+    // Full propagation: notify + fast-path apply + recoordinate.
+    // See PATCH above (and lib/connection-recoordinator.ts) for full
+    // rationale.
+    await recoordinateAfterSettingsChange(id, connection, updatedConnection, {
+      logTag: "PUT /connections/[id]",
+    })
 
     await SystemLogger.logConnection(`Connection updated successfully`, id, "info")
 
