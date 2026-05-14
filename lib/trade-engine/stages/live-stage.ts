@@ -2848,7 +2848,23 @@ async function checkAndForceCloseOnSltpCross(
   if (pos.executedQuantity <= 0) return null
   // Skip positions whose entry order has not confirmed yet — using entryPrice
   // as a proxy for the fill price would produce incorrect SL/TP cross signals.
-  if (pos.status === "closed" || pos.status === "rejected" || pos.status === "error" || pos.status === "placed") return null
+  // The `placed` skip is the most operationally significant — a position
+  // stuck in `placed` is never evaluated for close. The stuck-placed
+  // detector in syncWithExchange handles the safety net; this is
+  // intentionally silent for terminal statuses to avoid log spam.
+  if (pos.status === "closed" || pos.status === "rejected" || pos.status === "error") return null
+  if (pos.status === "placed") {
+    // Rate-limit to once-per-minute per position by using updatedAt as
+    // the throttle key — prevents log spam while still surfacing the
+    // skip during diagnosis.
+    const since = Date.now() - (pos.updatedAt || 0)
+    if (since > 60_000) {
+      console.log(
+        `${LOG_PREFIX} [cross-check skip] ${pos.symbol} (id=${pos.id}) status='placed' — entry order not filled yet; SL/TP cross check deferred`,
+      )
+    }
+    return null
+  }
 
   const fillPrice = pos.averageExecutionPrice
   // Require a confirmed fill price — entryPrice is an estimate and can be
@@ -3537,6 +3553,7 @@ export async function processSimulatedPositions(
 export async function syncWithExchange(connectionId: string, exchangeConnector: any): Promise<void> {
   await initRedis()
   const client = getRedisClient()
+  const syncStartMs = Date.now()
 
   try {
     // Previously each status filter triggered a full getLivePositions() scan,
@@ -3545,6 +3562,30 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     const allOpen = await getLivePositions(connectionId)
     const openPositions = allOpen.filter(
       (p) => p.status === "open" || p.status === "filled" || p.status === "partially_filled" || p.status === "placed",
+    )
+
+    // ── Observability heartbeat ───────────────────────────────────────
+    // Previously this function ran silently when there were zero
+    // tracked positions OR when every position was in a "do nothing"
+    // state — producing the operator's "orders not closing, no logs"
+    // symptom. Always emit a one-line breakdown of what the close-side
+    // pipeline is seeing so the operator can distinguish:
+    //   (a) sync isn't running at all (no log = caller throttled / paused)
+    //   (b) sync is running but finds nothing to act on
+    //   (c) sync is running and processing positions in known status
+    // Throttled to ~10s of useful detail so we don't flood logs at
+    // steady state; the per-position branches below still log their
+    // individual decisions.
+    const statusBreakdown = allOpen.reduce<Record<string, number>>((acc, p) => {
+      const s = String(p.status || "unknown")
+      acc[s] = (acc[s] || 0) + 1
+      return acc
+    }, {})
+    const placedCount = statusBreakdown.placed || 0
+    const simCount = statusBreakdown.simulated || 0
+    const totalLive = openPositions.filter((p) => p.status !== "placed").length
+    console.log(
+      `${LOG_PREFIX} [sync-tick] conn=${connectionId} tracked=${allOpen.length} open=${totalLive} placed=${placedCount} simulated=${simCount} statuses=${JSON.stringify(statusBreakdown)}`,
     )
 
     // ── Simulated-position sweep (paper-mode + is_live_trade=false) ─────
@@ -4000,9 +4041,97 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
                   filledQty: position.executedQuantity,
                 }
               )
+            } else if (order) {
+              // Order exists but not filled (placed/partial/cancelled/rejected) —
+              // log so the operator can see WHY the position stays in
+              // "placed" status. Previously the only signal was the
+              // position never progressing, which was indistinguishable
+              // from a bug.
+              console.log(
+                `${LOG_PREFIX} [fill-detect] ${position.symbol} order ${position.orderId} status=${order.status} filledQty=${order.filledQty ?? 0} — staying in 'placed'`,
+              )
             }
-          } catch {
-            /* ignore — next sync cycle will retry */
+          } catch (fillErr) {
+            // PREVIOUSLY SWALLOWED — this was the root cause of "orders
+            // never closing": every getOrder failure left the position
+            // stuck in `placed` forever, and the SL/TP cross check skips
+            // `placed` positions silently (see checkAndForceCloseOnSltpCross
+            // line "if (pos.status === 'placed') return null").
+            // We now log so the failure is visible. The retry on next
+            // sync tick still happens — no behaviour change, just
+            // observability.
+            console.warn(
+              `${LOG_PREFIX} [fill-detect] getOrder failed for ${position.symbol} orderId=${position.orderId}:`,
+              fillErr instanceof Error ? fillErr.message : String(fillErr),
+            )
+          }
+        }
+
+        // ── Stuck-in-placed detection ─────────────────────────────────
+        // A position in `placed` status with no executed qty has its
+        // entry order resting on the exchange book unfilled. The SL/TP
+        // cross check skips `placed` positions silently, so without
+        // this branch a stuck order could sit forever:
+        //   - Never closes via SL/TP cross (status gate)
+        //   - Never closes via max-hold-time (executedQty=0 gate)
+        //   - Never adopted as orphan (it IS in Redis)
+        //   - Never finalised as externally-closed (gate requires
+        //     executedQty>0 + status≠placed)
+        // Cancel the dangling entry order after STUCK_PLACED_MAX_MS and
+        // mark the position rejected so it leaves the open index.
+        if (position.status === "placed" && (position.executedQuantity ?? 0) === 0) {
+          const STUCK_PLACED_MAX_MS = 5 * 60_000 // 5 minutes
+          const placedAgeMs = Date.now() - (position.createdAt || position.updatedAt || Date.now())
+          if (placedAgeMs > STUCK_PLACED_MAX_MS) {
+            console.warn(
+              `${LOG_PREFIX} [stuck-placed] ${position.symbol} (id=${position.id}) has been 'placed' for ${Math.round(placedAgeMs / 1000)}s — cancelling entry order and rejecting position`,
+            )
+            await logProgressionEvent(
+              connectionId,
+              "live_trading",
+              "warning",
+              `Entry order stuck in 'placed' state for ${position.symbol} — cancelling`,
+              {
+                positionId: position.id,
+                orderId: position.orderId,
+                placedAgeMs,
+                stuckLimitMs: STUCK_PLACED_MAX_MS,
+              },
+            )
+            // Best-effort cancel of the entry order (bounded timeout).
+            if (position.orderId && exchangeConnector?.cancelOrder) {
+              try {
+                await withTimeout(
+                  exchangeConnector.cancelOrder(position.symbol, position.orderId) as Promise<any>,
+                  EXCHANGE_TIMEOUT_CANCEL_ORDER_MS,
+                  `stuck-placed cancelOrder(${position.symbol} ${position.orderId})`,
+                )
+              } catch (cancelErr) {
+                console.warn(
+                  `${LOG_PREFIX} [stuck-placed] cancel entry order failed for ${position.id}:`,
+                  cancelErr instanceof Error ? cancelErr.message : String(cancelErr),
+                )
+              }
+            }
+            // Mark position rejected and remove from open index. We use
+            // closeLivePosition with exitPrice=entryPrice so the existing
+            // terminal-state pipeline handles archive/lock/metrics — same
+            // path as every other close branch.
+            try {
+              await closeLivePosition(
+                connectionId,
+                position.id,
+                position.entryPrice || 0,
+                exchangeConnector,
+                "stuck_in_placed",
+              )
+            } catch (closeErr) {
+              console.warn(
+                `${LOG_PREFIX} [stuck-placed] closeLivePosition failed for ${position.id}:`,
+                closeErr instanceof Error ? closeErr.message : String(closeErr),
+              )
+            }
+            continue
           }
         }
 
@@ -4085,6 +4214,16 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         console.warn(`${LOG_PREFIX} Error syncing ${position.id}:`, err)
       }
     }
+    // Sync completion heartbeat. Pairs with the `[sync-tick]` entry log
+    // so the operator can see the loop ran to completion (not silently
+    // aborted by an uncaught throw) and how long it took. If [sync-tick]
+    // appears but [sync-done] does not for the same tick, something
+    // mid-loop is rejecting before the closing brace — which used to be
+    // invisible.
+    const syncMs = Date.now() - syncStartMs
+    console.log(
+      `${LOG_PREFIX} [sync-done] conn=${connectionId} took=${syncMs}ms processed=${openPositions.length} adopted=${adoptedCount}`,
+    )
   } catch (err) {
     console.error(`${LOG_PREFIX} Error syncing with exchange:`, err)
   }
