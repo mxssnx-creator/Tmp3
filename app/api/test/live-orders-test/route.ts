@@ -490,10 +490,29 @@ async function testStopLossOrder(
         error: `Unrecognized position shape: keys=[${Object.keys(position || {}).join(",")}]`,
       }
     }
-    const slPrice = metrics.entryPrice * 0.95 // 5% below entry
-    // Close 10% of the position, but no less than the venue's smallest
-    // tradeable unit. We can't easily query the precise step here, so a
-    // conservative floor of 1e-6 keeps the SL parameter strictly > 0.
+    // ── Direction-aware SL placement ─────────────────────────────────
+    // The previous version hard-coded `side="sell"` and `slPrice =
+    // entry * 0.95`. That is correct ONLY for long positions; for a
+    // SHORT it placed a SELL stop BELOW the entry, which BingX's order
+    // classification engine reinterprets as a take-profit (SELL below
+    // current price reduces a short), and rejects with code=110413
+    // "Take Profit price should be greater than the current price".
+    // The fix is direction-aware: for shorts we send a BUY stop ABOVE
+    // the entry (the canonical stop-loss for a short), and for longs
+    // the original SELL stop below entry.
+    //
+    // `metrics.side` falls back to "unknown" when the connector did not
+    // report direction; in that case we infer from the venue-side
+    // close-direction convention used elsewhere in this file (long ⇒
+    // sell-to-close, short ⇒ buy-to-close) and default to long when
+    // truly ambiguous so the test still exercises the placement path.
+    const isShort = metrics.side === "short"
+    const closeSide: "buy" | "sell" = isShort ? "buy" : "sell"
+    // SL trigger sits on the loss side of entry: below entry for longs,
+    // above entry for shorts. 5% offset matches the original test.
+    const slPrice = isShort ? metrics.entryPrice * 1.05 : metrics.entryPrice * 0.95
+    // Close 10% of the position, floored at 1e-6 so the request always
+    // carries a finite, strictly-positive number.
     const quantity = Math.max(metrics.quantity * 0.1, 1e-6)
 
     const slSymbol = toCanonicalSymbol(position.symbol)
@@ -505,10 +524,10 @@ async function testStopLossOrder(
 
     const result = await connector.placeStopOrder(
       slSymbol,
-      "sell",
+      closeSide,
       quantity,
       slPrice,
-      { stopPrice: slPrice, reduceOnly: true }
+      { stopPrice: slPrice, reduceOnly: true },
     )
 
     if (!result || !result.orderId) {
@@ -589,18 +608,47 @@ async function testOrderCancellation(connector: any): Promise<TestResult> {
       }
     }
 
-    // Try to cancel the first order
-    const orderToCancel = orders[0]
-    console.log(`${LOG_PREFIX} Cancelling order: ${orderToCancel.id} for ${orderToCancel.symbol}`)
-    
-    const result = await connector.cancelOrder(orderToCancel.symbol, orderToCancel.id)
-    
+    // Try to cancel the first order.
+    //
+    // Cross-venue id resolution: different connectors normalize the
+    // open-order shape differently.
+    //   • BingX returns { orderId, ... } — `id` is undefined
+    //   • Bybit returns { orderId, ... }
+    //   • Binance returns { orderId, ... }
+    //   • Some ccxt-style adapters return { id, ... }
+    // Reading `orderToCancel.id` blindly therefore produced the
+    // observed "Failed to cancel order undefined" → BingX 109400
+    // because the underlying request was missing the required
+    // `orderId` parameter. Pick the first non-empty candidate.
+    const orderToCancel = orders[0] || {}
+    const orderIdCandidate =
+      orderToCancel.id ??
+      orderToCancel.orderId ??
+      orderToCancel.orderID ??
+      orderToCancel.clientOrderId ??
+      orderToCancel.client_oid
+    const resolvedId = orderIdCandidate != null && String(orderIdCandidate).length > 0
+      ? String(orderIdCandidate)
+      : null
+    if (!resolvedId) {
+      return {
+        testName: "Order Cancellation",
+        success: false,
+        duration: Date.now() - start,
+        details: `Cannot resolve order id from connector payload`,
+        error: `Unrecognized order shape: keys=[${Object.keys(orderToCancel).join(",")}]`,
+      }
+    }
+    console.log(`${LOG_PREFIX} Cancelling order: ${resolvedId} for ${orderToCancel.symbol}`)
+
+    const result = await connector.cancelOrder(orderToCancel.symbol, resolvedId)
+
     if (!result || !result.success) {
       return {
         testName: "Order Cancellation",
         success: false,
         duration: Date.now() - start,
-        details: `Failed to cancel order ${orderToCancel.id}`,
+        details: `Failed to cancel order ${resolvedId}`,
         error: result?.error || "Cancellation returned false",
       }
     }
@@ -609,7 +657,7 @@ async function testOrderCancellation(connector: any): Promise<TestResult> {
       testName: "Order Cancellation",
       success: true,
       duration: Date.now() - start,
-      details: `Successfully cancelled order ${orderToCancel.id} for ${orderToCancel.symbol}`,
+      details: `Successfully cancelled order ${resolvedId} for ${orderToCancel.symbol}`,
     }
   } catch (error) {
     return {
@@ -709,8 +757,11 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
         error: `Unrecognized position shape: keys=[${Object.keys(position || {}).join(",")}]`,
       }
     }
-    const slPrice = metrics.entryPrice * 0.90 // 10% below entry
-    const tpPrice = metrics.entryPrice * 1.10 // 10% above entry  (kept for parity if future code needs it)
+    // Direction-aware SL/TP — see the comment in `testStopLossOrder` for
+    // the BingX 110413 misclassification this prevents.
+    const isShortLc = metrics.side === "short"
+    const slPrice = isShortLc ? metrics.entryPrice * 1.10 : metrics.entryPrice * 0.90 // 10% on the loss side
+    const tpPrice = isShortLc ? metrics.entryPrice * 0.90 : metrics.entryPrice * 1.10 // 10% on the gain side
     void tpPrice
     // Small qty: 10% of position, capped at 0.001, floored at 1e-6 so
     // the request always carries a finite, strictly-positive number.
