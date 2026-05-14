@@ -522,12 +522,23 @@ async function testStopLossOrder(
       )
     }
 
+    // CRITICAL: the connector signature is
+    //   placeStopOrder(symbol, closeSide, quantity, triggerPrice, kind, options)
+    // The 5th arg is the order CLASS - "stop_loss" or "take_profit".
+    // The previous version passed `{ stopPrice, reduceOnly }` here, which
+    // was coerced into the `kind` slot as a truthy object. The BingX
+    // connector then fell through to its default classifier and sent
+    // TAKE_PROFIT_MARKET, which the venue rejected with 110413
+    // ("Take Profit price should be greater than the current price")
+    // because our trigger was correctly BELOW market for a long SL.
+    // Passing the explicit kind makes the venue accept it as a real SL.
     const result = await connector.placeStopOrder(
       slSymbol,
       closeSide,
       quantity,
       slPrice,
-      { stopPrice: slPrice, reduceOnly: true },
+      "stop_loss",
+      { reduceOnly: true },
     )
 
     if (!result || !result.orderId) {
@@ -829,12 +840,15 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
     // Failures in any step are surfaced with the connector's verbatim
     // error message so we never log a generic "Failed to create control
     // order" without context again.
+    // 5th arg is the order CLASS ("stop_loss" / "take_profit"), not options.
+    // See the comment in `testStopLossOrder` for the BingX 110413 root cause.
     const slResult = await connector.placeStopOrder(
       lifecycleSymbol,
       closeSide,
       quantity,
       slPrice,
-      { stopPrice: slPrice, reduceOnly: true },
+      "stop_loss",
+      { reduceOnly: true },
     )
     console.log(
       `${LOG_PREFIX} SL placeStopOrder result: success=${slResult?.success} orderId=${slResult?.orderId ?? "none"} error=${slResult?.error ?? "none"}`,
@@ -855,7 +869,8 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
       closeSide,
       quantity,
       tpPrice,
-      { stopPrice: tpPrice, reduceOnly: true },
+      "take_profit",
+      { reduceOnly: true },
     )
     console.log(
       `${LOG_PREFIX} TP placeStopOrder result: success=${tpResult?.success} orderId=${tpResult?.orderId ?? "none"} error=${tpResult?.error ?? "none"}`,
