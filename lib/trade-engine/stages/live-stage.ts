@@ -1097,6 +1097,77 @@ async function pollOrderFill(
  * the connector accepted the request); returns `false` for any error so
  * callers can decide whether to retry or fall through to a market exit.
  */
+/**
+ * Cancel every leftover reduce-only order on the venue for a given
+ * symbol+close-side pair. This is the safety-net used immediately AFTER
+ * `closeLivePosition` finishes its by-id cancellations.
+ *
+ * Why we need a sweep on top of the recorded-id cancellations:
+ *   1. The recorded protection ids may be stale (re-armed after a
+ *      partial fill, the old id never made it to `savePosition` because
+ *      the process crashed between place-success and persist).
+ *   2. A by-id cancel can return failure for a transient reason (network
+ *      blip, brief 429) and the engine cannot afford to keep retrying
+ *      indefinitely. The sweep doubles as a retry on the next tick.
+ *   3. An operator may have placed a manual reduce-only leg that the
+ *      engine never knew about. Once the position is gone, that order
+ *      can only ever cause "exchange control orders chaos" — it has no
+ *      position to reduce, and the next entry on the same symbol would
+ *      see it as an unexpected closer.
+ *
+ * We filter conservatively to ONLY reduce-only orders matching the
+ * close direction so the sweep never touches another strategy's open
+ * orders on the same symbol.
+ */
+async function sweepOrphanProtectionOrders(
+  connector: any,
+  symbol: string,
+  closeSide: "buy" | "sell",
+): Promise<{ scanned: number; cancelled: number }> {
+  const result = { scanned: 0, cancelled: 0 }
+  if (!connector || typeof connector.getOpenOrders !== "function") return result
+  let orders: any[] = []
+  try {
+    const raw = (await withTimeout(
+      connector.getOpenOrders(symbol) as Promise<any>,
+      5000,
+      `sweepOrphan.getOpenOrders(${symbol})`,
+    )) as any[] | undefined
+    orders = Array.isArray(raw) ? raw : []
+  } catch (err) {
+    console.warn(
+      `${LOG_PREFIX} [sweep] getOpenOrders(${symbol}) failed: ${err instanceof Error ? err.message : String(err)}`,
+    )
+    return result
+  }
+  result.scanned = orders.length
+
+  // A reduce-only order with side === closeSide is, by definition, a
+  // protection leg for a position in `closeSide`'s opposite direction.
+  // We accept any flavour of the reduce-only flag the connectors emit:
+  // `reduceOnly`, `reduce_only`, `closePosition`, `isReduceOnly`.
+  const isReduceOnly = (o: any): boolean =>
+    !!(o?.reduceOnly ?? o?.reduce_only ?? o?.closePosition ?? o?.isReduceOnly)
+  const sameSide = (o: any): boolean =>
+    String(o?.side ?? o?.orderSide ?? "").toLowerCase() === closeSide
+
+  for (const o of orders) {
+    if (!isReduceOnly(o) || !sameSide(o)) continue
+    const id =
+      o?.id ?? o?.orderId ?? o?.orderID ?? o?.clientOrderId ?? o?.client_oid
+    if (id == null || String(id).length === 0) continue
+    const ok = await cancelProtectionOrder(connector, symbol, String(id), "OrphanSweep")
+    if (ok) result.cancelled++
+  }
+
+  if (result.cancelled > 0 || result.scanned > 0) {
+    console.log(
+      `${LOG_PREFIX} [sweep] ${symbol} close=${closeSide}: scanned=${result.scanned} cancelled=${result.cancelled}`,
+    )
+  }
+  return result
+}
+
 async function cancelProtectionOrder(
   connector: any,
   symbol: string,
@@ -3091,18 +3162,76 @@ export async function closeLivePosition(
     // requests have been in-flight the whole duration — typically zero
     // additional wait. We clear the local IDs regardless so the next
     // reconcile pass treats them as gone.
+    // Track which leg cancel actually succeeded so we DON'T blindly wipe
+    // a still-armed orderId. The original implementation cleared both
+    // ids unconditionally, which meant a transient cancel failure left
+    // an orphan reduce-only order on the venue with no local record to
+    // look it up by — exactly the "control orders chaos" the operator
+    // reported. We now only clear an id when the venue confirmed the
+    // order is gone (success path inside cancelProtectionOrder also
+    // returns `true` for "not found" / "already filled" / "already
+    // cancelled" — so the wipe is safe in those cases).
+    let slCancelled = false
+    let tpCancelled = false
+    const hadSlId = !!position.stopLossOrderId
+    const hadTpId = !!position.takeProfitOrderId
     if (cancellationPromises.length > 0) {
       const cancelResults = await Promise.all(
         cancellationPromises.map(p => p.catch(() => false)),
       )
+      let idx = 0
+      if (hadSlId) {
+        slCancelled = !!cancelResults[idx++]
+        if (slCancelled) position.stopLossOrderId = undefined
+      }
+      if (hadTpId) {
+        tpCancelled = !!cancelResults[idx++]
+        if (tpCancelled) position.takeProfitOrderId = undefined
+      }
       pushStep(
         position,
         "cancel_protection",
         cancelResults.every(Boolean),
-        `cancelled SL=${!!position.stopLossOrderId} TP=${!!position.takeProfitOrderId} (raced with close)`,
+        `cancelled SL=${hadSlId ? slCancelled : "n/a"} TP=${hadTpId ? tpCancelled : "n/a"} (raced with close)`,
       )
-      position.stopLossOrderId = undefined
-      position.takeProfitOrderId = undefined
+    }
+
+    // ── Orphan-sweep safety net ────────────────────────────────────────
+    // After the recorded-id cancels, scan the venue for ANY reduce-only
+    // order matching this symbol + close-side and cancel it. Catches:
+    //   • by-id cancels that just failed transiently (we get a free retry)
+    //   • protection ids that were never persisted (place-success → crash
+    //     → restart finds no id in Redis)
+    //   • operator-placed manual reduce-only legs the engine never knew
+    //     about — which become orphans the moment the position closes.
+    // Best-effort; we never let sweep failures block the close pipeline.
+    if (exchangeConnector) {
+      const sweepCloseSide: "buy" | "sell" =
+        position.direction === "long" ? "sell" : "buy"
+      try {
+        const swept = await sweepOrphanProtectionOrders(
+          exchangeConnector,
+          position.symbol,
+          sweepCloseSide,
+        )
+        if (swept.cancelled > 0) {
+          // If the sweep cleaned up the recorded ids' leftovers, clear
+          // the local fields too — at this point there is nothing on
+          // the venue tied to those ids.
+          if (hadSlId && !slCancelled) position.stopLossOrderId = undefined
+          if (hadTpId && !tpCancelled) position.takeProfitOrderId = undefined
+          pushStep(
+            position,
+            "orphan_sweep",
+            true,
+            `swept ${swept.cancelled}/${swept.scanned} orphan reduce-only orders`,
+          )
+        }
+      } catch (sweepErr) {
+        console.warn(
+          `${LOG_PREFIX} [sweep] ${position.symbol} error: ${sweepErr instanceof Error ? sweepErr.message : String(sweepErr)}`,
+        )
+      }
     }
 
     // ── 3. Compute realized PnL & ROI (margin-based to match exchange ROE) ──
