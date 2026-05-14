@@ -373,7 +373,7 @@ export class TradeEngineManager {
   private lockExtendTimer?: NodeJS.Timeout
 
   /**
-   * ── Live settings-reload bus ─────────────────────────────────────
+   * ── Live settings-reload bus ───────────────────────────────��─────
    *
    * When connection settings change (e.g. operator edits indication
    * thresholds, volume factor, presets, etc.) the API handler writes
@@ -2523,9 +2523,25 @@ export class TradeEngineManager {
       try {
         if (this.prehistoricTimer) unregisterEngineTimer(this.prehistoricTimer)
       } catch { /* stale handle is fine */ }
-      const timings = getEngineTimings()
-      const intervalMs = timings.prehistoricIntervalMs ?? 1000
-      this.prehistoricTimer = setTimeout(tick, intervalMs)
+      // ── No-pause cadence ──────────────────────────────────────────────
+      // The Prehistoric Progression runs CONTINUOUSLY back-to-back: the
+      // moment a cycle finishes, the next one starts. The `setTimeout(…, 0)`
+      // is NOT a delay — it's a yield to the Node.js event loop so the
+      // other two progressions (Realtime, LivePositions), the WebSocket
+      // handlers, and the API request loop all get a fair tick between
+      // cycles. Removing the yield entirely (e.g. an `await tick()` recursion
+      // or `setImmediate` chain) would starve the event loop and freeze
+      // the dev server / health checks under load.
+      //
+      // The `prehistoricIntervalMs` / `prehistoricCyclePauseMs` settings
+      // are intentionally IGNORED here so operators can't accidentally
+      // reintroduce a pause that would slow historical Set fill — those
+      // fields remain in `engine-timings.ts` for back-compat but are
+      // now no-ops for this loop. The historical Set processor's own
+      // per-timeframe `last_calc_at` gate (in stages/historical-stage)
+      // still throttles redundant recomputation, so back-to-back cycles
+      // don't translate to back-to-back exchange calls.
+      this.prehistoricTimer = setTimeout(tick, 0)
       registerEngineTimer(this.prehistoricTimer)
     }
 
