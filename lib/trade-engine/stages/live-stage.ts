@@ -1174,6 +1174,25 @@ async function placeProtectionOrder(
       return null
     }
 
+    // Defensive input validation. The SL/TP test suite previously sent
+    // `NaN` quantity from a venue-shape mismatch and the exchange echoed
+    // back "Invalid quantity: NaN" 800 ms later — costly because by then
+    // the entry position is already live and unprotected. Validate at the
+    // helper boundary so a future bug upstream surfaces immediately as a
+    // local log line rather than as a venue-side rejection mid-trade.
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      console.error(
+        `${LOG_PREFIX} ${orderLabel} placement rejected locally — invalid quantity=${quantity} for ${symbol}`,
+      )
+      return null
+    }
+    if (!Number.isFinite(triggerPrice) || triggerPrice <= 0) {
+      console.error(
+        `${LOG_PREFIX} ${orderLabel} placement rejected locally — invalid triggerPrice=${triggerPrice} for ${symbol}`,
+      )
+      return null
+    }
+
     const kind: "stop_loss" | "take_profit" =
       orderLabel === "StopLoss" ? "stop_loss" : "take_profit"
 
@@ -1205,9 +1224,16 @@ async function placeProtectionOrder(
       EXCHANGE_TIMEOUT_PLACE_STOP_MS,
       `placeStopOrder(${orderLabel} ${symbol})`,
     )
-    if (result?.success && (result.orderId || result.id)) {
-      console.log(`${LOG_PREFIX} ${orderLabel} placed: ${result.orderId || result.id} @ ${triggerPrice}`)
-      return result.orderId || result.id
+    // Coerce id to string. Some venues return numeric ids; downstream
+    // code does `if (pos.stopLossOrderId)` checks that would mistake a
+    // legitimately-zero (or zero-string) id for "no order placed". The
+    // venues we support never issue id=0 in practice, but the coercion
+    // keeps the type contract identical across connectors.
+    const rawId = result?.success ? (result.orderId ?? result.id) : null
+    const orderId = rawId !== null && rawId !== undefined && String(rawId).length > 0 ? String(rawId) : null
+    if (orderId) {
+      console.log(`${LOG_PREFIX} ${orderLabel} placed: ${orderId} @ ${triggerPrice}`)
+      return orderId
     }
     console.warn(`${LOG_PREFIX} ${orderLabel} placement failed: ${result?.error || "unknown"}`)
     return null
@@ -1305,7 +1331,18 @@ async function updateProtectionOrders(
   // last placement; >0.25% drift triggers a cancel-and-replace on each
   // leg even if the trigger price hasn't moved. This is the missing
   // fix the user reported as "TP/SL not working" after partial fills.
-  const armedQty = pos.protectionArmedQuantity ?? 0
+  // NaN-hardened drift detection. `protectionArmedQuantity` is JSON-
+  // round-tripped through Redis; a corrupted persistence path could
+  // resurrect it as NaN. With the original `armedQty <= 0` check NaN
+  // compares false on every operator, so qtyDrifted stayed false and
+  // a partial-fill increase would silently NOT re-arm. Coerce to a
+  // finite number first, treating non-finite or non-positive armed
+  // quantities as "never armed" (forces re-arm).
+  const armedQtyRaw = pos.protectionArmedQuantity
+  const armedQty =
+    typeof armedQtyRaw === "number" && Number.isFinite(armedQtyRaw) && armedQtyRaw > 0
+      ? armedQtyRaw
+      : 0
   const qtyDrifted =
     pos.executedQuantity > 0 &&
     (armedQty <= 0 ||
@@ -1314,58 +1351,105 @@ async function updateProtectionOrders(
   // ── Stop-Loss leg ────────────────────────────────────────────────────
   if (desiredSl <= 0 && pos.stopLossOrderId) {
     // SL was turned off — yank the existing order.
-    await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
-    pos.stopLossOrderId = undefined
-    pos.stopLossPrice = 0
-    result.changed = true
+    const cancelled = await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+    if (cancelled) {
+      pos.stopLossOrderId = undefined
+      pos.stopLossPrice = 0
+      result.changed = true
+    }
+    // Hard cancel failure: keep the recorded id so the next reconcile
+    // pass retries. Resetting it here would orphan the exchange-side
+    // order and produce a phantom unprotected position from our POV.
   } else if (
     desiredSl > 0 &&
     (!pos.stopLossOrderId || priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted)
   ) {
+    // Cancel-then-replace race: if a cancel fails we must NOT place a
+    // new SL — the old one is still armed on the exchange, and adding a
+    // second reduce-only at a different trigger price creates a window
+    // where a price spike crossing both levels fires both orders before
+    // the second's reduceOnly check rejects it. Treat a definitive
+    // cancel failure as "skip this tick, retry next tick" so reconcile
+    // can re-evaluate with the correct exchange state.
+    let oldGone = true
     if (pos.stopLossOrderId) {
-      await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+      oldGone = await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+      if (!oldGone) {
+        console.warn(
+          `${LOG_PREFIX} StopLoss cancel failed for ${pos.symbol} — deferring re-place to avoid duplicate reduceOnly`,
+        )
+      }
     }
-    const id = await placeProtectionOrder(
-      connector,
-      pos.symbol,
-      closeSide,
-      effectiveQty,
-      desiredSl,
-      "StopLoss",
-      pos.direction,
-    )
-    pos.stopLossOrderId = id || undefined
-    pos.stopLossPrice = desiredSl
-    result.changed = true
-    result.slPlaced = !!id
+    if (oldGone) {
+      const id = await placeProtectionOrder(
+        connector,
+        pos.symbol,
+        closeSide,
+        effectiveQty,
+        desiredSl,
+        "StopLoss",
+        pos.direction,
+      )
+      // Only treat the leg as "armed at desiredSl" when we actually have
+      // a confirmed order id. Setting `stopLossPrice = desiredSl` on a
+      // failed placement makes the next pass think the level is live
+      // (priceDrifted compares < 0.25%) and skip retry — leaving the
+      // position permanently unprotected.
+      if (id) {
+        pos.stopLossOrderId = id
+        pos.stopLossPrice = desiredSl
+        result.changed = true
+        result.slPlaced = true
+      } else {
+        pos.stopLossOrderId = undefined
+        // Leave pos.stopLossPrice untouched so priceDrifted(0, desired)
+        // forces a retry on the very next tick.
+        pos.stopLossPrice = 0
+      }
+    }
   }
 
   // ── Take-Profit leg ──────────────────────────────────────────────────
   if (desiredTp <= 0 && pos.takeProfitOrderId) {
-    await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
-    pos.takeProfitOrderId = undefined
-    pos.takeProfitPrice = 0
-    result.changed = true
+    const cancelled = await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+    if (cancelled) {
+      pos.takeProfitOrderId = undefined
+      pos.takeProfitPrice = 0
+      result.changed = true
+    }
   } else if (
     desiredTp > 0 &&
     (!pos.takeProfitOrderId || priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted)
   ) {
+    let oldGone = true
     if (pos.takeProfitOrderId) {
-      await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+      oldGone = await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+      if (!oldGone) {
+        console.warn(
+          `${LOG_PREFIX} TakeProfit cancel failed for ${pos.symbol} — deferring re-place to avoid duplicate reduceOnly`,
+        )
+      }
     }
-    const id = await placeProtectionOrder(
-      connector,
-      pos.symbol,
-      closeSide,
-      effectiveQty,
-      desiredTp,
-      "TakeProfit",
-      pos.direction,
-    )
-    pos.takeProfitOrderId = id || undefined
-    pos.takeProfitPrice = desiredTp
-    result.changed = true
-    result.tpPlaced = !!id
+    if (oldGone) {
+      const id = await placeProtectionOrder(
+        connector,
+        pos.symbol,
+        closeSide,
+        effectiveQty,
+        desiredTp,
+        "TakeProfit",
+        pos.direction,
+      )
+      if (id) {
+        pos.takeProfitOrderId = id
+        pos.takeProfitPrice = desiredTp
+        result.changed = true
+        result.tpPlaced = true
+      } else {
+        pos.takeProfitOrderId = undefined
+        pos.takeProfitPrice = 0
+      }
+    }
   }
 
   // After (re-)placement record the qty we armed for so the next pass
