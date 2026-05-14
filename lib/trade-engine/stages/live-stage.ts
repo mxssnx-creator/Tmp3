@@ -1292,6 +1292,54 @@ async function placeProtectionOrder(
 }
 
 /**
+ * Snapshot every order ID currently open on the venue, across all
+ * symbols, as a single normalized `Set<string>`. Used by the reconcile
+ * and sync loops to verify each position's recorded `stopLossOrderId`
+ * and `takeProfitOrderId` are still alive on the exchange — without
+ * making one `getOrder()` call per leg per position per tick.
+ *
+ * Returns `null` when the connector either has no `getOpenOrders` or
+ * when the call fails/times out. Callers MUST treat `null` as "skip
+ * liveness verification this tick" rather than "no orders exist" — the
+ * latter would incorrectly wipe every protection id on a transient
+ * network blip.
+ *
+ * Cross-venue order-id field walk matches the test harness in
+ * `/api/test/live-orders-test`: BingX returns `orderId`, ccxt-style
+ * adapters return `id`, some return both. We collect every non-empty
+ * candidate per row so we cannot miss a leg because the connector
+ * happened to name the field differently than expected.
+ */
+async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> {
+  if (!connector || typeof connector.getOpenOrders !== "function") return null
+  try {
+    // 5 s upper bound — same envelope as other reconcile-side venue calls.
+    // On timeout we degrade gracefully to drift-only reconciliation.
+    const orders = (await withTimeout(
+      connector.getOpenOrders() as Promise<any>,
+      5000,
+      "getOpenOrders(reconcile-tick)",
+    )) as any[] | undefined
+    if (!Array.isArray(orders)) return null
+    const set = new Set<string>()
+    for (const o of orders) {
+      const cands = [o?.id, o?.orderId, o?.orderID, o?.clientOrderId, o?.client_oid]
+      for (const c of cands) {
+        if (c == null) continue
+        const s = String(c)
+        if (s.length > 0) set.add(s)
+      }
+    }
+    return set
+  } catch (err) {
+    console.warn(
+      `${LOG_PREFIX} fetchLiveOrderIdSet failed: ${err instanceof Error ? err.message : String(err)}`,
+    )
+    return null
+  }
+}
+
+/**
  * Derive the desired SL/TP trigger prices from a live position's current
  * percentage settings and average execution price. Returns `0` for either
  * leg when the corresponding percentage is non-positive (i.e. SL/TP is
@@ -1359,6 +1407,17 @@ async function updateProtectionOrders(
   connector: any,
   pos: LivePosition,
   reason: string,
+  // Once-per-tick snapshot of order IDs currently open on the venue.
+  // When provided, we cross-check our recorded `stopLossOrderId` /
+  // `takeProfitOrderId` against this set: any recorded id NOT present in
+  // the live snapshot is treated as silently gone (filled, externally
+  // cancelled, expired, account-level reduce-only sweep, etc.) and the
+  // local fields are cleared so the existing "no id → place fresh"
+  // branch re-arms the leg on the same tick.
+  //
+  // Pass `null`/omit to skip verification (legacy callers that only
+  // want price/qty-drift reconciliation pay no extra REST cost).
+  liveOrderIds?: Set<string> | null,
 ): Promise<{ changed: boolean; slPlaced: boolean; tpPlaced: boolean }> {
   const result = { changed: false, slPlaced: false, tpPlaced: false }
   if (!connector) return result
@@ -1367,6 +1426,38 @@ async function updateProtectionOrders(
   // Protection orders are reduce-only — they cannot add new risk.
   const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
   if (effectiveQty <= 0) return result
+
+  // ── Liveness verification against the venue ──────────────────────────
+  // Without this step the engine has no way to notice a SILENTLY GONE
+  // protection order. The legacy drift-only check passes (price hasn't
+  // moved, qty hasn't moved, id is still set) and we leave the position
+  // unprotected indefinitely. The most common silent-gone causes:
+  //   • SL/TP fired for a partial qty on a venue that doesn't
+  //     auto-cancel the sibling leg (we keep the now-filled id)
+  //   • Account-level reduce-only sweep (Bybit / OKX during margin-mode
+  //     transitions)
+  //   • Venue auto-expired a triggered conditional order
+  //   • Operator manually cancelled via the venue UI
+  // Clearing the local id forces the placement branch below to re-arm
+  // the leg in the same reconcile tick.
+  if (liveOrderIds && liveOrderIds.size >= 0) {
+    if (pos.stopLossOrderId && !liveOrderIds.has(String(pos.stopLossOrderId))) {
+      console.log(
+        `${LOG_PREFIX} [verify] StopLoss ${pos.symbol} orderId=${pos.stopLossOrderId} not found on venue — clearing & re-arming`,
+      )
+      pos.stopLossOrderId = undefined
+      pos.stopLossPrice = 0
+      result.changed = true
+    }
+    if (pos.takeProfitOrderId && !liveOrderIds.has(String(pos.takeProfitOrderId))) {
+      console.log(
+        `${LOG_PREFIX} [verify] TakeProfit ${pos.symbol} orderId=${pos.takeProfitOrderId} not found on venue — clearing & re-arming`,
+      )
+      pos.takeProfitOrderId = undefined
+      pos.takeProfitPrice = 0
+      result.changed = true
+    }
+  }
 
   const { desiredSl, desiredTp } = computeDesiredProtectionPrices(pos)
   const closeSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
@@ -2872,7 +2963,7 @@ export async function closeLivePosition(
     // when the position has ALREADY been closed (typically because an SL
     // or TP order on the exchange fired between our last reconcile tick
     // and this close request). Known venue strings include:
-    //   • "Position not found"                  (BingX, OKX)
+    //   ��� "Position not found"                  (BingX, OKX)
     //   • "No open position to close"           (Bybit)
     //   • "Position size is zero or invalid"    (BingX)
     //   • "Position size is zero — nothing to close" (Bybit)
@@ -3589,6 +3680,14 @@ export async function reconcileLivePositions(
       exchangeMap.set(`${sym}|${direction}`, ep)
     }
 
+    // ── Once-per-tick venue open-orders snapshot ───────────────────────
+    // Used by `updateProtectionOrders` to detect silently-gone SL/TP
+    // (filled, externally cancelled, expired, sweep). One `getOpenOrders`
+    // call amortized across every position in the reconcile sweep, vs.
+    // 2 × getOrder() calls per position the alternative would require.
+    // `null` means "skip verification this tick"; the next tick retries.
+    const liveOrderIds = await fetchLiveOrderIdSet(exchangeConnector)
+
     for (const pos of openPositions) {
       summary.reconciled++
       try {
@@ -3689,7 +3788,12 @@ export async function reconcileLivePositions(
             continue
           }
           try {
-            await updateProtectionOrders(exchangeConnector, pos, justFilled ? "reconcile_fill_detected" : "reconcile")
+            await updateProtectionOrders(
+              exchangeConnector,
+              pos,
+              justFilled ? "reconcile_fill_detected" : "reconcile",
+              liveOrderIds,
+            )
           } catch (slTpErr) {
             console.warn(
               `${LOG_PREFIX} reconcile SL/TP heal error for ${pos.id}:`,
@@ -4427,6 +4531,12 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       exchangeMap.set(`${sym}|${direction}`, ep)
     }
 
+    // ── Once-per-tick venue open-orders snapshot ───────────────────────
+    // See `fetchLiveOrderIdSet` docs. Same purpose as in reconcile: lets
+    // `updateProtectionOrders` notice silently-gone SL/TP legs without
+    // calling getOrder() per leg. `null` ⇒ skip verification this tick.
+    const liveOrderIdsSync = await fetchLiveOrderIdSet(exchangeConnector)
+
     for (const position of openPositions) {
       try {
         const mapKey = `${normSym(position.symbol)}|${position.direction}`
@@ -4676,6 +4786,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               exchangeConnector,
               position,
               justFilled ? "sync_fill_detected" : "sync_heal",
+              liveOrderIdsSync,
             )
           } catch (slTpErr) {
             console.warn(
