@@ -46,6 +46,12 @@ interface EngineTimings {
   lockExtendIntervalMs: number
   maxPositionHoldMs: number
   progressionBufferFlushMs: number
+  // Three-progression loop tunables
+  prehistoricIntervalMs: number
+  prehistoricCyclePauseMs: number
+  realtimeIntervalMs: number
+  realtimeCyclePauseMs: number
+  livePositionsCyclePauseMs: number
 }
 
 // Mirror of `DEFAULT_ENGINE_TIMINGS`. Used when loadSettings can't fetch

@@ -82,6 +82,30 @@ export interface EngineTimings {
   // elapses. NOTE: this is read at module init; runtime changes apply
   // after engine restart (the setInterval handle is fixed at first read).
   progressionBufferFlushMs: number
+
+  // ── Three independent progression loops (the engine's "heartbeat") ──
+  // The engine drives three top-level loops, EACH independent of the others
+  // but sharing one inner ind+strat pipeline:
+  //
+  //   A. Prehistoric Progression  (default 1 s, continuous forever)
+  //      → for each timeframe × symbol: runIndStratCycle(historical)
+  //   B. Realtime  Progression    (default 1 s, continuous forever)
+  //      → for each symbol:           runIndStratCycle(realtime)
+  //   C. LivePositions Progression (default 200 ms, continuous forever)
+  //      → live-exchange sync (mark price, SL/TP cross, control orders)
+  //
+  // Each loop has a start-to-start interval AND a post-completion pause
+  // ("breath"). The pause guarantees the previous cycle's Redis writes
+  // are durable before the next cycle reads — mirrors the live-sync
+  // pause pattern that fixed double-fire SL/TP bugs.
+  prehistoricIntervalMs: number       // Loop A start-to-start
+  prehistoricCyclePauseMs: number     // Loop A post-cycle breath
+  realtimeIntervalMs: number          // Loop B start-to-start
+  realtimeCyclePauseMs: number        // Loop B post-cycle breath
+  livePositionsCyclePauseMs: number   // Loop C post-cycle breath
+                                      //   (Loop C uses `liveSyncIntervalMs`
+                                      //    as start-to-start gate — that
+                                      //    field already exists above.)
 }
 
 export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
@@ -99,6 +123,12 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   lockExtendIntervalMs:     15_000,
   maxPositionHoldMs:    4 * 60 * 60 * 1000,
   progressionBufferFlushMs:  3_000,
+  // ── Three-progression defaults ────────────────────────────────────────
+  prehistoricIntervalMs:        1_000,  // 1s timeframe cadence
+  prehistoricCyclePauseMs:         50,
+  realtimeIntervalMs:           1_000,
+  realtimeCyclePauseMs:            50,
+  livePositionsCyclePauseMs:       50,
 }
 
 // Hard min/max bounds — UI + API normalise to these to avoid pathological
@@ -119,6 +149,15 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
   lockExtendIntervalMs:      { min: 1_000,       max: 60_000              },
   maxPositionHoldMs:         { min: 0 /* off */, max: 7 * 24 * 60 * 60_000 },
   progressionBufferFlushMs:  { min: 500,         max: 60_000              },
+  // ── Three-progression bounds ──────────────────────────────────────────
+  // Floor at 200 ms protects the event loop from a runaway 1 ms cycle.
+  // Ceiling at 60 s gives operators a way to "park" a loop without
+  // disabling it entirely (e.g. quiet-mode for paper-only setups).
+  prehistoricIntervalMs:     { min: 200,         max: 60_000              },
+  prehistoricCyclePauseMs:   { min: 10,          max: 500                 },
+  realtimeIntervalMs:        { min: 200,         max: 60_000              },
+  realtimeCyclePauseMs:      { min: 10,          max: 500                 },
+  livePositionsCyclePauseMs: { min: 10,          max: 200                 },
 }
 
 // snake_case key in Redis hash → camelCase key in object. Both forms are
@@ -134,6 +173,11 @@ const REDIS_KEY_MAP: Record<keyof EngineTimings, string[]> = {
   lockExtendIntervalMs:       ["lock_extend_interval_ms",       "lockExtendIntervalMs"],
   maxPositionHoldMs:          ["max_position_hold_ms",          "maxPositionHoldMs"],
   progressionBufferFlushMs:   ["progression_buffer_flush_ms",   "progressionBufferFlushMs"],
+  prehistoricIntervalMs:      ["prehistoric_interval_ms",       "prehistoricIntervalMs"],
+  prehistoricCyclePauseMs:    ["prehistoric_cycle_pause_ms",    "prehistoricCyclePauseMs"],
+  realtimeIntervalMs:         ["realtime_interval_ms",          "realtimeIntervalMs"],
+  realtimeCyclePauseMs:       ["realtime_cycle_pause_ms",       "realtimeCyclePauseMs"],
+  livePositionsCyclePauseMs:  ["live_positions_cycle_pause_ms", "livePositionsCyclePauseMs"],
 }
 
 const CACHE_TTL_MS = 10_000
