@@ -44,6 +44,69 @@ function toCanonicalSymbol(raw: string): string {
   return s
 }
 
+/**
+ * Robustly extract `quantity` and `entryPrice` from a connector's
+ * `getPositions()` result. Different venues normalize position objects
+ * differently — Binance returns `positionAmt`, Bybit returns `size`,
+ * BingX returns `contracts`, ccxt-style returns `contracts` + `entryPrice`,
+ * raw REST returns `qty` + `avgPrice`, etc. The SL/TP tests previously
+ * read `position.contracts` blindly, producing `NaN` (and therefore
+ * `Invalid quantity: NaN` exchange-side rejections) for every venue that
+ * doesn't happen to use that exact field name.
+ *
+ * This helper tries every known field in priority order, normalizes the
+ * sign (some venues return negative size for short positions), and
+ * returns `null` when no usable values can be recovered — so the caller
+ * can surface a precise diagnostic instead of forwarding `NaN` to the
+ * exchange.
+ */
+function extractPositionMetrics(position: any): {
+  quantity: number
+  entryPrice: number
+  side: "long" | "short" | "unknown"
+} | null {
+  if (!position || typeof position !== "object") return null
+
+  const sizeRaw =
+    position.contracts ??
+    position.size ??
+    position.positionAmt ??
+    position.positionSize ??
+    position.qty ??
+    position.quantity ??
+    position.amount ??
+    position.positionQty ??
+    position.holdQty
+  const entryRaw =
+    position.entryPrice ??
+    position.avgPrice ??
+    position.averagePrice ??
+    position.avgEntryPrice ??
+    position.entry_price ??
+    position.openPrice ??
+    position.avg_entry_price
+  const sideRaw =
+    position.side ??
+    position.positionSide ??
+    position.direction ??
+    (typeof sizeRaw === "number" && sizeRaw < 0 ? "short" : undefined)
+
+  const size = Math.abs(Number(sizeRaw))
+  const entryPrice = Number(entryRaw)
+  if (!Number.isFinite(size) || size <= 0) return null
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0) return null
+
+  const sideStr = String(sideRaw ?? "").toLowerCase()
+  const side: "long" | "short" | "unknown" =
+    sideStr.includes("long") || sideStr === "buy"
+      ? "long"
+      : sideStr.includes("short") || sideStr === "sell"
+        ? "short"
+        : "unknown"
+
+  return { quantity: size, entryPrice, side }
+}
+
 interface TestResult {
   testName: string
   success: boolean
@@ -415,8 +478,23 @@ async function testStopLossOrder(
     }
 
     const position = positions[0]
-    const slPrice = position.entryPrice * 0.95 // 5% below entry
-    const quantity = position.contracts * 0.1 // Close 10% of position
+    // Use the cross-venue field-shape extractor — `position.contracts`
+    // is undefined on Binance / Bybit / OKX and produces a NaN qty.
+    const metrics = extractPositionMetrics(position)
+    if (!metrics) {
+      return {
+        testName: "Stop Loss Order",
+        success: false,
+        duration: Date.now() - start,
+        details: `Cannot derive position size/entry from connector payload (symbol="${position?.symbol}")`,
+        error: `Unrecognized position shape: keys=[${Object.keys(position || {}).join(",")}]`,
+      }
+    }
+    const slPrice = metrics.entryPrice * 0.95 // 5% below entry
+    // Close 10% of the position, but no less than the venue's smallest
+    // tradeable unit. We can't easily query the precise step here, so a
+    // conservative floor of 1e-6 keeps the SL parameter strictly > 0.
+    const quantity = Math.max(metrics.quantity * 0.1, 1e-6)
 
     const slSymbol = toCanonicalSymbol(position.symbol)
     if (slSymbol !== position.symbol) {
@@ -620,9 +698,26 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
     }
 
     const position = positions[0]
-    const slPrice = position.entryPrice * 0.90 // 10% below entry
-    const tpPrice = position.entryPrice * 1.10 // 10% above entry
-    const quantity = Math.min(position.contracts * 0.1, 0.001) // Small qty
+    // Same robust extraction as the SL test — see `extractPositionMetrics`.
+    const metrics = extractPositionMetrics(position)
+    if (!metrics) {
+      return {
+        testName: "Control Order Lifecycle",
+        success: false,
+        duration: Date.now() - start,
+        details: `Cannot derive position size/entry from connector payload (symbol="${position?.symbol}")`,
+        error: `Unrecognized position shape: keys=[${Object.keys(position || {}).join(",")}]`,
+      }
+    }
+    const slPrice = metrics.entryPrice * 0.90 // 10% below entry
+    const tpPrice = metrics.entryPrice * 1.10 // 10% above entry  (kept for parity if future code needs it)
+    void tpPrice
+    // Small qty: 10% of position, capped at 0.001, floored at 1e-6 so
+    // the request always carries a finite, strictly-positive number.
+    const quantity = Math.max(Math.min(metrics.quantity * 0.1, 0.001), 1e-6)
+    // Use the extracted side rather than `position.side` so connectors
+    // that report direction via `positionSide` / sign-of-size still work.
+    const closeSide = metrics.side === "short" ? "buy" : "sell"
 
     // Same exchange-native → ccxt-slash conversion as testStopLossOrder;
     // both placement AND the subsequent cancelOrder() MUST use the
@@ -638,7 +733,7 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
     // Try to place SL order
     const slResult = await connector.placeStopOrder(
       lifecycleSymbol,
-      position.side === "long" ? "sell" : "buy",
+      closeSide,
       quantity,
       slPrice,
       { stopPrice: slPrice, reduceOnly: true }
