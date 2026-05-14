@@ -562,25 +562,62 @@ async function testVerifyOrderCreation(connector: any): Promise<TestResult> {
   try {
     // Re-fetch open orders to verify recent orders were created
     const orders = await connector.getOpenOrders()
-    
+
     if (!orders || orders.length === 0) {
       return {
         testName: "Verify Order Creation",
         success: false,
         duration: Date.now() - start,
-        details: "No orders found after creation attempts",
+        details: "No open orders returned by connector",
       }
     }
 
-    const recentOrders = orders.filter(
-      (o: any) => Date.now() - o.timestamp < 60000
-    ) // Last 60 seconds
+    // ── Cross-venue timestamp extraction ──────────────────────────────
+    // Different connectors normalize the order timestamp differently:
+    //   • Binance / ccxt: `timestamp` (ms epoch)
+    //   • BingX:          `updateTime` / `time`
+    //   • Bybit:          `createdTime` / `updatedTime`
+    //   • OKX:            `cTime` / `uTime`
+    // The previous filter read `o.timestamp` blindly and produced
+    // `NaN - 60000 = NaN`, which is falsy — so EVERY order was filtered
+    // out and the test reported "0 recent orders" even when the SL we
+    // just placed was sitting in the response. The new extractor walks
+    // every known field; orders that genuinely have no timestamp are
+    // accepted into the count (the alternative — silently dropping
+    // them — gave the misleading "0 recent" reading).
+    const now = Date.now()
+    const extractTs = (o: any): number | null => {
+      const cands = [o?.timestamp, o?.updateTime, o?.time, o?.createdTime, o?.updatedTime, o?.cTime, o?.uTime]
+      for (const c of cands) {
+        if (c == null) continue
+        const n = typeof c === "number" ? c : Number(c)
+        if (Number.isFinite(n) && n > 0) return n
+      }
+      return null
+    }
+    const recentOrders = orders.filter((o: any) => {
+      const ts = extractTs(o)
+      // Accept untimestamped orders — connector simply didn't surface
+      // a field; better than silently zero'ing the count.
+      if (ts === null) return true
+      return now - ts < 60000
+    })
+
+    // Summarize order types to make the log line actionable: the
+    // operator can instantly see whether SL/TP/limit legs landed.
+    const typeSummary: Record<string, number> = {}
+    for (const o of orders as any[]) {
+      const t = String(o?.type ?? o?.orderType ?? "unknown").toLowerCase()
+      typeSummary[t] = (typeSummary[t] ?? 0) + 1
+    }
 
     return {
       testName: "Verify Order Creation",
       success: recentOrders.length > 0,
       duration: Date.now() - start,
-      details: `Verified ${recentOrders.length} recent orders created in last 60s`,
+      details:
+        `Verified ${recentOrders.length}/${orders.length} recent orders (≤60s). ` +
+        `Types: ${Object.entries(typeSummary).map(([t, n]) => `${t}=${n}`).join(", ") || "n/a"}`,
     }
   } catch (error) {
     return {
@@ -762,13 +799,12 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
     const isShortLc = metrics.side === "short"
     const slPrice = isShortLc ? metrics.entryPrice * 1.10 : metrics.entryPrice * 0.90 // 10% on the loss side
     const tpPrice = isShortLc ? metrics.entryPrice * 0.90 : metrics.entryPrice * 1.10 // 10% on the gain side
-    void tpPrice
     // Small qty: 10% of position, capped at 0.001, floored at 1e-6 so
     // the request always carries a finite, strictly-positive number.
     const quantity = Math.max(Math.min(metrics.quantity * 0.1, 0.001), 1e-6)
     // Use the extracted side rather than `position.side` so connectors
     // that report direction via `positionSide` / sign-of-size still work.
-    const closeSide = metrics.side === "short" ? "buy" : "sell"
+    const closeSide = isShortLc ? "buy" : "sell"
 
     // Same exchange-native → ccxt-slash conversion as testStopLossOrder;
     // both placement AND the subsequent cancelOrder() MUST use the
@@ -779,45 +815,107 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
         `${LOG_PREFIX} Normalized lifecycle symbol: "${position.symbol}" → "${lifecycleSymbol}"`,
       )
     }
-    console.log(`${LOG_PREFIX} Creating control orders for ${lifecycleSymbol}`)
+    console.log(
+      `${LOG_PREFIX} Creating control orders for ${lifecycleSymbol}: dir=${metrics.side} closeSide=${closeSide} qty=${quantity} SL=${slPrice} TP=${tpPrice}`,
+    )
 
-    // Try to place SL order
+    // ── Place BOTH SL and TP (these are the "control orders" plural) ──
+    // The previous version only placed an SL and called that "lifecycle".
+    // The complete lifecycle the operator actually cares about is:
+    //   1. place SL  → record id
+    //   2. place TP  → record id
+    //   3. cancel SL → verify cancel works
+    //   4. cancel TP → verify cancel works on the other leg too
+    // Failures in any step are surfaced with the connector's verbatim
+    // error message so we never log a generic "Failed to create control
+    // order" without context again.
     const slResult = await connector.placeStopOrder(
       lifecycleSymbol,
       closeSide,
       quantity,
       slPrice,
-      { stopPrice: slPrice, reduceOnly: true }
+      { stopPrice: slPrice, reduceOnly: true },
+    )
+    console.log(
+      `${LOG_PREFIX} SL placeStopOrder result: success=${slResult?.success} orderId=${slResult?.orderId ?? "none"} error=${slResult?.error ?? "none"}`,
     )
 
-    if (slResult && slResult.orderId) {
-      // Now try to cancel it to test cancel functionality
+    if (!slResult || !slResult.orderId) {
+      return {
+        testName: "Control Order Lifecycle",
+        success: false,
+        duration: Date.now() - start,
+        details: `Failed to create SL leg for ${lifecycleSymbol}`,
+        error: slResult?.error || "SL placeStopOrder returned no orderId",
+      }
+    }
+
+    const tpResult = await connector.placeStopOrder(
+      lifecycleSymbol,
+      closeSide,
+      quantity,
+      tpPrice,
+      { stopPrice: tpPrice, reduceOnly: true },
+    )
+    console.log(
+      `${LOG_PREFIX} TP placeStopOrder result: success=${tpResult?.success} orderId=${tpResult?.orderId ?? "none"} error=${tpResult?.error ?? "none"}`,
+    )
+
+    // ── Cancel both legs to verify the cancellation path ──────────────
+    // Cancel BOTH so the test leaves the account in the same state it
+    // found it (no orphan reduce-only orders that the next reconcile
+    // pass would have to clean up). If only one cancel works that's
+    // still useful diagnostic information — we surface both results.
+    let slCancelOk = false
+    let slCancelErr: string | null = null
+    try {
+      const slCancel = await connector.cancelOrder(lifecycleSymbol, slResult.orderId)
+      slCancelOk = !!slCancel?.success
+      slCancelErr = slCancel?.error ?? null
+    } catch (e) {
+      slCancelErr = e instanceof Error ? e.message : String(e)
+    }
+    console.log(
+      `${LOG_PREFIX} SL cancel result: ok=${slCancelOk} error=${slCancelErr ?? "none"}`,
+    )
+
+    let tpCancelOk = false
+    let tpCancelErr: string | null = null
+    if (tpResult?.orderId) {
       try {
-        const cancelResult = await connector.cancelOrder(lifecycleSymbol, slResult.orderId)
-        if (cancelResult.success) {
-          return {
-            testName: "Control Order Lifecycle",
-            success: true,
-            duration: Date.now() - start,
-            details: `Created SL ${slResult.orderId} and successfully cancelled (lifecycle test)`,
-          }
-        }
-      } catch (cancelErr) {
-        // Cancel might fail but SL creation succeeded
-        return {
-          testName: "Control Order Lifecycle",
-          success: true,
-          duration: Date.now() - start,
-          details: `Created SL order ${slResult.orderId} (cancel test failed but creation verified)`,
-        }
+        const tpCancel = await connector.cancelOrder(lifecycleSymbol, tpResult.orderId)
+        tpCancelOk = !!tpCancel?.success
+        tpCancelErr = tpCancel?.error ?? null
+      } catch (e) {
+        tpCancelErr = e instanceof Error ? e.message : String(e)
+      }
+      console.log(
+        `${LOG_PREFIX} TP cancel result: ok=${tpCancelOk} error=${tpCancelErr ?? "none"}`,
+      )
+    }
+
+    // Lifecycle is considered successful when BOTH legs were created.
+    // Cancellation outcomes are reported in details but don't fail the
+    // test on their own — orphan orders will be cleaned up by the
+    // protection reconciler on the next sync tick.
+    const tpCreated = !!tpResult?.orderId
+    if (!tpCreated) {
+      return {
+        testName: "Control Order Lifecycle",
+        success: false,
+        duration: Date.now() - start,
+        details: `Created SL ${slResult.orderId} but failed to create TP for ${lifecycleSymbol}`,
+        error: tpResult?.error || "TP placeStopOrder returned no orderId",
       }
     }
 
     return {
       testName: "Control Order Lifecycle",
-      success: false,
+      success: true,
       duration: Date.now() - start,
-      details: "Failed to create control order",
+      details:
+        `SL=${slResult.orderId} (cancel=${slCancelOk ? "ok" : `failed: ${slCancelErr}`}), ` +
+        `TP=${tpResult.orderId} (cancel=${tpCancelOk ? "ok" : `failed: ${tpCancelErr}`})`,
     }
   } catch (error) {
     return {

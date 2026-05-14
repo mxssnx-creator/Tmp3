@@ -1159,6 +1159,21 @@ async function placeProtectionOrder(
   orderLabel: "StopLoss" | "TakeProfit",
   positionDirection: "long" | "short",
 ): Promise<string | null> {
+  // ── Structured trace context ────────────────────────────────────────
+  // Every protection-order placement gets a single multi-field log line
+  // before any exchange interaction, so when an operator reports "the
+  // order didn't get created" we can immediately answer THREE questions
+  // from one grep:
+  //   1. What were the inputs the engine sent?
+  //   2. Did we even reach the venue? (rejected-locally entries say so)
+  //   3. What did the venue say back? (success line includes id/latency,
+  //      failure line includes the venue error verbatim)
+  const tag = `${LOG_PREFIX} [${orderLabel}] ${symbol}`
+  const placeStart = Date.now()
+  console.log(
+    `${tag} placement requested: dir=${positionDirection} closeSide=${closeSide} qty=${quantity} trigger=${triggerPrice}`,
+  )
+
   try {
     // Prefer the connector's CONDITIONAL-order path
     // (`placeStopOrder`) over a regular `placeOrder`. The legacy code
@@ -1170,7 +1185,7 @@ async function placeProtectionOrder(
     // (Bybit), and falls back to the limit-as-trigger behaviour on
     // connectors that haven't been upgraded yet (see `BaseExchangeConnector`).
     if (typeof connector?.placeStopOrder !== "function") {
-      console.warn(`${LOG_PREFIX} connector has no placeStopOrder — protection unavailable`)
+      console.warn(`${tag} REJECTED LOCALLY: connector has no placeStopOrder — protection unavailable`)
       return null
     }
 
@@ -1181,15 +1196,11 @@ async function placeProtectionOrder(
     // helper boundary so a future bug upstream surfaces immediately as a
     // local log line rather than as a venue-side rejection mid-trade.
     if (!Number.isFinite(quantity) || quantity <= 0) {
-      console.error(
-        `${LOG_PREFIX} ${orderLabel} placement rejected locally — invalid quantity=${quantity} for ${symbol}`,
-      )
+      console.error(`${tag} REJECTED LOCALLY: invalid quantity=${quantity} (must be finite, >0)`)
       return null
     }
     if (!Number.isFinite(triggerPrice) || triggerPrice <= 0) {
-      console.error(
-        `${LOG_PREFIX} ${orderLabel} placement rejected locally — invalid triggerPrice=${triggerPrice} for ${symbol}`,
-      )
+      console.error(`${tag} REJECTED LOCALLY: invalid triggerPrice=${triggerPrice} (must be finite, >0)`)
       return null
     }
 
@@ -1224,6 +1235,8 @@ async function placeProtectionOrder(
       EXCHANGE_TIMEOUT_PLACE_STOP_MS,
       `placeStopOrder(${orderLabel} ${symbol})`,
     )
+
+    const latencyMs = Date.now() - placeStart
     // Coerce id to string. Some venues return numeric ids; downstream
     // code does `if (pos.stopLossOrderId)` checks that would mistake a
     // legitimately-zero (or zero-string) id for "no order placed". The
@@ -1232,13 +1245,22 @@ async function placeProtectionOrder(
     const rawId = result?.success ? (result.orderId ?? result.id) : null
     const orderId = rawId !== null && rawId !== undefined && String(rawId).length > 0 ? String(rawId) : null
     if (orderId) {
-      console.log(`${LOG_PREFIX} ${orderLabel} placed: ${orderId} @ ${triggerPrice}`)
+      console.log(`${tag} PLACED: orderId=${orderId} @ trigger=${triggerPrice} qty=${quantity} latency=${latencyMs}ms`)
       return orderId
     }
-    console.warn(`${LOG_PREFIX} ${orderLabel} placement failed: ${result?.error || "unknown"}`)
+    // result.error is the connector's normalized venue-side message
+    // (e.g. "BingX stop order error (code=110413): Take Profit price
+    // should be greater than the current price"). We log it verbatim so
+    // operators see the EXACT venue rejection without having to jump
+    // log layers.
+    console.warn(
+      `${tag} VENUE REJECTED: error="${result?.error || "unknown"}" code=${result?.code ?? "n/a"} latency=${latencyMs}ms`,
+    )
     return null
   } catch (err) {
-    console.warn(`${LOG_PREFIX} ${orderLabel} error:`, err)
+    const latencyMs = Date.now() - placeStart
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`${tag} EXCEPTION: ${msg} latency=${latencyMs}ms`)
     return null
   }
 }
@@ -3649,7 +3671,7 @@ export async function reconcileLivePositions(
             )
           }
 
-          // ── Proactive close-in-time safety check ───────────────────
+          // ── Proactive close-in-time safety check ─────────────────��─
           // Even when the exchange-placed reduce-only SL/TP orders are
           // armed, on a sharp price gap (illiquid pair / news / slow
           // fill) the exchange may not fire them in time — leaving the
@@ -4482,7 +4504,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           continue // closeLivePosition persisted terminal state — skip per-position setex
         }
 
-        // ── Delayed-fill SL/TP arming ─────────────────────────���───────
+        // ── Delayed-fill SL/TP arming ────��────────────────────���───────
         // If the entry order was still pending when `executeLivePosition`
         // tried to place SL/TP, that step pushed `place_sl_tp = skipped`
         // and the position ended up `placed` with no protection orders.
