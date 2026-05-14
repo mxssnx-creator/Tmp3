@@ -592,20 +592,46 @@ export class TradeEngineManager {
       // tick of each processor fires the moment the `:done` flag flips.
       // ── Three-progression contract (architectural spec) ──────────────
       // Three independent top-level loops, each on its own timer:
-      //   A. Prehistoric Progression  (1 s)   → historical Sets fill
-      //   B. Realtime  Progression    (1 s)   → ind+pseudo+strat per cycle
-      //                                          (driven by startIndicationProcessor
-      //                                           for historical method-name reasons)
+      //   A. Prehistoric Progression  (continuous, no-pause) → historical Sets fill
+      //   B. Realtime  Progression    (1 s) → ind+pseudo+strat per cycle
+      //                                       (driven by startIndicationProcessor
+      //                                        for historical method-name reasons)
       //   C. LivePositions Progression (200 ms) → live exchange sync
-      //                                            (driven by startRealtimeProcessor)
+      //                                           (driven by startRealtimeProcessor)
       //
       // The legacy startStrategyProcessor remains armed as a long-interval
       // heartbeat tick only — strategy evaluation now happens inside the
       // shared pipeline called from the Realtime Progression.
-      this.startIndicationProcessor(config.indicationInterval)
-      this.startStrategyProcessor(config.strategyInterval)
-      this.startRealtimeProcessor(config.realtimeInterval)
-      this.startPrehistoricProgression()
+      //
+      // ── Startup ordering ─────────────────────────────────────────────
+      // Per the architectural spec: "On enabling connection, first finish
+      // prehistoric progress, then start realtime progress." The Realtime
+      // pipeline READS the indication Sets that the Prehistoric pipeline
+      // WRITES; if realtime starts before prehistoric has filled the Sets
+      // at least once, every live tick scores against an empty Set and
+      // the first wave of indications is meaningless.
+      //
+      // To enforce the gate we:
+      //   1. Start the Prehistoric loop first (and ONLY it).
+      //   2. Pass an `onFirstPassComplete` callback that arms the other
+      //      three progressions the moment the first historical cycle
+      //      writes the `prehistoric:{connId}:firstpass:done` flag.
+      //   3. The Prehistoric loop then continues running forever in the
+      //      background, refilling Sets from fresh market data each cycle.
+      //
+      // The callback path runs SYNCHRONOUSLY inside the prehistoric tick
+      // before scheduleNext, so the realtime loops are armed before the
+      // second prehistoric cycle even fires — no race window.
+      const armLiveProgressions = () => {
+        if (!this.isRunning) return
+        console.log(
+          `[v0] [Engine ${this.connectionId}] Prehistoric first-pass complete — arming Realtime, Strategy heartbeat, and LivePositions loops.`,
+        )
+        this.startIndicationProcessor(config.indicationInterval)
+        this.startStrategyProcessor(config.strategyInterval)
+        this.startRealtimeProcessor(config.realtimeInterval)
+      }
+      this.startPrehistoricProgression(armLiveProgressions)
 
       // Phase stays at `prehistoric_data` while the historical calculator
       // is filling sets. `loadPrehistoricData` updates the phase percent
@@ -630,12 +656,27 @@ export class TradeEngineManager {
         )
       }
 
-      // Verify timers are running
+      // Verify timers are running.
+      //
+      // Under the prehistoric-gated startup contract, the realtime /
+      // indication / strategy timers are intentionally NOT armed at boot
+      // — they are armed by the `armLiveProgressions` callback the moment
+      // the Prehistoric Progression finishes its first pass (which can
+      // take 5-30 s on a fresh boot). So at +2 s the only timer we can
+      // assert is the prehistoric one. The live timers get their own
+      // confirmation log via `armLiveProgressions` itself.
       setTimeout(async () => {
-        if (this.indicationTimer && this.strategyTimer && this.realtimeTimer) {
-          await logProgressionEvent(this.connectionId, "engine_started", "info", "All engine processors started")
+        if (this.prehistoricTimer) {
+          await logProgressionEvent(
+            this.connectionId,
+            "engine_started",
+            "info",
+            this.indicationTimer && this.realtimeTimer
+              ? "All engine processors started"
+              : "Prehistoric Progression running — live processors gated until first pass completes",
+          )
         } else {
-          console.error(`[v0] [Engine] Timer startup failed`)
+          console.error(`[v0] [Engine] Timer startup failed — prehistoric not armed`)
         }
       }, 2000)
       this.startHealthMonitoring()
@@ -2542,7 +2583,27 @@ export class TradeEngineManager {
    */
   private prehistoricTimer?: ReturnType<typeof setTimeout>
 
-  private startPrehistoricProgression(): void {
+  /**
+   * Start the Prehistoric Progression loop.
+   *
+   * @param onFirstPassComplete  Fired ONCE, after the very first cycle
+   *   has finished writing the `prehistoric:{connId}:firstpass:done`
+   *   flag. The continuous loop keeps running forever afterward. This
+   *   is the engine-startup gate: the Realtime + LivePositions + Strategy
+   *   loops must NOT start until this callback fires, so the realtime
+   *   pipeline only ever reads Sets that the prehistoric writer has
+   *   already populated. The callback is invoked even if the first cycle
+   *   produced zero successful symbols (it represents "the first pass
+   *   completed" — not "the first pass succeeded") so a connection with
+   *   stale market data still progresses out of bootstrap.
+   *
+   *   For the re-arm / self-heal call site (where the firstpass:done
+   *   flag is already persisted in Redis from the original boot), the
+   *   callback can be omitted — the realtime loop is already running.
+   */
+  private startPrehistoricProgression(
+    onFirstPassComplete?: () => void,
+  ): void {
     let cycleCount = 0
     let firstPassDone = false
     const connId = this.connectionId
@@ -2665,6 +2726,19 @@ export class TradeEngineManager {
             `Prehistoric Progression first-pass complete (${symbols.length} symbols, ${duration} ms)`,
             { cycle: cycleCount, symbols: symbols.length, durationMs: duration },
           ).catch(() => {})
+
+          // Release the startup gate. Wrapped in try/catch so a buggy
+          // callback can never break the continuous prehistoric loop.
+          if (onFirstPassComplete) {
+            try {
+              onFirstPassComplete()
+            } catch (cbErr) {
+              console.error(
+                `[v0] [PrehistoricProgression] onFirstPassComplete threw:`,
+                cbErr instanceof Error ? cbErr.message : String(cbErr),
+              )
+            }
+          }
         }
 
         // Cycle telemetry — surfaces the loop's heartbeat to the dashboard.
@@ -3135,7 +3209,7 @@ export class TradeEngineManager {
 
   // ───���────────────────────────────────────────────────────────────────
   //  Live settings reload
-  // ────────────────────────────────────────────────────────────────────
+  // ────────────────���───────────────────────────────────────────────────
 
   /**
    * Starts the per-connection settings watcher (3s poll). Cheap: a
