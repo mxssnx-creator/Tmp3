@@ -2028,7 +2028,7 @@ export async function executeLivePosition(
       pushStep(livePosition, "set_margin_type", true, "connector does not expose setMarginType — skipping")
     }
 
-    // ── Step 5: Place entry order with retry ─────────────────────���─────────
+    // ── Step 5: Place entry order with retry ─────────────────────����─────────
     const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
 
     // ── Comprehensive logging trace ──────────────────────────────────
@@ -2818,57 +2818,132 @@ export async function closeLivePosition(
     }
 
     // ── 2. Issue the close on the exchange with retry logic ────────────
+    //
+    // Critical classification rule: every connector returns
+    //   { success: false, error: "<reason>" }
+    // when the position has ALREADY been closed (typically because an SL
+    // or TP order on the exchange fired between our last reconcile tick
+    // and this close request). Known venue strings include:
+    //   • "Position not found"                  (BingX, OKX)
+    //   • "No open position to close"           (Bybit)
+    //   • "Position size is zero or invalid"    (BingX)
+    //   • "Position size is zero — nothing to close" (Bybit)
+    //   • "nothing to close" / "position is zero" / "already closed"
+    // These are NOT failures from our perspective — the exchange-side
+    // state already matches what we're trying to achieve. The previous
+    // implementation treated them as hard failures, burned both retries
+    // (4+ seconds per close), then logged "FAILED to close on exchange"
+    // and skipped the closed-counter increment. The operator therefore
+    // saw closes that "didn't happen" — when in fact the exchange close
+    // had completed via an SL/TP fill seconds earlier.
     let exchangeCloseSuccess = false
+    let exchangeCloseReason: "ok" | "already_closed" | "failed" | "skipped" = "skipped"
     if (exchangeConnector && typeof exchangeConnector.closePosition === "function") {
       const maxRetries = 2
-      // Tighter backoff: 200 → 400 ms instead of 500 → 1000 ms. The
-      // previous schedule was burning 1.5 s per close on the rare retry
-      // path without improving success rates.
+      // Tighter backoff: 200 → 400 ms. Transient API blips (rate-limit
+      // bump, brief network reload) clear in well under 500 ms; the old
+      // 500/1000 ms schedule wasted ~1.5 s per failing close without
+      // improving success rates.
       const backoffMs = [200, 400]
-      
+
+      const isAlreadyClosedError = (msg: string): boolean => {
+        const m = String(msg || "").toLowerCase()
+        return (
+          m.includes("position not found") ||
+          m.includes("no open position") ||
+          m.includes("nothing to close") ||
+          m.includes("size is zero") ||
+          m.includes("already closed") ||
+          m.includes("position is zero") ||
+          m.includes("position does not exist")
+        )
+      }
+      // Retryable failures are bounded by a sense of "this is a transient
+      // error and another attempt might succeed". Permanent rejections
+      // (invalid params, auth) should NOT retry. Right now we only retry
+      // on timeouts and explicit network errors — everything else falls
+      // through to the failed branch after a single attempt.
+      const isRetryableError = (msg: string): boolean => {
+        const m = String(msg || "").toLowerCase()
+        return (
+          m.includes("timeout") ||
+          m.includes("network") ||
+          m.includes("econn") ||
+          m.includes("rate limit") ||
+          m.includes("429") ||
+          m.includes("503") ||
+          m.includes("502")
+        )
+      }
+
       for (let attempt = 0; attempt < maxRetries; attempt++) {
+        let lastErrorMsg = ""
         try {
-          console.log(`${LOG_PREFIX} [v0] Attempting exchange close ${position.symbol} ${position.direction} (attempt ${attempt + 1}/${maxRetries})`)
-          
-          // Timeout for exchange close - don't block forever. Healthy venues
-          // return in 100-400 ms; 2 s leaves comfortable headroom for slow
-          // paths while halving the worst-case wall-clock on a stuck call.
+          console.log(
+            `${LOG_PREFIX} [v0] Attempting exchange close ${position.symbol} ${position.direction} (attempt ${attempt + 1}/${maxRetries})`,
+          )
+
+          // Per-attempt hard timeout. Healthy venues return in 100-400 ms;
+          // 2 s leaves headroom for the slow paths but bounds worst-case
+          // wall-clock so the close API and reconcile loops keep moving.
           const closePromise = exchangeConnector.closePosition(position.symbol, position.direction)
           const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Exchange close timeout after 2s')), 2000)
+            setTimeout(() => reject(new Error("Exchange close timeout after 2s")), 2000),
           )
-          const r = await Promise.race([closePromise, timeoutPromise])
-          
-          // Validate response explicitly - don't accept undefined/null
-          if (r && typeof r === 'object' && r.success === true) {
+          const r = (await Promise.race([closePromise, timeoutPromise])) as
+            | { success?: boolean; error?: string }
+            | undefined
+
+          if (r && typeof r === "object" && r.success === true) {
             exchangeCloseSuccess = true
+            exchangeCloseReason = "ok"
             console.log(`${LOG_PREFIX} [v0] Exchange close succeeded: ${position.symbol} ${position.direction}`)
             break
-          } else if (r && typeof r === 'object' && r.success === false) {
-            console.warn(`${LOG_PREFIX} [v0] Exchange close failed: ${position.symbol} - ${r.error || 'unknown error'}`)
-            if (attempt < maxRetries - 1) {
-              await new Promise(resolve => setTimeout(resolve, backoffMs[attempt]))
-              continue
-            }
-          } else {
-            console.error(`${LOG_PREFIX} [v0] Exchange close returned invalid response:`, r)
-            if (attempt < maxRetries - 1) {
-              await new Promise(resolve => setTimeout(resolve, backoffMs[attempt]))
-              continue
-            }
           }
-        } catch (err) {
-          console.error(`${LOG_PREFIX} [v0] Exchange close threw error (attempt ${attempt + 1}):`, err instanceof Error ? err.message : String(err))
-          if (attempt < maxRetries - 1) {
+
+          lastErrorMsg = (r && typeof r === "object" && r.error) ? String(r.error) : "invalid_response"
+
+          // ── Already-closed reconciliation ─────────────────────────────
+          // If the venue says the position is gone, we treat the close as
+          // successful and stop retrying. The DB-side terminal-state
+          // pipeline below still runs (PnL is computed from `closePrice`,
+          // which the caller passed as the trigger/mark price — which is
+          // close enough to the actual SL/TP fill that the operator's
+          // reported PnL is within a tick of reality).
+          if (isAlreadyClosedError(lastErrorMsg)) {
+            exchangeCloseSuccess = true
+            exchangeCloseReason = "already_closed"
+            console.log(
+              `${LOG_PREFIX} [v0] Exchange position already closed (SL/TP likely fired): ${position.symbol} ${position.direction} — reason="${lastErrorMsg}"`,
+            )
+            break
+          }
+
+          console.warn(`${LOG_PREFIX} [v0] Exchange close failed: ${position.symbol} - ${lastErrorMsg}`)
+          // Only retry on transient classes of error. Hard logic errors
+          // (invalid params, auth) get a single attempt and bail.
+          if (attempt < maxRetries - 1 && isRetryableError(lastErrorMsg)) {
             await new Promise(resolve => setTimeout(resolve, backoffMs[attempt]))
             continue
           }
+          break
+        } catch (err) {
+          lastErrorMsg = err instanceof Error ? err.message : String(err)
+          console.error(`${LOG_PREFIX} [v0] Exchange close threw error (attempt ${attempt + 1}): ${lastErrorMsg}`)
+          // Thrown timeouts and network errors ARE retryable.
+          if (attempt < maxRetries - 1 && isRetryableError(lastErrorMsg)) {
+            await new Promise(resolve => setTimeout(resolve, backoffMs[attempt]))
+            continue
+          }
+          break
         }
       }
-      
-      // Log final result
+
       if (!exchangeCloseSuccess) {
-        console.error(`${LOG_PREFIX} [v0] FAILED to close position on exchange after ${maxRetries} attempts: ${position.symbol} ${position.direction}`)
+        exchangeCloseReason = "failed"
+        console.error(
+          `${LOG_PREFIX} [v0] FAILED to close position on exchange after ${maxRetries} attempts: ${position.symbol} ${position.direction}`,
+        )
       }
     }
 
@@ -2913,11 +2988,24 @@ export async function closeLivePosition(
     position.realizedPnL = Math.round(pnl * 100) / 100
     position.closeReason = closeReason
     
+    // Step annotation distinguishes the three real outcomes:
+    //   • ok            → connector returned success
+    //   • already_closed → venue said position is gone (SL/TP fired)
+    //   • failed         → connector returned an error we couldn't recover
+    //   • skipped        → no connector was passed (manual DB-only close)
+    const exchangeNote =
+      !exchangeConnector
+        ? "" // no exchange leg
+        : exchangeCloseReason === "ok"
+          ? " [exchange-closed]"
+          : exchangeCloseReason === "already_closed"
+            ? " [exchange-already-closed]"
+            : " [exchange-close-FAILED]"
     pushStep(
       position,
       "close",
       true,
-      `close @ ${closePrice} pnl=${pnl.toFixed(2)} roi=${roi.toFixed(2)}% reason=${closeReason}${exchangeConnector && !exchangeCloseSuccess ? " [exchange-close-FAILED]" : ""}`,
+      `close @ ${closePrice} pnl=${pnl.toFixed(2)} roi=${roi.toFixed(2)}% reason=${closeReason}${exchangeNote}`,
     )
     // savePosition() handles index move + idempotent archival.
     // CHECK the moved-marker BEFORE savePosition() runs so we know
@@ -2935,7 +3023,13 @@ export async function closeLivePosition(
     if (!wasAlreadyClosed) {
       await incrementMetric(connectionId, "live_positions_closed_count")
       if (pnl > 0) await incrementMetric(connectionId, "live_wins_count")
-      if (!exchangeCloseSuccess) await incrementMetric(connectionId, "live_positions_close_failed_count")
+      // Only count as exchange-close failure when the connector actually
+      // failed. `already_closed` means the exchange-side state already
+      // matches our intent (SL/TP fired first), and `skipped` means we
+      // never had a connector — neither is a real failure.
+      if (exchangeCloseReason === "failed") {
+        await incrementMetric(connectionId, "live_positions_close_failed_count")
+      }
     }
 
     await logProgressionEvent(connectionId, "live_trading", "info", `Closed live position ${position.symbol}`, {
@@ -2948,10 +3042,20 @@ export async function closeLivePosition(
       leverage: lev,
       marginAtRisk: margin,
       exchangeCloseSucceeded: exchangeCloseSuccess,
+      exchangeCloseClassification: exchangeCloseReason,
     })
 
-    const closeStatus = exchangeCloseSuccess ? "SUCCEEDED" : "UNCERTAIN (DB-closed only)"
-    console.log(`${LOG_PREFIX} [v0] Closed ${position.symbol} ${position.direction} P&L=${pnl.toFixed(2)} ROI=${roi.toFixed(2)}% reason=${closeReason} exchange_close=${closeStatus}`)
+    const closeStatus =
+      exchangeCloseReason === "ok"
+        ? "SUCCEEDED"
+        : exchangeCloseReason === "already_closed"
+          ? "ALREADY-CLOSED (SL/TP fired)"
+          : exchangeCloseReason === "skipped"
+            ? "DB-only (no connector)"
+            : "FAILED (DB-closed; exchange uncertain)"
+    console.log(
+      `${LOG_PREFIX} [v0] Closed ${position.symbol} ${position.direction} P&L=${pnl.toFixed(2)} ROI=${roi.toFixed(2)}% reason=${closeReason} exchange_close=${closeStatus}`,
+    )
 
     return position
   } catch (err) {
