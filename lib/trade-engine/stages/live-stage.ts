@@ -28,6 +28,25 @@ import { VolumeCalculator } from "@/lib/volume-calculator"
 import { SystemLogger } from "@/lib/system-logger"
 import type { RealPosition } from "./real-stage"
 import { getEngineTimings } from "@/lib/engine-timings"
+import { withTimeout } from "@/lib/async-safety"
+
+/**
+ * Exchange-call timeout budgets (ms).
+ *
+ * These bound every exchange round-trip on the critical close / control-order
+ * path so a single hanging API call cannot freeze the sync loop. Tuned to
+ * match the venue's typical p99 latency for each endpoint with generous
+ * headroom; tighter than the realtime tick spacing so we never queue past
+ * the next tick. Hard-failures surface as timeouts in logs/metrics rather
+ * than silent infinite hangs.
+ *
+ * If any of these timeouts trip in production with healthy network conditions,
+ * the constants are the right knob to retune — keep them centralised here.
+ */
+const EXCHANGE_TIMEOUT_GET_POSITIONS_MS = 5_000
+const EXCHANGE_TIMEOUT_GET_ORDER_MS = 3_000
+const EXCHANGE_TIMEOUT_PLACE_STOP_MS = 5_000
+const EXCHANGE_TIMEOUT_CANCEL_ORDER_MS = 3_000
 
 const LOG_PREFIX = "[v0] [LivePositionStage]"
 
@@ -1057,7 +1076,15 @@ async function cancelProtectionOrder(
   if (!orderId) return false
   try {
     if (typeof connector?.cancelOrder !== "function") return false
-    const res = await connector.cancelOrder(symbol, orderId)
+    // Bounded — a hanging cancelOrder must not block close/heal paths.
+    // On timeout we return false; the position close pipeline tolerates a
+    // failed cancel (the order will be reconciled on the next reconcile
+    // sweep, and the close itself proceeds regardless).
+    const res = await withTimeout(
+      connector.cancelOrder(symbol, orderId) as Promise<any>,
+      EXCHANGE_TIMEOUT_CANCEL_ORDER_MS,
+      `cancelOrder(${label} ${orderId})`,
+    )
     if (res?.success) {
       console.log(`${LOG_PREFIX} ${label} cancelled: ${orderId}`)
       return true
@@ -1129,16 +1156,25 @@ async function placeProtectionOrder(
     // positionSide there, and the retry path only handles the inverse
     // hedge→one-way case). Letting the connector default to hedge-mode +
     // auto-retry covers both account types correctly.
-    const result = await connector.placeStopOrder(
-      symbol,
-      closeSide,
-      quantity,
-      triggerPrice,
-      kind,
-      {
-        reduceOnly: true,
-        positionSide: positionDirection === "long" ? "LONG" : "SHORT",
-      },
+    // Bounded — a hanging placeStopOrder would block the per-position sync
+    // loop and stall every other position's heal/close work behind it. On
+    // timeout we return null; the next sync tick will retry, and meanwhile
+    // `checkAndForceCloseOnSltpCross` provides the safety net (it triggers
+    // on price independent of whether the protection order is armed).
+    const result = await withTimeout(
+      connector.placeStopOrder(
+        symbol,
+        closeSide,
+        quantity,
+        triggerPrice,
+        kind,
+        {
+          reduceOnly: true,
+          positionSide: positionDirection === "long" ? "LONG" : "SHORT",
+        },
+      ) as Promise<any>,
+      EXCHANGE_TIMEOUT_PLACE_STOP_MS,
+      `placeStopOrder(${orderLabel} ${symbol})`,
     )
     if (result?.success && (result.orderId || result.id)) {
       console.log(`${LOG_PREFIX} ${orderLabel} placed: ${result.orderId || result.id} @ ${triggerPrice}`)
@@ -3161,7 +3197,7 @@ export async function reconcileLivePositions(
             }
           }
 
-          // ── SL/TP self-healing ──────────────────────────────────────────
+          // ── SL/TP self-healing ─────────────────��────────────────────────
           // Every reconcile cycle we verify protection orders match the
           // desired levels. updateProtectionOrders() is no-op when nothing
           // drifted — only fires real REST calls when something changed.
@@ -3619,7 +3655,20 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     let exchangePositions: any[] = []
     if (exchangeConnector && typeof exchangeConnector.getPositions === "function") {
       try {
-        exchangePositions = (await exchangeConnector.getPositions().catch(() => [])) || []
+        // Bounded — a hanging getPositions() would freeze every close path
+        // (externally-closed detection, orphan adoption, mark-price refresh,
+        // SL/TP cross check) all of which depend on this single call.
+        exchangePositions = (await withTimeout(
+          exchangeConnector.getPositions() as Promise<any[]>,
+          EXCHANGE_TIMEOUT_GET_POSITIONS_MS,
+          "syncWithExchange:getPositions",
+        ).catch((err: any) => {
+          console.warn(
+            `${LOG_PREFIX} getPositions failed/timeout in syncWithExchange:`,
+            err instanceof Error ? err.message : String(err),
+          )
+          return [] as any[]
+        })) || []
         if (Array.isArray(exchangePositions) && exchangePositions.length > 0) {
           // Build a set of (symbol|direction) keys we already track in any
           // status — including terminal ones — so we don't re-adopt a
@@ -3923,7 +3972,15 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         let justFilled = false
         if (position.status === "placed" && position.orderId) {
           try {
-            const order = await exchangeConnector.getOrder(position.symbol, position.orderId)
+            // Bounded — a hanging getOrder would block this position's
+            // entire sync slot and delay every downstream close/heal step.
+            // On timeout we just skip the fill detection for this tick;
+            // the next sync will retry.
+            const order = await withTimeout(
+              exchangeConnector.getOrder(position.symbol, position.orderId) as Promise<any>,
+              EXCHANGE_TIMEOUT_GET_ORDER_MS,
+              `getOrder(${position.symbol} ${position.orderId})`,
+            )
             if (order?.status === "filled") {
               position.executedQuantity = order.filledQty || position.quantity
               position.remainingQuantity = Math.max(0, position.quantity - position.executedQuantity)
