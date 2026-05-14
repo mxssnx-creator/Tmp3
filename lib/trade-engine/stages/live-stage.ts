@@ -2028,7 +2028,7 @@ export async function executeLivePosition(
       pushStep(livePosition, "set_margin_type", true, "connector does not expose setMarginType — skipping")
     }
 
-    // ── Step 5: Place entry order with retry ───────────────────────────────
+    // ── Step 5: Place entry order with retry ─────────────────────���─────────
     const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
 
     // ── Comprehensive logging trace ──────────────────────────────────
@@ -2381,18 +2381,39 @@ export async function executeLivePosition(
     }
 
     // C) getPosition() fallback when poll timed out without fill data.
+    //
+    // Exchange position registries are usually a few hundred ms behind
+    // order acknowledgements (orders go through the matching engine, then
+    // get persisted to the position service via internal pub/sub). A
+    // single getPosition() that comes back empty is therefore not
+    // conclusive proof the order didn't fill — it might just be the
+    // registry being slow. We try up to 3 times with 250 ms gaps before
+    // giving up and dropping to the computedVolume guard, which trades
+    // ~500 ms of additional confirmation latency for much higher accuracy
+    // of SL/TP sizing on slow-confirming venues.
     if (!fill.filled || fill.filledQty <= 0) {
       if (typeof exchangeConnector.getPosition === "function") {
-        try {
-          const exPos = await exchangeConnector.getPosition(realPosition.symbol)
-          const exSize = parseFloat(String(exPos?.size ?? exPos?.positionAmt ?? exPos?.quantity ?? "0")) || 0
-          const exEntry = parseFloat(String(exPos?.entryPrice ?? exPos?.avgPrice ?? "0")) || 0
-          if (exSize > 0) {
-            console.log(`${LOG_PREFIX} getPosition() fallback fill for ${realPosition.symbol}: size=${exSize} entry=${exEntry}`)
-            fill = { filled: true, filledQty: exSize, filledPrice: exEntry || currentPrice, status: "filled_via_position" }
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const exPos = await exchangeConnector.getPosition(realPosition.symbol)
+            const exSize = parseFloat(String(exPos?.size ?? exPos?.positionAmt ?? exPos?.quantity ?? exPos?.contracts ?? "0")) || 0
+            const exEntry = parseFloat(String(exPos?.entryPrice ?? exPos?.avgPrice ?? exPos?.averagePrice ?? "0")) || 0
+            if (Math.abs(exSize) > 0) {
+              console.log(`${LOG_PREFIX} getPosition() fallback fill for ${realPosition.symbol}: size=${exSize} entry=${exEntry} (attempt=${attempt + 1})`)
+              fill = {
+                filled: true,
+                filledQty: Math.abs(exSize),
+                filledPrice: exEntry || currentPrice,
+                status: "filled_via_position",
+              }
+              break
+            }
+          } catch {
+            /* transient error — counts as one attempt, fall through to retry */
           }
-        } catch {
-          /* best-effort — fall through to computedVolume guard below */
+          // Gap before the next probe — short enough that total worst-case
+          // is ~500 ms, long enough for the registry to catch up.
+          if (attempt < 2) await new Promise(r => setTimeout(r, 250))
         }
       }
     }
@@ -3632,11 +3653,21 @@ export async function reconcileLivePositions(
           // fired) the connector's closePosition() will get a "position
           // not found" error which is silently swallowed — the only side-
           // effect is one extra REST call per such reconcile cycle.
+          //
+          // Hard 2s timeout: without it, a hung connector here would block
+          // the entire reconcile loop, delaying every other position's
+          // reconciliation until the venue gave up. 2s is generous for a
+          // healthy exchange (typical close call returns in <500 ms) and
+          // bounded enough that the loop keeps making progress.
           if (pos.executedQuantity > 0 && pos.status !== "placed") {
             try {
-              await exchangeConnector.closePosition(pos.symbol, pos.direction)
+              const closeP = exchangeConnector.closePosition(pos.symbol, pos.direction)
+              const timeoutP = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("reconcile-close timeout after 2s")), 2000),
+              )
+              await Promise.race([closeP, timeoutP])
             } catch {
-              /* already gone — this is expected when SL/TP fired normally */
+              /* already gone, timed out, or transient — reconcile is best-effort */
             }
           }
 
