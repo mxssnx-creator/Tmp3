@@ -79,13 +79,13 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      orderId: result.orderId || result.order_id || "N/A",
+      orderId: (result as any)?.orderId || (result as any)?.order_id || "N/A",
       symbol,
       side,
       quantity,
       leverage,
       timestamp: Date.now(),
-      details: result.details || result,
+      details: (result as any)?.details || result,
     })
   } catch (error) {
     console.error("[PlaceOrder] Error:", error)

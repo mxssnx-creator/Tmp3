@@ -3969,7 +3969,13 @@ export async function reconcileLivePositions(
             // Engine-level rollup: one increment per POSITION (not per
             // leg) so the counter answers "how many positions had their
             // control orders touched this tick".
-            if (protectionResult.changed) summary.protectionRearmed++
+            if (protectionResult.changed) {
+              summary.protectionRearmed++
+              // Persist any protection changes (re-armed ids, cleared due to
+              // liveness-verify) so a serverless restart doesn't lose them.
+              await savePosition(pos)
+              summary.updated++
+            }
           } catch (slTpErr) {
             console.warn(
               `${LOG_PREFIX} reconcile SL/TP heal error for ${pos.id}:`,
@@ -4958,12 +4964,17 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         // after an operator-cancelled SL on the exchange it re-places.
         if (position.executedQuantity > 0) {
           try {
-            await updateProtectionOrders(
+            const protectionResult = await updateProtectionOrders(
               exchangeConnector,
               position,
               justFilled ? "sync_fill_detected" : "sync_heal",
               liveOrderIdsSync,
             )
+            // Persist any protection changes (placement, rearmed ids,
+            // liveness-verify clears) so a serverless restart doesn't lose them.
+            if (protectionResult.changed) {
+              await savePosition(position)
+            }
           } catch (slTpErr) {
             console.warn(
               `${LOG_PREFIX} sync SL/TP heal error for ${position.id}:`,
