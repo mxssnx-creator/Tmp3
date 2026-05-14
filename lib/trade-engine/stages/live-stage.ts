@@ -3555,6 +3555,63 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
   const client = getRedisClient()
   const syncStartMs = Date.now()
 
+  // ── Cross-caller single-flight gate ─────────────────────────────────
+  // `syncWithExchange` has three independent callers in production:
+  //   1. RealtimeProcessor.maybeRunLiveSync() — every 200 ms (in-process
+  //      gate `liveSyncInFlight` covers same-process collisions only)
+  //   2. /api/cron/sync-live-positions — Vercel cron, ~30 s
+  //   3. /api/trade-engine/resume      — one-shot on resume
+  //
+  // Without a Redis-backed lock the cron+realtime can run in parallel
+  // against the same per-position state (status flips, protection-
+  // order placement, externally-closed adoption — all racy when
+  // doubled). The in-process flag is process-local and useless across
+  // a serverless cron invocation hitting the same Redis as a long-
+  // running engine.
+  //
+  // Lock semantics:
+  //   • Key:    live_sync_lock:{connectionId}
+  //   • TTL:    30 s — generous headroom over the sync's p99 runtime
+  //             while still releasing within one heartbeat window if
+  //             the holder process dies mid-sync.
+  //   • NX:     atomic acquire; if already held we early-return as a
+  //             no-op (the existing holder will finish the work).
+  //   • Release: best-effort `del` in the finally block. On crash the
+  //             TTL is the safety net.
+  //
+  // This is intentionally LESS strict than the progression-lock
+  // (which uses ownerToken+epoch) because syncWithExchange is
+  // idempotent — losing a lock release just costs one skipped sync
+  // tick, not corrupted state.
+  const LIVE_SYNC_LOCK_KEY = `live_sync_lock:${connectionId}`
+  const LIVE_SYNC_LOCK_TTL_SEC = 30
+  let lockAcquired = false
+  if (client) {
+    try {
+      const acquireResult = await client.set(LIVE_SYNC_LOCK_KEY, String(syncStartMs), {
+        NX: true,
+        EX: LIVE_SYNC_LOCK_TTL_SEC,
+      })
+      lockAcquired = acquireResult === "OK"
+    } catch (lockErr) {
+      // Redis unreachable — fail open (proceed without the lock).
+      // The in-process flag in RealtimeProcessor still prevents
+      // same-process duplicate runs; the only path that loses
+      // dedup is cron-vs-realtime, which is rare and idempotent.
+      console.warn(
+        `${LOG_PREFIX} [sync-lock] acquire failed for ${connectionId} — proceeding without cross-caller lock:`,
+        lockErr instanceof Error ? lockErr.message : String(lockErr),
+      )
+      lockAcquired = true // treat as acquired so the finally block doesn't try to release
+    }
+    if (!lockAcquired) {
+      console.log(
+        `${LOG_PREFIX} [sync-lock] skip — another caller is mid-sync for conn=${connectionId} (likely cron+realtime overlap, idempotent skip)`,
+      )
+      return
+    }
+  }
+
   try {
     // Previously each status filter triggered a full getLivePositions() scan,
     // meaning we fetched the same open-positions index from Redis FOUR times
@@ -4226,6 +4283,27 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     )
   } catch (err) {
     console.error(`${LOG_PREFIX} Error syncing with exchange:`, err)
+  } finally {
+    // Release the cross-caller dedup lock. We don't bother with a
+    // compare-and-swap here because:
+    //   (a) the lock is short-TTL (30 s) — a missed release just
+    //       delays the next sync by at most that window.
+    //   (b) syncWithExchange is idempotent — losing the release
+    //       can't corrupt state, only skip work.
+    //   (c) the only path that bypassed the acquire (Redis-unreachable
+    //       fail-open) explicitly sets lockAcquired=true so we don't
+    //       attempt to release a lock we don't hold.
+    if (lockAcquired && client) {
+      try {
+        await client.del(LIVE_SYNC_LOCK_KEY)
+      } catch (releaseErr) {
+        // Lock will expire via TTL — log but don't surface.
+        console.warn(
+          `${LOG_PREFIX} [sync-lock] release failed for ${connectionId}; TTL will reap:`,
+          releaseErr instanceof Error ? releaseErr.message : String(releaseErr),
+        )
+      }
+    }
   }
 }
 
