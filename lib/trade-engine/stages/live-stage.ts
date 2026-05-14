@@ -3668,8 +3668,18 @@ async function checkAndForceCloseOnSltpCross(
 async function orphanCloseExpiredPositions(
   connectionId: string,
   connector: any,
-  summary: { reconciled: number; closed: number; errors: number; updated: number },
-  ): Promise<void> {
+  // Same shape as the reconcile summary so the function can roll up
+  // sweep activity into the engine-level totals without the caller
+  // having to mirror counters.
+  summary: {
+    reconciled: number
+    closed: number
+    errors: number
+    updated: number
+    protectionRearmed: number
+    orphansSwept: number
+  },
+): Promise<void> {
   const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
   if (MAX_HOLD_TIME_MS <= 0) return
 
@@ -3716,6 +3726,16 @@ async function orphanCloseExpiredPositions(
         if (pos.stopLossOrderId) cancels.push(cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss").catch(() => {}))
         if (pos.takeProfitOrderId) cancels.push(cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit").catch(() => {}))
         if (cancels.length) await Promise.all(cancels).catch(() => {})
+        // Same orphan-sweep used inside `closeLivePosition`. Wired here
+        // too so max-hold-expired positions also get the chaos-prevention
+        // pass — without it, an operator-placed reduce-only that the
+        // engine never recorded would survive the orphan-close because
+        // there'd be no by-id cancellation to trigger the sweep on.
+        const sweepCloseSide: "buy" | "sell" = pos.direction === "long" ? "sell" : "buy"
+        try {
+          const swept = await sweepOrphanProtectionOrders(connector, pos.symbol, sweepCloseSide)
+          summary.orphansSwept += swept.cancelled
+        } catch { /* sweep is best-effort */ }
       }
 
       await closeLivePosition(connectionId, pos.id, exitPrice, connector, reason).catch((err) => {
@@ -3738,11 +3758,34 @@ export async function reconcileLivePositions(
   updated: number
   closed: number
   errors: number
+  // ── Protection-leg activity counters ───────────────────────────────
+  // Surfaced on every reconcile tick so functional-overview / engine-stats
+  // dashboards can render the SL/TP control-order workload accurately:
+  //   • protectionRearmed: positions where updateProtectionOrders made a
+  //     net change this tick (place, replace, or liveness-clear). Counts
+  //     POSITIONS, not legs — a single tick that re-armed both SL and TP
+  //     on one position increments this by 1.
+  //   • orphansSwept: total reduce-only orders the post-close sweep
+  //     cancelled this tick. Aggregates the `orphanCloseExpiredPositions`
+  //     path; per-position sweeps that run inside `closeLivePosition`
+  //     are recorded in each position's `orphan_sweep` audit step
+  //     (the position is the source of truth for those, so we don't
+  //     double-count them here). 0 in the steady state; > 0 means real
+  //     chaos was prevented.
+  protectionRearmed: number
+  orphansSwept: number
 }> {
   await initRedis()
   const client = getRedisClient()
 
-  const summary = { reconciled: 0, updated: 0, closed: 0, errors: 0 }
+  const summary = {
+    reconciled: 0,
+    updated: 0,
+    closed: 0,
+    errors: 0,
+    protectionRearmed: 0,
+    orphansSwept: 0,
+  }
 
   // ── Simulated-position sweep (always runs, even without a connector) ──
   // Simulated positions don't touch the exchange — their close path is
@@ -3917,12 +3960,16 @@ export async function reconcileLivePositions(
             continue
           }
           try {
-            await updateProtectionOrders(
+            const protectionResult = await updateProtectionOrders(
               exchangeConnector,
               pos,
               justFilled ? "reconcile_fill_detected" : "reconcile",
               liveOrderIds,
             )
+            // Engine-level rollup: one increment per POSITION (not per
+            // leg) so the counter answers "how many positions had their
+            // control orders touched this tick".
+            if (protectionResult.changed) summary.protectionRearmed++
           } catch (slTpErr) {
             console.warn(
               `${LOG_PREFIX} reconcile SL/TP heal error for ${pos.id}:`,

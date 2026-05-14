@@ -67,6 +67,10 @@ interface SweepSummary {
   positionsReconciled: number
   positionsClosed: number
   positionsUpdated: number
+  // Protection-leg / control-order activity counters. See the
+  // reconcileLivePositions return-type docstring for exact semantics.
+  protectionRearmed: number
+  orphansSwept: number
   errors: number
 }
 
@@ -77,6 +81,8 @@ function newSummary(): SweepSummary {
     positionsReconciled: 0,
     positionsClosed: 0,
     positionsUpdated: 0,
+    protectionRearmed: 0,
+    orphansSwept: 0,
     errors: 0,
   }
 }
@@ -87,6 +93,8 @@ function mergeSummary(into: SweepSummary, from: SweepSummary): void {
   into.positionsReconciled += from.positionsReconciled
   into.positionsClosed     += from.positionsClosed
   into.positionsUpdated    += from.positionsUpdated
+  into.protectionRearmed   += from.protectionRearmed
+  into.orphansSwept        += from.orphansSwept
   into.errors              += from.errors
 }
 
@@ -166,6 +174,8 @@ async function runOneSweep(): Promise<SweepSummary> {
       summary.positionsReconciled += result.reconciled
       summary.positionsClosed     += result.closed
       summary.positionsUpdated    += result.updated
+      summary.protectionRearmed   += result.protectionRearmed
+      summary.orphansSwept        += result.orphansSwept
       summary.errors              += result.errors
     } catch (connErr) {
       summary.errors++
