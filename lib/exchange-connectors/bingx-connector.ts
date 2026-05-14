@@ -413,8 +413,12 @@ export class BingXConnector extends BaseExchangeConnector {
         if (hedgeMode) {
           params.positionSide = effectivePositionSide
         }
-        // reduceOnly is only meaningful on perp endpoints.
-        if (options.reduceOnly) {
+        // reduceOnly is only meaningful on perp endpoints — and on BingX
+        // hedge-mode accounts it is NOT allowed alongside positionSide
+        // (the venue rejects with code=109400). Hedge mode already implies
+        // the reduce-only semantic via positionSide+side opposition, so
+        // we suppress reduceOnly there. One-way mode still needs it.
+        if (options.reduceOnly && !hedgeMode) {
           params.reduceOnly = "true"
         }
         if (options.clientOrderId) {
@@ -445,6 +449,37 @@ export class BingXConnector extends BaseExchangeConnector {
       const data = await response.json()
 
       if (!this.isBingXSuccess(data.code)) {
+        // Special-case: 109400 "In the Hedge mode, the 'ReduceOnly' field
+        // can not be filled." A misrouted reduceOnly slipped through; strip
+        // it and retry once. Hedge mode's reduce-only semantic is carried
+        // by positionSide+side opposition, so the retry is still safe.
+        const reduceOnlyHedgeConflict =
+          String(data.code) === "109400" ||
+          /reduceonly.*hedge|hedge.*reduceonly/i.test(String(data.msg || ""))
+        if (reduceOnlyHedgeConflict && !isSpot && params.reduceOnly) {
+          this.log("Retrying order without reduceOnly (hedge-mode conflict 109400)")
+          delete params.reduceOnly
+          params.timestamp = Date.now()
+          const { signature: roRetrySig, queryString: roRetryQs } = this.signParams(params)
+          const roRetryUrl = `${this.getBaseUrl()}${endpoint}?${roRetryQs}&signature=${roRetrySig}`
+          const roRetryResp = await this.rateLimitedFetch(roRetryUrl, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const roRetryData = await roRetryResp.json()
+          if (this.isBingXSuccess(roRetryData.code)) {
+            const info = roRetryData.data?.order || roRetryData.data || {}
+            const id = info.orderId || info.id || roRetryData.data?.orderId
+            this.log(`✓ Order placed on retry (hedge, no reduceOnly): ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined }
+          }
+          // Fall through with the retry's response so the operator sees
+          // the real underlying error rather than the 109400 we already
+          // worked around.
+          data.code = roRetryData.code
+          data.msg = roRetryData.msg
+        }
+
         // Special-case: 80014 "position side does not match" — the account is
         // in one-way mode but we sent a hedge-mode positionSide. Retry once
         // without positionSide so the order still goes through rather than
@@ -549,12 +584,23 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: Date.now(),
       }
       if (hedgeMode) params.positionSide = positionSide
-      if (options.reduceOnly !== false) params.reduceOnly = "true"
+      // BingX hedge-mode rule: `reduceOnly` is NOT allowed when
+      // `positionSide` is set — the venue rejects with
+      //   code=109400 "In the Hedge mode, the 'ReduceOnly' field can not
+      //   be filled."
+      // In hedge mode the positionSide=LONG/SHORT combined with the
+      // opposite `side` IS the reduce-only semantic (it can only close
+      // the matching side), so omitting reduceOnly is safe and correct.
+      // In one-way mode we still need reduceOnly to prevent the order
+      // from accidentally flipping the position to the opposite side.
+      if (!hedgeMode && options.reduceOnly !== false) {
+        params.reduceOnly = "true"
+      }
       if (options.clientOrderId) params.clientOrderId = options.clientOrderId
 
       this.log(
         `Placing ${orderType} ${closeSide} ${qtyStr} ${bingxSymbol} @ stop=${stopStr}` +
-          `${hedgeMode ? ` posSide=${positionSide}` : " [one-way]"} [reduceOnly]`,
+          `${hedgeMode ? ` posSide=${positionSide} [hedge, reduceOnly implicit]` : " [one-way, reduceOnly]"}`,
       )
 
       const endpoint = "/openApi/swap/v2/trade/order"
@@ -571,7 +617,37 @@ export class BingXConnector extends BaseExchangeConnector {
 
       // Same one-way retry logic as `placeOrder`: BingX returns 80014 when
       // a hedge-mode positionSide is sent to a one-way account.
+      // Also handles 109400 — defensive fallback in case `hedgeMode` was
+      // not propagated from the caller and `reduceOnly` ended up on a
+      // hedge-mode request anyway. Strip it and retry once.
       if (!this.isBingXSuccess(data.code)) {
+        const reduceOnlyHedgeConflict =
+          String(data.code) === "109400" ||
+          /reduceonly.*hedge|hedge.*reduceonly/i.test(String(data.msg || ""))
+        if (reduceOnlyHedgeConflict && params.reduceOnly) {
+          this.log("Retrying stop order without reduceOnly (hedge-mode conflict 109400)")
+          delete params.reduceOnly
+          // Hedge mode requires positionSide; ensure it's present.
+          if (!params.positionSide) params.positionSide = positionSide
+          params.timestamp = Date.now()
+          const { signature: retrySig2, queryString: retryQs2 } = this.signParams(params)
+          const retryUrl2 = `${this.getBaseUrl()}${endpoint}?${retryQs2}&signature=${retrySig2}`
+          const retryResp2 = await this.rateLimitedFetch(retryUrl2, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const retryData2 = await retryResp2.json()
+          if (this.isBingXSuccess(retryData2.code)) {
+            const info2 = retryData2.data?.order || retryData2.data || {}
+            return {
+              success: true,
+              orderId: String(info2.orderId ?? info2.orderID ?? ""),
+            }
+          }
+          // Fall through to the normal error path with the retry's response.
+          data.code = retryData2.code
+          data.msg = retryData2.msg
+        }
         const sideMismatch = String(data.code) === "80014"
           || /position.*side/i.test(String(data.msg || ""))
         if (sideMismatch && hedgeMode) {
