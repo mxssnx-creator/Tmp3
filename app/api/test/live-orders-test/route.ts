@@ -60,6 +60,45 @@ function toCanonicalSymbol(raw: string): string {
  * can surface a precise diagnostic instead of forwarding `NaN` to the
  * exchange.
  */
+/**
+ * Per-base-asset minimum order quantity (in base units), keyed by the
+ * uppercased base ticker extracted from a CCXT-style symbol.
+ *
+ * These are conservative floors derived from BingX/Bybit/Binance public
+ * exchangeInfo for USDT-perp pairs as of the current trading session.
+ * They are NOT meant to be authoritative — the connector should ideally
+ * call `/exchangeInfo` at boot and cache the real values — but as a
+ * static floor they reliably prevent code=110422 ("minimum size per
+ * order") rejections in the test harness.
+ *
+ * The default of 1 base unit is intentionally restrictive for unknown
+ * symbols, encouraging the caller to override via configuration rather
+ * than silently shipping micro-orders that the venue will reject.
+ */
+const VENUE_MIN_QTY_BY_BASE: Record<string, number> = {
+  BTC: 0.0001,
+  ETH: 0.01,
+  BNB: 0.01,
+  SOL: 0.1,
+  XRP: 1,
+  ADA: 1,
+  DOGE: 10,
+  MATIC: 1,
+  AVAX: 0.1,
+  LINK: 0.1,
+  DOT: 0.1,
+  LTC: 0.01,
+  TRX: 10,
+  MLN: 0.1,
+  ATOM: 0.1,
+}
+function getVenueMinQty(symbol: string | undefined | null): number {
+  if (!symbol) return 1
+  // Accept either "BTC/USDT" (canonical) or "BTC-USDT" (BingX-native).
+  const base = String(symbol).split(/[\/\-_]/)[0]?.toUpperCase() ?? ""
+  return VENUE_MIN_QTY_BY_BASE[base] ?? 1
+}
+
 function extractPositionMetrics(position: any): {
   quantity: number
   entryPrice: number
@@ -511,9 +550,17 @@ async function testStopLossOrder(
     // SL trigger sits on the loss side of entry: below entry for longs,
     // above entry for shorts. 5% offset matches the original test.
     const slPrice = isShort ? metrics.entryPrice * 1.05 : metrics.entryPrice * 0.95
-    // Close 10% of the position, floored at 1e-6 so the request always
-    // carries a finite, strictly-positive number.
-    const quantity = Math.max(metrics.quantity * 0.1, 1e-6)
+    // Per-venue minimum quantity floor.
+    //
+    // BingX rejects orders below per-base-asset minimums with
+    //   code=110422 "The minimum size per order is 0.0001 BTC."
+    // The previous floor of `1e-6` was way below every real venue min
+    // and produced silent rejections on every small position. We now
+    // gate against the *actual* min for the position's base asset,
+    // accepting that the test may close more than 10% of the position
+    // when 10% itself rounds below the venue minimum — that's strictly
+    // better than the test failing on a healthy connector.
+    const quantity = Math.max(metrics.quantity * 0.1, getVenueMinQty(position.symbol))
 
     const slSymbol = toCanonicalSymbol(position.symbol)
     if (slSymbol !== position.symbol) {
@@ -734,14 +781,50 @@ async function testLimitOrderPlacement(connector: any): Promise<TestResult> {
       }
     }
 
-    // Try to place a limit order at a low price (likely not to fill)
+    // ── Venue-realistic limit order ───────────────────────────────────
+    // The previous version sent ETH/USDT qty=0.001 @ $100, which is
+    //   • $0.10 notional — below BingX/Bybit/Binance min notional (~$2-5)
+    //   • 4-5% of the current ETH market price — far enough below market
+    //     that some venues reject it as a "ridiculous" limit
+    // Both failure modes returned a falsy result without throwing, which
+    // surfaced as the unhelpful "Limit order placement returned no ID".
+    //
+    // The new approach:
+    //   1. Pull live market price for the symbol via `getMarkPrice` /
+    //      `getTicker` (whichever the connector exposes)
+    //   2. Place the buy-limit at 50% of market — safely far from filling
+    //      but within every venue's "reasonable price" guardrail
+    //   3. Size for a notional of ~$10 (well above min-notional on every
+    //      supported venue) using the per-base-asset min quantity floor
     const symbol = "ETH/USDT"
-    const qty = 0.001
-    const price = 100 // Very low price - won't fill but tests order placement
-    
+    let markPrice = 0
+    try {
+      if (typeof connector.getMarkPrice === "function") {
+        const mp = await connector.getMarkPrice(symbol)
+        markPrice = typeof mp === "number" ? mp : parseFloat(String(mp?.price ?? mp ?? "0")) || 0
+      } else if (typeof connector.getTicker === "function") {
+        const t = await connector.getTicker(symbol)
+        markPrice = parseFloat(String(t?.last ?? t?.price ?? t?.markPrice ?? "0")) || 0
+      } else if (typeof connector.getCurrentPrice === "function") {
+        markPrice = parseFloat(String((await connector.getCurrentPrice(symbol)) ?? "0")) || 0
+      }
+    } catch {
+      // fall through; markPrice=0 triggers the static-fallback branch below
+    }
+    // Static fallback when the connector exposes no price API — keeps
+    // the test runnable on minimal connectors and uses a conservative
+    // ETH price floor so the resulting limit is still well below market.
+    if (!Number.isFinite(markPrice) || markPrice <= 0) markPrice = 2000
+    const price = +(markPrice * 0.5).toFixed(2) // 50% of market, 2dp rounded
+    // Notional target ≈ $10. Floored at the venue's ETH minimum
+    // (0.01 on BingX) so we never trip code=110422.
+    const venueMinEth = getVenueMinQty(symbol)
+    const qty = Math.max(10 / price, venueMinEth)
+
+    console.log(`${LOG_PREFIX} Limit test: ${symbol} buy ${qty} @ ${price} (mark=${markPrice})`)
+
     try {
       const result = await connector.placeOrder(symbol, "buy", qty, price, "limit")
-      
       if (result && result.orderId) {
         return {
           testName: "Limit Order Placement",
@@ -750,22 +833,21 @@ async function testLimitOrderPlacement(connector: any): Promise<TestResult> {
           details: `Limit order placed: ${result.orderId} at ${price} for ${qty} ${symbol}`,
         }
       }
-    } catch (err) {
-      // Might fail due to invalid price, but test logic completed
       return {
         testName: "Limit Order Placement",
         success: false,
         duration: Date.now() - start,
-        details: "Limit order test - endpoint reachable",
+        details: `Limit order placement returned no ID for ${symbol} buy ${qty} @ ${price}`,
+        error: result?.error || "connector returned no orderId",
+      }
+    } catch (err) {
+      return {
+        testName: "Limit Order Placement",
+        success: false,
+        duration: Date.now() - start,
+        details: `Limit order threw for ${symbol} buy ${qty} @ ${price}`,
         error: err instanceof Error ? err.message : String(err),
       }
-    }
-
-    return {
-      testName: "Limit Order Placement",
-      success: false,
-      duration: Date.now() - start,
-      details: "Limit order placement returned no ID",
     }
   } catch (error) {
     return {
@@ -810,9 +892,12 @@ async function testControlOrderLifecycle(connector: any): Promise<TestResult> {
     const isShortLc = metrics.side === "short"
     const slPrice = isShortLc ? metrics.entryPrice * 1.10 : metrics.entryPrice * 0.90 // 10% on the loss side
     const tpPrice = isShortLc ? metrics.entryPrice * 0.90 : metrics.entryPrice * 1.10 // 10% on the gain side
-    // Small qty: 10% of position, capped at 0.001, floored at 1e-6 so
-    // the request always carries a finite, strictly-positive number.
-    const quantity = Math.max(Math.min(metrics.quantity * 0.1, 0.001), 1e-6)
+    // Small qty: 10% of position, capped at 0.001, floored at the
+    // venue's per-base-asset minimum (e.g. 0.0001 BTC on BingX) so the
+    // request never trips code=110422 "minimum size per order". The
+    // floor wins over the cap when the venue minimum is larger.
+    const venueMin = getVenueMinQty(position.symbol)
+    const quantity = Math.max(Math.min(metrics.quantity * 0.1, 0.001), venueMin)
     // Use the extracted side rather than `position.side` so connectors
     // that report direction via `positionSide` / sign-of-size still work.
     const closeSide = isShortLc ? "buy" : "sell"
