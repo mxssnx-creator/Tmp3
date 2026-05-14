@@ -46,8 +46,19 @@
  * ── Coordination guarantees ───────────────────────────────────────────
  * Both A (Prehistoric) and B (Realtime) loops call this pipeline. They
  * are independent loops on independent timers, so a slow prehistoric
- * cycle never blocks a realtime cycle. Set writes are keyspaced by
- * mode, so the loops never race on the same Redis hash.
+ * cycle never blocks a realtime cycle.
+ *
+ * Set keyspace is SHARED, not split by mode:
+ *
+ *   `indication_set:{connId}:{symbol}:{type}:{configHash}`
+ *
+ * The Prehistoric loop is the WRITER (fills Sets from historical
+ * candles via `IndicationSetsProcessor.processAllIndicationSets`).
+ * The Realtime loop is the READER (its `processIndication` consults
+ * the filled Sets to score the current live candle, then emits
+ * indications). The two never race because they use different
+ * inputs (historical candle array vs live tick) and the underlying
+ * `processAllIndicationSets` is idempotent per `(symbol, candleTimestamp)`.
  */
 
 import { IndicationProcessor } from "./indication-processor-fixed"
@@ -108,23 +119,25 @@ export async function runIndStratCycle(
 
   try {
     // ── Phase 1: Indication evaluation ────────────────────────────────
-    // Historical mode fills the prev-set keyspace from the configured
-    // look-back window. Realtime mode evaluates the current market
-    // snapshot and returns the active indication list.
+    // Historical mode FILLS the shared Set keyspace from the historical
+    // candle array. It must NOT call `processIndication` — that method
+    // writes to the realtime indication Redis key and computes against
+    // the LIVE tick, polluting state owned by the Realtime Progression.
+    //
+    // Realtime mode evaluates the current market snapshot AGAINST the
+    // Sets that the Prehistoric loop has been filling, then returns
+    // the active indication list for Phase 3.
     let indications: any[] = []
+    let historicalRan = false
     if (mode === "historical") {
       const window = deps.historicalWindow
       if (window) {
-        // Historical method returns void; it writes Sets directly.
-        // For Phase 3 we still need to pass indications, so we
-        // re-fetch the freshly-written ones via the realtime method
-        // afterwards (cheap — they're already in Redis hot cache).
+        // Writes Sets directly via IndicationSetsProcessor; returns void.
+        // After this completes, the realtime loop's next `processIndication`
+        // call will read the fresh Set state on its next tick.
         await deps.indication.processHistoricalIndications(symbol, window.start, window.end)
+        historicalRan = true
       }
-      // Re-read the active indications so Phase 3 has something to
-      // evaluate against. This is a single Redis hgetall + parse, no
-      // recomputation.
-      indications = await deps.indication.processIndication(symbol).catch(() => [] as any[])
     } else {
       indications = await deps.indication.processIndication(symbol).catch(() => [] as any[])
     }
@@ -145,30 +158,39 @@ export async function runIndStratCycle(
       )
     }
 
-    // ── Phase 3: Strategy evaluation (gated on Phase 1) ───────────────
-    // Skip when Phase 1 produced no valid indications — running
-    // StrategyProcessor against an empty indication set just churns
-    // the strategy_cycle_count counter without producing any work.
-    if (result.indicationCount > 0) {
-      if (mode === "historical") {
-        const window = deps.historicalWindow
-        if (window) {
-          await deps.strategy.processHistoricalStrategies(symbol, window.start, window.end)
-        }
-        // Historical writes are stage-internal; no per-cycle returns.
-      } else {
-        const stratResult = await deps.strategy
-          .processStrategy(symbol, indications)
+    // ── Phase 3: Strategy evaluation ──────────────────────────────────
+    // Historical mode: gate is "did Phase 1 fill Sets for this symbol".
+    // `processHistoricalStrategies` reads the prehistoric indications
+    // saved by `processHistoricalIndications` and flows them through
+    // the BASE→MAIN→REAL→LIVE coordinator in non-execution mode.
+    //
+    // Realtime mode: gate is "did Phase 1 produce live indications".
+    // Running StrategyProcessor against an empty indication list just
+    // churns counters without producing work.
+    if (mode === "historical") {
+      if (historicalRan) {
+        const window = deps.historicalWindow!
+        await deps.strategy
+          .processHistoricalStrategies(symbol, window.start, window.end)
           .catch((err) => {
             console.error(
-              `[v0] [SharedPipeline] Strategy failed for ${symbol}:`,
+              `[v0] [SharedPipeline] Historical strategy failed for ${symbol}:`,
               err instanceof Error ? err.message : String(err),
             )
-            return { strategiesEvaluated: 0, liveReady: 0 }
           })
-        result.strategiesEvaluated = stratResult.strategiesEvaluated || 0
-        result.liveReady = stratResult.liveReady || 0
       }
+    } else if (result.indicationCount > 0) {
+      const stratResult = await deps.strategy
+        .processStrategy(symbol, indications)
+        .catch((err) => {
+          console.error(
+            `[v0] [SharedPipeline] Strategy failed for ${symbol}:`,
+            err instanceof Error ? err.message : String(err),
+          )
+          return { strategiesEvaluated: 0, liveReady: 0 }
+        })
+      result.strategiesEvaluated = stratResult.strategiesEvaluated || 0
+      result.liveReady = stratResult.liveReady || 0
     }
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err)

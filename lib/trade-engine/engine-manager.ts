@@ -2597,6 +2597,32 @@ export class TradeEngineManager {
         const end = new Date()
         const start = new Date(end.getTime() - rangeHours * 60 * 60 * 1000)
 
+        // ── Load historical candles BEFORE the pipeline runs ─────────────
+        // `processHistoricalIndications` reads `market_data:{symbol}:candles`
+        // (and `:1s` / `:1m` envelopes) to drive the Set-fill loop. On a
+        // cold start that key may be empty until `loadMarketDataForEngine`
+        // populates it. Calling the loader here on every cycle guarantees:
+        //
+        //   • First-pass after engine boot has fresh data (no empty Sets).
+        //   • Subsequent cycles extend the candle window as new bars close
+        //     on the exchange — so Sets continuously absorb new market
+        //     activity, exactly as the spec demands.
+        //
+        // The loader is internally rate-limited and idempotent — calling
+        // it back-to-back is cheap when nothing has changed.
+        try {
+          const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
+          await loadMarketDataForEngine(symbols)
+        } catch (loadErr) {
+          console.warn(
+            `[v0] [PrehistoricProgression] Market-data load warning:`,
+            loadErr instanceof Error ? loadErr.message : String(loadErr),
+          )
+          // Non-fatal — continue to the pipeline. If candles are still
+          // missing, `processHistoricalIndications` will log NO DATA and
+          // skip the symbol gracefully.
+        }
+
         const pipelineDeps = {
           indication: this.indicationProcessor,
           strategy: this.strategyProcessor,
@@ -3107,7 +3133,7 @@ export class TradeEngineManager {
     return this.settingsVersion
   }
 
-  // ────────────────────────────────────────────────────────────────────
+  // ───���────────────────────────────────────────────────────────────────
   //  Live settings reload
   // ────────────────────────────────────────────────────────────────────
 
