@@ -1346,6 +1346,20 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
+      
+      // Check pause state before executing cycle
+      try {
+        const client = getRedisClient()
+        const globalState = await client.hgetall("trade_engine:global").catch(() => ({}))
+        if ((globalState as any).status === "paused") {
+          // Engine paused - reschedule but skip processing
+          scheduleNext(false)
+          return
+        }
+      } catch (err) {
+        // Ignore Redis errors - continue with cycle
+      }
+      
       const startTime = Date.now()
       // Local abort flag — when true, the finally block will NOT schedule the next cycle.
       let aborted = false
@@ -1741,6 +1755,20 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
+      
+      // Check pause state before executing cycle
+      try {
+        const client = getRedisClient()
+        const globalState = await client.hgetall("trade_engine:global").catch(() => ({}))
+        if ((globalState as any).status === "paused") {
+          // Engine paused - reschedule but skip processing
+          scheduleNext(false)
+          return
+        }
+      } catch (err) {
+        // Ignore Redis errors - continue with cycle
+      }
+      
       const startTime = Date.now()
       let producedStrategies = false
 
