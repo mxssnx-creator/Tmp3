@@ -29,6 +29,12 @@ import { SystemLogger } from "@/lib/system-logger"
 import type { RealPosition } from "./real-stage"
 import { getEngineTimings } from "@/lib/engine-timings"
 import { withTimeout } from "@/lib/async-safety"
+import {
+  newLiveOrderTrace,
+  withLiveOrderLogging,
+  logLiveOrderFinal,
+  type LiveOrderTrace,
+} from "@/lib/live-order-logger"
 
 /**
  * Exchange-call timeout budgets (ms).
@@ -1918,10 +1924,24 @@ export async function executeLivePosition(
     // ── Step 5: Place entry order with retry ───────────────────────────────
     const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
 
+    // ── Comprehensive logging trace ──────────────────────────────────
+    // One trace id spans the primary attempt, the leverage-reduced retry,
+    // the min-size correction retry, the fill polling, and the final
+    // outcome line. Grep `[v0] [LiveOrder]` + `trace=` to reconstruct the
+    // full lifecycle of any failing order. Trace is created here (not at
+    // function entry) so accumulation merges and dedup-skip paths above
+    // don't pollute the log with no-op traces.
+    const orderTrace: LiveOrderTrace = newLiveOrderTrace({
+      connectionId,
+      symbol: realPosition.symbol,
+      direction: realPosition.direction,
+      exchangeSide,
+    })
+
     console.log(
       `${LOG_PREFIX} EXECUTING REAL: ${realPosition.symbol} ${realPosition.direction} → ${exchangeSide} qty=${computedVolume.toFixed(
         6
-      )} @ ${currentPrice}`
+      )} @ ${currentPrice} trace=${orderTrace.traceId}`
     )
 
     // For perp entries we pass the explicit positionSide matching the real
@@ -1929,17 +1949,42 @@ export async function executeLivePosition(
     // that don't care about the options object simply ignore the 6th arg.
     // BingX's one-way-mode accounts auto-retry without positionSide if the
     // exchange rejects it (code 80014), so this is safe for both modes.
+    //
+    // The `retry()` helper repeats up to 3× on transient failures; we
+    // emit PRE/POST per ATTEMPT so the log shows each round-trip. The
+    // attempt counter is captured by closure so leverage-reduced and
+    // min-size-corrected retries below get distinct labels.
+    let placeAttempt = 0
     let orderResult: any = await retry(
-      () => exchangeConnector.placeOrder(
-        realPosition.symbol,
-        exchangeSide,
-        computedVolume,
-        undefined,
-        "market",
-        {
-          positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
-        },
-      ),
+      async () => {
+        placeAttempt += 1
+        const { raw } = await withLiveOrderLogging(
+          orderTrace,
+          {
+            quantity: computedVolume,
+            price: currentPrice,
+            leverage: livePosition.leverage,
+            marginType: livePosition.marginType ?? "unknown",
+            orderType: "market",
+            options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+            strategySetKey: livePosition.setKey,
+            realPositionId: realPosition.id,
+            attempt: placeAttempt,
+            label: "primary",
+          },
+          () => exchangeConnector.placeOrder(
+            realPosition.symbol,
+            exchangeSide,
+            computedVolume,
+            undefined,
+            "market",
+            {
+              positionSide: realPosition.direction === "long" ? "LONG" : "SHORT",
+            },
+          ),
+        )
+        return raw
+      },
       (r: any) => !!r?.success && !!(r.orderId || r.id),
       "placeOrder"
     )
@@ -1963,14 +2008,33 @@ export async function executeLivePosition(
         } catch { /* non-critical; the order might still succeed */ }
 
         const retryResult: any = await retry(
-          () => exchangeConnector.placeOrder(
-            realPosition.symbol,
-            exchangeSide,
-            computedVolume,
-            undefined,
-            "market",
-            { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
-          ),
+          async () => {
+            placeAttempt += 1
+            const { raw } = await withLiveOrderLogging(
+              orderTrace,
+              {
+                quantity: computedVolume,
+                price: currentPrice,
+                leverage: reducedLev,
+                marginType: livePosition.marginType ?? "unknown",
+                orderType: "market",
+                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                strategySetKey: livePosition.setKey,
+                realPositionId: realPosition.id,
+                attempt: placeAttempt,
+                label: "leverage-halved",
+              },
+              () => exchangeConnector.placeOrder(
+                realPosition.symbol,
+                exchangeSide,
+                computedVolume,
+                undefined,
+                "market",
+                { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+              ),
+            )
+            return raw
+          },
           (r: any) => !!r?.success && !!(r.orderId || r.id),
           "placeOrder-reducedLev",
           1 // single retry attempt — we already tried 3× above
@@ -2011,6 +2075,12 @@ export async function executeLivePosition(
         error: orderResult?.error,
       })
       await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+      await logLiveOrderFinal(orderTrace, {
+        status: "circuit_breaker",
+        livePositionId: livePosition.id,
+        reason: livePosition.statusReason,
+        extra: { errorCode: orderResult?.errorCode ?? orderResult?.code, error: orderResult?.error },
+      })
       return livePosition
     }
 
@@ -2050,14 +2120,33 @@ export async function executeLivePosition(
           `${LOG_PREFIX} Retrying ${realPosition.symbol} with corrected qty=${correctedQty.toFixed(6)} (exchange min=${requiredMin})`
         )
         const minRetry: any = await retry(
-          () => exchangeConnector.placeOrder(
-            realPosition.symbol,
-            exchangeSide,
-            correctedQty,
-            undefined,
-            "market",
-            { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
-          ),
+          async () => {
+            placeAttempt += 1
+            const { raw } = await withLiveOrderLogging(
+              orderTrace,
+              {
+                quantity: correctedQty,
+                price: currentPrice,
+                leverage: livePosition.leverage,
+                marginType: livePosition.marginType ?? "unknown",
+                orderType: "market",
+                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                strategySetKey: livePosition.setKey,
+                realPositionId: realPosition.id,
+                attempt: placeAttempt,
+                label: `min-corrected(required=${requiredMin})`,
+              },
+              () => exchangeConnector.placeOrder(
+                realPosition.symbol,
+                exchangeSide,
+                correctedQty,
+                undefined,
+                "market",
+                { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+              ),
+            )
+            return raw
+          },
           (r: any) => !!r?.success && !!(r.orderId || r.id),
           "placeOrder-minCorrection",
           1
@@ -2111,6 +2200,16 @@ export async function executeLivePosition(
       // margin-cooldown gate above still prevents a stampede of retries
       // when the failure is non-recoverable (insufficient balance).
       await releaseLock(connectionId, realPosition.symbol, realPosition.direction).catch(() => {})
+      await logLiveOrderFinal(orderTrace, {
+        status: "rejected",
+        livePositionId: livePosition.id,
+        reason: livePosition.statusReason,
+        extra: {
+          errorCode: orderResult?.errorCode ?? orderResult?.code,
+          error: orderResult?.error,
+          attempts: placeAttempt,
+        },
+      })
       return livePosition
     }
 
@@ -2212,6 +2311,14 @@ export async function executeLivePosition(
         filledPrice: fill.filledPrice,
         via: fill.status,
       })
+      await logLiveOrderFinal(orderTrace, {
+        status: "filled",
+        livePositionId: livePosition.id,
+        executedQuantity: fill.filledQty,
+        averagePrice: fill.filledPrice || currentPrice,
+        reason: `fill via=${fill.status}`,
+        extra: { orderId: livePosition.orderId, attempts: placeAttempt },
+      })
     } else {
       // D) Final guard: fill unconfirmed but order was accepted — treat as filled
       // with computedVolume so SL/TP can be placed. The position is "open" on the
@@ -2240,6 +2347,14 @@ export async function executeLivePosition(
         `Entry fill unconfirmed for ${realPosition.symbol} — SL/TP will use order qty as fallback`,
         { orderId: livePosition.orderId, status: fill.status, fallbackQty: computedVolume }
       )
+      await logLiveOrderFinal(orderTrace, {
+        status: "placed",
+        livePositionId: livePosition.id,
+        executedQuantity: computedVolume,
+        averagePrice: currentPrice,
+        reason: `fill unconfirmed — using computedVolume as fallback (pollStatus=${fill.status})`,
+        extra: { orderId: livePosition.orderId, attempts: placeAttempt },
+      })
     }
 
     // ── Step 7: Place Stop Loss and Take Profit orders ─────────────────────
