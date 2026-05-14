@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { getRedisClient, initRedis } from "@/lib/redis-db"
 import { createExchangeConnector } from "@/lib/exchange-connectors/factory"
+import { getVenueMinQty } from "@/lib/exchange-min-qty"
 import type { ExchangeConnection } from "@/lib/types"
 
 const LOG_PREFIX = "[v0] [LiveOrdersTest]"
@@ -60,44 +61,8 @@ function toCanonicalSymbol(raw: string): string {
  * can surface a precise diagnostic instead of forwarding `NaN` to the
  * exchange.
  */
-/**
- * Per-base-asset minimum order quantity (in base units), keyed by the
- * uppercased base ticker extracted from a CCXT-style symbol.
- *
- * These are conservative floors derived from BingX/Bybit/Binance public
- * exchangeInfo for USDT-perp pairs as of the current trading session.
- * They are NOT meant to be authoritative — the connector should ideally
- * call `/exchangeInfo` at boot and cache the real values — but as a
- * static floor they reliably prevent code=110422 ("minimum size per
- * order") rejections in the test harness.
- *
- * The default of 1 base unit is intentionally restrictive for unknown
- * symbols, encouraging the caller to override via configuration rather
- * than silently shipping micro-orders that the venue will reject.
- */
-const VENUE_MIN_QTY_BY_BASE: Record<string, number> = {
-  BTC: 0.0001,
-  ETH: 0.01,
-  BNB: 0.01,
-  SOL: 0.1,
-  XRP: 1,
-  ADA: 1,
-  DOGE: 10,
-  MATIC: 1,
-  AVAX: 0.1,
-  LINK: 0.1,
-  DOT: 0.1,
-  LTC: 0.01,
-  TRX: 10,
-  MLN: 0.1,
-  ATOM: 0.1,
-}
-function getVenueMinQty(symbol: string | undefined | null): number {
-  if (!symbol) return 1
-  // Accept either "BTC/USDT" (canonical) or "BTC-USDT" (BingX-native).
-  const base = String(symbol).split(/[\/\-_]/)[0]?.toUpperCase() ?? ""
-  return VENUE_MIN_QTY_BY_BASE[base] ?? 1
-}
+// Per-base-asset min-quantity floors live in `lib/exchange-min-qty.ts`
+// so the test harness and the live trading engine stay in lock-step.
 
 function extractPositionMetrics(position: any): {
   quantity: number

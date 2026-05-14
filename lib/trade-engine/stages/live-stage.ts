@@ -23,6 +23,7 @@
  */
 
 import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
+import { getVenueMinQty } from "@/lib/exchange-min-qty"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { VolumeCalculator } from "@/lib/volume-calculator"
 import { SystemLogger } from "@/lib/system-logger"
@@ -1204,6 +1205,29 @@ async function placeProtectionOrder(
       return null
     }
 
+    // ── Venue minimum-quantity floor ──────────────────────────────────
+    // Same per-base-asset floor used by the test harness — shared via
+    // `lib/exchange-min-qty.ts` so they cannot drift. BingX rejects
+    // sub-minimum orders with code=110422 "The minimum size per order
+    // is 0.0001 BTC."; the same class of rejection exists on Bybit
+    // (110007) and Binance (-1013).
+    //
+    // The protection layer is the LAST line of defense before the venue,
+    // so we floor up to the minimum rather than rejecting locally. The
+    // alternative — silently failing to arm SL/TP on micro-positions
+    // from partial fills — is far more dangerous than over-sizing the
+    // protection order by a fraction of a base unit. We log a warning
+    // whenever the floor actually kicks in so operators can spot the
+    // edge case if it becomes a pattern.
+    const venueMin = getVenueMinQty(symbol)
+    let effectiveQty = quantity
+    if (effectiveQty < venueMin) {
+      console.warn(
+        `${tag} QTY FLOORED: requested=${quantity} bumped to venueMin=${venueMin} (preventing code=110422)`,
+      )
+      effectiveQty = venueMin
+    }
+
     const kind: "stop_loss" | "take_profit" =
       orderLabel === "StopLoss" ? "stop_loss" : "take_profit"
 
@@ -1224,7 +1248,7 @@ async function placeProtectionOrder(
       connector.placeStopOrder(
         symbol,
         closeSide,
-        quantity,
+        effectiveQty,
         triggerPrice,
         kind,
         {
@@ -1245,7 +1269,9 @@ async function placeProtectionOrder(
     const rawId = result?.success ? (result.orderId ?? result.id) : null
     const orderId = rawId !== null && rawId !== undefined && String(rawId).length > 0 ? String(rawId) : null
     if (orderId) {
-      console.log(`${tag} PLACED: orderId=${orderId} @ trigger=${triggerPrice} qty=${quantity} latency=${latencyMs}ms`)
+      console.log(
+        `${tag} PLACED: orderId=${orderId} @ trigger=${triggerPrice} qty=${effectiveQty}${effectiveQty !== quantity ? ` (requested=${quantity}, floored)` : ""} latency=${latencyMs}ms`,
+      )
       return orderId
     }
     // result.error is the connector's normalized venue-side message
