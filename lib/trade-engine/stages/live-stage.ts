@@ -1492,11 +1492,39 @@ async function updateProtectionOrders(
 ): Promise<{ changed: boolean; slPlaced: boolean; tpPlaced: boolean }> {
   const result = { changed: false, slPlaced: false, tpPlaced: false }
   if (!connector) return result
-  // Use executedQuantity when confirmed; fall back to quantity (the original
-  // order size) so SL/TP can be placed even when fill-detection lagged.
-  // Protection orders are reduce-only — they cannot add new risk.
   const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
   if (effectiveQty <= 0) return result
+
+  // ── System-close-only mode ─────────────────────────────────────────
+  try {
+    const { getAppSettings } = await import("@/lib/redis-db")
+    const appSettings: any = (await getAppSettings().catch(() => null)) || {}
+    const systemCloseOnly =
+      appSettings.useSystemCloseOnly === true ||
+      appSettings.use_system_close_only === true ||
+      (pos as any)?.useSystemCloseOnly === true
+    if (systemCloseOnly) {
+      const cancels: Array<Promise<unknown>> = []
+      if (pos.stopLossOrderId) cancels.push(cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "SystemCloseSweep-SL").catch(() => false))
+      if (pos.takeProfitOrderId) cancels.push(cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "SystemCloseSweep-TP").catch(() => false))
+      if (cancels.length > 0) {
+        await Promise.allSettled(cancels)
+        console.log(`${LOG_PREFIX} [system-close] ${pos.symbol} — swept ${cancels.length} stale control order(s)`)
+        pos.stopLossOrderId = undefined
+        pos.takeProfitOrderId = undefined
+        pos.stopLossPrice = 0
+        pos.takeProfitPrice = 0
+        result.changed = true
+      }
+      ;(pos as any).protectionMode = "system_close"
+      return result
+    } else if ((pos as any).protectionMode === "system_close") {
+      delete (pos as any).protectionMode
+      result.changed = true
+    }
+  } catch (modeErr) {
+    console.warn(`${LOG_PREFIX} [system-close] toggle read failed for ${pos.symbol} — falling back to control orders:`, modeErr instanceof Error ? modeErr.message : String(modeErr))
+  }
 
   // ── Liveness verification against the venue ──────────────────────────
   // Without this step the engine has no way to notice a SILENTLY GONE
@@ -2375,7 +2403,7 @@ export async function executeLivePosition(
       }
     }
 
-    // ── Exchange circuit-breaker (109400) detection ───────────────────
+    // ── Exchange circuit-breaker (109400) detection ────���──────────────
     // Code 109400 = exchange temporarily halted API trading for this
     // symbol due to volatility. This is NOT a margin issue — record a
     // per-symbol circuit-breaker and let the connection continue placing
@@ -4542,7 +4570,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
             const recentlyClosed = await getClosedLivePositions(connectionId, 50).catch(() => [] as LivePosition[])
             for (const p of recentlyClosed) {
               const closedAgoMs = Date.now() - (p.closedAt || 0)
-              // Within 60s of close — exchange may still report position
+              // Within 60s of close ��� exchange may still report position
               // until the close fill propagates. After that window, treat
               // it as truly closed and orphan-adopt if it reappears.
               if (closedAgoMs < 60_000) {
@@ -4888,7 +4916,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
           }
         }
 
-        // ── Stuck-in-placed detection ─────────────────────────────────
+        // ── Stuck-in-placed detection ���────────────────────────────────
         // A position in `placed` status with no executed qty has its
         // entry order resting on the exchange book unfilled. The SL/TP
         // cross check skips `placed` positions silently, so without

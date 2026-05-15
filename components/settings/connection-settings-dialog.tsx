@@ -93,6 +93,15 @@ interface OverviewSettings {
   volumeFactorPreset: number
   marginMode:  "cross" | "isolated"
   volumeType:  "usdt" | "contract" | "spot"
+  /**
+   * When true: do NOT place exchange-side reduce-only SL/TP control
+   * orders for live positions on this connection. The engine instead
+   * monitors markPrice each reconcile/sync cycle and force-closes the
+   * position via a market reduce-only order when the desired band is
+   * crossed. Existing control orders on open positions are swept on the
+   * next cycle after the flag flips on.
+   */
+  useSystemCloseOnly: boolean
 }
 
 interface SymbolsSettings {
@@ -137,6 +146,7 @@ export function ConnectionSettingsDialog({
     volumeFactorPreset: 1.0,
     marginMode: "cross",
     volumeType: "usdt",
+    useSystemCloseOnly: false,
   })
 
   // ── Symbols state ───────────────────────────────────────────────
@@ -181,6 +191,7 @@ export function ConnectionSettingsDialog({
           volumeFactorPreset: Number(settings.volume_factor_preset) || 1.0,
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
+          useSystemCloseOnly: settings.use_system_close_only === true || settings.useSystemCloseOnly === true,
         })
         setSymbolsCfg(prev => ({
           ...prev,
@@ -261,6 +272,8 @@ export function ConnectionSettingsDialog({
         volume_factor_preset: overview.volumeFactorPreset,
         margin_mode: overview.marginMode,
         volume_type: overview.volumeType,
+        use_system_close_only: overview.useSystemCloseOnly,
+        useSystemCloseOnly:    overview.useSystemCloseOnly, // backwards-compat alias
         // Symbols
         symbols:      symbolsCfg.symbols,
         symbol_order: symbolsCfg.symbolOrder,
@@ -437,6 +450,34 @@ export function ConnectionSettingsDialog({
                         </SelectContent>
                       </Select>
                     </div>
+                  </div>
+
+                  <Separator className="my-4" />
+                  <SectionHeading
+                    icon={Zap}
+                    title="Close Mechanism"
+                    subtitle="Choose whether SL/TP are placed on the venue as control orders, or driven by the engine via system close."
+                  />
+
+                  <div className="flex items-start justify-between gap-4 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+                    <div className="flex-1 min-w-0 space-y-1">
+                      <Label className="text-xs font-medium">Live Trade Without Control Orders (System Close)</Label>
+                      <p className="text-[11px] leading-relaxed text-muted-foreground">
+                        When ON, the engine does <strong>not</strong> place reduce-only SL/TP orders on the
+                        exchange. Every reconcile and sync tick re-evaluates
+                        <code className="text-[10px] px-1 mx-0.5 rounded bg-muted">markPrice</code>
+                        against the desired SL/TP band and force-closes the position via a single market
+                        reduce-only order when crossed. Any leftover exchange control orders on open positions
+                        are swept on the next cycle.
+                      </p>
+                      <p className="text-[10px] text-amber-600 dark:text-amber-400">
+                        Live progress check is wired into every ongoing cycle — every close is verified post-fill.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={overview.useSystemCloseOnly}
+                      onCheckedChange={(checked) => setOverview(p => ({ ...p, useSystemCloseOnly: checked }))}
+                    />
                   </div>
                 </TabsContent>
 
