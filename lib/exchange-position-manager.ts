@@ -407,7 +407,7 @@ export class ExchangePositionManager {
 
       await setSettings(`coord_log:${params.connectionId}:${logId}`, {
         ...params,
-        success: params.success !== false,
+        success: params.success === true,
         timestamp: new Date().toISOString(),
       })
 

@@ -79,7 +79,7 @@ export async function testConnectionImmediate(
     ]) as any
 
     const duration = Date.now() - startTime
-    const success = testResult.success !== false
+    const success = testResult.success === true
 
     const result: ConnectionTestResult = {
       connectionId,

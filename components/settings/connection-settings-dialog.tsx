@@ -208,8 +208,26 @@ export function ConnectionSettingsDialog({
         }))
         if (settings.strategies?.main)   setStratMain(settings.strategies.main)
         if (settings.strategies?.preset) setStratPreset(settings.strategies.preset)
+        // Merge saved coord into defaults so older saves (without the
+        // Block ratio / max-stack fields, or without some variants) load
+        // cleanly and the new sliders aren't fed undefined.
         const coord = settings.coordination_settings || settings.coordinationSettings
-        if (coord) setCoordination(coord)
+        if (coord) {
+          setCoordination({
+            ...DEFAULT_COORDINATION_SETTINGS,
+            ...coord,
+            axes:     { ...DEFAULT_COORDINATION_SETTINGS.axes,     ...(coord.axes     || {}) },
+            variants: { ...DEFAULT_COORDINATION_SETTINGS.variants, ...(coord.variants || {}) },
+            blockVolumeRatio:
+              typeof coord.blockVolumeRatio === "number"
+                ? coord.blockVolumeRatio
+                : DEFAULT_COORDINATION_SETTINGS.blockVolumeRatio,
+            blockMaxStack:
+              typeof coord.blockMaxStack === "number"
+                ? coord.blockMaxStack
+                : DEFAULT_COORDINATION_SETTINGS.blockMaxStack,
+          })
+        }
       }
 
       // ── Active indications → Main + Preset ─────────────────────

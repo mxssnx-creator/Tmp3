@@ -242,18 +242,19 @@ class EnginePerformanceMonitor {
       },
       performance: {
         activeTimers,
-        indicationCycles: parseInt(indicationMetrics?.aggregated?.total_cycles || "0"),
-        strategyCycles: parseInt(strategyMetrics?.aggregated?.total_cycles || "0"),
-        realtimeCycles: parseInt(realtimeMetrics?.aggregated?.total_cycles || "0"),
-        totalCycles: parseInt(indicationMetrics?.aggregated?.total_cycles || "0") + 
-                     parseInt(strategyMetrics?.aggregated?.total_cycles || "0") +
-                     parseInt(realtimeMetrics?.aggregated?.total_cycles || "0"),
-        totalIndications: parseInt(indicationMetrics?.aggregated?.total_indications || "0"),
-        totalStrategies: parseInt(strategyMetrics?.aggregated?.total_strategies || "0"),
+        indicationCycles: Math.max(0, parseInt(indicationMetrics?.aggregated?.total_cycles || "0", 10)),
+        strategyCycles: Math.max(0, parseInt(strategyMetrics?.aggregated?.total_cycles || "0", 10)),
+        realtimeCycles: Math.max(0, parseInt(realtimeMetrics?.aggregated?.total_cycles || "0", 10)),
+        totalCycles: 
+          Math.max(0, parseInt(indicationMetrics?.aggregated?.total_cycles || "0", 10)) + 
+          Math.max(0, parseInt(strategyMetrics?.aggregated?.total_cycles || "0", 10)) +
+          Math.max(0, parseInt(realtimeMetrics?.aggregated?.total_cycles || "0", 10)),
+        totalIndications: Math.max(0, parseInt(indicationMetrics?.aggregated?.total_indications || "0", 10)),
+        totalStrategies: Math.max(0, parseInt(strategyMetrics?.aggregated?.total_strategies || "0", 10)),
         avgCycleTimeMs: Math.round(
-          (parseInt(indicationMetrics?.aggregated?.avg_duration_ms || "0") +
-           parseInt(strategyMetrics?.aggregated?.avg_duration_ms || "0") +
-           parseInt(realtimeMetrics?.aggregated?.avg_duration_ms || "0")) / 3
+          (Math.max(0, parseInt(indicationMetrics?.aggregated?.avg_duration_ms || "0", 10)) +
+           Math.max(0, parseInt(strategyMetrics?.aggregated?.avg_duration_ms || "0", 10)) +
+           Math.max(0, parseInt(realtimeMetrics?.aggregated?.avg_duration_ms || "0", 10))) / 3
         ),
       },
     }

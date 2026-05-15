@@ -28,7 +28,8 @@ export function AutoOptimalConfigurationForm({ onCalculate }: AutoOptimalConfigu
     takeprofit_max: 3.0,
     stoploss_min: 0.3,
     stoploss_max: 1.5,
-    trailing_enabled: false,
+    // Trailing on by default — see preset-type-dialog for the rationale.
+    trailing_enabled: true,
     trailing_only: false,
     min_profit_factor: 1.0,
     min_profit_factor_positions: 25,

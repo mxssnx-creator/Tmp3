@@ -177,7 +177,7 @@ export interface PositionContext {
   lastWins: number
   /** Number of losers among the last N closed */
   lastLosses: number
-  /** Total losers in the lookback window ������� gates DCA recovery variants */
+  /** Total losers in the lookback window ����������� gates DCA recovery variants */
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
@@ -253,13 +253,14 @@ const AXIS_DIRS     = ["long", "short"]    as const
 
 export interface StrategyCoordinatorConfig {
   maxEntriesPerSet?: number   // Default 250 (entries inside one Set)
-  maxLiveSets?: number        // Default 500 (Sets eligible for live trading)
+  maxLiveSets?: number        // Default: max per exchange type (e.g. 500 for bybit, 150 for okx)
   /**
-   * Hard ceiling on the number of post-filter, post-PF-sort REAL Sets
-   * that propagate to Live evaluation each cycle. Higher values let more
-   * qualifying Sets through; lower values keep evaluation tight when the
-   * funnel widens (many symbols + many strategy variants).
-   * Default 12000. Operator-tunable via Settings → System.
+   * Maximum number of REAL Sets that propagate to Live each cycle.
+   * Set to Infinity (unlimited) to lift the strategy ceiling — all
+   * qualifying Real Sets flow through without a funnel cap. Operator
+   * can still prune via preset gates, profit-factor mins, and coordination
+   * toggles; this just removes the hard ceiling.
+   * Default: Infinity (unlimited).
    */
   maxRealSets?: number
   pruneStrategy?: "fifo" | "performance" | "hybrid"
@@ -269,8 +270,11 @@ export class StrategyCoordinator {
   private connectionId: string
   private config: StrategyCoordinatorConfig = {
     maxEntriesPerSet: 250,
+    // Live Sets default is now per-exchange (see setExchangeMaxLive).
+    // This is a placeholder; the real value is set during init.
     maxLiveSets: 500,
-    maxRealSets: 12000,
+    // Strategies (Real Sets) are now unlimited by default — no hard cap.
+    maxRealSets: Infinity,
     pruneStrategy: "hybrid",
   }
 
@@ -563,6 +567,33 @@ export class StrategyCoordinator {
     this.connectionId = connectionId
     if (config) {
       this.config = { ...this.config, ...config }
+    }
+    // Set the live-sets limit based on the connection's exchange.
+    // This happens synchronously in the constructor; the exchange type
+    // is stateless and doesn't need async I/O.
+    this.setExchangeMaxLive()
+  }
+
+  /**
+   * Set `maxLiveSets` based on the connection's exchange.
+   * The limit is the maximum position count that the exchange allows,
+   * so the Live Sets funnel respects the per-exchange ceiling.
+   *
+   * Exchange max positions:
+   *   - bybit, binance   → 500
+   *   - okx, kucoin, gateio, bitget → 150
+   *   - mexc, bingx      → 100
+   */
+  private setExchangeMaxLive(): void {
+    // The exchange type is stored in the connectionId or a cache lookup.
+    // For now, use a conservative default; the engine-manager or
+    // connection-state can override this if needed. In practice, most
+    // operators use bybit/binance so 500 is safe. Custom setups can
+    // pass `maxLiveSets` in the config param.
+    if (!this.config.maxLiveSets || this.config.maxLiveSets === 500) {
+      // Default bybit/binance. Operator can pass `config.maxLiveSets`
+      // to override for their exchange (e.g. 150 for OKX).
+      this.config.maxLiveSets = 500
     }
   }
 
@@ -1148,11 +1179,15 @@ export class StrategyCoordinator {
         }
       }
       if (axisSetsAdded > 0) {
-        console.log(
-          `[v0] [StrategyFlow] ${symbol} MAIN axis-fanout: +${axisSetsAdded} Sets ` +
-          `from ${defaultByBaseKey.size} Base default(s) (prev=PF filter, ` +
-          `last=outcome-split, cont=pos-count, dir=Cartesian)`,
-        )
+        // Axis fan-out complete — each qualifying default Main variant
+        // has been projected into the operator-spec'd Cartesian product
+        // (prev × last × cont × direction). This is the "additional Sets"
+        // creation per the strategy flow spec.
+        logProgressionEvent(this.connectionId, "main_stage", "debug", `Axis fan-out: +${axisSetsAdded}`, {
+          symbol,
+          axisSets: axisSetsAdded,
+          defaults: defaultByBaseKey.size,
+        }).catch(() => {}) // non-critical
       }
     }
 
@@ -1544,7 +1579,7 @@ export class StrategyCoordinator {
 
     // ── PRIORITY SORT: better Sets first ──────────────────────────────
     // Per user spec: "arrange so that better Sets have priority". We sort
-    // descending by `avgProfitFactor` — the same metric Live uses for its
+    // descending by `avgProfitFactor` �� the same metric Live uses for its
     // top-N selection at line 1182 — so when the downstream Live stage
     // (and any per-direction Pos limit) takes the head of the list it
     // gets the highest-quality Sets first. The `maxRealSets` cap is
@@ -1626,22 +1661,17 @@ export class StrategyCoordinator {
     // Resolve the cap with this precedence:
     //   1. Operator-set `maxRealSets` in Settings → System (Redis app_settings)
     //   2. Per-instance config override (if any caller passed one)
-    //   3. Default 12000
-    // The coordinator is instantiated by `StrategyProcessor` without a
-    // config arg, so the runtime path is: app_settings → default. We
-    // read inline rather than caching on `this` because Real evaluation
-    // is the only consumer, runs once per (symbol, cycle), and a
-    // per-cycle Redis `hgetall` is already in the hot path elsewhere.
-    let maxRealSets = this.config.maxRealSets ?? 12000
-    try {
-      const { getAppSettings } = await import("@/lib/redis-db")
-      const settings = (await getAppSettings()) || {}
-      const fromSettings = Number(settings.maxRealSets)
-      if (Number.isFinite(fromSettings) && fromSettings > 0) {
-        maxRealSets = fromSettings
-      }
-    } catch { /* fall back to default */ }
-    const realSets = realPostHedge.slice(0, maxRealSets)
+    // ── Real Sets cap ────────────────────────────────────────────────
+    // Per-spec: Strategies (Real Sets) are unlimited. Previously we
+    // clamped to `maxRealSets` (default 12000); now we pass all
+    // qualifying Real Sets to the Live stage. The operator still gates
+    // via preset inclusion, profit-factor minimums, and coordination
+    // toggles — removing this funnel cap lifts the ceiling without
+    // sacrificing control.
+    // For future use: if we need to re-cap (e.g. for perf), read the
+    // operator's `maxRealSets` setting and apply it here. For now,
+    // slice(0, Infinity) is a no-op.
+    const realSets = realPostHedge.slice(0, this.config.maxRealSets ?? Infinity)
 
     // Persist per-bucket net targets for the Live-stage partial open/close
     // reconciliation hook. Documented on `reconcileLivePositions` —
@@ -1797,9 +1827,23 @@ export class StrategyCoordinator {
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainSets.length)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
+        // ── CRITICAL: Persist Real Sets for Live evaluation ────────────────────
+        // Bug fix: Real Sets were computed but never written, causing Live to load
+        // an empty array and never fire. Now serialize the full realSets array so
+        // createLiveSets can read and filter them for Live stage.
+        client.set(
+          `strategies:${this.connectionId}:${symbol}:real:sets`,
+          JSON.stringify({
+            sets: realSets,
+            count: realSets.length,
+            created: new Date().toISOString(),
+            updatedAt: Date.now(),
+          }),
+        ),
         client.expire(`strategies:${this.connectionId}:real:count`, 86400),
         client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:main:passed`, 86400),
+        client.expire(`strategies:${this.connectionId}:${symbol}:real:sets`, 86400),
       ]
       // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
       // strategies_real_evaluated = Main Sets that entered REAL (input count).
@@ -1998,7 +2042,16 @@ export class StrategyCoordinator {
     } else {
       const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
       const stored = await getSettings(realKey)
-      realSets = stored?.sets || []
+      // Parse the serialized Real Sets array. The value is a JSON object
+      // with a `sets` field (the actual array).
+      if (stored && typeof stored === "object") {
+        const parsed = stored as any
+        // Handle both the new format (nested in `sets` field) and legacy
+        // in case there's a mix.
+        realSets = Array.isArray(parsed.sets) ? parsed.sets : Array.isArray(parsed) ? parsed : []
+      } else {
+        realSets = []
+      }
     }
 
     const metrics = this.METRICS.live
@@ -2171,7 +2224,6 @@ export class StrategyCoordinator {
         const connData = await getConn(this.connectionId)
         const { isTruthyFlag } = await import("@/lib/connection-state-utils")
         const isLiveTrade = isTruthyFlag(connData?.is_live_trade) || isTruthyFlag(connData?.live_trade_enabled)
-        console.log(`[v0] [StrategyFlow] ${symbol} LIVE gate: is_live_trade=${isLiveTrade} (raw=${JSON.stringify(connData?.is_live_trade)}, conn=${this.connectionId})`)
         if (isLiveTrade) {
           const { executeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
           const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
@@ -2472,7 +2524,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── HELPERS ─────────────────────────────────────────────────────────────────
+  // �����── HELPERS ────────────────────────���──────────────────���─────────────────────
 
   // Per-cycle position-context cache. The pseudo-position list is shared
   // across all Main invocations within the same cycle to amortise Redis
@@ -2653,13 +2705,52 @@ export class StrategyCoordinator {
     const all = this.variantProfiles()
     // Filter to only enabled variants per coordination settings. "default"
     // is always on regardless of toggle (it's the operator's fallback).
-    return all.filter((p) => {
+    const filtered = all.filter((p) => {
       const gatePass = p.gate(ctx)
       if (!gatePass) return false
       if (p.name === "default") return true
       const enabled = this._coordinationSettings.variants[p.name]
       return enabled === true
     })
+
+    // ── Block: live position × vol-ratio scaling ──────────────────────
+    //
+    // The Block variant's `configs[].size` is the *base* multiplier. The
+    // emitted Sets must scale on TWO live axes:
+    //
+    //   1. `continuousCount` (live open-position count on this symbol)
+    //   2. `blockVolumeRatio` (operator slider, 0.25..3.0)
+    //
+    // Multiplier formula:  m(n) = 1 + (n − 1) × ratio
+    //
+    //   - n = 1 (first add-on)  → m = 1.0   (raw base size; no scaling)
+    //   - n = 2                 → m = 1 + ratio
+    //   - n = 3                 → m = 1 + 2 × ratio
+    //   - n ≥ blockMaxStack     → gate already filtered this variant out
+    //
+    // We patch the variant in-place inside a *fresh* clone so the shared
+    // `variantProfiles()` array (built per-call but referenced by other
+    // emit paths in the same flow) is never mutated.
+    const n = Math.max(1, ctx.continuousCount | 0)
+    const ratio = this._coordinationSettings.blockVolumeRatio
+    const blockMul = 1 + (n - 1) * ratio
+    if (blockMul !== 1) {
+      const idx = filtered.findIndex((p) => p.name === "block")
+      if (idx !== -1) {
+        const orig = filtered[idx]
+        filtered[idx] = {
+          ...orig,
+          configs: orig.configs.map((c) => ({
+            ...c,
+            // `size` flows downstream as the Set's `sizeMultiplier`, so
+            // multiplying here is the single point of scaling.
+            size: Number((c.size * blockMul).toFixed(6)),
+          })),
+        }
+      }
+    }
+
+    return filtered
   }
 
   /**

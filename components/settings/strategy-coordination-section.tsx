@@ -56,6 +56,14 @@ export interface CoordinationSettings {
     dca:      boolean
     pause:    boolean
   }
+  // ── Block-strategy: live position × vol-ratio coordination ──────────
+  // Knobs that flow into the Block variant's runtime size scaling.
+  // The coordinator multiplies each Block sub-config's base size by
+  //   m(n) = 1 + (n − 1) × blockVolumeRatio
+  // where n = live continuousCount on the symbol. blockMaxStack caps n
+  // (gate closes at n ≥ blockMaxStack) so the stacking is bounded.
+  blockVolumeRatio: number // 0.25..3.0 per spec band (UI clamps; engine re-clamps)
+  blockMaxStack:    number // 2..8 (gate uses `n < blockMaxStack`)
 }
 
 /** Spec-aligned defaults — match the constants in strategy-coordinator.ts. */
@@ -72,6 +80,8 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
     dca:      true,
     pause:    true,
   },
+  blockVolumeRatio: 1.0,
+  blockMaxStack:    3,
 }
 
 interface StrategyCoordinationSectionProps {
@@ -417,6 +427,129 @@ export function StrategyCoordinationSection({
               </div>
             )
           })}
+        </CardContent>
+      </Card>
+
+      {/* ── Block tuning card ────────────────────────────────────────
+          Two-axis live-coordination knobs for the Block variant:
+            • Volume-ratio slider → additive multiplier per live position
+            • Max-stack stepper   → upper bound on the gate (n < stack) */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <CardTitle className="text-sm">
+                Block — Live Position × Vol-Ratio
+              </CardTitle>
+              <CardDescription className="text-xs">
+                Adjusts how the Block variant scales add-on size by the live
+                open-position count on the symbol. The emitted Set&apos;s
+                size multiplier follows{" "}
+                <span className="font-mono text-[11px]">
+                  m(n) = 1 + (n − 1) × ratio
+                </span>{" "}
+                where <strong>n</strong> is the per-symbol open count and{" "}
+                <strong>ratio</strong> is set below. The gate closes when{" "}
+                <span className="font-mono text-[11px]">n ≥ max-stack</span>{" "}
+                so stacking is always bounded.
+              </CardDescription>
+            </div>
+            <Badge
+              variant={value.variants.block ? "default" : "outline"}
+              className="text-[10px]"
+            >
+              {value.variants.block ? "Active" : "Disabled"}
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Volume ratio */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <Label className="text-sm font-semibold">Volume Ratio</Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Additive scaling step per extra open position on the
+                  symbol. 1.0 ≈ doubles per add-on (spec default); 0.25 is
+                  conservative; 3.0 is aggressive. Engine clamps to
+                  0.25–3.0 even if the value is bypassed.
+                </p>
+              </div>
+              <Badge variant="outline" className="text-[10px] tabular-nums">
+                0.25–3.0
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.blockVolumeRatio]}
+                min={0.25}
+                max={3.0}
+                step={0.05}
+                onValueChange={(v) =>
+                  onChange({ ...value, blockVolumeRatio: Number(v[0].toFixed(2)) })
+                }
+                disabled={!value.variants.block}
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-10 text-right">
+                {value.blockVolumeRatio.toFixed(2)}×
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-2 pt-1 text-[11px]">
+              {[1, 2, 3].map((n) => {
+                const mul = 1 + (n - 1) * value.blockVolumeRatio
+                return (
+                  <div
+                    key={n}
+                    className="rounded-md border border-border/60 p-2 flex items-center justify-between gap-2"
+                  >
+                    <span className="text-muted-foreground">
+                      n={n}
+                    </span>
+                    <span className="font-mono tabular-nums font-semibold">
+                      ×{mul.toFixed(2)}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Max stack */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <Label className="text-sm font-semibold">Max Stack</Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Upper bound on the Block gate: variant fires only while{" "}
+                  <span className="font-mono text-[11px]">
+                    1 ≤ n &lt; max-stack
+                  </span>
+                  . Default 3 means the variant emits at n=1 and n=2 then
+                  closes. Engine clamps to 2–8.
+                </p>
+              </div>
+              <Badge variant="outline" className="text-[10px] tabular-nums">
+                2–8
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.blockMaxStack]}
+                min={2}
+                max={8}
+                step={1}
+                onValueChange={(v) =>
+                  onChange({ ...value, blockMaxStack: v[0] })
+                }
+                disabled={!value.variants.block}
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-8 text-right">
+                {value.blockMaxStack}
+              </span>
+            </div>
+          </div>
         </CardContent>
       </Card>
     </div>

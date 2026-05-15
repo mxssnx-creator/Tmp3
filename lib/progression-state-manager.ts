@@ -506,7 +506,7 @@ export class ProgressionStateManager {
         totalProfitP = Promise.resolve()
       }
 
-      const [totalTradesRaw, successfulTradesRaw] = await Promise.all([
+      const [totalTradesRaw, successfulTradesRaw, totalProfitRaw] = await Promise.all([
         totalTradesP,
         successfulTradesP,
         totalProfitP,
