@@ -134,14 +134,20 @@ export class StrategyProcessor {
       // Spec: *"indications calcs for each Type and config coord possibility
       // and evaluated If correct, then inits Strategies calc"*.
       //
-      // Strategy flow should only kick in once indications have been
-      // calculated AND passed per-type validation. Validation here is
-      // permissive (we don't want to starve Base-level learning), but
-      // we DO require at least one indication per distinct `type` to
-      // pass a minimal profit-factor floor. If zero indications pass
-      // the gate, skip the flow with a log event so the dashboard can
-      // surface the state — otherwise we'd silently churn on empty
-      // evaluations every cycle.
+      // Strategy flow kicks in once indications have been calculated AND
+      // passed per-type validation. Validation here is INTENTIONALLY
+      // permissive to avoid starving Base-level learning on a fresh
+      // engine where no PF has been computed yet:
+      //
+      //   - validated === false → explicit reject (skip)
+      //   - validated === true  → explicit accept
+      //   - PF missing/zero     → ACCEPT (fresh indication, no learning yet)
+      //   - PF present          → require PF >= floor
+      //
+      // The downstream Base/Main/Real filters apply their own PF+DDT
+      // thresholds on derived Sets, so passing fresh indications through
+      // here does not weaken the production order pipeline — it only
+      // ensures the engine can bootstrap its statistics.
       const VALIDITY_PF_FLOOR = 0.5
       const validIndications = indications.filter((ind) => {
         if (!ind) return false
@@ -151,11 +157,16 @@ export class StrategyProcessor {
         // Keep anything with an explicit `validated === true` regardless
         // of PF (the indication processor already vetted it).
         if (ind.validated === true) return true
-        // Legacy path: accept indications whose canonical profit-factor
-        // field meets the floor. Read both camelCase (new writer) and
-        // snake_case (legacy writer) field names.
-        const pf = Number(ind.profitFactor ?? ind.profit_factor ?? 0)
-        return Number.isFinite(pf) && pf >= VALIDITY_PF_FLOOR
+        // Read both camelCase (new writer) and snake_case (legacy writer)
+        // field names.
+        const pfRaw = ind.profitFactor ?? ind.profit_factor
+        // Fresh indication path: when PF has never been written, the
+        // indication has not been graded yet. Accept it so Base learning
+        // can bootstrap — downstream stages still apply their own gates.
+        if (pfRaw === undefined || pfRaw === null) return true
+        const pf = Number(pfRaw)
+        if (!Number.isFinite(pf) || pf === 0) return true
+        return pf >= VALIDITY_PF_FLOOR
       })
 
       if (validIndications.length === 0) {
@@ -237,8 +248,6 @@ export class StrategyProcessor {
         lastIndicationCount: validIndications.length,
         lastLatestTimestamp: latestIndicationTs,
       })
-
-      console.log(`[v0] [StrategyFlow] ${symbol}: Starting progressive evaluation with ${validIndications.length}/${indications.length} valid indications`)
 
       // Execute complete strategy coordination flow using ONLY the
       // validated indications. Base/Main/Real/Live filtering downstream
