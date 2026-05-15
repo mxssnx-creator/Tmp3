@@ -1620,20 +1620,13 @@ export class BingXConnector extends BaseExchangeConnector {
           return await this.getOpenOrder(params.symbol, params.orderId, params.clientOrderId)
         
         case "getOrder":
-          return await this.getOrder(params.symbol, params.orderId, params.clientOrderId)
+          return await this.getOrderDetails(params.symbol, params.orderId, params.clientOrderId)
         
         case "getOpenOrders":
-          return await this.getOpenOrders(params.symbol, params.type)
+          return await this.getOpenOrders(params.symbol)
         
         case "getOrderHistory":
-          return await this.getOrderHistory(
-            params.symbol,
-            params.currency,
-            params.orderId,
-            params.startTime,
-            params.endTime,
-            params.limit
-          )
+          return await this.getOrderHistory(params.symbol, params.limit)
         
         case "getForceOrders":
           return await this.getForceOrders(
@@ -1676,7 +1669,7 @@ export class BingXConnector extends BaseExchangeConnector {
    * @param symbol - Optional: specific symbol to close positions for
    * @returns Success status and list of closed position IDs
    */
-  async closeAllPositions(symbol?: string): Promise<{ success: boolean; success?: string[]; failed?: any[]; error?: string }> {
+  async closeAllPositions(symbol?: string): Promise<{ success: boolean; successful?: string[]; failed?: any[]; error?: string }> {
     try {
       this.log(`[API] Closing all positions${symbol ? ` for ${symbol}` : ""}`)
       
@@ -1705,7 +1698,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`✓ Closed ${data.data?.success?.length || 0} positions`)
       return {
         success: true,
-        success: data.data?.success || [],
+        successful: data.data?.success || [],
         failed: data.data?.failed || [],
       }
     } catch (error) {
@@ -1873,7 +1866,7 @@ export class BingXConnector extends BaseExchangeConnector {
    * @param orderIds - Array of order IDs to cancel (max 10)
    * @returns Arrays of successfully cancelled and failed orders
    */
-  async batchCancelOrders(symbol: string, orderIds: string[]): Promise<{ success: boolean; success?: any[]; failed?: any[]; error?: string }> {
+  async batchCancelOrders(symbol: string, orderIds: string[]): Promise<{ success: boolean; successful?: any[]; failed?: any[]; error?: string }> {
     try {
       if (!Array.isArray(orderIds) || orderIds.length === 0) {
         throw new Error("Order IDs must be a non-empty array")
@@ -1912,7 +1905,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`✓ Batch cancel: ${succeeded.length} cancelled, ${failed.length} failed`)
       return {
         success: true,
-        success: succeeded,
+        successful: succeeded,
         failed: failed,
       }
     } catch (error) {
@@ -1935,7 +1928,7 @@ export class BingXConnector extends BaseExchangeConnector {
    * @param type - Optional: order type filter (LIMIT, MARKET, STOP_MARKET, etc.)
    * @returns Arrays of cancelled and failed orders
    */
-  async cancelAllOrders(symbol?: string, type?: string): Promise<{ success: boolean; success?: any[]; failed?: any[]; error?: string }> {
+  async cancelAllOrders(symbol?: string, type?: string): Promise<{ success: boolean; successful?: any[]; failed?: any[]; error?: string }> {
     try {
       this.log(`[API] Cancelling all open orders${symbol ? ` for ${symbol}` : ""}${type ? ` (type: ${type})` : ""}`)
       
@@ -1971,7 +1964,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`✓ Cancelled all orders: ${succeeded.length} cancelled, ${failed.length} failed`)
       return {
         success: true,
-        success: succeeded,
+        successful: succeeded,
         failed: failed,
       }
     } catch (error) {
@@ -2225,7 +2218,7 @@ export class BingXConnector extends BaseExchangeConnector {
    * Official API: GET /openApi/swap/v2/trade/order
    * Rate limit: 30/s per UID; 2/s per IP
    */
-  async getOrder(
+  async getOrderDetails(
     symbol: string,
     orderId?: string,
     clientOrderId?: string

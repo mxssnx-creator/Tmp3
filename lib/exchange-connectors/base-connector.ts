@@ -141,6 +141,26 @@ export abstract class BaseExchangeConnector {
   }
 
   /**
+   * Unified swap-trade execution gateway.
+   *
+   * BingX implements this with a switch over operation names
+   * ("placeOrder", "cancelOrder", "batchPlaceOrders", "closeAllPositions",
+   * "getOpenOrders", "setKillSwitch", etc.). Other connectors may override
+   * this to expose equivalent operations. The default implementation returns
+   * a structured failure so callers can safely branch on `result.success`.
+   */
+  async executeSwapTrade(
+    operation: string,
+    _params: Record<string, any> = {},
+  ): Promise<any> {
+    this.log(`executeSwapTrade("${operation}") is not implemented for this connector`)
+    return {
+      success: false,
+      error: `executeSwapTrade not implemented for ${this.credentials.connectionLibrary || "this"} connector`,
+    }
+  }
+
+  /**
    * Get the API path for this connection's contract type
    * Different exchanges use different paths based on api_type
    */
