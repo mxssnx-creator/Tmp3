@@ -1,24 +1,35 @@
 {
-  "buildCommand": "npm run vercel-build",
+  "buildCommand": "bash scripts/vercel-build-setup.sh",
   "installCommand": "npm install --legacy-peer-deps",
   "env": {
     "NODE_ENV": "production",
     "NODE_PG_FORCE_NATIVE": "false",
     "npm_config_build_from_source": "false",
-    "SKIP_OPTIONAL_DEPS": "true"
+    "SKIP_OPTIONAL_DEPS": "true",
+    "NEXT_PUBLIC_ANALYTICS_ID": "default"
   },
   "framework": "nextjs",
   "regions": ["iad1"],
+  "trailingSlash": false,
+  "cleanUrls": true,
   "rewrites": [
     {
       "source": "/api/:path*",
       "destination": "/api/:path*"
     }
   ],
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "/main",
+      "permanent": false
+    }
+  ],
   "functions": {
     "app/api/**/*.ts": {
       "memory": 3008,
-      "maxDuration": 300
+      "maxDuration": 300,
+      "runtime": "nodejs20.x"
     }
   },
   "crons": [
@@ -29,6 +40,38 @@
     {
       "path": "/api/cron/generate-indications",
       "schedule": "*/5 * * * *"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store, no-cache, must-revalidate, proxy-revalidate"
+        },
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        },
+        {
+          "key": "X-XSS-Protection",
+          "value": "1; mode=block"
+        }
+      ]
+    },
+    {
+      "source": "/_next/static/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=31536000, immutable"
+        }
+      ]
     }
   ]
 }
