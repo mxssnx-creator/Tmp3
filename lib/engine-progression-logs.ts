@@ -114,8 +114,18 @@ async function flushLogBuffer(logKey: string): Promise<void> {
   try {
     const client = getRedisClient()
     
-    // Use lpush for efficient prepend (native Redis list operation)
-    await client.lpush(logKey, ...toFlush.reverse())
+    // ── Progression logs should appear in chronological order ──────────
+    // We use lpush to prepend to a Redis list (lpush prepends to the
+    // head; lrange returns from head to tail). Without reversing the
+    // entries, the FIRST entry in toFlush becomes the HEAD (index 0),
+    // so lrange(0, MAX) returns them in chronological order as written.
+    //
+    // Previously we did `lpush(...toFlush.reverse())` which reversed
+    // the order, making lrange read them backwards. The reader at line
+    // 158 does NOT reverse, so logs appeared in reverse chronological
+    // order. Removing the .reverse() here fixes the bug — logs now
+    // display oldest first.
+    await client.lpush(logKey, ...toFlush)
     
     // Trim to max size
     await client.ltrim(logKey, 0, MAX_LOGS_PER_CONNECTION - 1)
