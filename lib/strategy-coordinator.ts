@@ -2472,7 +2472,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── HELPERS ─────────────────────────────────────────────────────────────────
+  // ���── HELPERS ─────────────────────────────────────────────────────────────────
 
   // Per-cycle position-context cache. The pseudo-position list is shared
   // across all Main invocations within the same cycle to amortise Redis
@@ -2653,13 +2653,52 @@ export class StrategyCoordinator {
     const all = this.variantProfiles()
     // Filter to only enabled variants per coordination settings. "default"
     // is always on regardless of toggle (it's the operator's fallback).
-    return all.filter((p) => {
+    const filtered = all.filter((p) => {
       const gatePass = p.gate(ctx)
       if (!gatePass) return false
       if (p.name === "default") return true
       const enabled = this._coordinationSettings.variants[p.name]
       return enabled === true
     })
+
+    // ── Block: live position × vol-ratio scaling ──────────────────────
+    //
+    // The Block variant's `configs[].size` is the *base* multiplier. The
+    // emitted Sets must scale on TWO live axes:
+    //
+    //   1. `continuousCount` (live open-position count on this symbol)
+    //   2. `blockVolumeRatio` (operator slider, 0.25..3.0)
+    //
+    // Multiplier formula:  m(n) = 1 + (n − 1) × ratio
+    //
+    //   - n = 1 (first add-on)  → m = 1.0   (raw base size; no scaling)
+    //   - n = 2                 → m = 1 + ratio
+    //   - n = 3                 → m = 1 + 2 × ratio
+    //   - n ≥ blockMaxStack     → gate already filtered this variant out
+    //
+    // We patch the variant in-place inside a *fresh* clone so the shared
+    // `variantProfiles()` array (built per-call but referenced by other
+    // emit paths in the same flow) is never mutated.
+    const n = Math.max(1, ctx.continuousCount | 0)
+    const ratio = this._coordinationSettings.blockVolumeRatio
+    const blockMul = 1 + (n - 1) * ratio
+    if (blockMul !== 1) {
+      const idx = filtered.findIndex((p) => p.name === "block")
+      if (idx !== -1) {
+        const orig = filtered[idx]
+        filtered[idx] = {
+          ...orig,
+          configs: orig.configs.map((c) => ({
+            ...c,
+            // `size` flows downstream as the Set's `sizeMultiplier`, so
+            // multiplying here is the single point of scaling.
+            size: Number((c.size * blockMul).toFixed(6)),
+          })),
+        }
+      }
+    }
+
+    return filtered
   }
 
   /**
