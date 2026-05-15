@@ -2224,7 +2224,6 @@ export class StrategyCoordinator {
         const connData = await getConn(this.connectionId)
         const { isTruthyFlag } = await import("@/lib/connection-state-utils")
         const isLiveTrade = isTruthyFlag(connData?.is_live_trade) || isTruthyFlag(connData?.live_trade_enabled)
-        console.log(`[v0] [StrategyFlow] ${symbol} LIVE gate: is_live_trade=${isLiveTrade} (raw=${JSON.stringify(connData?.is_live_trade)}, conn=${this.connectionId})`)
         if (isLiveTrade) {
           const { executeLivePosition } = await import("@/lib/trade-engine/stages/live-stage")
           const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
@@ -2525,7 +2524,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // �����── HELPERS ────────────────────────���────────────────────────────────────────
+  // �����── HELPERS ────────────────────────���──────────────────���─────────────────────
 
   // Per-cycle position-context cache. The pseudo-position list is shared
   // across all Main invocations within the same cycle to amortise Redis

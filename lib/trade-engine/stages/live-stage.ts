@@ -2295,6 +2295,34 @@ export async function executeLivePosition(
     // BingX's one-way-mode accounts auto-retry without positionSide if the
     // exchange rejects it (code 80014), so this is safe for both modes.
     //
+    // ── CRITICAL: Re-check is_live_trade gate RIGHT BEFORE order placement ──────
+    // The flag is checked once at entry (line 1959), but if the operator toggles
+    // Control Orders off during preflight, we must catch it here before sending
+    // the order to the exchange. This is a defensive second gate.
+    const { getConnection: reCheckConn } = await import("@/lib/redis-db")
+    const { isTruthyFlag: reCheckTruthy } = await import("@/lib/connection-state-utils")
+    const freshSettings = (await reCheckConn(connectionId)) || {}
+    const isStillLive =
+      reCheckTruthy(freshSettings.is_live_trade) ||
+      reCheckTruthy(freshSettings.live_trade_enabled)
+
+    if (!isStillLive) {
+      livePosition.status = "rejected"
+      livePosition.statusReason =
+        `Control Orders disabled (is_live_trade=false) — order blocked before exchange placement`
+      pushStep(livePosition, "entry", false, livePosition.statusReason)
+      await savePosition(livePosition)
+      await incrementMetric(connectionId, "live_orders_blocked_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "info",
+        livePosition.statusReason,
+        { symbol: realPosition.symbol, direction: realPosition.direction },
+      ).catch(() => {})
+      return livePosition
+    }
+
     // The `retry()` helper repeats up to 3× on transient failures; we
     // emit PRE/POST per ATTEMPT so the log shows each round-trip. The
     // attempt counter is captured by closure so leverage-reduced and
