@@ -40,11 +40,12 @@ import {
   Activity,
 } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
-import {
-  StrategyCoordinationSection,
-  DEFAULT_COORDINATION_SETTINGS,
-  type CoordinationSettings,
-} from "./strategy-coordination-section"
+// Collapsed to a single-line import: an earlier edit cycle left a stale
+// HMR module record for this file in `.next/cache`, causing the named
+// export `StrategyCoordinationSection` to resolve to `undefined` at
+// render time ("StrategyCoordinationSection is not defined"). A
+// fresh import shape forces the bundler to emit a new module id.
+import { StrategyCoordinationSection, DEFAULT_COORDINATION_SETTINGS, type CoordinationSettings } from "@/components/settings/strategy-coordination-section"
 
 // ─────────────────────────────────────────────────────────────────────
 // PUBLIC API
@@ -354,7 +355,7 @@ export function ConnectionSettingsDialog({
     [exchangeSymbols, symbolsCfg.symbols],
   )
 
-  // ─────────────────────────────────────────────────────────────────
+  // ────────────────────────────────────���────────────────────────────
   // RENDER
   // ─────────────────────────────────────────────────────────────────
 

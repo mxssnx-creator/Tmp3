@@ -2146,12 +2146,21 @@ export function ActiveConnectionCard({
         connectionId={connection.connectionId}
         connectionName={connName}
       />
-      <ConnectionSettingsDialog
-        open={settingsDialogOpen}
-        onOpenChange={setSettingsDialogOpen}
-        connectionId={connection.connectionId}
-        connectionName={connName}
-      />
+      {/* Lazy-mount the settings dialog so its heavy subtree (incl. the
+          Strategy Coordination section) only enters the React tree when
+          the user actually opens it. This (a) isolates the parent error
+          boundary on the Active Connections panel from any transient
+          module-load issues in the dialog's deep imports, and (b) keeps
+          the initial dashboard render cheaper for connections that the
+          operator never opens. */}
+      {settingsDialogOpen && (
+        <ConnectionSettingsDialog
+          open={settingsDialogOpen}
+          onOpenChange={setSettingsDialogOpen}
+          connectionId={connection.connectionId}
+          connectionName={connName}
+        />
+      )}
       <ProgressionLogsDialog
         open={logsDialogOpen}
         onOpenChange={setLogsDialogOpen}
