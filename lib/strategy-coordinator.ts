@@ -177,7 +177,7 @@ export interface PositionContext {
   lastWins: number
   /** Number of losers among the last N closed */
   lastLosses: number
-  /** Total losers in the lookback window ��������� gates DCA recovery variants */
+  /** Total losers in the lookback window ����������� gates DCA recovery variants */
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
@@ -1179,11 +1179,15 @@ export class StrategyCoordinator {
         }
       }
       if (axisSetsAdded > 0) {
-        console.log(
-          `[v0] [StrategyFlow] ${symbol} MAIN axis-fanout: +${axisSetsAdded} Sets ` +
-          `from ${defaultByBaseKey.size} Base default(s) (prev=PF filter, ` +
-          `last=outcome-split, cont=pos-count, dir=Cartesian)`,
-        )
+        // Axis fan-out complete — each qualifying default Main variant
+        // has been projected into the operator-spec'd Cartesian product
+        // (prev × last × cont × direction). This is the "additional Sets"
+        // creation per the strategy flow spec.
+        logProgressionEvent(this.connectionId, "main_stage", "debug", `Axis fan-out: +${axisSetsAdded}`, {
+          symbol,
+          axisSets: axisSetsAdded,
+          defaults: defaultByBaseKey.size,
+        }).catch(() => {}) // non-critical
       }
     }
 
@@ -1575,7 +1579,7 @@ export class StrategyCoordinator {
 
     // ── PRIORITY SORT: better Sets first ──────────────────────────────
     // Per user spec: "arrange so that better Sets have priority". We sort
-    // descending by `avgProfitFactor` — the same metric Live uses for its
+    // descending by `avgProfitFactor` �� the same metric Live uses for its
     // top-N selection at line 1182 — so when the downstream Live stage
     // (and any per-direction Pos limit) takes the head of the list it
     // gets the highest-quality Sets first. The `maxRealSets` cap is
