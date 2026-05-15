@@ -37,12 +37,65 @@ import { safeParseResponse } from "@/lib/safe-response-parser"
  * - Hedge position mode
  */
 export class BingXConnector extends BaseExchangeConnector {
+  private timeOffset: number = 0 // milliseconds to adjust local time
+  private lastTimeSync: number = 0
+  private timeSyncIntervalMs: number = 300000 // re-sync every 5 minutes
+
   constructor(credentials: ExchangeCredentials, exchange: string = "bingx") {
     super(credentials, exchange)
   }
 
   private getBaseUrl(): string {
     return this.credentials.isTestnet ? "https://testnet-open-api.bingx.com" : "https://open-api.bingx.com"
+  }
+
+  /**
+   * Synchronize local time with the BingX server. BingX enforces strict
+   * timestamp validation (±1000ms window); if the server time is drifted,
+   * all signed requests fail with "timestamp is invalid" (code=109400).
+   *
+   * This method fetches `/openApi/v1/public/time` once per session and
+   * computes the offset, then applies it to all future `getTimestamp()` calls.
+   * Re-syncs every 5 minutes to handle gradual clock drift.
+   */
+  private async syncServerTime(): Promise<void> {
+    const now = Date.now()
+    if (now - this.lastTimeSync < this.timeSyncIntervalMs) {
+      return // recently synced
+    }
+
+    try {
+      const response = await fetch(`${this.getBaseUrl()}/openApi/v1/public/time`, {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      })
+      const data = await response.json()
+      if (data.code === 0 || data.code === "0") {
+        const serverTime = Number(data.data?.serverTime || data.serverTime || data.time || 0)
+        if (serverTime > 0) {
+          this.timeOffset = serverTime - Date.now()
+          this.lastTimeSync = now
+          if (Math.abs(this.timeOffset) > 100) {
+            this.log(
+              `[v0] Server time sync: offset=${this.timeOffset}ms ` +
+              `(server=${serverTime}, local=${Date.now()})`,
+            )
+          }
+        }
+      }
+    } catch (err) {
+      // Fall back to local time; worst case we'll hit timestamp errors
+      // and retry with a fresh sync.
+      this.log(`[v0] Failed to sync server time: ${String(err).slice(0, 80)}`)
+    }
+  }
+
+  /**
+   * Get the current timestamp, adjusted for server time drift.
+   * Returns local time + pre-computed offset from the last sync.
+   */
+  private getTimestamp(): number {
+    return Date.now() + this.timeOffset
   }
 
   private getSignature(params: Record<string, any>): string {
@@ -197,12 +250,15 @@ export class BingXConnector extends BaseExchangeConnector {
   }
 
   async getBalance(): Promise<ExchangeConnectorResult> {
-    const timestamp = Date.now()
-    const baseUrl = this.getBaseUrl()
-
-    this.log("Generating signature...")
-
     try {
+      // Sync server time before any signed request to prevent "timestamp is invalid" errors
+      await this.syncServerTime()
+
+      const timestamp = this.getTimestamp()
+      const baseUrl = this.getBaseUrl()
+
+      this.log("Generating signature...")
+
       // Validate credentials first
       if (!this.credentials.apiKey || !this.credentials.apiSecret) {
         throw new Error("API key and secret are required")
@@ -386,6 +442,9 @@ export class BingXConnector extends BaseExchangeConnector {
     options: PlaceOrderOptions = {},
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
+      // Sync server time before any signed request to prevent timestamp errors
+      await this.syncServerTime()
+
       // ── Quantity sanity & formatting ─────────────────────────────────────
       // BingX rejects quantities that fall below the symbol step size, and in
       // many cases responds with its generic "this api is not exist" error
@@ -451,7 +510,7 @@ export class BingXConnector extends BaseExchangeConnector {
         side: side.toUpperCase(),
         type: orderType === "market" ? "MARKET" : "LIMIT",
         quantity: qtyStr,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       if (!isSpot) {
@@ -504,7 +563,7 @@ export class BingXConnector extends BaseExchangeConnector {
         if (reduceOnlyHedgeConflict && !isSpot && params.reduceOnly) {
           this.log("Retrying order without reduceOnly (hedge-mode conflict 109400)")
           delete params.reduceOnly
-          params.timestamp = Date.now()
+          params.timestamp = this.getTimestamp()
           const { signature: roRetrySig, queryString: roRetryQs } = this.signParams(params)
           const roRetryUrl = `${this.getBaseUrl()}${endpoint}?${roRetryQs}&signature=${roRetrySig}`
           const roRetryResp = await this.rateLimitedFetch(roRetryUrl, {
@@ -590,6 +649,9 @@ export class BingXConnector extends BaseExchangeConnector {
     options: PlaceOrderOptions = {},
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       const isSpot = this.credentials.apiType === "spot"
       if (isSpot) {
         // Spot has no native stop-market — let the base fallback handle it.
@@ -626,7 +688,7 @@ export class BingXConnector extends BaseExchangeConnector {
         // workingType=MARK_PRICE prevents wick-driven false triggers
         // on thin tickers; matches BingX's own UI default for SL/TP.
         workingType: "MARK_PRICE",
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       if (hedgeMode) params.positionSide = positionSide
       // BingX hedge-mode rule: `reduceOnly` is NOT allowed when
@@ -730,6 +792,9 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async cancelOrder(symbol: string, orderId: string): Promise<{ success: boolean; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       this.log(`Cancelling order ${orderId} for ${symbol}`)
 
       // Perp swap: DELETE /openApi/swap/v2/trade/order (no separate cancel path).
@@ -742,7 +807,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const params = {
         symbol: bingxSymbol,
         orderId,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -1171,6 +1236,9 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setLeverage(symbol: string, leverage: number): Promise<{ success: boolean; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       const bingxSymbol = this.toBingXSymbol(symbol)
       this.log(`Setting leverage to ${leverage}x for ${bingxSymbol} on both sides`)
 
@@ -1185,7 +1253,7 @@ export class BingXConnector extends BaseExchangeConnector {
           symbol: bingxSymbol,
           side,
           leverage: String(leverage),
-          timestamp: String(Date.now()),
+          timestamp: String(this.getTimestamp()),
         }
         const { signature, queryString: signedQs } = this.signParams(params)
         const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${signedQs}&signature=${signature}`
@@ -1225,13 +1293,16 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setMarginType(symbol: string, marginType: "cross" | "isolated"): Promise<{ success: boolean; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       const bingxSymbol = this.toBingXSymbol(symbol)
       this.log(`Setting margin type to ${marginType} for ${bingxSymbol}`)
 
       const params: Record<string, string> = {
         symbol: bingxSymbol,
         marginType: marginType === "cross" ? "CROSSED" : "ISOLATED",
-        timestamp: String(Date.now()),
+        timestamp: String(this.getTimestamp()),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -1265,11 +1336,14 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async setPositionMode(hedgeMode: boolean): Promise<{ success: boolean; error?: string }> {
     try {
+      // Sync server time before any signed request
+      await this.syncServerTime()
+
       this.log(`Setting position mode to ${hedgeMode ? "hedge" : "one-way"}`)
 
       const params: Record<string, string> = {
         dualSidePosition: String(hedgeMode),
-        timestamp: String(Date.now()),
+        timestamp: String(this.getTimestamp()),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
