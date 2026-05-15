@@ -177,7 +177,7 @@ export interface PositionContext {
   lastWins: number
   /** Number of losers among the last N closed */
   lastLosses: number
-  /** Total losers in the lookback window ������� gates DCA recovery variants */
+  /** Total losers in the lookback window ��������� gates DCA recovery variants */
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
@@ -1823,9 +1823,23 @@ export class StrategyCoordinator {
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainSets.length)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
+        // ── CRITICAL: Persist Real Sets for Live evaluation ────────────────────
+        // Bug fix: Real Sets were computed but never written, causing Live to load
+        // an empty array and never fire. Now serialize the full realSets array so
+        // createLiveSets can read and filter them for Live stage.
+        client.set(
+          `strategies:${this.connectionId}:${symbol}:real:sets`,
+          JSON.stringify({
+            sets: realSets,
+            count: realSets.length,
+            created: new Date().toISOString(),
+            updatedAt: Date.now(),
+          }),
+        ),
         client.expire(`strategies:${this.connectionId}:real:count`, 86400),
         client.expire(`strategies:${this.connectionId}:real:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:main:passed`, 86400),
+        client.expire(`strategies:${this.connectionId}:${symbol}:real:sets`, 86400),
       ]
       // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
       // strategies_real_evaluated = Main Sets that entered REAL (input count).
@@ -2024,7 +2038,16 @@ export class StrategyCoordinator {
     } else {
       const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
       const stored = await getSettings(realKey)
-      realSets = stored?.sets || []
+      // Parse the serialized Real Sets array. The value is a JSON object
+      // with a `sets` field (the actual array).
+      if (stored && typeof stored === "object") {
+        const parsed = stored as any
+        // Handle both the new format (nested in `sets` field) and legacy
+        // in case there's a mix.
+        realSets = Array.isArray(parsed.sets) ? parsed.sets : Array.isArray(parsed) ? parsed : []
+      } else {
+        realSets = []
+      }
     }
 
     const metrics = this.METRICS.live
@@ -2498,7 +2521,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // �����── HELPERS ─────────────────────────────────────────────────────────────────
+  // �����── HELPERS ────────────────────────���────────────────────────────────────────
 
   // Per-cycle position-context cache. The pseudo-position list is shared
   // across all Main invocations within the same cycle to amortise Redis
