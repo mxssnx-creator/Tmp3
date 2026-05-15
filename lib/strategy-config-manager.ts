@@ -439,7 +439,7 @@ export class StrategyConfigManager {
     // Redis keys and the original sequential loop was N · RTT for an
     // N-config universe (often 50+).
     const all = await Promise.all(
-      configs.map(async (config) => ({ config, stats: await this.getStats(config.id) })),
+      configs.map((config) => this.getStats(config.id).then((stats) => ({ config, stats }))),
     )
     return all.reduce<{ config: StrategyConfig; stats: StrategyStats } | null>(
       (best, cur) => (!best || cur.stats.winRate > best.stats.winRate ? cur : best),
