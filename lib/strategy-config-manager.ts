@@ -434,15 +434,16 @@ export class StrategyConfigManager {
 
   async getBestPerformingConfig(): Promise<{ config: StrategyConfig; stats: StrategyStats } | null> {
     const configs = await this.getEnabledConfigs()
-    let best: { config: StrategyConfig; stats: StrategyStats } | null = null
-
-    for (const config of configs) {
-      const stats = await this.getStats(config.id)
-      if (!best || stats.winRate > best.stats.winRate) {
-        best = { config, stats }
-      }
-    }
-
-    return best
+    if (configs.length === 0) return null
+    // Pipeline the per-config stats reads — they are independent
+    // Redis keys and the original sequential loop was N · RTT for an
+    // N-config universe (often 50+).
+    const all = await Promise.all(
+      configs.map(async (config) => ({ config, stats: await this.getStats(config.id) })),
+    )
+    return all.reduce<{ config: StrategyConfig; stats: StrategyStats } | null>(
+      (best, cur) => (!best || cur.stats.winRate > best.stats.winRate ? cur : best),
+      null,
+    )
   }
 }

@@ -40,6 +40,11 @@ import {
   Activity,
 } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
+import {
+  StrategyCoordinationSection,
+  DEFAULT_COORDINATION_SETTINGS,
+  type CoordinationSettings,
+} from "./strategy-coordination-section"
 
 // ─────────────────────────────────────────────────────────────────────
 // PUBLIC API
@@ -164,6 +169,7 @@ export function ConnectionSettingsDialog({
   const [indPreset, setIndPreset] = useState<ChannelProfile>(DEFAULT_INDICATION_PROFILE)
   const [stratMain,   setStratMain]   = useState<StrategyChannel>(DEFAULT_STRATEGY_PROFILE)
   const [stratPreset, setStratPreset] = useState<StrategyChannel>(DEFAULT_STRATEGY_PROFILE)
+  const [coordination, setCoordination] = useState<CoordinationSettings>(DEFAULT_COORDINATION_SETTINGS)
 
   // ─────────────────────────────────────────────────────────────────
   // LOAD
@@ -201,6 +207,8 @@ export function ConnectionSettingsDialog({
         }))
         if (settings.strategies?.main)   setStratMain(settings.strategies.main)
         if (settings.strategies?.preset) setStratPreset(settings.strategies.preset)
+        const coord = settings.coordination_settings || settings.coordinationSettings
+        if (coord) setCoordination(coord)
       }
 
       // ── Active indications → Main + Preset ─────────────────────
@@ -283,6 +291,9 @@ export function ConnectionSettingsDialog({
           main:   stratMain,
           preset: stratPreset,
         },
+        // Strategy coordination (axes + variants toggles)
+        coordination_settings: coordination,
+        coordinationSettings:  coordination, // legacy alias
       }
 
       const [settingsRes, indRes] = await Promise.all([
@@ -310,7 +321,7 @@ export function ConnectionSettingsDialog({
     } finally {
       setSaving(false)
     }
-  }, [connectionId, connectionName, overview, symbolsCfg, stratMain, stratPreset, indMain, indPreset, onOpenChange])
+  }, [connectionId, connectionName, overview, symbolsCfg, stratMain, stratPreset, indMain, indPreset, coordination, onOpenChange])
 
   // ─────────────────────────────────────────────────────────────────
   // SYMBOL HELPERS
@@ -651,7 +662,7 @@ export function ConnectionSettingsDialog({
   )
 }
 
-// ─────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────���────────────────────────────────
 // SUB-COMPONENTS
 // ─────────────────────────────────────────────────────────────────────
 

@@ -474,15 +474,28 @@ export class StrategyCoordinator {
     if (now - this._coordinationLoadedAt < this._coordinationTtlMs) return
     this._coordinationLoadedAt = now
     try {
-      const { getConnectionSettings } = await import("@/lib/redis-db")
-      const settings = (await getConnectionSettings(this.connectionId)) || {}
+      const { getConnection } = await import("@/lib/redis-db")
+      const conn = await getConnection(this.connectionId)
+      if (!conn) return
+      const raw = (conn as any).connection_settings
+      const settings = typeof raw === "string" ? JSON.parse(raw) : raw || {}
       const coord = settings.coordination_settings || settings.coordinationSettings
       if (coord?.axes && coord?.variants) {
-        this._coordinationSettings = coord
-        console.log(
-          `[v0] [StrategyCoordinator:${this.connectionId}] Coordination settings loaded:`,
-          `Block=${coord.variants.block}, DCA=${coord.variants.dca}, Trailing=${coord.variants.trailing}`,
-        )
+        // Merge with defaults so a partial UI save doesn't strip toggles.
+        this._coordinationSettings = {
+          axes: {
+            prev:  { ...this._coordinationSettings.axes.prev,  ...coord.axes.prev },
+            last:  { ...this._coordinationSettings.axes.last,  ...coord.axes.last },
+            cont:  { ...this._coordinationSettings.axes.cont,  ...coord.axes.cont },
+            pause: { ...this._coordinationSettings.axes.pause, ...coord.axes.pause },
+          },
+          variants: {
+            trailing: coord.variants.trailing !== false,
+            block:    coord.variants.block    !== false, // default-on per spec
+            dca:      coord.variants.dca      !== false,
+            pause:    coord.variants.pause    !== false,
+          },
+        }
       }
     } catch (err) {
       console.warn(
