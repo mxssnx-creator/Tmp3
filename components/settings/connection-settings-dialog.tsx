@@ -616,15 +616,19 @@ export function ConnectionSettingsDialog({
                 {/* STRATEGIES ─────────────────────────────────── */}
                 <TabsContent value="strategies" className="mt-0">
                   <Tabs defaultValue="main" className="w-full">
-                    <TabsList className="grid grid-cols-2 h-8 mb-4 w-fit">
-                      <TabsTrigger value="main"   className="text-xs px-4">Main</TabsTrigger>
+                    <TabsList className="grid grid-cols-3 h-8 mb-4 w-fit">
+                      <TabsTrigger value="main" className="text-xs px-4">Main</TabsTrigger>
                       <TabsTrigger value="preset" className="text-xs px-4">Preset</TabsTrigger>
+                      <TabsTrigger value="coordination" className="text-xs px-4">Coordination</TabsTrigger>
                     </TabsList>
                     <TabsContent value="main">
                       <StrategyProfileEditor profile={stratMain} onChange={setStratMain} />
                     </TabsContent>
                     <TabsContent value="preset">
                       <StrategyProfileEditor profile={stratPreset} onChange={setStratPreset} />
+                    </TabsContent>
+                    <TabsContent value="coordination">
+                      <StrategyCoordinationSection value={coordination} onChange={setCoordination} />
                     </TabsContent>
                   </Tabs>
                 </TabsContent>

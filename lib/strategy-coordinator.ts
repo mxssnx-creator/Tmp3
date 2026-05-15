@@ -177,7 +177,7 @@ export interface PositionContext {
   lastWins: number
   /** Number of losers among the last N closed */
   lastLosses: number
-  /** Total losers in the lookback window ����� gates DCA recovery variants */
+  /** Total losers in the lookback window ������� gates DCA recovery variants */
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
@@ -273,6 +273,43 @@ export class StrategyCoordinator {
     maxRealSets: 12000,
     pruneStrategy: "hybrid",
   }
+
+  /**
+   * Per-cycle cached coordination settings (axes + variants toggles).
+   * The coordinator loads this from connection settings on each flow and
+   * respects the operator's toggles for position-count axes and categorical
+   * variants (trailing, block, dca, pause). Cached for `_coordinationTtlMs`
+   * (5s) to avoid spamming Redis on every symbol's evaluation.
+   */
+  private _coordinationSettings: {
+    axes: {
+      prev:  { enabled: boolean; maxWindow: number }
+      last:  { enabled: boolean; maxWindow: number }
+      cont:  { enabled: boolean; maxWindow: number }
+      pause: { enabled: boolean; maxWindow: number }
+    }
+    variants: {
+      trailing: boolean
+      block:    boolean
+      dca:      boolean
+      pause:    boolean
+    }
+  } = {
+    axes: {
+      prev:  { enabled: true,  maxWindow: 12 },
+      last:  { enabled: true,  maxWindow: 4  },
+      cont:  { enabled: true,  maxWindow: 8  },
+      pause: { enabled: true,  maxWindow: 8  },
+    },
+    variants: {
+      trailing: true,
+      block:    true, // ← ENABLED by default (per spec)
+      dca:      true,
+      pause:    true,
+    },
+  }
+  private _coordinationLoadedAt = 0
+  private readonly _coordinationTtlMs = 5_000
 
   /**
    * Per-cycle snapshot of `pseudo_positions:{conn}:active_config_keys`.
@@ -420,6 +457,41 @@ export class StrategyCoordinator {
     }
   }
 
+  /**
+   * Load coordination settings (axes + variants toggles) from connection settings.
+   *
+   * The operator can toggle each variant (trailing, block, dca, pause) and each
+   * axis (prev, last, cont, pause) via the connection-settings dialog. The
+   * toggles flow here on each strategy-flow cycle and gate which variants are
+   * evaluated and which axis windows are consulted.
+   *
+   * Cached for `_coordinationTtlMs` (5s). Falls back to spec defaults on
+   * error or missing settings so the coordinator always functions even if
+   * the operator never touched the UI.
+   */
+  private async loadCoordinationSettings(): Promise<void> {
+    const now = Date.now()
+    if (now - this._coordinationLoadedAt < this._coordinationTtlMs) return
+    this._coordinationLoadedAt = now
+    try {
+      const { getConnectionSettings } = await import("@/lib/redis-db")
+      const settings = (await getConnectionSettings(this.connectionId)) || {}
+      const coord = settings.coordination_settings || settings.coordinationSettings
+      if (coord?.axes && coord?.variants) {
+        this._coordinationSettings = coord
+        console.log(
+          `[v0] [StrategyCoordinator:${this.connectionId}] Coordination settings loaded:`,
+          `Block=${coord.variants.block}, DCA=${coord.variants.dca}, Trailing=${coord.variants.trailing}`,
+        )
+      }
+    } catch (err) {
+      console.warn(
+        `[v0] [StrategyCoordinator] loadCoordinationSettings() failed; using defaults`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
+  }
+
   constructor(connectionId: string, config?: StrategyCoordinatorConfig) {
     this.connectionId = connectionId
     if (config) {
@@ -444,15 +516,16 @@ export class StrategyCoordinator {
     const results: StrategyEvaluation[] = []
 
     try {
-      // ── Hydrate PF thresholds from operator settings ─────────────
-      // 5s TTL inside the loader bounds Redis pressure; slider changes
+      // ── Hydrate PF thresholds + Coordination settings from operator settings ─
+      // 5s TTL inside the loaders bounds Redis pressure; slider/toggle changes
       // in the Settings dialog flow into the engine within ≤5s. We
-      // call this on EVERY entry — both per-symbol and per-batch —
-      // because the TTL cap makes it cheap, and the alternative
-      // (calling it once on engine startup) would require an engine
-      // restart whenever an operator tunes the PF gates. That's not
-      // acceptable for a live-tuning interface.
-      await this.loadAppPFThresholds()
+      // call these on EVERY flow (including per-symbol in batch loops) —
+      // the TTL ensures they become no-ops except for the first symbol
+      // or the first after a 5s quiet period.
+      await Promise.all([
+        this.loadAppPFThresholds(),
+        this.loadCoordinationSettings(),
+      ])
 
       // Fetch the per-cycle position coordination context once. Prehistoric
       // runs use a neutral context (no open positions, no prior outcomes) so
@@ -2510,7 +2583,16 @@ export class StrategyCoordinator {
    * open state to do so cleanly.
    */
   private selectActiveVariants(ctx: PositionContext): Array<ReturnType<StrategyCoordinator["variantProfiles"]>[number]> {
-    return this.variantProfiles().filter((p) => p.gate(ctx))
+    const all = this.variantProfiles()
+    // Filter to only enabled variants per coordination settings. "default"
+    // is always on regardless of toggle (it's the operator's fallback).
+    return all.filter((p) => {
+      const gatePass = p.gate(ctx)
+      if (!gatePass) return false
+      if (p.name === "default") return true
+      const enabled = this._coordinationSettings.variants[p.name]
+      return enabled === true
+    })
   }
 
   /**
