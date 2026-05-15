@@ -371,7 +371,7 @@ export class TradeExecutionOrchestrator {
         throw new Error(result.error || "Failed to close all positions")
       }
 
-      const closedPositions = result.success || []
+      const closedPositions = result.successful || []
       this.log(`✓ Closed ${closedPositions.length} positions${symbol ? ` for ${symbol}` : " globally"}`)
 
       // Update database
@@ -555,7 +555,7 @@ export class TradeExecutionOrchestrator {
         throw new Error(result.error || "Failed to cancel orders")
       }
 
-      const successCount = result.success?.length || 0
+      const successCount = result.successful?.length || 0
       const failedCount = result.failed?.length || 0
 
       this.log(`✓ Cancelled ${successCount} orders, ${failedCount} failed`)

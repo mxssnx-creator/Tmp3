@@ -128,6 +128,51 @@ export class BingXConnector extends BaseExchangeConnector {
     return code === 0 || code === "0"
   }
 
+  /**
+   * Safe JSON parse that preserves orderId precision.
+   *
+   * BingX (and Binance) emit order IDs as JSON NUMBERS up to ~19 digits
+   * long, well beyond `Number.MAX_SAFE_INTEGER` (16 digits, max
+   * 9007199254740991). The default `response.json()` parses them as
+   * IEEE-754 doubles, silently losing the last 1-3 digits — e.g.
+   * `2055068855617294300` becomes the nearest representable double
+   * `2055068855617294336`. The cancellation pipeline then targets an
+   * orderId that doesn't exist on the venue, producing the observed
+   * `code=109400 "order not exist"`.
+   *
+   * Fix: read the body as text and quote-wrap every numeric value
+   * associated with an ID-bearing field BEFORE JSON.parse, so the IDs
+   * survive as strings. We deliberately target a curated whitelist of
+   * field names (orderId, orderID, id, clientOrderId, transactId,
+   * positionId) rather than every long number — prices/quantities are
+   * always safely within double precision and we want to keep them as
+   * numbers for ergonomic arithmetic at call sites.
+   */
+  private async safeJson(response: Response): Promise<any> {
+    const text = await response.text()
+    if (!text) return {}
+    // (?<="orderId":\s*) lookbehind then a bare numeric (one or more
+    // digits, possibly negative) → wrap in quotes. `g` so every
+    // occurrence in arrays is handled. Anchored on the next char so we
+    // don't accidentally wrap already-quoted strings (the negative
+    // lookahead `(?!")` is implicit because the regex requires a digit
+    // immediately after the colon-whitespace).
+    const idFields = ["orderId", "orderID", "id", "clientOrderId", "transactId", "positionId"]
+    const pattern = new RegExp(
+      `("(?:${idFields.join("|")})"\\s*:\\s*)(-?\\d+)(\\s*[,}\\]])`,
+      "g",
+    )
+    const safeText = text.replace(pattern, '$1"$2"$3')
+    try {
+      return JSON.parse(safeText)
+    } catch {
+      // If the regex transform broke parsing for an unexpected payload
+      // shape, fall back to the unmodified text — better to lose ID
+      // precision than to fail the whole response.
+      return JSON.parse(text)
+    }
+  }
+
   getCapabilities(): string[] {
     return ["futures", "perpetual_futures", "leverage", "hedge_mode", "cross_margin"]
   }
@@ -413,8 +458,12 @@ export class BingXConnector extends BaseExchangeConnector {
         if (hedgeMode) {
           params.positionSide = effectivePositionSide
         }
-        // reduceOnly is only meaningful on perp endpoints.
-        if (options.reduceOnly) {
+        // reduceOnly is only meaningful on perp endpoints — and on BingX
+        // hedge-mode accounts it is NOT allowed alongside positionSide
+        // (the venue rejects with code=109400). Hedge mode already implies
+        // the reduce-only semantic via positionSide+side opposition, so
+        // we suppress reduceOnly there. One-way mode still needs it.
+        if (options.reduceOnly && !hedgeMode) {
           params.reduceOnly = "true"
         }
         if (options.clientOrderId) {
@@ -442,9 +491,40 @@ export class BingXConnector extends BaseExchangeConnector {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
+        // Special-case: 109400 "In the Hedge mode, the 'ReduceOnly' field
+        // can not be filled." A misrouted reduceOnly slipped through; strip
+        // it and retry once. Hedge mode's reduce-only semantic is carried
+        // by positionSide+side opposition, so the retry is still safe.
+        const reduceOnlyHedgeConflict =
+          String(data.code) === "109400" ||
+          /reduceonly.*hedge|hedge.*reduceonly/i.test(String(data.msg || ""))
+        if (reduceOnlyHedgeConflict && !isSpot && params.reduceOnly) {
+          this.log("Retrying order without reduceOnly (hedge-mode conflict 109400)")
+          delete params.reduceOnly
+          params.timestamp = Date.now()
+          const { signature: roRetrySig, queryString: roRetryQs } = this.signParams(params)
+          const roRetryUrl = `${this.getBaseUrl()}${endpoint}?${roRetryQs}&signature=${roRetrySig}`
+          const roRetryResp = await this.rateLimitedFetch(roRetryUrl, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const roRetryData = await this.safeJson(roRetryResp)
+          if (this.isBingXSuccess(roRetryData.code)) {
+            const info = roRetryData.data?.order || roRetryData.data || {}
+            const id = info.orderId || info.id || roRetryData.data?.orderId
+            this.log(`✓ Order placed on retry (hedge, no reduceOnly): ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined }
+          }
+          // Fall through with the retry's response so the operator sees
+          // the real underlying error rather than the 109400 we already
+          // worked around.
+          data.code = roRetryData.code
+          data.msg = roRetryData.msg
+        }
+
         // Special-case: 80014 "position side does not match" — the account is
         // in one-way mode but we sent a hedge-mode positionSide. Retry once
         // without positionSide so the order still goes through rather than
@@ -461,7 +541,7 @@ export class BingXConnector extends BaseExchangeConnector {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
-          const retryData = await retryResp.json()
+          const retryData = await this.safeJson(retryResp)
           if (this.isBingXSuccess(retryData.code)) {
             const info = retryData.data?.order || retryData.data || {}
             const id = info.orderId || info.id || retryData.data?.orderId
@@ -549,12 +629,23 @@ export class BingXConnector extends BaseExchangeConnector {
         timestamp: Date.now(),
       }
       if (hedgeMode) params.positionSide = positionSide
-      if (options.reduceOnly !== false) params.reduceOnly = "true"
+      // BingX hedge-mode rule: `reduceOnly` is NOT allowed when
+      // `positionSide` is set — the venue rejects with
+      //   code=109400 "In the Hedge mode, the 'ReduceOnly' field can not
+      //   be filled."
+      // In hedge mode the positionSide=LONG/SHORT combined with the
+      // opposite `side` IS the reduce-only semantic (it can only close
+      // the matching side), so omitting reduceOnly is safe and correct.
+      // In one-way mode we still need reduceOnly to prevent the order
+      // from accidentally flipping the position to the opposite side.
+      if (!hedgeMode && options.reduceOnly !== false) {
+        params.reduceOnly = "true"
+      }
       if (options.clientOrderId) params.clientOrderId = options.clientOrderId
 
       this.log(
         `Placing ${orderType} ${closeSide} ${qtyStr} ${bingxSymbol} @ stop=${stopStr}` +
-          `${hedgeMode ? ` posSide=${positionSide}` : " [one-way]"} [reduceOnly]`,
+          `${hedgeMode ? ` posSide=${positionSide} [hedge, reduceOnly implicit]` : " [one-way, reduceOnly]"}`,
       )
 
       const endpoint = "/openApi/swap/v2/trade/order"
@@ -567,11 +658,41 @@ export class BingXConnector extends BaseExchangeConnector {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       // Same one-way retry logic as `placeOrder`: BingX returns 80014 when
       // a hedge-mode positionSide is sent to a one-way account.
+      // Also handles 109400 — defensive fallback in case `hedgeMode` was
+      // not propagated from the caller and `reduceOnly` ended up on a
+      // hedge-mode request anyway. Strip it and retry once.
       if (!this.isBingXSuccess(data.code)) {
+        const reduceOnlyHedgeConflict =
+          String(data.code) === "109400" ||
+          /reduceonly.*hedge|hedge.*reduceonly/i.test(String(data.msg || ""))
+        if (reduceOnlyHedgeConflict && params.reduceOnly) {
+          this.log("Retrying stop order without reduceOnly (hedge-mode conflict 109400)")
+          delete params.reduceOnly
+          // Hedge mode requires positionSide; ensure it's present.
+          if (!params.positionSide) params.positionSide = positionSide
+          params.timestamp = Date.now()
+          const { signature: retrySig2, queryString: retryQs2 } = this.signParams(params)
+          const retryUrl2 = `${this.getBaseUrl()}${endpoint}?${retryQs2}&signature=${retrySig2}`
+          const retryResp2 = await this.rateLimitedFetch(retryUrl2, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const retryData2 = await this.safeJson(retryResp2)
+          if (this.isBingXSuccess(retryData2.code)) {
+            const info2 = retryData2.data?.order || retryData2.data || {}
+            return {
+              success: true,
+              orderId: String(info2.orderId ?? info2.orderID ?? ""),
+            }
+          }
+          // Fall through to the normal error path with the retry's response.
+          data.code = retryData2.code
+          data.msg = retryData2.msg
+        }
         const sideMismatch = String(data.code) === "80014"
           || /position.*side/i.test(String(data.msg || ""))
         if (sideMismatch && hedgeMode) {
@@ -584,7 +705,7 @@ export class BingXConnector extends BaseExchangeConnector {
             method: "POST",
             headers: { "X-BX-APIKEY": this.credentials.apiKey },
           })
-          const retryData = await retryResp.json()
+          const retryData = await this.safeJson(retryResp)
           if (this.isBingXSuccess(retryData.code)) {
             const info = retryData.data?.order || retryData.data || {}
             const id = info.orderId || info.id || retryData.data?.orderId
@@ -636,7 +757,7 @@ export class BingXConnector extends BaseExchangeConnector {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -675,7 +796,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return null
@@ -738,7 +859,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -777,7 +898,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -833,7 +954,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -882,7 +1003,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -965,7 +1086,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1001,7 +1122,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1034,7 +1155,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         return []
@@ -1043,7 +1164,7 @@ export class BingXConnector extends BaseExchangeConnector {
       return Array.isArray(data.data) ? data.data : []
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
-      this.logError(`✗ Failed to fetch transfer history: ${errorMsg}`)
+      this.logError(`�� Failed to fetch transfer history: ${errorMsg}`)
       return []
     }
   }
@@ -1072,7 +1193,7 @@ export class BingXConnector extends BaseExchangeConnector {
           method: "POST",
           headers: { "X-BX-APIKEY": this.credentials.apiKey },
         })
-        const data = await response.json()
+        const data = await this.safeJson(response)
         return { side, ok: this.isBingXSuccess(data.code), data }
       }
 
@@ -1122,7 +1243,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         // Margin-type-unchanged is not a real error on BingX; ignore code 101404.
@@ -1160,7 +1281,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1202,7 +1323,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (data.code !== 0 && data.code !== "0") {
         return null
@@ -1275,7 +1396,7 @@ export class BingXConnector extends BaseExchangeConnector {
         return null
       }
 
-      const data = await response.json()
+      const data = await this.safeJson(response)
 
       if (data.code !== 0 && data.code !== "0") {
         // Silently return null to avoid log flooding
@@ -1499,20 +1620,13 @@ export class BingXConnector extends BaseExchangeConnector {
           return await this.getOpenOrder(params.symbol, params.orderId, params.clientOrderId)
         
         case "getOrder":
-          return await this.getOrder(params.symbol, params.orderId, params.clientOrderId)
+          return await this.getOrderDetails(params.symbol, params.orderId, params.clientOrderId)
         
         case "getOpenOrders":
-          return await this.getOpenOrders(params.symbol, params.type)
+          return await this.getOpenOrders(params.symbol)
         
         case "getOrderHistory":
-          return await this.getOrderHistory(
-            params.symbol,
-            params.currency,
-            params.orderId,
-            params.startTime,
-            params.endTime,
-            params.limit
-          )
+          return await this.getOrderHistory(params.symbol, params.limit)
         
         case "getForceOrders":
           return await this.getForceOrders(
@@ -1555,7 +1669,7 @@ export class BingXConnector extends BaseExchangeConnector {
    * @param symbol - Optional: specific symbol to close positions for
    * @returns Success status and list of closed position IDs
    */
-  async closeAllPositions(symbol?: string): Promise<{ success: boolean; success?: string[]; failed?: any[]; error?: string }> {
+  async closeAllPositions(symbol?: string): Promise<{ success: boolean; successful?: string[]; failed?: any[]; error?: string }> {
     try {
       this.log(`[API] Closing all positions${symbol ? ` for ${symbol}` : ""}`)
       
@@ -1575,7 +1689,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1584,7 +1698,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`✓ Closed ${data.data?.success?.length || 0} positions`)
       return {
         success: true,
-        success: data.data?.success || [],
+        successful: data.data?.success || [],
         failed: data.data?.failed || [],
       }
     } catch (error) {
@@ -1625,7 +1739,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1717,7 +1831,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1752,7 +1866,7 @@ export class BingXConnector extends BaseExchangeConnector {
    * @param orderIds - Array of order IDs to cancel (max 10)
    * @returns Arrays of successfully cancelled and failed orders
    */
-  async batchCancelOrders(symbol: string, orderIds: string[]): Promise<{ success: boolean; success?: any[]; failed?: any[]; error?: string }> {
+  async batchCancelOrders(symbol: string, orderIds: string[]): Promise<{ success: boolean; successful?: any[]; failed?: any[]; error?: string }> {
     try {
       if (!Array.isArray(orderIds) || orderIds.length === 0) {
         throw new Error("Order IDs must be a non-empty array")
@@ -1779,7 +1893,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1791,7 +1905,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`✓ Batch cancel: ${succeeded.length} cancelled, ${failed.length} failed`)
       return {
         success: true,
-        success: succeeded,
+        successful: succeeded,
         failed: failed,
       }
     } catch (error) {
@@ -1814,7 +1928,7 @@ export class BingXConnector extends BaseExchangeConnector {
    * @param type - Optional: order type filter (LIMIT, MARKET, STOP_MARKET, etc.)
    * @returns Arrays of cancelled and failed orders
    */
-  async cancelAllOrders(symbol?: string, type?: string): Promise<{ success: boolean; success?: any[]; failed?: any[]; error?: string }> {
+  async cancelAllOrders(symbol?: string, type?: string): Promise<{ success: boolean; successful?: any[]; failed?: any[]; error?: string }> {
     try {
       this.log(`[API] Cancelling all open orders${symbol ? ` for ${symbol}` : ""}${type ? ` (type: ${type})` : ""}`)
       
@@ -1838,7 +1952,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1850,7 +1964,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`✓ Cancelled all orders: ${succeeded.length} cancelled, ${failed.length} failed`)
       return {
         success: true,
-        success: succeeded,
+        successful: succeeded,
         failed: failed,
       }
     } catch (error) {
@@ -1900,7 +2014,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -1979,7 +2093,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2028,7 +2142,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2078,7 +2192,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2104,7 +2218,7 @@ export class BingXConnector extends BaseExchangeConnector {
    * Official API: GET /openApi/swap/v2/trade/order
    * Rate limit: 30/s per UID; 2/s per IP
    */
-  async getOrder(
+  async getOrderDetails(
     symbol: string,
     orderId?: string,
     clientOrderId?: string
@@ -2126,7 +2240,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2180,7 +2294,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)
@@ -2232,7 +2346,7 @@ export class BingXConnector extends BaseExchangeConnector {
         headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
       
-      const data = await response.json()
+      const data = await this.safeJson(response)
       
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)

@@ -38,6 +38,7 @@ interface EngineSettings {
 interface EngineTimings {
   cronSyncIntervalSeconds: number
   liveSyncIntervalMs: number
+  liveSyncPauseMs: number
   heartbeatIntervalMs: number
   strategyFlowMinIntervalMs: number
   strategyFlowHardThrottleMs: number
@@ -45,6 +46,12 @@ interface EngineTimings {
   lockExtendIntervalMs: number
   maxPositionHoldMs: number
   progressionBufferFlushMs: number
+  // Three-progression loop tunables
+  prehistoricIntervalMs: number
+  prehistoricCyclePauseMs: number
+  realtimeIntervalMs: number
+  realtimeCyclePauseMs: number
+  livePositionsCyclePauseMs: number
 }
 
 // Mirror of `DEFAULT_ENGINE_TIMINGS`. Used when loadSettings can't fetch
@@ -52,7 +59,8 @@ interface EngineTimings {
 // blank — operator sees the actual defaults the engine will use.
 const DEFAULT_TIMINGS: EngineTimings = {
   cronSyncIntervalSeconds:   15,
-  liveSyncIntervalMs:        5_000,
+  liveSyncIntervalMs:          200,
+  liveSyncPauseMs:              50,
   heartbeatIntervalMs:       1_000,
   strategyFlowMinIntervalMs: 1_500,
   strategyFlowHardThrottleMs:  750,
@@ -60,6 +68,16 @@ const DEFAULT_TIMINGS: EngineTimings = {
   lockExtendIntervalMs:     15_000,
   maxPositionHoldMs:    4 * 60 * 60 * 1000,
   progressionBufferFlushMs:  3_000,
+  // Three-progression defaults. NOTE: per the no-pause refactor, the
+  // Prehistoric loop ignores its interval/pause fields at runtime and
+  // always cycles back-to-back via setTimeout(_, 0). The fields are
+  // surfaced here so operators see what was historically configured,
+  // but edits to them have no effect on the running engine.
+  prehistoricIntervalMs:     1_000,
+  prehistoricCyclePauseMs:      50,
+  realtimeIntervalMs:        1_000,
+  realtimeCyclePauseMs:         50,
+  livePositionsCyclePauseMs:    50,
 }
 
 // Mirror of `ENGINE_TIMING_BOUNDS`. The API clamps server-side too;
@@ -70,8 +88,12 @@ const TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; max: number; uni
     help: "Sub-minute sync cadence. The cron handler self-loops inside each 60s Vercel invocation, sleeping this many seconds between sweeps. 15s = 4 sweeps/min.",
   },
   liveSyncIntervalMs: {
-    min: 500, max: 60_000, unit: "ms", live: true,
-    help: "Realtime processor's exchange-sync throttle. Lower = faster external-close detection but more REST calls.",
+    min: 100, max: 60_000, unit: "ms", live: true,
+    help: "Realtime processor's exchange-sync cadence (start-to-start). Default 200 ms matches the live exchange-positions update rate. Lower = faster close-on-SL/TP detection but more REST calls; min 100 ms.",
+  },
+  liveSyncPauseMs: {
+    min: 10, max: 200, unit: "ms", live: true,
+    help: "Breath after each completed sync cycle before the next can fire — mirrors the main progression cyclePauseMs pattern. Ensures previous sync's Redis writes / control-order placements are durable before the next sync reads.",
   },
   heartbeatIntervalMs: {
     min: 250, max: 30_000, unit: "ms", live: true,
@@ -100,6 +122,32 @@ const TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; max: number; uni
   progressionBufferFlushMs: {
     min: 500, max: 60_000, unit: "ms", live: false,
     help: "Progression log buffer flushes after this interval OR when it hits 50 entries. Restart engine to apply.",
+  },
+  // ── Three-progression tunables ────────────────────────────────────────
+  // Important: the Prehistoric loop runs continuously back-to-back per
+  // the architectural spec — its interval/pause fields below are kept
+  // for back-compat but are NO-OPS at runtime. The UI flags them as
+  // read-only via `live: false` so operators can see the historical
+  // value without being misled into thinking edits take effect.
+  prehistoricIntervalMs: {
+    min: 200, max: 60_000, unit: "ms", live: false,
+    help: "(no-op) Prehistoric Progression runs continuously back-to-back; this field is kept for back-compat only. The historical-Set processor's per-timeframe last_calc_at gate is the real throttle.",
+  },
+  prehistoricCyclePauseMs: {
+    min: 10, max: 500, unit: "ms", live: false,
+    help: "(no-op) Prehistoric loop has no inter-cycle pause; the next cycle is scheduled on the next event-loop tick.",
+  },
+  realtimeIntervalMs: {
+    min: 200, max: 60_000, unit: "ms", live: true,
+    help: "Realtime Progression start-to-start cadence — drives the shared ind+pseudo+strat pipeline per symbol.",
+  },
+  realtimeCyclePauseMs: {
+    min: 10, max: 500, unit: "ms", live: true,
+    help: "Breath after each Realtime cycle completes. Lower = tighter cadence, higher CPU; higher = quieter.",
+  },
+  livePositionsCyclePauseMs: {
+    min: 10, max: 200, unit: "ms", live: true,
+    help: "Breath after each LivePositions sync (exchange mark price + SL/TP cross + protection orders). Default 50 ms gives the 200 ms cadence a comfortable margin.",
   },
 }
 
@@ -146,6 +194,7 @@ export function SystemSettings() {
           }
           read("cron_sync_interval_seconds",    "cronSyncIntervalSeconds")
           read("live_sync_interval_ms",         "liveSyncIntervalMs")
+          read("live_sync_pause_ms",            "liveSyncPauseMs")
           read("heartbeat_interval_ms",         "heartbeatIntervalMs")
           read("strategy_flow_min_interval_ms", "strategyFlowMinIntervalMs")
           read("strategy_flow_hard_throttle_ms","strategyFlowHardThrottleMs")
@@ -188,6 +237,7 @@ export function SystemSettings() {
           body: JSON.stringify({
             cron_sync_interval_seconds:    timings.cronSyncIntervalSeconds,
             live_sync_interval_ms:         timings.liveSyncIntervalMs,
+            live_sync_pause_ms:            timings.liveSyncPauseMs,
             heartbeat_interval_ms:         timings.heartbeatIntervalMs,
             strategy_flow_min_interval_ms: timings.strategyFlowMinIntervalMs,
             strategy_flow_hard_throttle_ms:timings.strategyFlowHardThrottleMs,

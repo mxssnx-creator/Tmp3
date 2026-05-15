@@ -85,13 +85,29 @@ export class RealtimeProcessor {
   // symbol reaches the Real-stage block). For sub-second SL/TP response
   // the realtime tick has to drive it.
   //
-  // Rate-limited to LIVE_SYNC_INTERVAL_MS so we don't hammer the exchange
-  // REST endpoint on every realtime tick (which can fire >1× per second
-  // under dense market data). Per-instance throttle is sufficient because
-  // the engine spawns one RealtimeProcessor per connectionId.
-  private lastLiveSyncAt = 0
+  // Rate-limited to settings.liveSyncIntervalMs (default 200 ms, matches
+  // the live exchange-positions update cadence). Per-instance throttle is
+  // sufficient because the engine spawns one RealtimeProcessor per
+  // connectionId.
+  //
+  // Two timestamps + a single-flight flag = three independent gates:
+  //   1. `liveSyncInFlight`         — never start a sync while one is
+  //                                   already running (handles slow REST
+  //                                   round-trips during a tick storm).
+  //   2. `lastLiveSyncStartedAt`    — enforce the target cadence
+  //                                   (start-to-start = liveSyncIntervalMs).
+  //   3. `lastLiveSyncCompletedAt`  — enforce a post-completion breath
+  //                                   (completion-to-start = liveSyncPauseMs).
+  //
+  // Mirrors the main progression cycle pattern in engine-manager.ts: each
+  // cycle runs to full completion → short pause → next cycle. The pause
+  // guarantees downstream Redis writes / control-order placements made
+  // by the previous sync are fully durable before the next sync reads.
+  private lastLiveSyncStartedAt = 0
+  private lastLiveSyncCompletedAt = 0
   private liveSyncInFlight = false
-  private static readonly LIVE_SYNC_INTERVAL_MS = 5_000
+  private static readonly LIVE_SYNC_INTERVAL_MS = 200
+  private static readonly LIVE_SYNC_PAUSE_MS = 50
 
   constructor(connectionId: string) {
     this.connectionId = connectionId
@@ -198,6 +214,89 @@ export class RealtimeProcessor {
   }
 
   /**
+   * Phase 2 of the shared ind+strat pipeline — per-symbol pseudo
+   * position handling.
+   *
+   * Called by `runIndStratCycle` between indication and strategy
+   * evaluation. ALWAYS runs regardless of indication outcome, so open
+   * positions never miss a mark-to-market / TP / SL / max-hold check.
+   *
+   * Behaviour is identical to `processRealtimeUpdates` for the matching
+   * symbol's positions:
+   *   - refresh `current_price` from the 200 ms market-data cache
+   *   - recompute `unrealized_pnl`
+   *   - update `trailing_stop_price` (single- or multi-step path)
+   *   - close on take_profit / stop_loss / max_hold_time_exceeded
+   *
+   * Returns the number of positions processed so callers can drive
+   * telemetry / idle backoff without re-querying Redis.
+   *
+   * NOTE: this method DOES NOT touch live-exchange sync — that is the
+   * responsibility of the dedicated LivePositions Progression loop in
+   * engine-manager. See the three-progression contract.
+   */
+  async updateOpenPseudoPositionsForSymbol(symbol: string): Promise<number> {
+    try {
+      // Advisory readiness — Phase B (prev-set enrichment) gates on this,
+      // but Phase A (mark-to-market + TP/SL) ALWAYS runs.
+      const prehistoricReady = await this.isPrehistoricReady()
+
+      // Filter active positions to this symbol. Cheap in-memory filter
+      // after one cached LRANGE — far cheaper than an indexed lookup.
+      const all = await this.positionManager.getActivePositions()
+      const positions = (all || []).filter((p: any) => p?.symbol === symbol)
+      if (positions.length === 0) return 0
+
+      // Pre-warm the shared price cache for THIS symbol in one round-trip.
+      // `prefetchMarketDataBatch` is idempotent — calling it with a single
+      // symbol is the same cost as the upstream's batched call, but it
+      // guarantees a fresh price even if a sibling symbol's tick warmed
+      // the cache moments ago for a different pair.
+      await prefetchMarketDataBatch([symbol]).catch(() => { /* non-critical */ })
+
+      // Process all positions for this symbol in parallel. Each call
+      // carries the position hash through so the manager skips a second
+      // HGETALL.
+      await Promise.all(
+        positions.map((position) => this.processPosition(position, prehistoricReady)),
+      )
+
+      // Surface the per-symbol pseudo-update counters so the dashboard
+      // can verify Phase 2 is firing inside each shared-pipeline cycle.
+      try {
+        const client = getRedisClient()
+        const progKey = `progression:${this.connectionId}`
+        await Promise.all([
+          client.hincrby(progKey, "pseudo_positions_updated_count", positions.length),
+          client.hincrby(progKey, "pseudo_positions_update_cycles", 1),
+          client.hset(progKey, {
+            pseudo_positions_last_update_at: new Date().toISOString(),
+            pseudo_positions_last_symbol: symbol,
+            // Dashboard back-compat: the stats route surfaces
+            // `pseudo_positions_last_count` as the `lastBatchSize`
+            // tile. Under the per-symbol shared pipeline each call IS
+            // a "batch" (one symbol's open positions), so we write the
+            // symbol's own count here. Operators reading the tile
+            // interpret it as "positions touched in the most recent cycle".
+            pseudo_positions_last_count: String(positions.length),
+          }),
+          client.expire(progKey, 7 * 24 * 60 * 60),
+        ])
+      } catch {
+        // Non-critical visibility metric — never break the pipeline.
+      }
+
+      return positions.length
+    } catch (err) {
+      console.error(
+        `[v0] [RealtimeProcessor] updateOpenPseudoPositionsForSymbol(${symbol}) failed:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      return 0
+    }
+  }
+
+  /**
    * Process real-time updates for all active positions.
    *
    * ── Decoupling contract (P0-5) ────────────────────────────────────
@@ -301,16 +400,16 @@ export class RealtimeProcessor {
         }
       }
 
-      // ── Live-position exchange sync (fire-and-forget, rate-limited) ──
-      // Drives SL/TP cross detection, protection-order healing, and
-      // mark-price refresh for all open LIVE positions on this connection.
-      // Independent of the pseudo-position pipeline below — we kick it
-      // off here BEFORE the count==0 early-return because the pseudo
-      // count may be 0 while live positions are still open (e.g. after
-      // all pseudo Sets closed but their live mirrors are still open
-      // on the exchange waiting for SL/TP). Throttled internally via
-      // `lastLiveSyncAt`.
-      void this.maybeRunLiveSync()
+      // ── Live-position exchange sync — MOVED to its own progression ───
+      // The fire-and-forget `void this.maybeRunLiveSync()` call that
+      // used to live here has been removed. Live exchange-positions
+      // handling is now driven by `engine-manager.startLivePositionsProgression`
+      // (the third independent top-level progression loop, default
+      // 200 ms cadence). That loop calls `syncWithExchange` directly
+      // and is single-flighted via the Redis lock `live_sync_lock:{connId}`,
+      // so pseudo-position handling here no longer needs to coordinate
+      // with exchange sync. See the architectural spec for the three-
+      // progression contract.
 
       if (count === 0) {
         return { updates: 0 }
@@ -832,13 +931,36 @@ export class RealtimeProcessor {
    */
   private async maybeRunLiveSync(): Promise<void> {
     const now = Date.now()
+    // ── Gate 1: single-flight ─────────────────────────────────────────
+    // Never start a sync while another is in progress. A slow REST
+    // round-trip during a tick storm must NOT queue overlapping syncs;
+    // they would race on the same per-position Redis state.
     if (this.liveSyncInFlight) return
-    // Read cadence from settings:system; static const is the fallback only
-    // until the engine-timings cache lands (~milliseconds after boot).
+
+    // Read cadence + pause from settings:system; static consts are the
+    // fallback only until the engine-timings cache lands (~milliseconds
+    // after boot).
+    const timings = getEngineTimings()
     const liveSyncIntervalMs =
-      getEngineTimings().liveSyncIntervalMs || RealtimeProcessor.LIVE_SYNC_INTERVAL_MS
-    if (now - this.lastLiveSyncAt < liveSyncIntervalMs) return
-    this.lastLiveSyncAt = now
+      timings.liveSyncIntervalMs || RealtimeProcessor.LIVE_SYNC_INTERVAL_MS
+    const liveSyncPauseMs =
+      (typeof timings.liveSyncPauseMs === "number" ? timings.liveSyncPauseMs : RealtimeProcessor.LIVE_SYNC_PAUSE_MS)
+
+    // ── Gate 2: target cadence (start-to-start) ───────────────────────
+    // Enforce the configured interval between sync STARTS. Drives the
+    // close-detection cadence (default 200 ms = 5 sweeps/sec).
+    if (now - this.lastLiveSyncStartedAt < liveSyncIntervalMs) return
+
+    // ── Gate 3: post-completion breath ────────────────────────────────
+    // After the previous sync finished, wait `liveSyncPauseMs` before
+    // the next can start. Mirrors the main progression cycle's 50 ms
+    // breath — gives the event loop room and ensures downstream Redis
+    // writes from the previous sync are observable to the next one.
+    // On the very first tick `lastLiveSyncCompletedAt` is 0, so this
+    // gate is a no-op (now - 0 >> pauseMs).
+    if (now - this.lastLiveSyncCompletedAt < liveSyncPauseMs) return
+
+    this.lastLiveSyncStartedAt = now
     this.liveSyncInFlight = true
 
     try {
@@ -949,6 +1071,10 @@ export class RealtimeProcessor {
         err instanceof Error ? err.message : String(err),
       )
     } finally {
+      // Stamp completion FIRST so the post-completion pause gate measures
+      // from real "work done" rather than "lock released" — these are the
+      // same instant here, but ordering this explicitly documents intent.
+      this.lastLiveSyncCompletedAt = Date.now()
       this.liveSyncInFlight = false
     }
   }

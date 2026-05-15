@@ -14,7 +14,11 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "start": "NODE_OPTIONS='--max-old-space-size=8192' next start -p 3002",
-    "vercel-build": "NODE_OPTIONS='--max-old-space-size=8192' next build"
+    "vercel-build": "NODE_OPTIONS='--max-old-space-size=8192' next build",
+    "vercel-build-setup": "bash scripts/vercel-build-setup.sh",
+    "post-deploy-verify": "bash scripts/post-deploy-verify.sh",
+    "deploy:local": "vercel",
+    "deploy:prod": "vercel --prod"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",

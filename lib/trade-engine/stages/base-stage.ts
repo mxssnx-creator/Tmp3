@@ -48,22 +48,31 @@ export async function generateBasePositions(
   try {
     const connectionId = connection.id || connection.name
 
-    for (const indication of indications) {
-      // Count existing positions in each direction
-      const existingLong = await countExistingPositions(
-        client,
-        connectionId,
-        indication.symbol,
-        "long"
-      )
-      const existingShort = await countExistingPositions(
-        client,
-        connectionId,
-        indication.symbol,
-        "short"
-      )
+    // ── Parallel per-indication base-position generation ───────────────
+    //
+    // Each indication is fully independent (different symbol/direction
+    // keyspace) — the original sequential loop awaited 2 reads + up to
+    // 2 writes per indication, serialising the entire stage. We now:
+    //   1. Pipeline the existence-count reads for ALL indications.
+    //   2. Compute the open-position deltas synchronously.
+    //   3. Pipeline the storeBasePosition writes.
+    //
+    // This collapses the stage from O(N · RTT) into O(3 · RTT)
+    // regardless of N, which is the same shape as the engine-manager's
+    // per-symbol fan-out and is bounded by Promise.all's natural
+    // pipelining inside the Redis client.
+    const existenceCounts = await Promise.all(
+      indications.map(async (indication) => {
+        const [existingLong, existingShort] = await Promise.all([
+          countExistingPositions(client, connectionId, indication.symbol, "long"),
+          countExistingPositions(client, connectionId, indication.symbol, "short"),
+        ])
+        return { indication, existingLong, existingShort }
+      }),
+    )
 
-      // Generate LONG position if under limit
+    const writes: Promise<unknown>[] = []
+    for (const { indication, existingLong, existingShort } of existenceCounts) {
       if (existingLong < maxLong) {
         const longPosition: BasePosition = {
           id: `base:${connectionId}:${indication.symbol}:${Date.now()}:long`,
@@ -81,16 +90,12 @@ export async function generateBasePositions(
           createdAt: Date.now(),
           updatedAt: Date.now(),
         }
-
         basePositions.push(longPosition)
-        await storeBasePosition(client, longPosition)
-
+        writes.push(storeBasePosition(client, longPosition))
         console.log(
           `${LOG_PREFIX} Created LONG base position ${longPosition.id} (strength: ${indication.strength.toFixed(2)})`
         )
       }
-
-      // Generate SHORT position if under limit
       if (existingShort < maxShort) {
         const shortPosition: BasePosition = {
           id: `base:${connectionId}:${indication.symbol}:${Date.now()}:short`,
@@ -108,23 +113,19 @@ export async function generateBasePositions(
           createdAt: Date.now(),
           updatedAt: Date.now(),
         }
-
         basePositions.push(shortPosition)
-        await storeBasePosition(client, shortPosition)
-
+        writes.push(storeBasePosition(client, shortPosition))
         console.log(
           `${LOG_PREFIX} Created SHORT base position ${shortPosition.id} (strength: ${indication.strength.toFixed(2)})`
         )
       }
-
-      // If at limit, don't create more
       if (existingLong >= maxLong && existingShort >= maxShort) {
         console.log(
           `${LOG_PREFIX} Position limits reached for ${indication.symbol} (${existingLong}/${maxLong} long, ${existingShort}/${maxShort} short)`
         )
-        continue
       }
     }
+    if (writes.length > 0) await Promise.all(writes)
 
     console.log(`${LOG_PREFIX} Generated ${basePositions.length} base positions`)
     return basePositions

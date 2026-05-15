@@ -946,16 +946,17 @@ export class ConfigSetProcessor {
     stats: any
   }>> {
     const configs = await this.strategyManager.getEnabledConfigs()
-    const results: Array<{ config: StrategyConfig; stats: any }> = []
-
-    for (const config of configs) {
-      const stats = await this.strategyManager.getStats(config.id)
-      if (stats.totalPositions > 0) {
-        results.push({ config, stats })
-      }
-    }
-
-    return results
+    // Fan out the per-config stats reads — each is an independent
+    // Redis lookup and the sequential pattern serialised N round-trips
+    // on dashboards that frequently call this for the top-N panel.
+    const all = await Promise.all(
+      configs.map(async (config) => {
+        const stats = await this.strategyManager.getStats(config.id)
+        return { config, stats }
+      }),
+    )
+    return all
+      .filter((r) => r.stats.totalPositions > 0)
       .sort((a, b) => b.stats.winRate - a.stats.winRate)
       .slice(0, limit)
   }

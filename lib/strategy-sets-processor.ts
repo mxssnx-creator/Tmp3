@@ -188,27 +188,23 @@ export class StrategySetsProcessor {
     let qualified = 0
     let total = 0
 
+    const batch: Array<{ strategy: any; indicationType: string }> = []
     for (const indication of indications) {
-      try {
-        total++
-        // Base: broad intake (must be much higher volume than main/real)
-        if (indication.confidence > 0.45 && indication.profitFactor > 0.9) {
-          const strategy = {
-            profitFactor: indication.profitFactor * 0.95,
-            confidence: indication.confidence,
-            metadata: { ...indication.metadata, strategyType: "base", riskLevel: "low" },
-          }
-
-          if (strategy.profitFactor >= 1.0) {
-            qualified++
-            await this.saveStrategyToSet(setKey, strategy, "base", indication.type)
-          }
+      total++
+      // Base: broad intake (must be much higher volume than main/real)
+      if (indication.confidence > 0.45 && indication.profitFactor > 0.9) {
+        const strategy = {
+          profitFactor: indication.profitFactor * 0.95,
+          confidence: indication.confidence,
+          metadata: { ...indication.metadata, strategyType: "base", riskLevel: "low" },
         }
-      } catch (error) {
-        console.error(`[v0] [StrategySets] Base strategy error:`, error)
+        if (strategy.profitFactor >= 1.0) {
+          qualified++
+          batch.push({ strategy, indicationType: indication.type })
+        }
       }
     }
-
+    await this.saveBatchToSet(setKey, batch, "base")
     return { type: "base", total, qualified }
   }
 
@@ -220,27 +216,22 @@ export class StrategySetsProcessor {
     let qualified = 0
     let total = 0
 
+    const batch: Array<{ strategy: any; indicationType: string }> = []
     for (const indication of indications) {
-      try {
-        total++
-        // Main: stricter than base
-        if (indication.confidence > 0.62 && indication.profitFactor > 1.2) {
-          const strategy = {
-            profitFactor: indication.profitFactor,
-            confidence: indication.confidence,
-            metadata: { ...indication.metadata, strategyType: "main", riskLevel: "medium" },
-          }
-
-          if (strategy.profitFactor >= 1.0) {
-            qualified++
-            await this.saveStrategyToSet(setKey, strategy, "main", indication.type)
-          }
+      total++
+      if (indication.confidence > 0.62 && indication.profitFactor > 1.2) {
+        const strategy = {
+          profitFactor: indication.profitFactor,
+          confidence: indication.confidence,
+          metadata: { ...indication.metadata, strategyType: "main", riskLevel: "medium" },
         }
-      } catch (error) {
-        console.error(`[v0] [StrategySets] Main strategy error:`, error)
+        if (strategy.profitFactor >= 1.0) {
+          qualified++
+          batch.push({ strategy, indicationType: indication.type })
+        }
       }
     }
-
+    await this.saveBatchToSet(setKey, batch, "main")
     return { type: "main", total, qualified }
   }
 
@@ -252,27 +243,22 @@ export class StrategySetsProcessor {
     let qualified = 0
     let total = 0
 
+    const batch: Array<{ strategy: any; indicationType: string }> = []
     for (const indication of indications) {
-      try {
-        total++
-        // Real: strictest (must remain less than main volume)
-        if (indication.confidence > 0.78 && indication.profitFactor > 1.45) {
-          const strategy = {
-            profitFactor: indication.profitFactor * 1.1, // Aggressive multiplier
-            confidence: indication.confidence,
-            metadata: { ...indication.metadata, strategyType: "real", riskLevel: "high" },
-          }
-
-          if (strategy.profitFactor >= 1.0) {
-            qualified++
-            await this.saveStrategyToSet(setKey, strategy, "real", indication.type)
-          }
+      total++
+      if (indication.confidence > 0.78 && indication.profitFactor > 1.45) {
+        const strategy = {
+          profitFactor: indication.profitFactor * 1.1,
+          confidence: indication.confidence,
+          metadata: { ...indication.metadata, strategyType: "real", riskLevel: "high" },
         }
-      } catch (error) {
-        console.error(`[v0] [StrategySets] Real strategy error:`, error)
+        if (strategy.profitFactor >= 1.0) {
+          qualified++
+          batch.push({ strategy, indicationType: indication.type })
+        }
       }
     }
-
+    await this.saveBatchToSet(setKey, batch, "real")
     return { type: "real", total, qualified }
   }
 
@@ -284,26 +270,103 @@ export class StrategySetsProcessor {
     let qualified = 0
     let total = 0
 
+    const batch: Array<{ strategy: any; indicationType: string }> = []
     for (const indication of indications) {
-      try {
-        total++
-        // Live: All indications with any positive profit factor
-        if (indication.profitFactor >= 1.0) {
-          const strategy = {
-            profitFactor: indication.profitFactor,
-            confidence: indication.confidence,
-            metadata: { ...indication.metadata, strategyType: "live", riskLevel: "variable" },
-          }
-
-          qualified++
-          await this.saveStrategyToSet(setKey, strategy, "live", indication.type)
+      total++
+      if (indication.profitFactor >= 1.0) {
+        const strategy = {
+          profitFactor: indication.profitFactor,
+          confidence: indication.confidence,
+          metadata: { ...indication.metadata, strategyType: "live", riskLevel: "variable" },
         }
-      } catch (error) {
-        console.error(`[v0] [StrategySets] Live strategy error:`, error)
+        qualified++
+        batch.push({ strategy, indicationType: indication.type })
       }
     }
-
+    await this.saveBatchToSet(setKey, batch, "live")
     return { type: "live", total, qualified }
+  }
+
+  /**
+   * Batch-save multiple qualifying strategies to the same set pool in
+   * ONE read-merge-compact-write transaction.
+   *
+   * The original `saveStrategyToSet` was called once per qualifying
+   * indication in a sequential loop, paying the read-modify-write cost
+   * per entry. With ~hundreds of qualifying indications per symbol
+   * that was the dominant CPU + Redis cost of the strategy-sets stage.
+   *
+   * Parallelising the individual `saveStrategyToSet` calls would
+   * RACE because they all read-modify-write the SAME `setKey`. This
+   * batch path avoids the race AND collapses the I/O.
+   */
+  private async saveBatchToSet(
+    setKey: string,
+    strategies: Array<{ strategy: any; indicationType: string }>,
+    strategyType: string,
+  ): Promise<void> {
+    if (strategies.length === 0) return
+    try {
+      const client = await getCachedClient()
+      let entries: any[] = []
+      const existing = await client.get(setKey)
+      if (existing) {
+        try { entries = JSON.parse(existing) } catch { entries = [] }
+      }
+
+      const baseTs = Date.now()
+      for (let i = 0; i < strategies.length; i++) {
+        const { strategy, indicationType } = strategies[i]
+        entries.push({
+          id: `${strategyType}_${baseTs}_${i}_${Math.random().toString(36).slice(2, 6)}`,
+          timestamp: new Date().toISOString(),
+          profitFactor: strategy.profitFactor,
+          confidence: strategy.confidence,
+          indicationType,
+          strategyType,
+          metadata: strategy.metadata,
+        })
+      }
+
+      const cfg = await this.resolveCompaction(strategyType as keyof StrategySetLimits)
+      entries = compact(entries, cfg, "best")
+
+      // Pipeline the writes — the set value and its stats are
+      // independent keys so they can flow concurrently.
+      const statsKey = `${setKey}:stats`
+      const [_, prevStatsRaw] = await Promise.all([
+        client.set(setKey, JSON.stringify(entries)),
+        getSettings(statsKey),
+      ])
+      const prevStats = prevStatsRaw || {}
+      const stats = {
+        maxEntries: cfg.floor,
+        currentEntries: entries.length,
+        totalCalculated: (prevStats.totalCalculated || 0) + strategies.length,
+        totalQualified: (prevStats.totalQualified || 0) + strategies.length,
+        avgProfitFactor:
+          entries.length > 0
+            ? entries.reduce((sum: number, e: any) => sum + e.profitFactor, 0) / entries.length
+            : 0,
+        lastCalculated: new Date().toISOString(),
+      }
+      await setSettings(statsKey, stats)
+
+      // Single broadcast per batch — dashboard observers debounce
+      // their own re-fetches so emitting N times per cycle would just
+      // flood without value.
+      if (entries.length > 0) {
+        emitStrategyUpdate(this.connectionId, {
+          id: entries[0].id,
+          symbol: setKey.split(":")[2],
+          profit_factor: stats.avgProfitFactor || 0,
+          win_rate: strategies[0].strategy?.confidence || 0,
+          active_positions: entries.length,
+        })
+      }
+    } catch (error) {
+      console.error(`[v0] [StrategySets] Failed to batch-save ${strategies.length} entries to ${setKey}:`, error)
+    }
   }
 
   /**

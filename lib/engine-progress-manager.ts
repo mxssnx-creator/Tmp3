@@ -586,7 +586,11 @@ export class EngineProgressManager {
       metrics.bulkCloses++
     }
     metrics.lastCloseTime = new Date().toISOString()
-    metrics.closeSuccessRate = (metrics.totalClosures - metrics.totalOrdersFailed) / metrics.totalClosures
+    // closeOperationMetrics only tracks completed closures (no failure
+    // counter on this type — failures bubble up earlier in the close
+    // path and never reach this recorder). Every recorded entry is by
+    // definition a successful close, so success rate is 1.0.
+    metrics.closeSuccessRate = 1.0
     this.addLog('info', `Close operation: ${automated ? 'automated' : 'manual'}${bulk ? ' (bulk)' : ''}`)
     await this.saveState()
   }

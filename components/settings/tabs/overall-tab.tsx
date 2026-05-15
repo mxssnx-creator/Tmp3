@@ -262,6 +262,25 @@ export function OverallTab({
                       onCheckedChange={(checked) => handleSettingChange("min_volume_enforcement", checked)}
                     />
                   </div>
+
+                  <div className="flex items-start justify-between gap-4 p-3 border rounded-lg bg-amber-500/5 border-amber-500/30">
+                    <div className="flex-1 min-w-0">
+                      <Label>Live Trade Without Control Orders (System Close)</Label>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Do <strong>not</strong> place reduce-only Stop-Loss / Take-Profit orders on the exchange.
+                        The engine monitors <code className="text-[10px] px-1 rounded bg-muted">markPrice</code> every
+                        reconcile and sync cycle and force-closes via a single market order when the SL/TP band is crossed.
+                        Any existing exchange SL/TP control orders on open positions are swept on the next cycle.
+                      </p>
+                      <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-1.5">
+                        Live progress check is wired into every ongoing cycle — every close is verified post-fill.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={(settings as any).useSystemCloseOnly === true}
+                      onCheckedChange={(checked) => handleSettingChange("useSystemCloseOnly" as any, checked)}
+                    />
+                  </div>
                 </div>
               </div>
 

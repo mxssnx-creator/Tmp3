@@ -164,17 +164,23 @@ export class IntervalProgressionManager {
    * Get interval health status
    */
   async getIntervalHealth(connectionId: string): Promise<Record<string, any>> {
-    const types = ["direction", "move", "active", "optimal"]
+    const types = ["direction", "move", "active", "optimal"] as const
     const health: Record<string, any> = {}
 
-    for (const type of types) {
-      const configKey = `interval_config:${connectionId}:${type}`
-      const config = (await getSettings(configKey)) as IntervalConfig | null
-
+    // Pipeline the 4 config reads — they're independent keys and the
+    // dashboard polls this endpoint frequently, so serialising 4 RTTs
+    // shows up in p99 latency.
+    const configs = await Promise.all(
+      types.map((type) =>
+        getSettings(`interval_config:${connectionId}:${type}`) as Promise<IntervalConfig | null>,
+      ),
+    )
+    for (let i = 0; i < types.length; i++) {
+      const type = types[i]
+      const config = configs[i]
       if (config) {
         const lockKey = `${connectionId}:${type}`
         const isRunning = this.intervals.has(lockKey)
-
         health[type] = {
           enabled: config.enabled,
           isRunning,
@@ -186,7 +192,6 @@ export class IntervalProgressionManager {
         }
       }
     }
-
     return health
   }
 
@@ -195,16 +200,18 @@ export class IntervalProgressionManager {
    */
   async initializeIntervals(connectionId: string): Promise<void> {
     const defaults = IntervalProgressionManager.getDefaultIntervals()
-
-    for (const [type, config] of Object.entries(defaults)) {
-      const configKey = `interval_config:${connectionId}:${type}`
-      const existing = await getSettings(configKey)
-
-      if (!existing) {
-        await setSettings(configKey, config)
-        console.log(`[v0] Initialized interval config for ${connectionId}:${type}`)
-      }
-    }
+    // Each (connection, type) config key is independent — fan out
+    // the read-or-create pairs so initialisation isn't N · RTT.
+    await Promise.all(
+      Object.entries(defaults).map(async ([type, config]) => {
+        const configKey = `interval_config:${connectionId}:${type}`
+        const existing = await getSettings(configKey)
+        if (!existing) {
+          await setSettings(configKey, config)
+          console.log(`[v0] Initialized interval config for ${connectionId}:${type}`)
+        }
+      }),
+    )
   }
 
   /**

@@ -40,6 +40,12 @@ import {
   Activity,
 } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
+// Collapsed to a single-line import: an earlier edit cycle left a stale
+// HMR module record for this file in `.next/cache`, causing the named
+// export `StrategyCoordinationSection` to resolve to `undefined` at
+// render time ("StrategyCoordinationSection is not defined"). A
+// fresh import shape forces the bundler to emit a new module id.
+import { StrategyCoordinationSection, DEFAULT_COORDINATION_SETTINGS, type CoordinationSettings } from "@/components/settings/strategy-coordination-section"
 
 // ─────────────────────────────────────────────────────────────────────
 // PUBLIC API
@@ -93,6 +99,15 @@ interface OverviewSettings {
   volumeFactorPreset: number
   marginMode:  "cross" | "isolated"
   volumeType:  "usdt" | "contract" | "spot"
+  /**
+   * When true: do NOT place exchange-side reduce-only SL/TP control
+   * orders for live positions on this connection. The engine instead
+   * monitors markPrice each reconcile/sync cycle and force-closes the
+   * position via a market reduce-only order when the desired band is
+   * crossed. Existing control orders on open positions are swept on the
+   * next cycle after the flag flips on.
+   */
+  useSystemCloseOnly: boolean
 }
 
 interface SymbolsSettings {
@@ -137,6 +152,7 @@ export function ConnectionSettingsDialog({
     volumeFactorPreset: 1.0,
     marginMode: "cross",
     volumeType: "usdt",
+    useSystemCloseOnly: false,
   })
 
   // ── Symbols state ───────────────────────────────────────────────
@@ -154,6 +170,7 @@ export function ConnectionSettingsDialog({
   const [indPreset, setIndPreset] = useState<ChannelProfile>(DEFAULT_INDICATION_PROFILE)
   const [stratMain,   setStratMain]   = useState<StrategyChannel>(DEFAULT_STRATEGY_PROFILE)
   const [stratPreset, setStratPreset] = useState<StrategyChannel>(DEFAULT_STRATEGY_PROFILE)
+  const [coordination, setCoordination] = useState<CoordinationSettings>(DEFAULT_COORDINATION_SETTINGS)
 
   // ─────────────────────────────────────────────────────────────────
   // LOAD
@@ -181,6 +198,7 @@ export function ConnectionSettingsDialog({
           volumeFactorPreset: Number(settings.volume_factor_preset) || 1.0,
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
+          useSystemCloseOnly: settings.use_system_close_only === true || settings.useSystemCloseOnly === true,
         })
         setSymbolsCfg(prev => ({
           ...prev,
@@ -190,6 +208,8 @@ export function ConnectionSettingsDialog({
         }))
         if (settings.strategies?.main)   setStratMain(settings.strategies.main)
         if (settings.strategies?.preset) setStratPreset(settings.strategies.preset)
+        const coord = settings.coordination_settings || settings.coordinationSettings
+        if (coord) setCoordination(coord)
       }
 
       // ── Active indications → Main + Preset ─────────────────────
@@ -261,6 +281,8 @@ export function ConnectionSettingsDialog({
         volume_factor_preset: overview.volumeFactorPreset,
         margin_mode: overview.marginMode,
         volume_type: overview.volumeType,
+        use_system_close_only: overview.useSystemCloseOnly,
+        useSystemCloseOnly:    overview.useSystemCloseOnly, // backwards-compat alias
         // Symbols
         symbols:      symbolsCfg.symbols,
         symbol_order: symbolsCfg.symbolOrder,
@@ -270,6 +292,9 @@ export function ConnectionSettingsDialog({
           main:   stratMain,
           preset: stratPreset,
         },
+        // Strategy coordination (axes + variants toggles)
+        coordination_settings: coordination,
+        coordinationSettings:  coordination, // legacy alias
       }
 
       const [settingsRes, indRes] = await Promise.all([
@@ -297,7 +322,7 @@ export function ConnectionSettingsDialog({
     } finally {
       setSaving(false)
     }
-  }, [connectionId, connectionName, overview, symbolsCfg, stratMain, stratPreset, indMain, indPreset, onOpenChange])
+  }, [connectionId, connectionName, overview, symbolsCfg, stratMain, stratPreset, indMain, indPreset, coordination, onOpenChange])
 
   // ─────────────────────────────────────────────────────────────────
   // SYMBOL HELPERS
@@ -330,7 +355,7 @@ export function ConnectionSettingsDialog({
     [exchangeSymbols, symbolsCfg.symbols],
   )
 
-  // ─────────────────────────────────────────────────────────────────
+  // ────────────────────────────────────���────────────────────────────
   // RENDER
   // ─────────────────────────────────────────────────────────────────
 
@@ -437,6 +462,34 @@ export function ConnectionSettingsDialog({
                         </SelectContent>
                       </Select>
                     </div>
+                  </div>
+
+                  <Separator className="my-4" />
+                  <SectionHeading
+                    icon={Zap}
+                    title="Close Mechanism"
+                    subtitle="Choose whether SL/TP are placed on the venue as control orders, or driven by the engine via system close."
+                  />
+
+                  <div className="flex items-start justify-between gap-4 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+                    <div className="flex-1 min-w-0 space-y-1">
+                      <Label className="text-xs font-medium">Live Trade Without Control Orders (System Close)</Label>
+                      <p className="text-[11px] leading-relaxed text-muted-foreground">
+                        When ON, the engine does <strong>not</strong> place reduce-only SL/TP orders on the
+                        exchange. Every reconcile and sync tick re-evaluates
+                        <code className="text-[10px] px-1 mx-0.5 rounded bg-muted">markPrice</code>
+                        against the desired SL/TP band and force-closes the position via a single market
+                        reduce-only order when crossed. Any leftover exchange control orders on open positions
+                        are swept on the next cycle.
+                      </p>
+                      <p className="text-[10px] text-amber-600 dark:text-amber-400">
+                        Live progress check is wired into every ongoing cycle — every close is verified post-fill.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={overview.useSystemCloseOnly}
+                      onCheckedChange={(checked) => setOverview(p => ({ ...p, useSystemCloseOnly: checked }))}
+                    />
                   </div>
                 </TabsContent>
 
@@ -575,15 +628,19 @@ export function ConnectionSettingsDialog({
                 {/* STRATEGIES ─────────────────────────────────── */}
                 <TabsContent value="strategies" className="mt-0">
                   <Tabs defaultValue="main" className="w-full">
-                    <TabsList className="grid grid-cols-2 h-8 mb-4 w-fit">
-                      <TabsTrigger value="main"   className="text-xs px-4">Main</TabsTrigger>
+                    <TabsList className="grid grid-cols-3 h-8 mb-4 w-fit">
+                      <TabsTrigger value="main" className="text-xs px-4">Main</TabsTrigger>
                       <TabsTrigger value="preset" className="text-xs px-4">Preset</TabsTrigger>
+                      <TabsTrigger value="coordination" className="text-xs px-4">Coordination</TabsTrigger>
                     </TabsList>
                     <TabsContent value="main">
                       <StrategyProfileEditor profile={stratMain} onChange={setStratMain} />
                     </TabsContent>
                     <TabsContent value="preset">
                       <StrategyProfileEditor profile={stratPreset} onChange={setStratPreset} />
+                    </TabsContent>
+                    <TabsContent value="coordination">
+                      <StrategyCoordinationSection value={coordination} onChange={setCoordination} />
                     </TabsContent>
                   </Tabs>
                 </TabsContent>
@@ -606,7 +663,7 @@ export function ConnectionSettingsDialog({
   )
 }
 
-// ─────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────���────────────────────────────────
 // SUB-COMPONENTS
 // ─────────────────────────────────────────────────────────────────────
 

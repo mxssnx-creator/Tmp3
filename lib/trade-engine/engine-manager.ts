@@ -159,6 +159,9 @@ import { IndicationProcessor } from "./indication-processor-fixed"
 import { StrategyProcessor, clearFlowThrottleForConnection } from "./strategy-processor"
 import { PseudoPositionManager } from "./pseudo-position-manager"
 import { RealtimeProcessor } from "./realtime-processor"
+import { runIndStratCycle } from "./shared-ind-strat-pipeline"
+import { IndicationSetsProcessor } from "@/lib/indication-sets-processor"
+import { getEngineTimings } from "@/lib/engine-timings"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { loadMarketDataForEngine } from "@/lib/market-data-loader"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
@@ -372,7 +375,7 @@ export class TradeEngineManager {
   private lockExtendTimer?: NodeJS.Timeout
 
   /**
-   * ── Live settings-reload bus ─────────────────────────────────────
+   * ── Live settings-reload bus ───────────────────────────────���─────
    *
    * When connection settings change (e.g. operator edits indication
    * thresholds, volume factor, presets, etc.) the API handler writes
@@ -588,9 +591,48 @@ export class TradeEngineManager {
       // phase auto-derivation straight to "live_trading" while the
       // prehistoric calculator was still running. The first productive
       // tick of each processor fires the moment the `:done` flag flips.
-      this.startIndicationProcessor(config.indicationInterval)
-      this.startStrategyProcessor(config.strategyInterval)
-      this.startRealtimeProcessor(config.realtimeInterval)
+      // ── Three-progression contract (architectural spec) ──────────────
+      // Three independent top-level loops, each on its own timer:
+      //   A. Prehistoric Progression  (continuous, no-pause) → historical Sets fill
+      //   B. Realtime  Progression    (1 s) → ind+pseudo+strat per cycle
+      //                                       (driven by startIndicationProcessor
+      //                                        for historical method-name reasons)
+      //   C. LivePositions Progression (200 ms) → live exchange sync
+      //                                           (driven by startRealtimeProcessor)
+      //
+      // The legacy startStrategyProcessor remains armed as a long-interval
+      // heartbeat tick only — strategy evaluation now happens inside the
+      // shared pipeline called from the Realtime Progression.
+      //
+      // ── Startup ordering ─────────────────────────────────────────────
+      // Per the architectural spec: "On enabling connection, first finish
+      // prehistoric progress, then start realtime progress." The Realtime
+      // pipeline READS the indication Sets that the Prehistoric pipeline
+      // WRITES; if realtime starts before prehistoric has filled the Sets
+      // at least once, every live tick scores against an empty Set and
+      // the first wave of indications is meaningless.
+      //
+      // To enforce the gate we:
+      //   1. Start the Prehistoric loop first (and ONLY it).
+      //   2. Pass an `onFirstPassComplete` callback that arms the other
+      //      three progressions the moment the first historical cycle
+      //      writes the `prehistoric:{connId}:firstpass:done` flag.
+      //   3. The Prehistoric loop then continues running forever in the
+      //      background, refilling Sets from fresh market data each cycle.
+      //
+      // The callback path runs SYNCHRONOUSLY inside the prehistoric tick
+      // before scheduleNext, so the realtime loops are armed before the
+      // second prehistoric cycle even fires — no race window.
+      const armLiveProgressions = () => {
+        if (!this.isRunning) return
+        console.log(
+          `[v0] [Engine ${this.connectionId}] Prehistoric first-pass complete — arming Realtime, Strategy heartbeat, and LivePositions loops.`,
+        )
+        this.startIndicationProcessor(config.indicationInterval)
+        this.startStrategyProcessor(config.strategyInterval)
+        this.startRealtimeProcessor(config.realtimeInterval)
+      }
+      this.startPrehistoricProgression(armLiveProgressions)
 
       // Phase stays at `prehistoric_data` while the historical calculator
       // is filling sets. `loadPrehistoricData` updates the phase percent
@@ -615,12 +657,27 @@ export class TradeEngineManager {
         )
       }
 
-      // Verify timers are running
+      // Verify timers are running.
+      //
+      // Under the prehistoric-gated startup contract, the realtime /
+      // indication / strategy timers are intentionally NOT armed at boot
+      // — they are armed by the `armLiveProgressions` callback the moment
+      // the Prehistoric Progression finishes its first pass (which can
+      // take 5-30 s on a fresh boot). So at +2 s the only timer we can
+      // assert is the prehistoric one. The live timers get their own
+      // confirmation log via `armLiveProgressions` itself.
       setTimeout(async () => {
-        if (this.indicationTimer && this.strategyTimer && this.realtimeTimer) {
-          await logProgressionEvent(this.connectionId, "engine_started", "info", "All engine processors started")
+        if (this.prehistoricTimer) {
+          await logProgressionEvent(
+            this.connectionId,
+            "engine_started",
+            "info",
+            this.indicationTimer && this.realtimeTimer
+              ? "All engine processors started"
+              : "Prehistoric Progression running — live processors gated until first pass completes",
+          )
         } else {
-          console.error(`[v0] [Engine] Timer startup failed`)
+          console.error(`[v0] [Engine] Timer startup failed — prehistoric not armed`)
         }
       }, 2000)
       this.startHealthMonitoring()
@@ -697,9 +754,10 @@ export class TradeEngineManager {
       // (indication/strategy/realtime are now setTimeout-based; healthCheck/heartbeat
       // remain setInterval. clearInterval and clearTimeout are interchangeable on
       // Node.js Timeouts but we use clearTimeout where appropriate for clarity.)
-      if (this.indicationTimer) { clearTimeout(this.indicationTimer); this.indicationTimer = undefined }
-      if (this.strategyTimer)   { clearTimeout(this.strategyTimer);   this.strategyTimer = undefined }
-      if (this.realtimeTimer)   { clearTimeout(this.realtimeTimer);   this.realtimeTimer = undefined }
+      if (this.indicationTimer)  { clearTimeout(this.indicationTimer);  this.indicationTimer = undefined }
+      if (this.strategyTimer)    { clearTimeout(this.strategyTimer);    this.strategyTimer = undefined }
+      if (this.realtimeTimer)    { clearTimeout(this.realtimeTimer);    this.realtimeTimer = undefined }
+      if (this.prehistoricTimer) { clearTimeout(this.prehistoricTimer); this.prehistoricTimer = undefined }
       if (this.healthCheckTimer) { clearInterval(this.healthCheckTimer); this.healthCheckTimer = undefined }
       if (this.heartbeatTimer)   { clearInterval(this.heartbeatTimer);   this.heartbeatTimer = undefined }
       
@@ -799,6 +857,14 @@ export class TradeEngineManager {
     } catch (e) {
       console.error(`[v0] [Engine ${this.connectionId}] re-arm realtime failed:`, e)
     }
+    try {
+      if (!this.prehistoricTimer) {
+        this.startPrehistoricProgression()
+        reasons.push("prehistoric")
+      }
+    } catch (e) {
+      console.error(`[v0] [Engine ${this.connectionId}] re-arm prehistoric failed:`, e)
+    }
 
     if (reasons.length === 0) {
       // All timers already exist — they may simply be blocked on Redis
@@ -843,6 +909,10 @@ export class TradeEngineManager {
     if (this.realtimeTimer) {
       clearTimeout(this.realtimeTimer)
       this.realtimeTimer = undefined
+    }
+    if (this.prehistoricTimer) {
+      clearTimeout(this.prehistoricTimer)
+      this.prehistoricTimer = undefined
     }
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer)
@@ -972,7 +1042,7 @@ export class TradeEngineManager {
           prehistoric_data_error: err instanceof Error ? err.message : String(err),
           updated_at: new Date().toISOString(),
         })
-        // ── Error-path phase advance ───────────────────────────────────
+        // ── Error-path phase advance ────────────────────���──────────────
         // Even on prehistoric failure, force the gate open so the engine
         // doesn't appear "stuck at prehistoric_data" forever. The
         // realtime processor's Phase A (TP/SL on open positions) still
@@ -1346,6 +1416,20 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
+      
+      // Check pause state before executing cycle
+      try {
+        const client = getRedisClient()
+        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+        if (globalState && globalState.status === "paused") {
+          // Engine paused - reschedule but skip processing
+          scheduleNext(false)
+          return
+        }
+      } catch (err) {
+        // Ignore Redis errors - continue with cycle
+      }
+      
       const startTime = Date.now()
       // Local abort flag — when true, the finally block will NOT schedule the next cycle.
       let aborted = false
@@ -1375,7 +1459,7 @@ export class TradeEngineManager {
           return
         }
 
-        // ── CHECK: Settings dirty flag and reload if needed ────────────────────────
+        // ── CHECK: Settings dirty flag and reload if needed ──────────────���─────────
         // When user updates connection settings via UI, a dirty flag is set.
         // On the next indication tick, we detect it and clear the flag.
         try {
@@ -1433,33 +1517,73 @@ export class TradeEngineManager {
         // sentinel AND an entry in `failedSymbols` so we can surface
         // partial-coverage telemetry (operator-visible Redis counter +
         // progression-event ledger) instead of silently swallowing it.
+        // ── REALTIME PROGRESSION (per architectural spec) ──────────────
+        // This loop is the **Realtime Progression** — for each symbol it
+        // drives the canonical shared 3-phase pipeline:
+        //   Phase 1: indication evaluation
+        //   Phase 2: pseudo position update/close (ALWAYS)
+        //   Phase 3: strategy evaluation (gated on valid indications)
+        //
+        // The legacy startStrategyProcessor loop is now a no-op (kept
+        // for rearmIfStalled compatibility). All ind+strat work for
+        // realtime mode happens here, in one synchronized cycle per
+        // symbol — guaranteeing the spec's "same intervalled progress
+        // for ind and strat" contract and the "pseudo handling between
+        // indications and strategies" ordering.
         const failedSymbols: { symbol: string; error: string }[] = []
-        const indicationResults = await withCycleDeadline(
+        const pipelineDeps = {
+          indication: this.indicationProcessor,
+          strategy: this.strategyProcessor,
+          realtime: this.realtimeProcessor,
+        }
+        const pipelineResults = await withCycleDeadline(
           mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, (symbol) =>
-            this.indicationProcessor.processIndication(symbol).catch((err) => {
+            runIndStratCycle(this.connectionId, symbol, "realtime", pipelineDeps).catch((err) => {
               const msg = err instanceof Error ? err.message : String(err)
               failedSymbols.push({ symbol, error: msg })
-              console.error(`[v0] [IndicationProcessor] Error for ${symbol}:`, msg)
-              return [] as any[]
+              console.error(`[v0] [RealtimeProgression] Error for ${symbol}:`, msg)
+              return {
+                symbol,
+                mode: "realtime" as const,
+                indicationCount: 0,
+                pseudoUpdates: 0,
+                strategiesEvaluated: 0,
+                liveReady: 0,
+                durationMs: 0,
+                error: msg,
+              }
             }),
           ),
-          `Engine ${this.connectionId} indication`,
+          `Engine ${this.connectionId} realtime-progression`,
         )
 
-        // Comprehensive indication logging with per-type breakdown
+        // Synthesize indication-result shape from the pipeline results
+        // so the existing telemetry block below works unchanged. The
+        // pipeline returns indication counts but not the full indication
+        // objects, so we materialize empty arrays sized to the count —
+        // sufficient for the per-cycle counter writes (count + types are
+        // tracked at the processor level by `saveIndication`).
+        const indicationResults: any[][] = pipelineResults.map((r) =>
+          Array.from({ length: r.indicationCount }, () => ({})),
+        )
         const indicationTypeCounts: Record<string, number> = {}
         const symbolIndicationCounts: Record<string, number> = {}
-        for (let i = 0; i < indicationResults.length; i++) {
-          const arr = indicationResults[i]
-          const symbol = symbols[i]
-          symbolIndicationCounts[symbol] = arr?.length || 0
-          for (const ind of arr) {
-            const t = ind?.type as string
-            if (t) {
-              indicationTypeCounts[t] = (indicationTypeCounts[t] || 0) + 1
-            }
-          }
+        // The underlying processors (IndicationProcessor.processIndication
+        // and StrategyProcessor.processStrategy) write their OWN counters
+        // into the progression hash on every call. The pipeline-level
+        // aggregation here is purely for the optional progress event log
+        // emitted at the tail of this cycle.
+        let pipelineStrategiesEvaluated = 0
+        let pipelineLiveReady = 0
+        let pipelinePseudoUpdates = 0
+        for (let i = 0; i < pipelineResults.length; i++) {
+          const r = pipelineResults[i]
+          symbolIndicationCounts[r.symbol] = r.indicationCount
+          pipelineStrategiesEvaluated += r.strategiesEvaluated
+          pipelineLiveReady += r.liveReady
+          pipelinePseudoUpdates += r.pseudoUpdates
         }
+        void pipelineStrategiesEvaluated; void pipelineLiveReady; void pipelinePseudoUpdates
 
         const totalIndications = indicationResults.reduce((sum: number, arr: any[]) => sum + (arr?.length || 0), 0)
         producedIndications = totalIndications > 0
@@ -1517,6 +1641,17 @@ export class TradeEngineManager {
           const nowMs = Date.now()
           const writes: Promise<any>[] = [
             client.hincrby(redisKey, "indication_cycle_count", 1),
+            // ── Realtime Progression cycle counter (three-progression refactor) ──
+            // The legacy `realtime_cycle_count` field used to be incremented
+            // inside `startRealtimeProcessor`'s per-position loop. That loop
+            // was repurposed into the LivePositions Progression, which writes
+            // its own `live_positions_cycle_count`. The dashboard's
+            // `realtime` / `realtimeLive` tiles still read this field, so we
+            // must keep it updated — and the canonical "realtime cycle" is
+            // now THIS loop (shared ind+pseudo+strat pipeline per symbol).
+            // One hincrby per Realtime Progression cycle matches the legacy
+            // semantics: one cycle = one full per-symbol fan-out.
+            client.hincrby(redisKey, "realtime_cycle_count", 1),
             client.hincrby(redisKey, "frames_processed", 1),
             client.hset(redisKey, "symbols_processed", String(symbols.length)),
             // Continuous "still alive" stamp on the progression hash so
@@ -1688,6 +1823,37 @@ export class TradeEngineManager {
    * progressively up to 1s so the engine stops "spinning" on nothing.
    */
   private startStrategyProcessor(_intervalSeconds: number = 1): void {
+    // ── ARCHITECTURAL CHANGE (three-progression refactor) ────────────────
+    // Strategy evaluation no longer runs as an independent top-level
+    // loop. It is now Phase 3 of the canonical shared ind+strat
+    // pipeline, called per-symbol from inside the Realtime Progression
+    // (which is driven by `startIndicationProcessor` for historical
+    // method-name reasons — see header comment on that method).
+    //
+    // This method is kept as a long-interval heartbeat tick so the
+    // `rearmIfStalled` watchdog continues to see `this.strategyTimer`
+    // armed, and so call sites in startup / error cleanup don't need
+    // to change. The tick body performs no work — it just self-
+    // reschedules every 30 s.
+    const HEARTBEAT_INTERVAL_MS = 30_000
+    const heartbeatTick = () => {
+      if (!this.isRunning) return
+      try {
+        if (this.strategyTimer) unregisterEngineTimer(this.strategyTimer)
+      } catch { /* stale handle is fine */ }
+      // Capture in a local const so TS keeps the non-undefined narrowing
+      // across the property assignment + register call. Reading `this.strategyTimer`
+      // back after assignment widens to `Timeout | undefined` because
+      // control-flow analysis doesn't track property writes through `this`.
+      const t = setTimeout(heartbeatTick, HEARTBEAT_INTERVAL_MS)
+      this.strategyTimer = t
+      registerEngineTimer(t)
+    }
+    heartbeatTick()
+    return
+    // The original loop body below is unreachable — preserved only as
+    // a reference for the legacy behaviour. Safe to delete in a follow-up.
+    // eslint-disable-next-line @typescript-eslint/no-unreachable-code-error
     let cycleCount = 0
     let totalDuration = 0
     let errorCount = 0
@@ -1741,6 +1907,20 @@ export class TradeEngineManager {
 
     const tick = async () => {
       if (!this.isRunning) return
+      
+      // Check pause state before executing cycle
+      try {
+        const client = getRedisClient()
+        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+        if (globalState && globalState.status === "paused") {
+          // Engine paused - reschedule but skip processing
+          scheduleNext(false)
+          return
+        }
+      } catch (err) {
+        // Ignore Redis errors - continue with cycle
+      }
+      
       const startTime = Date.now()
       let producedStrategies = false
 
@@ -1975,9 +2155,14 @@ export class TradeEngineManager {
       }
     }
 
-    // Kick off the first cycle immediately.
-    this.strategyTimer = setTimeout(tick, 0)
-    registerEngineTimer(this.strategyTimer)
+    // Kick off the first cycle immediately. Capture in a local const so
+    // TS keeps the non-undefined narrowing across the property assignment
+    // + register call.
+    {
+      const t = setTimeout(tick, 0)
+      this.strategyTimer = t
+      registerEngineTimer(t)
+    }
   }
 
   /**
@@ -1999,10 +2184,180 @@ export class TradeEngineManager {
    * (max 1s) across consecutive empty cycles.
    */
   private startRealtimeProcessor(_intervalSeconds: number = 1): void {
+    // ── ARCHITECTURAL CHANGE (three-progression refactor) ────────────────
+    // This method NO LONGER runs per-position mark-to-market / TP / SL
+    // (that work is now Phase 2 of the shared ind+strat pipeline, fired
+    // from inside the Realtime Progression via `startIndicationProcessor`).
+    //
+    // Renamed semantically: this is now the **LivePositions Progression**
+    // — the third independent top-level loop, default 200 ms cadence,
+    // driving live exchange-side position sync exclusively:
+    //   - mark-price refresh for open LIVE positions
+    //   - SL/TP cross detection + force-close on missed exchange triggers
+    //   - protection ("control") order placement and healing
+    //   - orphan adoption
+    //   - simulated-position sweep (paper-mode connections)
+    //
+    // Cadence is read live from `settings:system.live_sync_interval_ms`
+    // (default 200 ms) — the same field the old `maybeRunLiveSync` used,
+    // so existing operator configurations Just Work.
     let cycleCount = 0
+    let errorCount = 0
+    let liveSyncInFlight = false
+    let lastSyncCompletedAt = 0
+
+    const tickLivePositions = async () => {
+      if (!this.isRunning) return
+      const cycleStart = Date.now()
+
+      // ── Single-flight guard ─────────────────────────────────────────
+      // A slow exchange REST round-trip can outlast the configured
+      // interval; we MUST NOT queue overlapping syncs (they would race
+      // on the same per-position Redis state).
+      if (liveSyncInFlight) {
+        scheduleNextLive()
+        return
+      }
+
+      // ── Post-completion breath ──────────────────────────────────────
+      // Wait `livePositionsCyclePauseMs` after the previous cycle finished
+      // before the next can start. Mirrors the main progression pause
+      // pattern — gives the event loop room and ensures previous Redis
+      // writes are durable.
+      const timings = getEngineTimings()
+      const cyclePauseMs = timings.livePositionsCyclePauseMs ?? 50
+      if (cycleStart - lastSyncCompletedAt < cyclePauseMs) {
+        scheduleNextLive()
+        return
+      }
+
+      // Pause-state check — when the global coordinator is paused, skip
+      // exchange ops but keep simulated-position sweep running so paper
+      // trades still close locally.
+      let globallyPaused = false
+      try {
+        const client = getRedisClient()
+        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+        globallyPaused = globalState?.status === "paused"
+      } catch { /* ignore */ }
+
+      liveSyncInFlight = true
+      try {
+        // Always run simulated-position sweep first (covers paper-only).
+        try {
+          const { processSimulatedPositions } = await import("./stages/live-stage")
+          await processSimulatedPositions(this.connectionId)
+        } catch (simErr) {
+          console.warn(
+            `[v0] [LivePositions] processSimulatedPositions error:`,
+            simErr instanceof Error ? simErr.message : String(simErr),
+          )
+        }
+
+        if (!globallyPaused) {
+          // Build a connector and call syncWithExchange. Mirrors the
+          // logic previously inside `maybeRunLiveSync` but in a
+          // standalone loop instead of piggybacked on the realtime tick.
+          try {
+            const { getConnection } = await import("@/lib/redis-db")
+            const connection = await getConnection(this.connectionId)
+            if (connection) {
+              const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
+              const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
+              if (apiKey && apiSecret) {
+                const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+                const connector = await createExchangeConnector(connection.exchange, {
+                  apiKey,
+                  apiSecret,
+                  apiType: connection.api_type,
+                  contractType: connection.contract_type,
+                  isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
+                })
+                if (connector) {
+                  const { syncWithExchange } = await import("./stages/live-stage")
+                  await syncWithExchange(this.connectionId, connector)
+                }
+              }
+            }
+          } catch (syncErr) {
+            console.warn(
+              `[v0] [LivePositions] syncWithExchange error for ${this.connectionId}:`,
+              syncErr instanceof Error ? syncErr.message : String(syncErr),
+            )
+          }
+        }
+
+        cycleCount++
+        const duration = Date.now() - cycleStart
+        this.componentHealth.realtime.lastCycleDuration = duration
+        this.componentHealth.realtime.cycleCount = cycleCount
+        this.componentHealth.realtime.successRate =
+          cycleCount > 0 ? ((cycleCount - errorCount) / cycleCount) * 100 : 100
+
+        // Progression hash telemetry — counters proving the LivePositions
+        // loop is alive and cycling at its configured cadence.
+        try {
+          const client = getRedisClient()
+          const progKey = `progression:${this.connectionId}`
+          const nowMs = Date.now()
+          await Promise.all([
+            client.hincrby(progKey, "live_positions_cycle_count", 1),
+            client.hset(progKey, {
+              live_positions_last_cycle_at: String(nowMs),
+              live_positions_last_cycle_ms: String(duration),
+            }),
+            client.hset(`settings:trade_engine_state:${this.connectionId}`, {
+              status: "running",
+              last_processor_heartbeat: String(nowMs),
+              last_live_positions_run: new Date(nowMs).toISOString(),
+            }),
+            client.expire(progKey, 7 * 24 * 60 * 60),
+          ])
+        } catch { /* non-critical */ }
+      } catch (err) {
+        errorCount++
+        this.componentHealth.realtime.errorCount++
+        console.error(
+          `[v0] [LivePositions] Cycle error for ${this.connectionId}:`,
+          err instanceof Error ? err.message : String(err),
+        )
+      } finally {
+        lastSyncCompletedAt = Date.now()
+        liveSyncInFlight = false
+        scheduleNextLive()
+      }
+    }
+
+    const scheduleNextLive = () => {
+      if (!this.isRunning) return
+      try {
+        if (this.realtimeTimer) unregisterEngineTimer(this.realtimeTimer)
+      } catch { /* stale handle is fine */ }
+      const timings = getEngineTimings()
+      // Start-to-start cadence = liveSyncIntervalMs (default 200 ms).
+      // Subtract elapsed work time so a slow cycle doesn't slip cadence.
+      const intervalMs = timings.liveSyncIntervalMs ?? 200
+      this.realtimeTimer = setTimeout(tickLivePositions, intervalMs)
+      registerEngineTimer(this.realtimeTimer)
+    }
+
+    // Kick off the first cycle immediately. See narrowing note in
+    // startStrategyProcessor for why we capture in a local const.
+    {
+      const t = setTimeout(tickLivePositions, 0)
+      this.realtimeTimer = t
+      registerEngineTimer(t)
+    }
+    return
+    // ── Legacy body preserved as unreachable reference ───────────────────
+    // eslint-disable-next-line @typescript-eslint/no-unreachable-code-error
+    let cycleCount_legacy = 0
+    void cycleCount_legacy
+    let cycleCount2 = 0
     let gatedCycles = 0
     let totalDuration = 0
-    let errorCount = 0
+    let errorCount2 = 0
+    void cycleCount2; void gatedCycles; void totalDuration; void errorCount2
 
     const MAX_IDLE_PAUSE_MS = 1000
     // Fast-poll cadence while waiting for prehistoric to finish. Kept
@@ -2195,10 +2550,357 @@ export class TradeEngineManager {
     // report "gated" (prehistoric still running) and re-poll on
     // PREHISTORIC_WAIT_POLL_MS, or run a full cycle if prehistoric is
     // already complete.
-    this.realtimeTimer = setTimeout(tick, 0)
-    
-    // Register timer for cleanup on module reload
-    registerEngineTimer(this.realtimeTimer)
+    // Local-const capture for TS narrowing — see startStrategyProcessor.
+    {
+      const t = setTimeout(tick, 0)
+      this.realtimeTimer = t
+      // Register timer for cleanup on module reload
+      registerEngineTimer(t)
+    }
+  }
+
+  /**
+   * Prehistoric Progression — the first of the three independent top-level
+   * progression loops per the architectural spec.
+   *
+   *   "prehistoric progress by interval of its timeframes (default 1 s) is
+   *    own progress using the unique ind. and strat. progress for calcs
+   *    and filling unique Sets which also getting used for RealTime Progress."
+   *
+   * Continuous, forever, at `prehistoricIntervalMs` (default 1000 ms).
+   * Each cycle:
+   *   1. Compute the look-back window from `prehistoric_range_hours`
+   *      (default 8 h; bounds 1–50 h).
+   *   2. For each symbol (concurrency-capped at `SYMBOL_CONCURRENCY`):
+   *        runIndStratCycle(symbol, "historical", { window })
+   *   3. After the first complete pass, set
+   *        prehistoric:{connId}:done = 1                  (back-compat)
+   *        prehistoric:{connId}:firstpass:done = 1        (new gate)
+   *      so the Realtime Progression can flip from "gated" to active.
+   *
+   * Coordination: writes go to the **historical Set keyspace** owned by
+   * IndicationSetsProcessor + StrategyConfigManager. The Realtime
+   * Progression writes to the live Set keyspace. The two never race.
+   */
+  private prehistoricTimer?: ReturnType<typeof setTimeout>
+
+  /**
+   * Start the Prehistoric Progression loop.
+   *
+   * @param onFirstPassComplete  Fired ONCE, after the very first cycle
+   *   has finished writing the `prehistoric:{connId}:firstpass:done`
+   *   flag. The continuous loop keeps running forever afterward. This
+   *   is the engine-startup gate: the Realtime + LivePositions + Strategy
+   *   loops must NOT start until this callback fires, so the realtime
+   *   pipeline only ever reads Sets that the prehistoric writer has
+   *   already populated. The callback is invoked even if the first cycle
+   *   produced zero successful symbols (it represents "the first pass
+   *   completed" — not "the first pass succeeded") so a connection with
+   *   stale market data still progresses out of bootstrap.
+   *
+   *   For the re-arm / self-heal call site (where the firstpass:done
+   *   flag is already persisted in Redis from the original boot), the
+   *   callback can be omitted — the realtime loop is already running.
+   */
+  private startPrehistoricProgression(
+    onFirstPassComplete?: () => void,
+  ): void {
+    let cycleCount = 0
+    let firstPassDone = false
+    const connId = this.connectionId
+
+    const scheduleNext = () => {
+      if (!this.isRunning) return
+      try {
+        if (this.prehistoricTimer) unregisterEngineTimer(this.prehistoricTimer)
+      } catch { /* stale handle is fine */ }
+      // ── No-pause cadence ──────────────────────────────────────────────
+      // The Prehistoric Progression runs CONTINUOUSLY back-to-back: the
+      // moment a cycle finishes, the next one starts. The `setTimeout(…, 0)`
+      // is NOT a delay — it's a yield to the Node.js event loop so the
+      // other two progressions (Realtime, LivePositions), the WebSocket
+      // handlers, and the API request loop all get a fair tick between
+      // cycles. Removing the yield entirely (e.g. an `await tick()` recursion
+      // or `setImmediate` chain) would starve the event loop and freeze
+      // the dev server / health checks under load.
+      //
+      // The `prehistoricIntervalMs` / `prehistoricCyclePauseMs` settings
+      // are intentionally IGNORED here so operators can't accidentally
+      // reintroduce a pause that would slow historical Set fill — those
+      // fields remain in `engine-timings.ts` for back-compat but are
+      // now no-ops for this loop. The historical Set processor's own
+      // per-timeframe `last_calc_at` gate (in stages/historical-stage)
+      // still throttles redundant recomputation, so back-to-back cycles
+      // don't translate to back-to-back exchange calls.
+      this.prehistoricTimer = setTimeout(tick, 0)
+      registerEngineTimer(this.prehistoricTimer)
+    }
+
+    const tick = async () => {
+      if (!this.isRunning) return
+      const cycleStart = Date.now()
+
+      try {
+        const symbols = await this.getSymbols()
+        if (!symbols || symbols.length === 0) {
+          scheduleNext()
+          return
+        }
+
+        // Resolve the look-back window from settings on each cycle so
+        // operator edits take effect on the next iteration without
+        // restart.
+        const { getAppSettings } = await import("@/lib/redis-db")
+        const appSettings = await getAppSettings().catch(() => ({} as any))
+        const rawHours = Number(
+          appSettings?.prehistoric_range_hours ?? appSettings?.prehistoricRangeHours ?? 8,
+        )
+        const rangeHours = Math.max(1, Math.min(50, Number.isFinite(rawHours) ? rawHours : 8))
+        const windowEndMs = Date.now()
+        const windowStartMs = windowEndMs - rangeHours * 60 * 60 * 1000
+
+        // ── Step A: Bulk-load market data ONCE per cycle ─────────────────
+        // The loader writes the canonical `market_data:{symbol}:candles`
+        // JSON array (1 s bars over the look-back window) plus the `:1s`
+        // envelope. We call it once for the full symbol list, then iterate
+        // the loaded candles in Step B — exactly as the spec demands:
+        // "load marketdata at once for specific range then process by its
+        // timeframe interval."
+        try {
+          const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
+          await loadMarketDataForEngine(symbols)
+        } catch (loadErr) {
+          console.warn(
+            `[v0] [PrehistoricProgression] Market-data load warning:`,
+            loadErr instanceof Error ? loadErr.message : String(loadErr),
+          )
+          // Non-fatal — the per-symbol replay below will log NO DATA and
+          // skip any symbol whose candle key is still empty.
+        }
+
+        // ── Step B: Per-symbol step-by-step replay ───────────────────────
+        // For each symbol, walk the loaded candles from the per-symbol
+        // checkpoint forward at the data's native timeframe interval
+        // (1 s — that's what the loader writes), and call the SAME shared
+        // pipeline the Realtime Progression uses, once per candle, with
+        // `asOfMs` set to that candle's timestamp.
+        //
+        // Cross-cycle checkpointing: `prehistoric:checkpoint:{connId}:{symbol}`
+        // stores the timestamp of the last replayed candle. On the next
+        // cycle we resume from there, so the loop only ever replays NEW
+        // candles (the freshly-loaded tail) — not the entire range every
+        // pass. This makes back-to-back cycles cheap once the catch-up
+        // phase completes.
+        //
+        // Per-cycle safety cap: MAX_REPLAY_STEPS_PER_SYMBOL bounds the
+        // work each symbol can do in one cycle, so a cold start with a
+        // 50-hour range (180 000 candles) doesn't monopolize the event
+        // loop. The remaining candles replay on subsequent cycles.
+        const MAX_REPLAY_STEPS_PER_SYMBOL = 500
+        const client = getRedisClient()
+
+        const replayOneSymbol = async (
+          symbol: string,
+        ): Promise<{ symbol: string; stepsReplayed: number; indications: number; strategies: number; durationMs: number; error?: string }> => {
+          const symStart = Date.now()
+          try {
+            // Load candles for this symbol (the same key the indication
+            // processor's getHistoricalCandles reads).
+            const candlesRaw = await client.get(`market_data:${symbol}:candles`)
+            if (!candlesRaw) {
+              return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
+            }
+            const candles: any[] = JSON.parse(
+              typeof candlesRaw === "string" ? candlesRaw : JSON.stringify(candlesRaw),
+            )
+            if (!Array.isArray(candles) || candles.length === 0) {
+              return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
+            }
+
+            // Resolve resume point. On the very first cycle (no checkpoint)
+            // we start at the configured window's start so we don't skip
+            // backward bars; on subsequent cycles we resume strictly
+            // after the last replayed timestamp.
+            const ckptKey = `prehistoric:checkpoint:${connId}:${symbol}`
+            const ckptRaw = await client.get(ckptKey).catch(() => null)
+            const ckpt = ckptRaw ? Number(ckptRaw) : windowStartMs
+            const resumeFrom = Number.isFinite(ckpt) ? ckpt : windowStartMs
+
+            // Filter to candles strictly newer than the checkpoint AND
+            // within the look-back window. Ascending order is preserved.
+            const pending = candles
+              .filter((c: any) => {
+                const ts = Number(c?.timestamp ?? c?.t ?? 0)
+                return Number.isFinite(ts) && ts > resumeFrom && ts <= windowEndMs
+              })
+              .sort((a: any, b: any) => Number(a?.timestamp ?? 0) - Number(b?.timestamp ?? 0))
+
+            if (pending.length === 0) {
+              return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
+            }
+
+            // Cap per-cycle work so cold starts don't starve the loop.
+            const steps = pending.slice(0, MAX_REPLAY_STEPS_PER_SYMBOL)
+
+            // One shared sets processor for the whole symbol so we don't
+            // pay the per-step allocation tax.
+            const setsProcessor = new IndicationSetsProcessor(connId)
+
+            let indicationsTotal = 0
+            let strategiesTotal = 0
+            let lastReplayedTs = resumeFrom
+
+            for (const candle of steps) {
+              if (!this.isRunning) break
+              const asOfMs = Number(candle?.timestamp ?? candle?.t ?? 0)
+              if (!Number.isFinite(asOfMs)) continue
+
+              // SAME pipeline the Realtime Progression uses — single
+              // source of indication + strategy logic for both modes.
+              const stepResult = await runIndStratCycle(connId, symbol, "historical", {
+                indication: this.indicationProcessor,
+                strategy: this.strategyProcessor,
+                realtime: this.realtimeProcessor,
+                asOfMs,
+                asOfCandle: candle,
+                setsProcessor,
+              })
+              indicationsTotal += stepResult.indicationCount
+              strategiesTotal += stepResult.strategiesEvaluated
+              lastReplayedTs = asOfMs
+            }
+
+            // Persist the new checkpoint so the next cycle resumes at
+            // `lastReplayedTs + 1`. 7-day TTL — long enough to survive
+            // a weekend restart, short enough that a cleared symbol set
+            // self-recovers without manual key cleanup.
+            if (lastReplayedTs > resumeFrom) {
+              await client
+                .set(ckptKey, String(lastReplayedTs), { EX: 7 * 24 * 60 * 60 })
+                .catch(() => { /* non-critical */ })
+            }
+
+            return {
+              symbol,
+              stepsReplayed: steps.length,
+              indications: indicationsTotal,
+              strategies: strategiesTotal,
+              durationMs: Date.now() - symStart,
+            }
+          } catch (err) {
+            return {
+              symbol,
+              stepsReplayed: 0,
+              indications: 0,
+              strategies: 0,
+              durationMs: Date.now() - symStart,
+              error: err instanceof Error ? err.message : String(err),
+            }
+          }
+        }
+
+        const results = await withCycleDeadline(
+          mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, replayOneSymbol),
+          `Engine ${connId} prehistoric-progression`,
+        )
+
+        cycleCount++
+        const duration = Date.now() - cycleStart
+
+        // First-pass done: flip both flags so the gated realtime loop
+        // can become productive. Subsequent cycles re-fill the Sets
+        // continuously as new market data arrives.
+        if (!firstPassDone) {
+          firstPassDone = true
+          try {
+            const client = getRedisClient()
+            await Promise.all([
+              client.set(`prehistoric:${connId}:done`, "1", { EX: 86400 }),
+              client.set(`prehistoric:${connId}:firstpass:done`, "1", { EX: 86400 }),
+            ])
+          } catch { /* non-critical */ }
+          await logProgressionEvent(
+            connId,
+            "prehistoric_progression",
+            "info",
+            `Prehistoric Progression first-pass complete (${symbols.length} symbols, ${duration} ms)`,
+            { cycle: cycleCount, symbols: symbols.length, durationMs: duration },
+          ).catch(() => {})
+
+          // Release the startup gate. Wrapped in try/catch so a buggy
+          // callback can never break the continuous prehistoric loop.
+          if (onFirstPassComplete) {
+            try {
+              onFirstPassComplete()
+            } catch (cbErr) {
+              console.error(
+                `[v0] [PrehistoricProgression] onFirstPassComplete threw:`,
+                cbErr instanceof Error ? cbErr.message : String(cbErr),
+              )
+            }
+          }
+        }
+
+        // Cycle telemetry — surfaces the loop's heartbeat to the dashboard.
+        // Now reports replay-step totals so operators can see real per-cycle
+        // work (e.g. "1 200 steps replayed across 12 symbols, 340 indications,
+        // 18 strategies") instead of an opaque cycle count.
+        const stepsTotal = results.reduce(
+          (acc: number, r: any) => acc + (Number(r?.stepsReplayed) || 0),
+          0,
+        )
+        const indTotal = results.reduce(
+          (acc: number, r: any) => acc + (Number(r?.indications) || 0),
+          0,
+        )
+        const stratTotal = results.reduce(
+          (acc: number, r: any) => acc + (Number(r?.strategies) || 0),
+          0,
+        )
+        const successCount = results.filter((r: any) => r && !r.error).length
+        try {
+          const telemetryClient = getRedisClient()
+          const progKey = `progression:${connId}`
+          const nowMs = Date.now()
+          await Promise.all([
+            telemetryClient.hincrby(progKey, "prehistoric_progression_cycles", 1),
+            telemetryClient.hincrby(progKey, "prehistoric_replay_steps_total", stepsTotal),
+            telemetryClient.hincrby(progKey, "prehistoric_indications_total", indTotal),
+            telemetryClient.hincrby(progKey, "prehistoric_strategies_total", stratTotal),
+            telemetryClient.hset(progKey, {
+              prehistoric_progression_last_cycle_at: String(nowMs),
+              prehistoric_progression_last_cycle_ms: String(duration),
+              prehistoric_progression_last_symbols: String(successCount),
+              prehistoric_progression_last_steps: String(stepsTotal),
+              prehistoric_progression_last_indications: String(indTotal),
+              prehistoric_progression_last_strategies: String(stratTotal),
+            }),
+            telemetryClient.expire(progKey, 7 * 24 * 60 * 60),
+          ])
+        } catch { /* non-critical */ }
+
+        // Throttled cycle log — every 50 cycles to avoid stdout flooding,
+        // plus an unconditional log on cycle 1 and whenever a cycle does
+        // non-trivial work (>0 steps), so operators see catch-up progress
+        // without having to wait for the 50-cycle boundary.
+        if (cycleCount === 1 || cycleCount % 50 === 0 || stepsTotal > 0) {
+          console.log(
+            `[v0] [PrehistoricProgression] cycle=${cycleCount} symbols=${symbols.length} steps=${stepsTotal} indications=${indTotal} strategies=${stratTotal} duration=${duration}ms range=${rangeHours}h`,
+          )
+        }
+      } catch (err) {
+        console.error(
+          `[v0] [PrehistoricProgression] cycle error:`,
+          err instanceof Error ? err.message : String(err),
+        )
+      } finally {
+        scheduleNext()
+      }
+    }
+
+    // Kick off the first cycle immediately.
+    this.prehistoricTimer = setTimeout(tick, 0)
+    registerEngineTimer(this.prehistoricTimer)
   }
 
   /**
@@ -2629,9 +3331,9 @@ export class TradeEngineManager {
     return this.settingsVersion
   }
 
-  // ────────────────────────────────────────────────────────────────────
+  // ───���────────────────────────────────────────────────────────────────
   //  Live settings reload
-  // ────────────────────────────────────────────────────────────────────
+  // ────────────────���───────────────────────────────────────────────────
 
   /**
    * Starts the per-connection settings watcher (3s poll). Cheap: a

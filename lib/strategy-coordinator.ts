@@ -177,7 +177,7 @@ export interface PositionContext {
   lastWins: number
   /** Number of losers among the last N closed */
   lastLosses: number
-  /** Total losers in the lookback window ����� gates DCA recovery variants */
+  /** Total losers in the lookback window ������� gates DCA recovery variants */
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
@@ -273,6 +273,69 @@ export class StrategyCoordinator {
     maxRealSets: 12000,
     pruneStrategy: "hybrid",
   }
+
+  /**
+   * Per-cycle cached coordination settings (axes + variants toggles).
+   * The coordinator loads this from connection settings on each flow and
+   * respects the operator's toggles for position-count axes and categorical
+   * variants (trailing, block, dca, pause). Cached for `_coordinationTtlMs`
+   * (5s) to avoid spamming Redis on every symbol's evaluation.
+   */
+  private _coordinationSettings: {
+    axes: {
+      prev:  { enabled: boolean; maxWindow: number }
+      last:  { enabled: boolean; maxWindow: number }
+      cont:  { enabled: boolean; maxWindow: number }
+      pause: { enabled: boolean; maxWindow: number }
+    }
+    variants: {
+      trailing: boolean
+      block:    boolean
+      dca:      boolean
+      pause:    boolean
+    }
+    /**
+     * Block-strategy live-position × volume-ratio coordination knobs.
+     *
+     * The Block variant fires when the per-symbol open-position count is in
+     * `[1 .. blockMaxStack-1]` and emits ADD-ON entries that scale on TWO
+     * axes simultaneously:
+     *
+     *   1. **Live position count** — each additional open position on the
+     *      symbol multiplies the add-on size by `(1 + (n-1) × ratio)` where
+     *      `n = continuousCount` and `ratio = blockVolumeRatio`. At `n=1`
+     *      the multiplier is 1.0 (no scaling — first add-on uses raw base
+     *      sub-config size). At `n=2` it becomes `(1 + ratio)`.
+     *
+     *   2. **Operator vol-ratio** — `blockVolumeRatio` is the per-position
+     *      additive step (0.25 = +25 % per extra open position). The spec
+     *      default 1.0 mirrors the legacy `applyBlockAdjustment` math in
+     *      `lib/strategies.ts` so existing presets keep their behaviour.
+     *
+     * `blockMaxStack` replaces the magic `< 3` literal that used to live
+     * inside the variant gate; the operator can now widen or narrow the
+     * cap from the Connection Settings dialog without a code change.
+     */
+    blockVolumeRatio: number
+    blockMaxStack:    number
+  } = {
+    axes: {
+      prev:  { enabled: true,  maxWindow: 12 },
+      last:  { enabled: true,  maxWindow: 4  },
+      cont:  { enabled: true,  maxWindow: 8  },
+      pause: { enabled: true,  maxWindow: 8  },
+    },
+    variants: {
+      trailing: true,
+      block:    true, // ← ENABLED by default (per spec)
+      dca:      true,
+      pause:    true,
+    },
+    blockVolumeRatio: 1.0,
+    blockMaxStack:    3,
+  }
+  private _coordinationLoadedAt = 0
+  private readonly _coordinationTtlMs = 5_000
 
   /**
    * Per-cycle snapshot of `pseudo_positions:{conn}:active_config_keys`.
@@ -420,6 +483,82 @@ export class StrategyCoordinator {
     }
   }
 
+  /**
+   * Load coordination settings (axes + variants toggles) from connection settings.
+   *
+   * The operator can toggle each variant (trailing, block, dca, pause) and each
+   * axis (prev, last, cont, pause) via the connection-settings dialog. The
+   * toggles flow here on each strategy-flow cycle and gate which variants are
+   * evaluated and which axis windows are consulted.
+   *
+   * Cached for `_coordinationTtlMs` (5s). Falls back to spec defaults on
+   * error or missing settings so the coordinator always functions even if
+   * the operator never touched the UI.
+   */
+  private async loadCoordinationSettings(): Promise<void> {
+    const now = Date.now()
+    if (now - this._coordinationLoadedAt < this._coordinationTtlMs) return
+    this._coordinationLoadedAt = now
+    try {
+      const { getConnection } = await import("@/lib/redis-db")
+      const conn = await getConnection(this.connectionId)
+      if (!conn) return
+      const raw = (conn as any).connection_settings
+      const settings = typeof raw === "string" ? JSON.parse(raw) : raw || {}
+      const coord = settings.coordination_settings || settings.coordinationSettings
+      if (coord?.axes && coord?.variants) {
+        // Coerce the block ratio + stack to safe numeric bands. Operators
+        // can dial the ratio between 0.25 and 3.0 per add-on (so the worst
+        // case at max-stack 3 caps out at 1 + 2×3 = 7× base sub-config
+        // size — extreme but bounded). Stack is clamped to 2..8 so the
+        // gate predicate (`n >= 1 && n < stack`) always admits at least
+        // one stack level when Block is on.
+        const ratioRaw = Number(
+          coord.blockVolumeRatio ??
+            coord.block_volume_ratio ??
+            coord.variants.blockVolumeRatio ??
+            this._coordinationSettings.blockVolumeRatio,
+        )
+        const ratio = Number.isFinite(ratioRaw)
+          ? Math.min(3.0, Math.max(0.25, ratioRaw))
+          : this._coordinationSettings.blockVolumeRatio
+
+        const stackRaw = Number(
+          coord.blockMaxStack ??
+            coord.block_max_stack ??
+            coord.variants.blockMaxStack ??
+            this._coordinationSettings.blockMaxStack,
+        )
+        const stack = Number.isFinite(stackRaw)
+          ? Math.min(8, Math.max(2, Math.round(stackRaw)))
+          : this._coordinationSettings.blockMaxStack
+
+        // Merge with defaults so a partial UI save doesn't strip toggles.
+        this._coordinationSettings = {
+          axes: {
+            prev:  { ...this._coordinationSettings.axes.prev,  ...coord.axes.prev },
+            last:  { ...this._coordinationSettings.axes.last,  ...coord.axes.last },
+            cont:  { ...this._coordinationSettings.axes.cont,  ...coord.axes.cont },
+            pause: { ...this._coordinationSettings.axes.pause, ...coord.axes.pause },
+          },
+          variants: {
+            trailing: coord.variants.trailing !== false,
+            block:    coord.variants.block    !== false, // default-on per spec
+            dca:      coord.variants.dca      !== false,
+            pause:    coord.variants.pause    !== false,
+          },
+          blockVolumeRatio: ratio,
+          blockMaxStack:    stack,
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[v0] [StrategyCoordinator] loadCoordinationSettings() failed; using defaults`,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
+  }
+
   constructor(connectionId: string, config?: StrategyCoordinatorConfig) {
     this.connectionId = connectionId
     if (config) {
@@ -444,15 +583,16 @@ export class StrategyCoordinator {
     const results: StrategyEvaluation[] = []
 
     try {
-      // ── Hydrate PF thresholds from operator settings ─────────────
-      // 5s TTL inside the loader bounds Redis pressure; slider changes
+      // ── Hydrate PF thresholds + Coordination settings from operator settings ─
+      // 5s TTL inside the loaders bounds Redis pressure; slider/toggle changes
       // in the Settings dialog flow into the engine within ≤5s. We
-      // call this on EVERY entry — both per-symbol and per-batch —
-      // because the TTL cap makes it cheap, and the alternative
-      // (calling it once on engine startup) would require an engine
-      // restart whenever an operator tunes the PF gates. That's not
-      // acceptable for a live-tuning interface.
-      await this.loadAppPFThresholds()
+      // call these on EVERY flow (including per-symbol in batch loops) —
+      // the TTL ensures they become no-ops except for the first symbol
+      // or the first after a 5s quiet period.
+      await Promise.all([
+        this.loadAppPFThresholds(),
+        this.loadCoordinationSettings(),
+      ])
 
       // Fetch the per-cycle position coordination context once. Prehistoric
       // runs use a neutral context (no open positions, no prior outcomes) so
@@ -1193,7 +1333,7 @@ export class StrategyCoordinator {
         }),
       )
 
-      // ── Per-axis Position-Count window counters (cumulative) ──────────
+      // ─�� Per-axis Position-Count window counters (cumulative) ──────────
       //
       // Spec: *"step 1 previous 1-12; Last (of previous) 1-4; continuous
       // 1-8 and Pause 1-8"*. Every Main Set materialised this cycle was
@@ -2510,7 +2650,16 @@ export class StrategyCoordinator {
    * open state to do so cleanly.
    */
   private selectActiveVariants(ctx: PositionContext): Array<ReturnType<StrategyCoordinator["variantProfiles"]>[number]> {
-    return this.variantProfiles().filter((p) => p.gate(ctx))
+    const all = this.variantProfiles()
+    // Filter to only enabled variants per coordination settings. "default"
+    // is always on regardless of toggle (it's the operator's fallback).
+    return all.filter((p) => {
+      const gatePass = p.gate(ctx)
+      if (!gatePass) return false
+      if (p.name === "default") return true
+      const enabled = this._coordinationSettings.variants[p.name]
+      return enabled === true
+    })
   }
 
   /**
@@ -2690,8 +2839,19 @@ export class StrategyCoordinator {
       },
       {
         name: "block",
-        // At least one open position, but don't let block stack indefinitely
-        gate: (c) => c.continuousCount >= 1 && c.continuousCount < 3,
+        // ── Block gate: ≥1 open pos on this symbol, capped by stack ─────
+        //
+        // The cap (`blockMaxStack`) is operator-controlled (defaults to 3
+        // for spec parity). At `n = blockMaxStack` the gate closes —
+        // preventing unbounded add-on stacking on a single symbol.
+        gate: (c) => c.continuousCount >= 1 && c.continuousCount < this._coordinationSettings.blockMaxStack,
+        // ── Block sub-configs ─ size is the *base* multiplier that
+        // `selectActiveVariants` THEN scales by `(1 + (n−1)×ratio)` at
+        // evaluation time so the live position count and the operator's
+        // vol-ratio knob both flow into the emitted Set's
+        // `sizeMultiplier`. Keeping the raw bases here (1.5 / 2.0)
+        // preserves the relative aggression spread between the two
+        // entries; the runtime scaling is additive on top.
         configs: [
           { size: 1.5, leverage: 2, state: "add", pfBias: 1.08, ddtBias: 45 },
           { size: 2.0, leverage: 2, state: "add", pfBias: 1.12, ddtBias: 75 },

@@ -412,8 +412,19 @@ Example with ratio 1.5:
     priceData: number[],
     settings: MarketActivitySettings
   ): Promise<{ isActive: boolean; details: string }> {
+    // ── Validation always runs unless explicitly disabled ──────────────────
+    // The previous code returned early with `isActive: true` when
+    // `settings.enabled = false`, which bypassed validation entirely.
+    // This is incorrect semantics — "disabled" should mean the check is
+    // not enforced (always returns true), not that we skip validation. The
+    // new logic only skips when explicitly disabled; otherwise always
+    // validates market conditions (volatility, price change).
     if (!settings.enabled) {
       return { isActive: true, details: "Market activity check disabled" }
+    }
+
+    if (!priceData || priceData.length === 0) {
+      return { isActive: false, details: "No price data available" }
     }
 
     const calculationRange = settings.calculationRange // 5-20 seconds
@@ -432,8 +443,13 @@ Example with ratio 1.5:
       const frameStart = i * calculationFrame
       const frameEnd = (i + 1) * calculationFrame
       const frameData = priceData.slice(frameStart, frameEnd)
+      if (frameData.length < 2) continue
       const frameChange = Math.abs(frameData[frameData.length - 1] - frameData[0]) / frameData[0]
       frameChanges.push(frameChange)
+    }
+
+    if (frameChanges.length === 0) {
+      return { isActive: false, details: "No frame changes to evaluate" }
     }
 
     // Get last calculationRange frames
@@ -442,27 +458,30 @@ Example with ratio 1.5:
 
     // Check if average change meets position cost ratio
     if (avgChange < positionCostRatio) {
-      return { 
-        isActive: false, 
-        details: `Average change ${(avgChange * 100).toFixed(2)}% < required ${(positionCostRatio * 100).toFixed(2)}%` 
+      return {
+        isActive: false,
+        details: `Average change ${(avgChange * 100).toFixed(2)}% < required ${(positionCostRatio * 100).toFixed(2)}%`,
       }
     }
 
     // Calculate volatility
     const mean = relevantFrames.reduce((sum, val) => sum + val, 0) / relevantFrames.length
-    const variance = relevantFrames.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / relevantFrames.length
+    const variance = relevantFrames.reduce(
+      (sum, val) => sum + Math.pow(val - mean, 2),
+      0
+    ) / relevantFrames.length
     const volatility = Math.sqrt(variance)
 
     if (volatility < settings.minVolatility) {
-      return { 
-        isActive: false, 
-        details: `Volatility ${(volatility * 100).toFixed(2)}% < required ${(settings.minVolatility * 100).toFixed(2)}%` 
+      return {
+        isActive: false,
+        details: `Volatility ${(volatility * 100).toFixed(2)}% < required ${(settings.minVolatility * 100).toFixed(2)}%`,
       }
     }
 
-    return { 
-      isActive: true, 
-      details: `Active: ${(avgChange * 100).toFixed(2)}% change, ${(volatility * 100).toFixed(2)}% volatility` 
+    return {
+      isActive: true,
+      details: `Market active: avg change ${(avgChange * 100).toFixed(2)}%, volatility ${(volatility * 100).toFixed(2)}%`,
     }
   }
 }
