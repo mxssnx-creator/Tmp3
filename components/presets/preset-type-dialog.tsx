@@ -46,7 +46,10 @@ export function PresetTypeDialog({ open, onOpenChange, presetType, onSave }: Pre
   const [timeoutPerIndication, setTimeoutPerIndication] = useState(60)
   const [timeoutAfterPosition, setTimeoutAfterPosition] = useState(300)
 
-  const [trailingEnabled, setTrailingEnabled] = useState(false)
+  // Trailing is on by default for new preset types — the variant is
+  // axis-independent in the coordinator and lifts hit-rate on TP-side
+  // exits, so the operator opts OUT rather than in.
+  const [trailingEnabled, setTrailingEnabled] = useState(true)
 
   const [blockEnabled, setBlockEnabled] = useState(false)
   const [blockOnly, setBlockOnly] = useState(false)
@@ -98,7 +101,10 @@ export function PresetTypeDialog({ open, onOpenChange, presetType, onSave }: Pre
       setMaxPositionsPerRange(presetType.max_positions_per_range || 3)
       setTimeoutPerIndication(presetType.timeout_per_indication || 60)
       setTimeoutAfterPosition(presetType.timeout_after_position || 300)
-      setTrailingEnabled(presetType.trailing_enabled ?? false)
+      // Matches the new-preset default: when an older record didn't
+      // persist `trailing_enabled`, treat it as ON rather than OFF so
+      // the dialog UI agrees with the engine-side default.
+      setTrailingEnabled(presetType.trailing_enabled ?? true)
       setBlockEnabled(presetType.block_enabled ?? false)
       setBlockOnly(presetType.block_only ?? false)
       setDcaEnabled(presetType.dca_enabled ?? false)
