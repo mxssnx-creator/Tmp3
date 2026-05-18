@@ -1763,6 +1763,9 @@ export async function GET(
       //     `live.positions[].mirroredSets` array carries those
       //     equivalent Sets so the UI can render "N Sets → 1 Order".
       openPositions: (() => {
+        const pseudoOpen = Math.max(0, n(progHash.pseudo_positions_created_count))
+        const mainOpen = Math.max(0, n(progHash.main_positions_created_count))
+        const realOpen = Math.max(0, n(progHash.real_positions_created_count))
         const liveOpen = Math.max(
           0,
           n(progHash.live_positions_created_count) -

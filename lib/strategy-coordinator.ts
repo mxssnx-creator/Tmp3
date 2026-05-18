@@ -1848,15 +1848,20 @@ export class StrategyCoordinator {
       await _client.expire(`strategies_active:${this.connectionId}`, 600)
     } catch { /* non-critical */ }
 
-    // `failedEvaluation` counts Base Sets that were rejected by the validation
-    // filter. When a single Base Set produces multiple related variant Sets
-    // (default + trailing + block …) we still want the pass/fail accounting
-    // to reference the unique Base Sets, so derive it from parent lineage.
+    // ── Position count metrics for main stage ──────────────────────
+    // Track entries created at Main stage so dashboard pipeline shows progress
     const uniqueBaseSetsProduced = new Set<string>()
     for (const s of mainSets) uniqueBaseSetsProduced.add(s.parentSetKey ?? s.setKey)
-    const failed = baseSets.length - uniqueBaseSetsProduced.size
     
-    // Count axis Sets by direction for diagnostic logging
+    const mainEntriesTotal = mainSets.reduce((sum, s) => sum + (s.entryCount ?? 0), 0)
+    try {
+      const client = getRedisClient()
+      const progKey = `progression:${this.connectionId}`
+      if (mainEntriesTotal > 0) {
+        await client.hincrby(progKey, "main_positions_created_count", mainEntriesTotal)
+      }
+    } catch { /* non-critical */ }
+
     const axisSetsCount = mainSets.filter(s => s.axisWindows).length
     const axisLong = mainSets.filter(s => s.axisWindows?.direction === "long").length
     const axisShort = mainSets.filter(s => s.axisWindows?.direction === "short").length
@@ -1872,8 +1877,6 @@ export class StrategyCoordinator {
         `ctx={cont=${ctx.continuousCount},lastW=${ctx.lastWins},lastL=${ctx.lastLosses},prevL=${ctx.prevLosses}} ` +
         `| sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}}`
       )
-    } else {
-      console.log(`[v0] [StrategyFlow] ${symbol} MAIN: 0 base sets available`)
     }
 
     return {
@@ -1883,7 +1886,7 @@ export class StrategyCoordinator {
         timestamp: new Date(),
         totalCreated: baseSets.length,
         passedEvaluation: mainSets.length,
-        failedEvaluation: failed,
+        failedEvaluation: baseSets.length - uniqueBaseSetsProduced.size,
         avgProfitFactor: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgProfitFactor, 0) / mainSets.length : 0,
         avgDrawdownTime: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / mainSets.length : 0,
       },
@@ -2367,7 +2370,7 @@ export class StrategyCoordinator {
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
 
-      // ── P1-1: Real-stage per-variant aggregation ────────────────────
+      // ── P1-1: Real-stage per-variant aggregation ───────────���────────
       // Same shape as Main's `variantAgg` but computed over the Real
       // output (post-PF/DDT filter). Lets the stats API answer "how
       // much of Real is Default vs Adjust{Block, DCA} vs Trailing?"
@@ -2515,6 +2518,17 @@ export class StrategyCoordinator {
     console.log(
       `[v0] [StrategyFlow] ${symbol} REAL: ${realSets.length}/${mainSets.length} Sets promoted (minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime})`
     )
+
+    // ── Position count metrics for real stage ──────────────────────
+    // Track entries passing Real filter so dashboard shows promotion success
+    const realEntriesTotal = realSets.reduce((sum, s) => sum + (s.entryCount ?? 0), 0)
+    try {
+      const client = getRedisClient()
+      const progKey = `progression:${this.connectionId}`
+      if (realEntriesTotal > 0) {
+        await client.hincrby(progKey, "real_positions_created_count", realEntriesTotal)
+      }
+    } catch { /* non-critical */ }
 
     return {
       result: {
