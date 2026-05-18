@@ -352,6 +352,25 @@ export class StrategyCoordinator {
      */
     blockVolumeRatio: number
     blockMaxStack:    number
+    /**
+     * ── Stage-validation min-position thresholds (operator spec) ──────
+     *
+     * `mainEvalPosCount` — minimum `entryCount` a Base Set must contain
+     *   before its profitFactor + drawdownTime are evaluated for
+     *   promotion to Main. Below this threshold the Set is SKIPPED at
+     *   Main (not validated, not counted as passed). Range 5..50 step 5,
+     *   default 15.
+     *
+     * `realEvalPosCount` — same semantics for Main → Real. Default 10.
+     *
+     * Skipping (rather than failing) is intentional: low-position Sets
+     * naturally re-enter the validation pool on subsequent cycles once
+     * enough pseudo-positions have closed. This matches the operator's
+     * "if less pos exist in set then do not validate" requirement and
+     * preserves count integrity (no false-negative `passed_sets` writes).
+     */
+    mainEvalPosCount: number
+    realEvalPosCount: number
   } = {
     axes: {
       prev:  { enabled: true,  maxWindow: 12 },
@@ -367,6 +386,8 @@ export class StrategyCoordinator {
     },
     blockVolumeRatio: 1.0,
     blockMaxStack:    3,
+    mainEvalPosCount: 15,
+    realEvalPosCount: 10,
   }
   private _coordinationLoadedAt = 0
   private readonly _coordinationTtlMs = 5_000
@@ -459,22 +480,22 @@ export class StrategyCoordinator {
       description: "One Set per (indication_type × direction) — all qualifying",
     },
     main: {
-      maxDrawdownTime: 180,   // 3 hours — aligned to short-duration trade profile
+      maxDrawdownTime: 300,   // 5 hours — operator spec, validation ceiling at Main
       minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.5,        // advisory only
-      description: "Sets promoted from BASE with profitFactor >= main-threshold + DDT <= 3h",
+      description: "Sets promoted from BASE with profitFactor >= main-threshold + DDT <= 5h, gated by minPositions",
     },
     real: {
-      maxDrawdownTime: 180,   // 3 hours — consistent with MAIN
+      maxDrawdownTime: 300,   // 5 hours — operator spec, validation ceiling at Real
       minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.65,       // advisory only
-      description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= 3h",
+      description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= 5h, gated by minPositions",
     },
     live: {
-      maxDrawdownTime: 180,   // 3 hours — ensures REAL sets flow through to LIVE
+      maxDrawdownTime: 300,   // 5 hours — aligned with Main + Real
       minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.65,       // advisory only
-      description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= 3h) ready for live trading",
+      description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= 5h) ready for live trading",
     },
   }
 
@@ -586,6 +607,31 @@ export class StrategyCoordinator {
           ? Math.min(8, Math.max(2, Math.round(stackRaw)))
           : this._coordinationSettings.blockMaxStack
 
+        // ── Stage-validation min-position counts (operator spec) ─────
+        // 5..50 step 5, defaults 15 (Main) / 10 (Real). Snap to the
+        // 5-step grid so a value typed via API doesn't bypass slider
+        // granularity. Two persistence paths supported:
+        //   1. Nested  coord.{mainEvalPosCount,realEvalPosCount}
+        //   2. Flat    settings.{mainEvalPosCount,realEvalPosCount}
+        //      (top-level mirror written by the dialog for cheap reads)
+        const snapPosCount = (raw: unknown, fallback: number): number => {
+          const n = Number(raw)
+          if (!Number.isFinite(n) || n < 5) return fallback
+          return Math.min(50, Math.max(5, Math.round(n / 5) * 5))
+        }
+        const mainEvalRaw =
+          coord.mainEvalPosCount ??
+          coord.main_eval_pos_count ??
+          (settings as any).mainEvalPosCount ??
+          this._coordinationSettings.mainEvalPosCount
+        const realEvalRaw =
+          coord.realEvalPosCount ??
+          coord.real_eval_pos_count ??
+          (settings as any).realEvalPosCount ??
+          this._coordinationSettings.realEvalPosCount
+        const mainEvalPosCount = snapPosCount(mainEvalRaw, this._coordinationSettings.mainEvalPosCount)
+        const realEvalPosCount = snapPosCount(realEvalRaw, this._coordinationSettings.realEvalPosCount)
+
         // Merge with defaults so a partial UI save doesn't strip toggles.
         this._coordinationSettings = {
           axes: {
@@ -602,6 +648,8 @@ export class StrategyCoordinator {
           },
           blockVolumeRatio: ratio,
           blockMaxStack:    stack,
+          mainEvalPosCount,
+          realEvalPosCount,
         }
       }
     } catch (err) {
@@ -1169,6 +1217,18 @@ export class StrategyCoordinator {
     const ctx = posCtx ?? this.neutralPositionContext()
     const mainSets: StrategySet[] = []
 
+    // ── Stage-validation min-position threshold (operator spec) ────
+    // "Main has to evaluate from stage Base with profitfactor for X
+    //  pre pseudo positions for specific config … if less pos exist
+    //  in set then do not validate."
+    // Sets below the threshold are SKIPPED (silent continue) — they
+    // re-enter the validation pool on subsequent cycles once their
+    // entryCount climbs. Tracked via a single counter so the dashboard
+    // can surface "skipped due to insufficient positions" without
+    // polluting the passed/failed buckets.
+    const mainMinPos = this._coordinationSettings.mainEvalPosCount
+    let skippedLowPos = 0
+
     // ── 1. Fingerprint-cache lookup ────────────────────────────────────────
     // Fetch last cycle's fingerprint map up-front. `fpCacheKey` stores a
     // per-symbol hash of { fingerprint: JSON.stringify(set) } entries. We
@@ -1200,6 +1260,19 @@ export class StrategyCoordinator {
     const defaultByBaseKey = new Map<string, StrategySet>()
 
     for (const baseSet of baseSets) {
+      // ── Min-positions gate (operator spec) ──────────────────────
+      // Skip Sets that don't yet have enough completed pseudo-positions
+      // to support a meaningful PF + DDT validation. Counted but not
+      // passed/failed — these will be re-validated on subsequent cycles
+      // as their entryCount grows. `entryCount` reflects realised
+      // completed positions per the Set spec; Sets with `entries.length`
+      // mismatch fall back to the array length.
+      const setPosCount = baseSet.entryCount ?? baseSet.entries?.length ?? 0
+      if (setPosCount < mainMinPos) {
+        skippedLowPos++
+        continue
+      }
+
       // Base-level validation — P0-2: PF + DDT are the ONLY filter axes.
       // Confidence is advisory metadata (used by Live stage's trailing-
       // variant selector) and is NOT a gate here. A high-PF / low-DDT
@@ -1272,6 +1345,20 @@ export class StrategyCoordinator {
         // maxEntries upstream; we stringify the whole Set for fidelity).
         nextFpCache[fingerprint] = JSON.stringify(built)
       }
+    }
+
+    // ── Log min-pos skip count (diagnostic) ───────────────────────
+    // Surface the number of Base Sets that didn't meet `mainEvalPosCount`
+    // at this cycle so the operator can see when the threshold is
+    // throttling promotion. Non-critical; debug level.
+    if (skippedLowPos > 0) {
+      logProgressionEvent(
+        this.connectionId,
+        "main_stage",
+        "debug",
+        `Main min-pos gate skipped ${skippedLowPos}/${baseSets.length} (threshold=${mainMinPos})`,
+        { symbol, skippedLowPos, threshold: mainMinPos, baseTotal: baseSets.length },
+      ).catch(() => {})
     }
 
     // ── 3. Position-Count Cartesian fan-out (operator spec) ──────────
@@ -1691,9 +1778,31 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.real
 
+    // ── Stage-validation min-position threshold (operator spec) ────
+    // Same semantics as Main: Sets below `realEvalPosCount` are
+    // SKIPPED — they're not validated against PF/DDT and not promoted
+    // to Real. Default 10. Re-evaluated on subsequent cycles once
+    // entryCount accumulates.
+    const realMinPos = this._coordinationSettings.realEvalPosCount
+    const beforePosGate = mainSets.length
+    const mainSetsEligible = mainSets.filter((s) => {
+      const pc = s.entryCount ?? s.entries?.length ?? 0
+      return pc >= realMinPos
+    })
+    const skippedRealLowPos = beforePosGate - mainSetsEligible.length
+    if (skippedRealLowPos > 0) {
+      logProgressionEvent(
+        this.connectionId,
+        "real_stage",
+        "debug",
+        `Real min-pos gate skipped ${skippedRealLowPos}/${beforePosGate} (threshold=${realMinPos})`,
+        { symbol, skippedLowPos: skippedRealLowPos, threshold: realMinPos, mainTotal: beforePosGate },
+      ).catch(() => {})
+    }
+
     // P0-2: Real filter axes are PF-min + DDT-max ONLY. Confidence is
     // advisory metadata and is not part of the filter predicate.
-    const realQualifying = mainSets.filter(
+    const realQualifying = mainSetsEligible.filter(
       (s) =>
         s.avgProfitFactor >= metrics.minProfitFactor &&
         s.avgDrawdownTime <= metrics.maxDrawdownTime,
