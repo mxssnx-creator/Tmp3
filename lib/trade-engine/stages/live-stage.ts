@@ -5365,7 +5365,7 @@ export async function syncLiveFromPseudo(
           const fill = Number(livePos.averageExecutionPrice || livePos.entryPrice || 0)
           if (fill > 0) {
             const liveSide: "long" | "short" =
-              livePos.direction === "short" || livePos.side === "short" ? "short" : "long"
+              livePos.direction === "short" ? "short" : "long"
             // SL distance (percent of fill). For long: fill > stop → positive.
             // For short: stop > fill → positive. Both branches yield a
             // non-negative percent that fits the existing slPct contract
