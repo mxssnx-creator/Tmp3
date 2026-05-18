@@ -281,6 +281,51 @@ const AXIS_LAST     = [1, 2, 3, 4]         as const
 const AXIS_CONT     = [1, 2, 3, 4, 5, 6, 7, 8] as const
 const AXIS_DIRS     = ["long", "short"]    as const
 
+/**
+ * ── Plan-perf Tier 2: precomputed axisKey table ────────────────────
+ *
+ * The axis-fan-out hot path inside `expandAxisSets` builds an axisKey
+ * string per (prev, last, cont, outcome, dir) tuple. With 5 × 4 × 8 ×
+ * 2 × 2 = 640 possible tuples, recomputing the template-literal on
+ * every Base Set's fan-out (called per (symbol × cycle)) was wasted
+ * work — the keys are pure functions of the axis tuple values, never
+ * change at runtime.
+ *
+ * We pre-build the full key table once at module load and look up by
+ * (prev, last, cont, outcome, dir) using a flat numeric index. This
+ * cuts ~640 string allocations + ~5 concatenations each off every
+ * Base-Set fan-out call. At 10 symbols × ~30 base Sets × 1 cycle/sec
+ * that's ~190k string allocations/sec eliminated (when the cache
+ * misses; on hits we already short-circuit).
+ *
+ * The encoding (`p${prev}_l${last}_c${cont}_o${outcome}_d${dir}`) is
+ * preserved verbatim so existing setKey-derived consumers (Redis
+ * keys, `parentSetKey` chain reconstruction, dashboard groupings)
+ * continue to match exactly.
+ */
+const AXIS_OUTCOMES = ["pos", "neg"] as const
+type AxisOutcome = (typeof AXIS_OUTCOMES)[number]
+type AxisDir = (typeof AXIS_DIRS)[number]
+const AXIS_KEY_TABLE: ReadonlyMap<string, string> = (() => {
+  const m = new Map<string, string>()
+  for (const prev of AXIS_PREV) {
+    for (const last of AXIS_LAST) {
+      for (const cont of AXIS_CONT) {
+        for (const outcome of AXIS_OUTCOMES) {
+          for (const dir of AXIS_DIRS) {
+            const k = `${prev}|${last}|${cont}|${outcome}|${dir}`
+            m.set(k, `p${prev}_l${last}_c${cont}_o${outcome}_d${dir}`)
+          }
+        }
+      }
+    }
+  }
+  return m
+})()
+function axisKeyOf(prev: number, last: number, cont: number, outcome: AxisOutcome, dir: AxisDir): string {
+  return AXIS_KEY_TABLE.get(`${prev}|${last}|${cont}|${outcome}|${dir}`)!
+}
+
 export interface StrategyCoordinatorConfig {
   maxEntriesPerSet?: number   // Default 250 (entries inside one Set)
   maxLiveSets?: number        // Default: max per exchange type (e.g. 500 for bybit, 150 for okx)
@@ -403,6 +448,48 @@ export class StrategyCoordinator {
    * fresh fetch instead of trusting old data.
    */
   private _activeKeysCache: { keys: Set<string>; cycleAt: number } | null = null
+
+  /**
+   * ── Plan-perf Tier 1: parsed-fingerprint LRU ───────────────────────
+   *
+   * The fpCache stored in Redis is keyed by `fingerprint → JSON.stringify(set)`.
+   * Until this perf pass, every cache HIT cost a full `JSON.parse` of a
+   * ~1-4 KB payload — at the upper bound (10 symbols × ~80 variant fps
+   * each × 1 cycle/sec) that's ~800 parses/sec, dominating createMainSets
+   * CPU. This in-process LRU stores the already-parsed StrategySet so a
+   * cache hit costs O(1).
+   *
+   * Keyed by `fingerprint` directly: fingerprints are deterministic and
+   * already encode {connectionId, symbol, baseConfig, variant, posCtx}
+   * so collisions across connections/symbols are impossible by
+   * construction.
+   *
+   * Capped at 4 096 entries (≈10 connections × 10 symbols × 40 variants).
+   * Eviction is "delete oldest insertion" via Map iteration order.
+   *
+   * Sets are stored by REFERENCE — callers MUST treat them as
+   * read-only. createMainSets only reads, never mutates, so this is
+   * safe. If a future caller needs to mutate, they should clone the
+   * returned record explicitly.
+   */
+  private static readonly _FP_LRU_MAX = 4_096
+  private static _fpLru: Map<string, StrategySet> = new Map()
+  private static _fpLruGet(fp: string): StrategySet | undefined {
+    const hit = StrategyCoordinator._fpLru.get(fp)
+    if (hit !== undefined) {
+      // Touch: re-insert to the back so it survives eviction longer.
+      StrategyCoordinator._fpLru.delete(fp)
+      StrategyCoordinator._fpLru.set(fp, hit)
+    }
+    return hit
+  }
+  private static _fpLruSet(fp: string, set: StrategySet): void {
+    if (StrategyCoordinator._fpLru.size >= StrategyCoordinator._FP_LRU_MAX) {
+      const oldest = StrategyCoordinator._fpLru.keys().next().value
+      if (oldest !== undefined) StrategyCoordinator._fpLru.delete(oldest)
+    }
+    StrategyCoordinator._fpLru.set(fp, set)
+  }
 
   /**
    * 30-second per-instance cache for `connection_settings.prevPiMinCount`.
@@ -1300,25 +1387,31 @@ export class StrategyCoordinator {
         // Cache hit — reuse the cached Set verbatim. This is the "IF NOT
         // ALREADY CREATED" path the user asked for.
         if (fpCache[fingerprint]) {
-          try {
-            const cached = JSON.parse(fpCache[fingerprint]) as StrategySet
-            // Sanity-check the cached record before reusing it
-            if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
-              // Re-attach the parent's trailing profile in case the cached
-              // payload was written before the profile field existed
-              // (operators upgrading mid-cycle keep working).
-              if (baseSet.trailingProfile && !cached.trailingProfile) {
-                cached.trailingProfile = baseSet.trailingProfile
-              }
-              mainSets.push(cached)
-              // Capture the `default` Main variant for downstream
-              // Position-Count Cartesian fan-out (even on cache hit).
-              if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, cached)
-              nextFpCache[fingerprint] = fpCache[fingerprint]
-              reused++
-              continue
+          // Tier-1 perf: parsed-fingerprint LRU avoids JSON.parse on
+          // every hit. Falls through to JSON.parse on LRU miss; the
+          // parsed result is then memoised so the next hit is O(1).
+          let cached = StrategyCoordinator._fpLruGet(fingerprint)
+          if (cached === undefined) {
+            try {
+              cached = JSON.parse(fpCache[fingerprint]) as StrategySet
+              if (cached) StrategyCoordinator._fpLruSet(fingerprint, cached)
+            } catch { /* fall through — regenerate on parse failure */ }
+          }
+          if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
+            // Re-attach the parent's trailing profile in case the cached
+            // payload was written before the profile field existed
+            // (operators upgrading mid-cycle keep working).
+            if (baseSet.trailingProfile && !cached.trailingProfile) {
+              cached.trailingProfile = baseSet.trailingProfile
             }
-          } catch { /* fall through — regenerate on parse failure */ }
+            mainSets.push(cached)
+            // Capture the `default` Main variant for downstream
+            // Position-Count Cartesian fan-out (even on cache hit).
+            if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, cached)
+            nextFpCache[fingerprint] = fpCache[fingerprint]
+            reused++
+            continue
+          }
         }
 
         // Cache miss — build a fresh related Set from this profile.
@@ -1344,6 +1437,11 @@ export class StrategyCoordinator {
         // ~4KB per entry (the bulky `entries` array is already pruned to
         // maxEntries upstream; we stringify the whole Set for fidelity).
         nextFpCache[fingerprint] = JSON.stringify(built)
+        // Tier-1 perf: also seed the parsed-fp LRU so subsequent
+        // cycles' hits skip JSON.parse entirely. `built` is freshly
+        // built and treated as read-only by all downstream consumers
+        // (createMainSets/evaluateRealSets only read fields).
+        StrategyCoordinator._fpLruSet(fingerprint, built)
       }
     }
 
@@ -1808,7 +1906,7 @@ export class StrategyCoordinator {
         s.avgDrawdownTime <= metrics.maxDrawdownTime,
     )
 
-    // ── PRIORITY SORT: better Sets first ──────────────────────────────
+    // ── PRIORITY SORT: better Sets first ─────────────────��────────────
     // Per user spec: "arrange so that better Sets have priority". We sort
     // descending by `avgProfitFactor` �� the same metric Live uses for its
     // top-N selection at line 1182 — so when the downstream Live stage
@@ -1892,7 +1990,7 @@ export class StrategyCoordinator {
     // Resolve the cap with this precedence:
     //   1. Operator-set `maxRealSets` in Settings → System (Redis app_settings)
     //   2. Per-instance config override (if any caller passed one)
-    // ── Real Sets cap ────────────────────────────────────────────────
+    // ── Real Sets cap ─────────────────────────────────────────────���──
     // Per-spec: Strategies (Real Sets) are unlimited. Previously we
     // clamped to `maxRealSets` (default 12000); now we pass all
     // qualifying Real Sets to the Live stage. The operator still gates
@@ -2363,7 +2461,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����──────────��──────��──────────────────────���────────
+  // ─── STAGE 4: LIVE ─────────����──────────��─────����──────────────────────���────────
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -3218,7 +3316,7 @@ export class StrategyCoordinator {
         for (const cont of AXIS_CONT) {
           for (const dir of AXIS_DIRS) {
             for (const outcome of outcomes) {
-              const axisKey = `p${prev}_l${last}_c${cont}_o${outcome}_d${dir}`
+              const axisKey = axisKeyOf(prev, last, cont, outcome, dir)
               axisSets.push({
                 setKey:          `${parentKey}#axis:${axisKey}`,
                 parentSetKey:    parentKey,

@@ -92,15 +92,54 @@ export function getMaxLeverageForExchange(
  * for non-hot paths — the live stage's `placeLiveOrder` already has
  * the connection in scope and should call `getMaxLeverageForExchange`
  * directly with `connection.exchange` to avoid a redundant lookup.
+ *
+ * ── Perf: 30 s in-memory memo ──────────────────────────────────────
+ * Connections rarely change exchange after creation, so we cache the
+ * resolved leverage for 30 s. The cache is keyed by connectionId and
+ * keeps both successful and SAFE-default results so a transient store
+ * miss doesn't keep hammering Redis. Negative result TTL is shorter
+ * (5 s) so a reconnected connection picks up its real leverage fast.
  */
+type LevCacheEntry = { value: number; expiresAt: number; isFallback: boolean }
+const LEV_CACHE = new Map<string, LevCacheEntry>()
+const LEV_TTL_OK_MS = 30_000
+const LEV_TTL_FALLBACK_MS = 5_000
+
 export async function getMaxLeverageForConnection(
   connectionId: string,
 ): Promise<number> {
+  const now = Date.now()
+  const cached = LEV_CACHE.get(connectionId)
+  if (cached && cached.expiresAt > now) return cached.value
+
   try {
     const { getConnection } = await import("./redis-db")
     const connection = await getConnection(connectionId)
-    return getMaxLeverageForExchange(connection?.exchange)
+    const exchange = connection?.exchange
+    const value = getMaxLeverageForExchange(exchange)
+    const isFallback = !exchange || value === SAFE_DEFAULT_MAX_LEVERAGE
+    LEV_CACHE.set(connectionId, {
+      value,
+      expiresAt: now + (isFallback ? LEV_TTL_FALLBACK_MS : LEV_TTL_OK_MS),
+      isFallback,
+    })
+    return value
   } catch {
+    LEV_CACHE.set(connectionId, {
+      value: SAFE_DEFAULT_MAX_LEVERAGE,
+      expiresAt: now + LEV_TTL_FALLBACK_MS,
+      isFallback: true,
+    })
     return SAFE_DEFAULT_MAX_LEVERAGE
   }
+}
+
+/**
+ * Test-only / settings-change hook to invalidate cached leverage for a
+ * connection (e.g. after the operator edits the predefinition or the
+ * connection is hot-swapped). Pass `undefined` to flush the entire cache.
+ */
+export function invalidateMaxLeverageCache(connectionId?: string): void {
+  if (connectionId === undefined) LEV_CACHE.clear()
+  else LEV_CACHE.delete(connectionId)
 }

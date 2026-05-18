@@ -135,8 +135,22 @@ export function ProgressionLogsDialog({
   useEffect(() => {
     if (!open) return
     loadData()
-    const interval = setInterval(loadData, 2000)
-    return () => clearInterval(interval)
+    // Tier-1 perf: visibility-gated polling. Hidden tab = no fetches.
+    let cancelled = false
+    const interval = setInterval(() => {
+      if (cancelled) return
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return
+      loadData()
+    }, 2000)
+    const onVisibility = () => {
+      if (!cancelled && typeof document !== "undefined" && document.visibilityState === "visible") loadData()
+    }
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisibility)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisibility)
+    }
   }, [open, loadData])
 
   const handleClearLogs = async () => {
