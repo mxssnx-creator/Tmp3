@@ -1848,12 +1848,17 @@ export class StrategyCoordinator {
         // Only count Real Sets whose parent is currently RUNNING (= the
         // "Combined" semantic). All Real Sets contribute to the lifetime
         // "Overall" count regardless of running state.
+        // Compose into the shared `accPipeline` so a 30-Set burst writes
+        // once instead of 30 times — at 10 symbols this drops Real-stage
+        // round-trips by ~10x and is the main reason cycles stay flat
+        // past 4 symbols.
         bumpValidPositions({
           connectionId: this.connectionId,
           symbol,
           indicationType: s.indicationType,
           direction: s.direction,
           isRunningNow: realActiveKeysForVP.has(parentKey),
+          externalPipeline: accPipeline,
         })
       }
       ;(accPipeline as any).exec().catch(() => {})

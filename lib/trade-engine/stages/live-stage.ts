@@ -1474,6 +1474,48 @@ function priceDrifted(current: number | undefined, desired: number): boolean {
  * Returns a boolean indicating whether anything changed (so callers can
  * decide whether to persist the position).
  */
+
+// ── System-close-only flag, micro-cached ─────────────────────────────
+//
+// Reconcile fans out across every live position; without this cache
+// each position would HGETALL `app_settings:*` to read one boolean.
+// 2 s TTL is short enough that operator toggles take visible effect
+// within one reconcile cycle, long enough to collapse a whole burst
+// of position-level calls into one Redis round-trip.
+const SYSTEM_CLOSE_TTL_MS = 2000
+let _systemCloseCacheValue: boolean | null = null
+let _systemCloseCacheAt = 0
+let _systemCloseInflight: Promise<boolean> | null = null
+
+async function getCachedSystemCloseOnly(): Promise<boolean> {
+  const now = Date.now()
+  if (_systemCloseCacheValue !== null && now - _systemCloseCacheAt < SYSTEM_CLOSE_TTL_MS) {
+    return _systemCloseCacheValue
+  }
+  if (_systemCloseInflight) return _systemCloseInflight
+  _systemCloseInflight = (async () => {
+    try {
+      const { getAppSettings } = await import("@/lib/redis-db")
+      const appSettings: any = (await getAppSettings().catch(() => null)) || {}
+      const v =
+        appSettings.useSystemCloseOnly === true ||
+        appSettings.use_system_close_only === true
+      _systemCloseCacheValue = v
+      _systemCloseCacheAt = Date.now()
+      return v
+    } catch {
+      // Fail closed: assume venue control orders (the default) on read
+      // failure rather than incorrectly arming system-close-only mode.
+      _systemCloseCacheValue = false
+      _systemCloseCacheAt = Date.now()
+      return false
+    } finally {
+      _systemCloseInflight = null
+    }
+  })()
+  return _systemCloseInflight
+}
+
 async function updateProtectionOrders(
   connector: any,
   pos: LivePosition,
@@ -1495,13 +1537,19 @@ async function updateProtectionOrders(
   const effectiveQty = pos.executedQuantity > 0 ? pos.executedQuantity : (pos.quantity ?? 0)
   if (effectiveQty <= 0) return result
 
-  // ── System-close-only mode ─────────────────────────────────────────
+  // ── System-close-only mode (cached) ────────────────────────────────
+  // Reconcile fans out across every live position on every tick, so
+  // calling `getAppSettings()` here would issue one HGETALL per
+  // position per tick — at 50 positions × 1 Hz that's 50 round-trips
+  // for a flag that changes only when an operator toggles it in
+  // settings. Cache the boolean for `SYSTEM_CLOSE_TTL_MS` (≈2 s) so
+  // every position in the same reconcile burst reuses one read; the
+  // TTL is short enough that toggling the setting takes effect within
+  // ~2 s of the next tick (well below the operator's perceptual
+  // threshold) and long enough to collapse a whole tick's worth of
+  // reads into one.
   try {
-    const { getAppSettings } = await import("@/lib/redis-db")
-    const appSettings: any = (await getAppSettings().catch(() => null)) || {}
-    const systemCloseOnly =
-      appSettings.useSystemCloseOnly === true ||
-      appSettings.use_system_close_only === true ||
+    const systemCloseOnly = await getCachedSystemCloseOnly() ||
       (pos as any)?.useSystemCloseOnly === true
     if (systemCloseOnly) {
       const cancels: Array<Promise<unknown>> = []
@@ -1586,109 +1634,125 @@ async function updateProtectionOrders(
     (armedQty <= 0 ||
       Math.abs(pos.executedQuantity - armedQty) / Math.max(armedQty, 1e-12) > 0.0025)
 
-  // ── Stop-Loss leg ────────────────────────────────────────────────────
-  if (desiredSl <= 0 && pos.stopLossOrderId) {
-    // SL was turned off — yank the existing order.
-    const cancelled = await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
-    if (cancelled) {
-      pos.stopLossOrderId = undefined
-      pos.stopLossPrice = 0
-      result.changed = true
-    }
-    // Hard cancel failure: keep the recorded id so the next reconcile
-    // pass retries. Resetting it here would orphan the exchange-side
-    // order and produce a phantom unprotected position from our POV.
-  } else if (
-    desiredSl > 0 &&
-    (!pos.stopLossOrderId || priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted)
-  ) {
-    // Cancel-then-replace race: if a cancel fails we must NOT place a
-    // new SL — the old one is still armed on the exchange, and adding a
-    // second reduce-only at a different trigger price creates a window
-    // where a price spike crossing both levels fires both orders before
-    // the second's reduceOnly check rejects it. Treat a definitive
-    // cancel failure as "skip this tick, retry next tick" so reconcile
-    // can re-evaluate with the correct exchange state.
-    let oldGone = true
-    if (pos.stopLossOrderId) {
-      oldGone = await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
-      if (!oldGone) {
-        console.warn(
-          `${LOG_PREFIX} StopLoss cancel failed for ${pos.symbol} — deferring re-place to avoid duplicate reduceOnly`,
-        )
-      }
-    }
-    if (oldGone) {
-      const id = await placeProtectionOrder(
-        connector,
-        pos.symbol,
-        closeSide,
-        effectiveQty,
-        desiredSl,
-        "StopLoss",
-        pos.direction,
-      )
-      // Only treat the leg as "armed at desiredSl" when we actually have
-      // a confirmed order id. Setting `stopLossPrice = desiredSl` on a
-      // failed placement makes the next pass think the level is live
-      // (priceDrifted compares < 0.25%) and skip retry — leaving the
-      // position permanently unprotected.
-      if (id) {
-        pos.stopLossOrderId = id
-        pos.stopLossPrice = desiredSl
-        result.changed = true
-        result.slPlaced = true
-      } else {
+  // ── Stop-Loss + Take-Profit legs: parallelised cancel-then-replace ──
+  //
+  // Latency contract: control orders MUST arm "instantly" — the operator
+  // explicitly called this out. The original implementation processed
+  // SL then TP sequentially, so a fresh promotion paid up to 4 venue
+  // REST round-trips on the critical path (cancel-SL → place-SL →
+  // cancel-TP → place-TP). On a 100 ms RTT venue that's ≈400 ms before
+  // either protection leg is armed. By driving both legs through a
+  // single `Promise.all` we cut that to ≈200 ms — both legs arm in
+  // parallel, and the per-leg cancel-then-replace internal sequence is
+  // preserved (so the duplicate-reduceOnly race the original guard
+  // prevents cannot reappear). Each leg only ever mutates its own
+  // position fields, so there is no cross-leg write contention.
+  const slLeg = (async () => {
+    if (desiredSl <= 0 && pos.stopLossOrderId) {
+      // SL was turned off — yank the existing order. Hard cancel
+      // failures intentionally keep the recorded id so the next
+      // reconcile pass retries; resetting it here would orphan the
+      // exchange-side order and produce a phantom unprotected position
+      // from our POV.
+      const cancelled = await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+      if (cancelled) {
         pos.stopLossOrderId = undefined
-        // Leave pos.stopLossPrice untouched so priceDrifted(0, desired)
-        // forces a retry on the very next tick.
         pos.stopLossPrice = 0
-      }
-    }
-  }
-
-  // ── Take-Profit leg ──────────────────────────────────────────────────
-  if (desiredTp <= 0 && pos.takeProfitOrderId) {
-    const cancelled = await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
-    if (cancelled) {
-      pos.takeProfitOrderId = undefined
-      pos.takeProfitPrice = 0
-      result.changed = true
-    }
-  } else if (
-    desiredTp > 0 &&
-    (!pos.takeProfitOrderId || priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted)
-  ) {
-    let oldGone = true
-    if (pos.takeProfitOrderId) {
-      oldGone = await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
-      if (!oldGone) {
-        console.warn(
-          `${LOG_PREFIX} TakeProfit cancel failed for ${pos.symbol} — deferring re-place to avoid duplicate reduceOnly`,
-        )
-      }
-    }
-    if (oldGone) {
-      const id = await placeProtectionOrder(
-        connector,
-        pos.symbol,
-        closeSide,
-        effectiveQty,
-        desiredTp,
-        "TakeProfit",
-        pos.direction,
-      )
-      if (id) {
-        pos.takeProfitOrderId = id
-        pos.takeProfitPrice = desiredTp
         result.changed = true
-        result.tpPlaced = true
-      } else {
+      }
+    } else if (
+      desiredSl > 0 &&
+      (!pos.stopLossOrderId || priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted)
+    ) {
+      // Cancel-then-replace race: if a cancel fails we must NOT place
+      // a new SL — the old one is still armed on the exchange, and
+      // adding a second reduce-only at a different trigger price
+      // creates a window where a price spike crossing both levels
+      // fires both orders before the second's reduceOnly check
+      // rejects it. Treat a definitive cancel failure as "skip this
+      // tick, retry next tick" so reconcile can re-evaluate.
+      let oldGone = true
+      if (pos.stopLossOrderId) {
+        oldGone = await cancelProtectionOrder(connector, pos.symbol, pos.stopLossOrderId, "StopLoss")
+        if (!oldGone) {
+          console.warn(
+            `${LOG_PREFIX} StopLoss cancel failed for ${pos.symbol} — deferring re-place to avoid duplicate reduceOnly`,
+          )
+        }
+      }
+      if (oldGone) {
+        const id = await placeProtectionOrder(
+          connector,
+          pos.symbol,
+          closeSide,
+          effectiveQty,
+          desiredSl,
+          "StopLoss",
+          pos.direction,
+        )
+        // Only treat the leg as "armed at desiredSl" when we actually
+        // have a confirmed order id. Setting stopLossPrice = desiredSl
+        // on a failed placement would make the next pass think the
+        // level is live (priceDrifted compares < 0.25%) and skip
+        // retry — leaving the position permanently unprotected.
+        if (id) {
+          pos.stopLossOrderId = id
+          pos.stopLossPrice = desiredSl
+          result.changed = true
+          result.slPlaced = true
+        } else {
+          pos.stopLossOrderId = undefined
+          pos.stopLossPrice = 0
+        }
+      }
+    }
+  })()
+
+  const tpLeg = (async () => {
+    if (desiredTp <= 0 && pos.takeProfitOrderId) {
+      const cancelled = await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+      if (cancelled) {
         pos.takeProfitOrderId = undefined
         pos.takeProfitPrice = 0
+        result.changed = true
+      }
+    } else if (
+      desiredTp > 0 &&
+      (!pos.takeProfitOrderId || priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted)
+    ) {
+      let oldGone = true
+      if (pos.takeProfitOrderId) {
+        oldGone = await cancelProtectionOrder(connector, pos.symbol, pos.takeProfitOrderId, "TakeProfit")
+        if (!oldGone) {
+          console.warn(
+            `${LOG_PREFIX} TakeProfit cancel failed for ${pos.symbol} — deferring re-place to avoid duplicate reduceOnly`,
+          )
+        }
+      }
+      if (oldGone) {
+        const id = await placeProtectionOrder(
+          connector,
+          pos.symbol,
+          closeSide,
+          effectiveQty,
+          desiredTp,
+          "TakeProfit",
+          pos.direction,
+        )
+        if (id) {
+          pos.takeProfitOrderId = id
+          pos.takeProfitPrice = desiredTp
+          result.changed = true
+          result.tpPlaced = true
+        } else {
+          pos.takeProfitOrderId = undefined
+          pos.takeProfitPrice = 0
+        }
       }
     }
-  }
+  })()
+
+  await Promise.all([slLeg, tpLeg])
 
   // After (re-)placement record the qty we armed for so the next pass
   // can detect further drift accurately.

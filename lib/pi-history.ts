@@ -349,21 +349,30 @@ export interface ValidPositionsBumpInput {
    */
   isRunningNow: boolean
   delta?: number
+  /**
+   * Optional pipeline to compose into. When provided we add commands
+   * but DO NOT exec — caller is responsible for one combined exec.
+   * This is the path used by the per-cycle Real tuner so a 30-symbol
+   * burst writes once instead of 30 times.
+   */
+  externalPipeline?: ReturnType<ReturnType<typeof getRedisClient>["multi"]>
 }
 
 export function bumpValidPositions(input: ValidPositionsBumpInput): void {
-  const { connectionId, symbol, indicationType, direction, isRunningNow } = input
+  const { connectionId, symbol, indicationType, direction, isRunningNow, externalPipeline } = input
   const delta = input.delta ?? 1
   if (!connectionId || delta <= 0) return
   const k = VALID_POS_KEY(connectionId)
-  const client = getRedisClient().multi()
+  const client = externalPipeline ?? getRedisClient().multi()
   client.hincrby(k, "overall", delta)
   if (isRunningNow) client.hincrby(k, "combined", delta)
   client.hincrby(k, `by_symbol:${symbol || "unknown"}`, delta)
   client.hincrby(k, `by_dir:${direction}`, delta)
   client.hincrby(k, `by_type:${indicationType || "unknown"}`, delta)
   client.expire(k, TTL_SECONDS)
-  ;(client as any).exec().catch(() => {})
+  if (!externalPipeline) {
+    ;(client as any).exec().catch(() => {})
+  }
 }
 
 export interface ValidPositionsSnapshot {
