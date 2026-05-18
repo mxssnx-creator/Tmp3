@@ -164,7 +164,7 @@ export interface StrategyStageTracking {
    * "add to statistics and overviews.. Valid Positions Counts ..
    *  Overall, Combined (Accumulated)."
    *
-   * Maintained by `lib/pi-history.ts::bumpValidPositions`, fired from
+   * Maintained by `lib/pos-history.ts::bumpValidPositions`, fired from
    * `evaluateRealSets` once per Real Set produced.
    *   - overall:  lifetime count of valid Real Sets ever produced
    *   - combined: Sets whose parent Base is currently running (alive)
@@ -178,11 +178,11 @@ export interface StrategyStageTracking {
     byType: Record<string, number>
   }
   /**
-   * Connection-level prev-PI summary so settings panels and dashboard
+   * Connection-level prev-pos summary so settings panels and dashboard
    * tiles can render "what's the engine learning right now" without
    * reading raw redis hashes.
    */
-  prevPi: {
+  prevPos: {
     count: number
     successRate: number
     profitFactor: number
@@ -310,23 +310,28 @@ export async function getStrategyTracking(
   // Axis accumulation at Real stage
   const axisAccumulation = await readAxisAccumulation(client, connectionId)
 
-  // ── Valid Positions + Prev-PI rollup ──
-  // Both are connection-scoped HASHes maintained by `lib/pi-history.ts`.
+  // ── Valid Positions + Prev-pos rollup ──
+  // Both are connection-scoped HASHes maintained by `lib/pos-history.ts`.
   // We resolve them in parallel with the rest of the tracking reads so
   // dashboard refreshes stay one round-trip in the steady state.
-  const { getValidPositions, getPiHistoryOverall } = await import(
-    "@/lib/pi-history",
+  const { getValidPositions, getPosHistoryOverall } = await import(
+    "@/lib/pos-history",
   )
-  const prevPiMinCountSetting = Number(
-    (settings as Record<string, string>).prevPiMinCount || "5",
+  // Backwards-compat: the operator setting key was historically
+  // `prevPiMinCount`. The new code-side name is `prevPosMinCount`. We
+  // accept either to avoid silently losing the operator's tuning when
+  // the rename ships, with the new key taking precedence.
+  const csRecord = settings as Record<string, string>
+  const prevPosMinCountSetting = Number(
+    csRecord.prevPosMinCount || csRecord.prevPiMinCount || "5",
   )
-  const prevPiMinCount =
-    Number.isFinite(prevPiMinCountSetting) && prevPiMinCountSetting > 0
-      ? Math.min(50, Math.floor(prevPiMinCountSetting))
+  const prevPosMinCount =
+    Number.isFinite(prevPosMinCountSetting) && prevPosMinCountSetting > 0
+      ? Math.min(50, Math.floor(prevPosMinCountSetting))
       : 5
-  const [validPositions, prevPi] = await Promise.all([
+  const [validPositions, prevPos] = await Promise.all([
     getValidPositions(connectionId),
-    getPiHistoryOverall(connectionId, prevPiMinCount),
+    getPosHistoryOverall(connectionId, prevPosMinCount),
   ])
 
   // Active sets currently processing (counted across symbols)
@@ -418,13 +423,13 @@ export async function getStrategyTracking(
       cap: Number(settings.maxLiveSets || "500"),
     },
     validPositions,
-    prevPi: {
-      count: prevPi.count,
-      successRate: prevPi.successRate,
-      profitFactor: prevPi.profitFactor,
-      avgDDT: prevPi.avgDDT,
-      minCount: prevPiMinCount,
-      active: prevPi.hasSignal,
+    prevPos: {
+      count: prevPos.count,
+      successRate: prevPos.successRate,
+      profitFactor: prevPos.profitFactor,
+      avgDDT: prevPos.avgDDT,
+      minCount: prevPosMinCount,
+      active: prevPos.hasSignal,
     },
   }
 }

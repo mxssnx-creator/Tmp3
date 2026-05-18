@@ -636,7 +636,7 @@ export class PseudoPositionManager {
       // into the existing close pipeline so the whole transaction stays
       // one round-trip.
       try {
-        const { recordPiClosed } = await import("@/lib/pi-history")
+        const { recordPosClosed } = await import("@/lib/pos-history")
         const indicationType = String(
           position.indication_type ||
           position.signal_source     ||
@@ -657,7 +657,7 @@ export class PseudoPositionManager {
         // with full position duration when there was a drawdown sample,
         // 0 otherwise. Fine for cumulative averages.
         const drawdownMinutes = drawdownPctOrPx > 0 ? positionDurationMin : 0
-        recordPiClosed({
+        recordPosClosed({
           connectionId: this.connectionId,
           symbol: String(position.symbol || ""),
           indicationType,
@@ -666,9 +666,9 @@ export class PseudoPositionManager {
           drawdownMinutes,
           pipeline,
         })
-      } catch (piErr) {
-        // Non-critical; PI history is observability only.
-        console.warn(`[v0] [closePosition] recordPiClosed failed:`, piErr)
+      } catch (posErr) {
+        // Non-critical; pos history is observability only.
+        console.warn(`[v0] [closePosition] recordPosClosed failed:`, posErr)
       }
 
       if (configId) {

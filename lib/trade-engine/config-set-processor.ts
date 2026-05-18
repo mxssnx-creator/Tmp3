@@ -786,17 +786,17 @@ export class ConfigSetProcessor {
   ): Promise<number> {
     if (configs.length === 0) return 0
 
-    // ── Systemwide fix: prehistoric must populate pi_history ───────────
+    // ── Systemwide fix: prehistoric must populate pos_history ───────────
     // The Main/Real min-pos gates (mainEvalPosCount / realEvalPosCount,
-    // default 15/10) read `baseSet.prevPi.count` (sourced from the
-    // pi_history:* hashes) to decide whether a Base Set has enough
+    // default 15/10) read `baseSet.prevPos.count` (sourced from the
+    // pos_history:* hashes) to decide whether a Base Set has enough
     // historic context to be promoted. If this is empty when realtime
     // starts, the gates skip every Set and Main/Real stay 0 forever —
     // the user's "no sets evaluated" symptom.
     //
-    // recordPiClosed() is what populates pi_history. It was previously
+    // recordPosClosed() is what populates pos_history. It was previously
     // only called by the live close path (pseudo-position-manager.ts).
-    // We now mirror every closed prehistoric position into pi_history
+    // We now mirror every closed prehistoric position into pos_history
     // through the same primitive, batched into one Redis pipeline per
     // symbol-config so the round-trip cost stays bounded even when
     // a single config produces hundreds of historic closes.
@@ -804,7 +804,7 @@ export class ConfigSetProcessor {
     // Spec: "Make sure prehistoric progress works completely correct
     //   with created sets data and then start realtime progress, AFTER
     //   prehistoric has finished, fix systemwide."
-    const { recordPiClosed } = await import("@/lib/pi-history")
+    const { recordPosClosed } = await import("@/lib/pos-history")
     const piClient = getRedisClient()
 
     const perConfigCounts = await Promise.all(
@@ -818,11 +818,11 @@ export class ConfigSetProcessor {
             await Promise.all(positions.map((p) => this.strategyManager.addPosition(config.id, p)))
           }
 
-          // ── Mirror closed positions into pi_history (systemwide fix) ──
+          // ── Mirror closed positions into pos_history (systemwide fix) ──
           // Compose every closed historic position into ONE pipeline so
           // the per-config cost is one round-trip regardless of fill
           // count. Open prehistoric tails (the trailing in-position row
-          // emitted at end-of-range) are excluded — recordPiClosed
+          // emitted at end-of-range) are excluded — recordPosClosed
           // semantically means "one closed trade observed", and
           // including open tails would over-count the count/wins/loss
           // accumulators feeding the Main gate.
@@ -834,13 +834,13 @@ export class ConfigSetProcessor {
                 const direction = p.direction === "short" ? "short" : "long"
                 const indicationType = p.indication_type || config.type || "unknown"
                 const resultPct = Number(p.result) || 0
-                // recordPiClosed expects pnl in quote currency. The
+                // recordPosClosed expects pnl in quote currency. The
                 // prehistoric position result is a percentage; we
                 // scale to a unit-equivalent so the pf_num_x1000 /
-                // pf_den_x1000 ratios in pi_history remain meaningful
+                // pf_den_x1000 ratios in pos_history remain meaningful
                 // (they're always read as ratios downstream). Sign
                 // is preserved, magnitude in percentage points.
-                recordPiClosed({
+                recordPosClosed({
                   connectionId: this.connectionId,
                   symbol: p.symbol || symbol,
                   indicationType,
@@ -852,10 +852,10 @@ export class ConfigSetProcessor {
               }
               await (pipeline as any).exec()
             } catch (piErr) {
-              // Non-critical — pi_history is observability/gate metadata.
+              // Non-critical — pos_history is observability/gate metadata.
               // We never let it block the prehistoric run.
               console.warn(
-                `[v0] [ConfigSetProcessor] pi_history mirror failed for ${config.id}:`,
+                `[v0] [ConfigSetProcessor] pos_history mirror failed for ${config.id}:`,
                 piErr instanceof Error ? piErr.message : String(piErr),
               )
             }
@@ -937,7 +937,7 @@ export class ConfigSetProcessor {
             exit_price: currentPrice,
             // Carry direction + indication_type into the in-memory
             // PseudoPosition so the prehistoric write path
-            // (processStrategyConfigs) can populate pi_history with
+            // (processStrategyConfigs) can populate pos_history with
             // the correct (symbol × type × long|short) bucket. The
             // legacy "|"-delimited Set serialization in
             // StrategyConfigManager.serializeEntry intentionally

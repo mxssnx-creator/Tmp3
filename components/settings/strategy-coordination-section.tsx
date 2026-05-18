@@ -75,9 +75,9 @@ export interface CoordinationSettings {
    * fresh boots can produce trades immediately. At/above the threshold
    * the engine engages historic PF min-blend and Real-stage size/leverage
    * tuning. Default 5 = smallest statistically meaningful denominator.
-   * Backed by `connection_settings:{conn}.prevPiMinCount`.
+   * Backed by `connection_settings:{conn}.prevPosMinCount`.
    */
-  prevPiMinCount: number // 1..50, default 5
+  prevPosMinCount: number // 1..50, default 5
 
   /**
    * ── Main-stage validation min position-count ───────────────────────
@@ -114,7 +114,7 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
   },
   blockVolumeRatio: 1.0,
   blockMaxStack:    3,
-  prevPiMinCount:   5,
+  prevPosMinCount:   5,
   mainEvalPosCount: 15,
   realEvalPosCount: 10,
 }
@@ -633,7 +633,7 @@ export function StrategyCoordinationSection({
           <div className="rounded-lg border border-border/60 p-3 space-y-2">
             <div className="flex items-center justify-between gap-3">
               <Label className="text-sm font-semibold">
-                Min closed PIs for blend
+                Min closed positions for blend
               </Label>
               <Badge variant="secondary" className="text-[10px] tabular-nums">
                 default 5
@@ -641,17 +641,17 @@ export function StrategyCoordinationSection({
             </div>
             <div className="flex items-center gap-3 pt-1">
               <Slider
-                value={[value.prevPiMinCount]}
+                value={[value.prevPosMinCount]}
                 min={1}
                 max={50}
                 step={1}
                 onValueChange={(v) =>
-                  onChange({ ...value, prevPiMinCount: v[0] })
+                  onChange({ ...value, prevPosMinCount: v[0] })
                 }
                 className="flex-1"
               />
               <span className="text-xs font-semibold tabular-nums w-8 text-right">
-                {value.prevPiMinCount}
+                {value.prevPosMinCount}
               </span>
             </div>
             <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
