@@ -1974,9 +1974,11 @@ export class StrategyCoordinator {
     type HedgeBucket = { long: StrategySet[]; short: StrategySet[] }
     const hedgeBuckets = new Map<string, HedgeBucket>()
     const passthrough: StrategySet[] = []
+    let axisSetsCounted = 0
     for (const s of realSorted) {
       const dir = s.axisWindows?.direction
       if (!dir || !s.axisWindows) { passthrough.push(s); continue }
+      axisSetsCounted++
       const aw = s.axisWindows
       const outcome = aw.outcome ?? "pos"
       // ── Per-Base hedge isolation (operator spec) ────────────────────
@@ -1992,6 +1994,7 @@ export class StrategyCoordinator {
       if (!b) { b = { long: [], short: [] }; hedgeBuckets.set(bucketKey, b) }
       if (dir === "short") b.short.push(s); else b.long.push(s)
     }
+    console.log(`[v0] [RealStage] ${symbol}: realSorted=${realSorted.length} axisSetsCounted=${axisSetsCounted} passthrough=${passthrough.length}`)
 
     const netted: StrategySet[] = []
     const netTargetWrites: Record<string, string> = {}
@@ -2012,6 +2015,8 @@ export class StrategyCoordinator {
       netCancelled += Math.min(L, S) * 2 + Math.max(0, winnerPool.length - remainder)
       netTargetWrites[bucketKey] = `${winnerDir}:${remainder}`
     }
+
+    console.log(`[v0] [RealStage] ${symbol}: hedgeBuckets=${hedgeBuckets.size} netted=${netted.length} cancelled=${netCancelled}`)
 
     const realPostHedge = [...passthrough, ...netted].sort(
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
@@ -2171,7 +2176,7 @@ export class StrategyCoordinator {
     // reconciliation hook. Documented on `reconcileLivePositions` —
     // direction unchanged & magnitude grew → partial OPEN for Δ; direction
     // unchanged & magnitude shrunk → partial CLOSE lowest-PF; direction
-    // flipped or flat:0 → close all in bucket then optionally re-open.
+    // flipped or flat:0 ��� close all in bucket then optionally re-open.
     if (Object.keys(netTargetWrites).length > 0) {
       try {
         // Inline client — `client` for the broader function is declared
