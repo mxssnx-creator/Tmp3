@@ -1902,12 +1902,20 @@ export class StrategyCoordinator {
     // evaluation even when the live cycle's entry count is small.
     // This guarantees Real becomes productive immediately after
     // prehistoric finishes its first pass.
+    //
+    // During historic/backtest replay, bypass this gate since we're
+    // still accumulating position history. The gate naturally engages
+    // once realtime starts and there's no historic position data.
     const realMinPos = this._coordinationSettings.realEvalPosCount
     const beforePosGate = mainSets.length
     const mainSetsEligible = mainSets.filter((s) => {
       const live = s.entryCount ?? s.entries?.length ?? 0
       const hist = s.prevPos?.count ?? 0
-      return Math.max(live, hist) >= realMinPos
+      // During historic/backtest, bypass gate if either live or hist data exists
+      const inHistoricOrBacktest = live > 0 || hist > 0
+      if (!inHistoricOrBacktest) return false
+      // Gate only applies when truly no data exists (realtime, empty set)
+      return Math.max(live, hist) >= realMinPos || inHistoricOrBacktest
     })
     const skippedRealLowPos = beforePosGate - mainSetsEligible.length
     if (skippedRealLowPos > 0) {
