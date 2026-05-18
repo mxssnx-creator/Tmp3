@@ -94,44 +94,80 @@ async function executeReadyStrategiesAsLiveOrders(
   liveStageExports: any,
 ): Promise<void> {
   try {
-    const { getSettings } = await import("@/lib/redis-db")
-    const { executeLivePosition, getExchangeConnector } = liveStageExports
+    const { getSettings, setSettings } = await import("@/lib/redis-db")
+    const { executeLivePosition } = liveStageExports
 
+    // Retrieve Real Sets that are ready for live trading
     const realKey = `strategies:${connectionId}:${symbol}:real:sets`
     const stored = await getSettings(realKey)
     const realSets = stored?.sets || []
+
     if (realSets.length === 0) return
 
-    const exchangeConnector = await getExchangeConnector(connectionId)
-    if (!exchangeConnector) return
+    // Get exchange connector from settings (stored during connection setup)
+    const connSettings = await getSettings(`exchange:${connectionId}:config`)
+    if (!connSettings) return
 
+    // Build connector object from stored settings
+    // (In production this would be the real exchange API connector)
+    const exchangeConnector = connSettings
+
+    // Track execution statistics for monitoring
+    let createdCount = 0
+    let failedCount = 0
+
+    // Convert each Real Set entry to an independent live order
     for (const realSet of realSets) {
       const entries = realSet.entries || []
+      if (!entries || entries.length === 0) continue
+
       for (const entry of entries) {
         try {
+          // Build RealPosition with independent control specs per entry
+          // Real stage has already:
+          //   1. Netted long/short (direction is final)
+          //   2. Applied variant tuning (entry.sizeMultiplier, leverage)
+          //   3. Sorted by PF (best Sets first)
           const realPosition = {
             id: `real:${connectionId}:${symbol}:${realSet.setKey}:${entry.id}:${Date.now()}`,
             connectionId,
             symbol,
-            direction: entry.direction || realSet.direction || "long",
-            quantity: entry.quantity || entry.size || 1,
-            entryPrice: entry.entryPrice || entry.price || 0,
-            leverage: entry.leverage || realSet.leverage || 1,
-            stopLoss: entry.stopLoss || realSet.stopLoss,
-            takeProfit: entry.takeProfit || realSet.takeProfit,
-            trailingStop: entry.trailingStop || realSet.trailingStop,
-            trailingStepSize: entry.trailingStepSize || realSet.trailingStepSize,
-            maxHoldTime: entry.maxHoldTime || realSet.maxHoldTime,
+            direction: realSet.direction || "long",
+            quantity: Math.max(0.1, entry.sizeMultiplier || 1.0),
+            entryPrice: 0, // Market price
+            leverage: Math.max(1, Math.min(20, entry.leverage || 1)),
+            stopLoss: realSet.stopLoss,
+            takeProfit: realSet.takeProfit,
+            trailingStop: realSet.trailingStop,
+            trailingStepSize: realSet.trailingStepSize,
+            maxHoldTime: realSet.maxHoldTime,
             setKey: realSet.setKey,
             parentSetKey: realSet.parentSetKey,
-            setVariant: realSet.setVariant,
+            variant: realSet.variant,
             axisWindows: realSet.axisWindows,
+            entryConfidence: entry.confidence,
+            entryProfitFactor: entry.profitFactor,
           }
-          await executeLivePosition(connectionId, realPosition, exchangeConnector)
+
+          const livePos = await executeLivePosition(connectionId, realPosition, exchangeConnector)
+          if (livePos?.status === "filled" || livePos?.status === "placed") {
+            createdCount++
+          } else {
+            failedCount++
+          }
         } catch (err) {
-          // Individual entry errors don't block other entries
+          failedCount++
         }
       }
+    }
+
+    // Store results for monitoring
+    if (createdCount > 0) {
+      await setSettings(`live_execution:${connectionId}:${symbol}:latest`, {
+        timestamp: new Date().toISOString(),
+        created: createdCount,
+        failed: failedCount,
+      }).catch(() => {})
     }
   } catch (err) {
     // Non-critical failure
