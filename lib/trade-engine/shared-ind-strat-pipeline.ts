@@ -80,6 +80,62 @@ export interface PipelineDeps {
   asOfMs?: number
   asOfCandle?: any
   setsProcessor?: IndicationSetsProcessor
+  /** Live stage exports — contains executeLivePosition for realtime order placement. */
+  liveStage?: any
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Internal: Convert Real Sets to live orders with independent control specs
+// ────────────────────────────────────────────────────────────────────────────
+
+async function executeReadyStrategiesAsLiveOrders(
+  connectionId: string,
+  symbol: string,
+  liveStageExports: any,
+): Promise<void> {
+  try {
+    const { getSettings } = await import("@/lib/redis-db")
+    const { executeLivePosition, getExchangeConnector } = liveStageExports
+
+    const realKey = `strategies:${connectionId}:${symbol}:real:sets`
+    const stored = await getSettings(realKey)
+    const realSets = stored?.sets || []
+    if (realSets.length === 0) return
+
+    const exchangeConnector = await getExchangeConnector(connectionId)
+    if (!exchangeConnector) return
+
+    for (const realSet of realSets) {
+      const entries = realSet.entries || []
+      for (const entry of entries) {
+        try {
+          const realPosition = {
+            id: `real:${connectionId}:${symbol}:${realSet.setKey}:${entry.id}:${Date.now()}`,
+            connectionId,
+            symbol,
+            direction: entry.direction || realSet.direction || "long",
+            quantity: entry.quantity || entry.size || 1,
+            entryPrice: entry.entryPrice || entry.price || 0,
+            leverage: entry.leverage || realSet.leverage || 1,
+            stopLoss: entry.stopLoss || realSet.stopLoss,
+            takeProfit: entry.takeProfit || realSet.takeProfit,
+            trailingStop: entry.trailingStop || realSet.trailingStop,
+            trailingStepSize: entry.trailingStepSize || realSet.trailingStepSize,
+            maxHoldTime: entry.maxHoldTime || realSet.maxHoldTime,
+            setKey: realSet.setKey,
+            parentSetKey: realSet.parentSetKey,
+            setVariant: realSet.setVariant,
+            axisWindows: realSet.axisWindows,
+          }
+          await executeLivePosition(connectionId, realPosition, exchangeConnector)
+        } catch (err) {
+          // Individual entry errors don't block other entries
+        }
+      }
+    }
+  } catch (err) {
+    // Non-critical failure
+  }
 }
 
 /**
@@ -169,6 +225,18 @@ export async function runIndStratCycle(
         })
       result.strategiesEvaluated = stratResult.strategiesEvaluated || 0
       result.liveReady = stratResult.liveReady || 0
+
+      // ── Phase 4: Execute ready Real Sets as live orders (realtime only) ──
+      if (mode === "realtime" && result.liveReady > 0 && deps?.liveStage) {
+        try {
+          await executeReadyStrategiesAsLiveOrders(connectionId, symbol, deps.liveStage)
+        } catch (err) {
+          console.error(
+            `[v0] [SharedPipeline] Live order execution error:`,
+            err instanceof Error ? err.message : String(err),
+          )
+        }
+      }
     }
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err)

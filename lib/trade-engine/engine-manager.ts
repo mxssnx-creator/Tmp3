@@ -1535,6 +1535,7 @@ export class TradeEngineManager {
           indication: this.indicationProcessor,
           strategy: this.strategyProcessor,
           realtime: this.realtimeProcessor,
+          liveStage: require("./stages/live-stage"),
         }
         const pipelineResults = await withCycleDeadline(
           mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, (symbol) =>
