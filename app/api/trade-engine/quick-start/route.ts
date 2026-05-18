@@ -531,6 +531,19 @@ export async function POST(request: Request) {
             // Wipe progression-accumulator fields and stale prehistoric
             // completion markers (per-connection only — other connections unaffected).
             client.del(`prehistoric:${connectionId}:done`),
+            // ── Cache-marker invalidation (root-cause fix) ────────────────
+            // `prehistoric_loaded:{id}` is the 24-hour "skip prehistoric"
+            // marker engine-manager.ts checks at boot. If we leave it set,
+            // the next engine start hits the cache path, never re-runs the
+            // ConfigSetProcessor one-shot, never simulates closes, never
+            // populates `historic_avg_profit_factor` or `pos_history`, and
+            // immediately stamps `is_complete: 1` — producing the operator-
+            // reported symptoms: "no base PF value, no avg real positions
+            // value, historic progress ending too fast, no sets evaluated,
+            // realtime starting before historic completes". Every QuickStart
+            // press must force a fresh prehistoric run.
+            client.del(`prehistoric_loaded:${connectionId}`),
+            client.del(`prehistoric:${connectionId}:firstpass:done`),
             client.del(`prehistoric:${connectionId}:symbols`), // Clear old processed symbols set
             client.hdel(`prehistoric:${connectionId}`,
               "is_complete",
@@ -539,6 +552,12 @@ export async function POST(request: Request) {
               "candles_loaded",
               "indicators_calculated",
               "total_duration_ms",
+              // Also wipe the historic PF aggregates so a stale cached
+              // value can't leak through to the dashboard between runs.
+              // ConfigSetProcessor recomputes these every prehistoric run.
+              "historic_avg_profit_factor",
+              "historic_avg_profit_factor_count",
+              "historic_avg_profit_factor_at",
             ).catch(() => 0),
             client.hdel(`progression:${connectionId}`,
               "real_active_pos_sum_x100",
