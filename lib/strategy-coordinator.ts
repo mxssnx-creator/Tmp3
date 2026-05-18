@@ -383,6 +383,25 @@ export class StrategyCoordinator {
    */
   private _activeKeysCache: { keys: Set<string>; cycleAt: number } | null = null
 
+  /**
+   * 30-second per-instance cache for `connection_settings.prevPiMinCount`.
+   *
+   * Plan-perf #2: this HGETALL was firing once per (symbol, cycle) inside
+   * `createBaseSets`. At 10 symbols × ~1 cycle/sec that's 10 redundant
+   * full-hash reads/sec for a value that the operator changes through a
+   * settings dialog (i.e. every ~hour at most). Coalesced to a 30-second
+   * lifetime: shared across all symbols on this instance, refreshed
+   * cheaply, and far more responsive than the natural cadence of the
+   * underlying setting.
+   *
+   * Cache holds the *parsed* int (not the raw hash) so the read path is
+   * branch-free. Sentinel `-1` means "not yet loaded" — first read loads
+   * synchronously, subsequent symbol cycles reuse without I/O.
+   */
+  private _prevPiMinCountValue = -1
+  private _prevPiMinCountAt = 0
+  private readonly _prevPiMinCountTtlMs = 30_000
+
   // ── Profit factor thresholds per stage (system-wide defaults) ──────
   //
   // Spec: "Change at Main Trade PF for Base, Main, Real, Live to
@@ -835,13 +854,29 @@ export class StrategyCoordinator {
       // Operator-tunable threshold (Settings → Strategies → Coordination).
       // Read from connection_settings hash; fall back to 5 (≈ statistical
       // smallest meaningful win-rate denominator).
+      //
+      // 30-second per-instance cache: the operator changes this through a
+      // settings dialog, so the natural cadence is ~hourly at fastest. Per-
+      // symbol-per-cycle HGETALLs were costing 10 round-trips/sec at 10
+      // symbols for a value that almost never moves. The settings dirty-
+      // flag broadcast is independent of this cache, so a save still gets
+      // picked up within one realtime tick *of the next refresh window*
+      // — the cap matches the responsiveness of every other settings
+      // value on this code path.
       try {
-        const client = getRedisClient()
-        const cs = (await client.hgetall(
-          `connection_settings:${this.connectionId}`,
-        )) as Record<string, string>
-        const v = Number(cs?.prevPiMinCount || "")
-        if (Number.isFinite(v) && v >= 1) prevPiMinCount = Math.min(50, Math.floor(v))
+        const cachedAge = Date.now() - this._prevPiMinCountAt
+        if (this._prevPiMinCountValue >= 0 && cachedAge < this._prevPiMinCountTtlMs) {
+          prevPiMinCount = this._prevPiMinCountValue
+        } else {
+          const client = getRedisClient()
+          const cs = (await client.hgetall(
+            `connection_settings:${this.connectionId}`,
+          )) as Record<string, string>
+          const v = Number(cs?.prevPiMinCount || "")
+          if (Number.isFinite(v) && v >= 1) prevPiMinCount = Math.min(50, Math.floor(v))
+          this._prevPiMinCountValue = prevPiMinCount
+          this._prevPiMinCountAt = Date.now()
+        }
       } catch { /* default stays */ }
       piMap = await getPiHistoryBatch(this.connectionId, symbol, pairs, prevPiMinCount)
     } catch (piErr) {
