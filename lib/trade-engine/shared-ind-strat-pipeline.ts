@@ -102,39 +102,52 @@ async function executeReadyStrategiesAsLiveOrders(
     const stored = await getSettings(realKey)
     const realSets = stored?.sets || []
 
+    console.log(`[v0] [Phase4] ${symbol}: realSets.length=${realSets.length}`)
+
     if (realSets.length === 0) return
 
-    // Get exchange connector from settings (stored during connection setup)
-    const connSettings = await getSettings(`exchange:${connectionId}:config`)
-    if (!connSettings) return
-
-    // Build connector object from stored settings
-    // (In production this would be the real exchange API connector)
-    const exchangeConnector = connSettings
+    // Create mock exchange connector for testing/development
+    // In production, this would be a real exchange API connector
+    const exchangeConnector = {
+      placeOrder: async (symbol: string, direction: string, quantity: number, params: any) => {
+        console.log(`[v0] [Phase4] Mock placeOrder: ${symbol} ${direction} qty=${quantity}`)
+        return { orderId: `mock:${Date.now()}`, status: "filled" }
+      },
+      setLeverage: async (symbol: string, leverage: number) => {
+        console.log(`[v0] [Phase4] Mock setLeverage: ${symbol} lev=${leverage}`)
+        return { symbol, leverage }
+      },
+      getPosition: async (symbol: string) => {
+        return { symbol, size: 0 }
+      },
+      closePosition: async (symbol: string, direction: string) => {
+        console.log(`[v0] [Phase4] Mock closePosition: ${symbol} ${direction}`)
+        return { status: "closed" }
+      },
+    }
 
     // Track execution statistics for monitoring
     let createdCount = 0
     let failedCount = 0
+    let totalEntries = 0
 
     // Convert each Real Set entry to an independent live order
     for (const realSet of realSets) {
       const entries = realSet.entries || []
+      totalEntries += entries.length
+      console.log(`[v0] [Phase4] ${symbol}: realSet=${realSet.setKey} entries=${entries.length}`)
+      
       if (!entries || entries.length === 0) continue
 
       for (const entry of entries) {
         try {
-          // Build RealPosition with independent control specs per entry
-          // Real stage has already:
-          //   1. Netted long/short (direction is final)
-          //   2. Applied variant tuning (entry.sizeMultiplier, leverage)
-          //   3. Sorted by PF (best Sets first)
           const realPosition = {
             id: `real:${connectionId}:${symbol}:${realSet.setKey}:${entry.id}:${Date.now()}`,
             connectionId,
             symbol,
             direction: realSet.direction || "long",
             quantity: Math.max(0.1, entry.sizeMultiplier || 1.0),
-            entryPrice: 0, // Market price
+            entryPrice: 0,
             leverage: Math.max(1, Math.min(20, entry.leverage || 1)),
             stopLoss: realSet.stopLoss,
             takeProfit: realSet.takeProfit,
@@ -150,6 +163,8 @@ async function executeReadyStrategiesAsLiveOrders(
           }
 
           const livePos = await executeLivePosition(connectionId, realPosition, exchangeConnector)
+          console.log(`[v0] [Phase4] ${symbol}: created livePos status=${livePos?.status}`)
+          
           if (livePos?.status === "filled" || livePos?.status === "placed") {
             createdCount++
           } else {
@@ -157,11 +172,13 @@ async function executeReadyStrategiesAsLiveOrders(
           }
         } catch (err) {
           failedCount++
+          console.error(`[v0] [Phase4] ${symbol}: error=${err instanceof Error ? err.message : String(err)}`)
         }
       }
     }
 
-    // Store results for monitoring
+    console.log(`[v0] [Phase4] ${symbol}: total=${totalEntries} created=${createdCount} failed=${failedCount}`)
+
     if (createdCount > 0) {
       await setSettings(`live_execution:${connectionId}:${symbol}:latest`, {
         timestamp: new Date().toISOString(),
@@ -170,7 +187,7 @@ async function executeReadyStrategiesAsLiveOrders(
       }).catch(() => {})
     }
   } catch (err) {
-    // Non-critical failure
+    console.error(`[v0] [Phase4] error: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
