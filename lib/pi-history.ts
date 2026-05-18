@@ -328,6 +328,66 @@ export async function getRealPiAccumulation(
   }
 }
 
+// ── Per-axis-Set continuous-count ledger (Main "additional Pos-Count Sets") ───
+//
+// Operator spec: "the ongoing continuous count of Pis. To be added,
+// counted onto the new sets". Each Main axis Set (the
+// prev × last × cont × outcome × dir Cartesian fan-out) needs its own
+// rolling count of how many live continuous positions have actually
+// accumulated onto it across cycles. Independent from
+// `real_pi_acc:{conn}` (which is per-Base aggregate) so the dashboard
+// can drill in to a specific axis bucket within a Base.
+//
+// Field key:  `${parentSetKey}|${axisKey}`
+//   - parentSetKey isolates Bases (each Base Set has its own configs)
+//   - axisKey already encodes (prev,last,cont,dir,outcome) tuple
+//
+// HASH per connection with hincrby semantics + sliding 7-day TTL,
+// pipeline-friendly to be batched alongside the Real tuner's
+// existing accumulation pipeline.
+
+/**
+ * Increment per-axis-Set continuous-count accumulation. Designed to be
+ * called once per cycle per surviving axis Set with `delta` set to the
+ * Set's current `entryCount` (= baseEC + min(cont, liveCont)). Composes
+ * into an external pipeline when provided.
+ */
+export function bumpAxisPosAccumulation(
+  connectionId: string,
+  parentSetKey: string,
+  axisKey: string,
+  delta = 1,
+  externalPipeline?: ReturnType<ReturnType<typeof getRedisClient>["multi"]>,
+): void {
+  if (!connectionId || !parentSetKey || !axisKey || delta <= 0) return
+  const key = `axis_pos_acc:${connectionId}`
+  const field = `${parentSetKey}|${axisKey}`
+  const client = externalPipeline ?? getRedisClient().multi()
+  client.hincrby(key, field, delta)
+  client.expire(key, TTL_SECONDS)
+  if (!externalPipeline) {
+    ;(client as any).exec().catch(() => {})
+  }
+}
+
+/** Read full per-axis accumulation map (for the Strategy Pipeline UI). */
+export async function getAxisPosAccumulation(
+  connectionId: string,
+): Promise<Record<string, number>> {
+  try {
+    const client = getRedisClient()
+    const hash = (await client.hgetall(`axis_pos_acc:${connectionId}`)) as Record<
+      string,
+      string
+    >
+    const out: Record<string, number> = {}
+    for (const [k, v] of Object.entries(hash || {})) out[k] = Number(v) || 0
+    return out
+  } catch {
+    return {}
+  }
+}
+
 // ── Valid Positions Counters ───────────────────────────────────────────
 //
 // Separate from PI history: these track LIVE-promoted Sets (positions

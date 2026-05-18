@@ -1495,8 +1495,17 @@ export class StrategyCoordinator {
     let axisSetsAdded = 0
     if (defaultByBaseKey.size > 0) {
       const minPF = metrics.minProfitFactor   // Same gate as Base→Main
+      // Live continuous-count snapshot from the **per-symbol** position
+      // context (continuousCount on `symbolCtx` was already patched to
+      // `ctx.perSymbolOpen[symbol]` at line ~1339). Capping each axis
+      // Set's `entryCount` by this value (inside expandAxisSets) is what
+      // makes the axis fan-out reflect the operator-spec'd "ongoing
+      // continuous count of Pis to be added, counted onto the new sets"
+      // instead of static projections. Per-symbol is correct because
+      // axis Sets and their hedge bucketing are scoped to one symbol.
+      const liveCont = symbolCtx?.continuousCount ?? 0
       for (const defaultSet of defaultByBaseKey.values()) {
-        const expanded = this.expandAxisSets(defaultSet, minPF)
+        const expanded = this.expandAxisSets(defaultSet, minPF, liveCont)
         for (const axisSet of expanded) {
           mainSets.push(axisSet)
           axisSetsAdded++
@@ -1507,10 +1516,11 @@ export class StrategyCoordinator {
         // has been projected into the operator-spec'd Cartesian product
         // (prev × last × cont × direction). This is the "additional Sets"
         // creation per the strategy flow spec.
-        logProgressionEvent(this.connectionId, "main_stage", "debug", `Axis fan-out: +${axisSetsAdded}`, {
+        logProgressionEvent(this.connectionId, "main_stage", "debug", `Axis fan-out: +${axisSetsAdded} liveCont=${liveCont}`, {
           symbol,
           axisSets: axisSetsAdded,
           defaults: defaultByBaseKey.size,
+          liveCont,
         }).catch(() => {}) // non-critical
       }
     }
@@ -1974,7 +1984,15 @@ export class StrategyCoordinator {
       if (!dir || !s.axisWindows) { passthrough.push(s); continue }
       const aw = s.axisWindows
       const outcome = aw.outcome ?? "pos"
-      const bucketKey = `${symbol}|${s.indicationType}|p${aw.prev}|l${aw.last}|c${aw.cont}|o${outcome}`
+      // ── Per-Base hedge isolation (operator spec) ────────────────────
+      // Spec: "long, short hedge based on Base sets with INDEPENDENT
+      // configs". Bucket identity must be per-parent-Base so axis Sets
+      // from different Base configs do NOT cancel each other. Without
+      // the parentSetKey prefix, two long axis Sets from Base A and an
+      // unrelated short axis Set from Base B (sharing the same axis
+      // tuple) would netting to 1 long survivor — which is wrong.
+      const parentKey = s.parentSetKey ?? s.setKey.split("#")[0]
+      const bucketKey = `${parentKey}|${symbol}|${s.indicationType}|p${aw.prev}|l${aw.last}|c${aw.cont}|o${outcome}`
       let b = hedgeBuckets.get(bucketKey)
       if (!b) { b = { long: [], short: [] }; hedgeBuckets.set(bucketKey, b) }
       if (dir === "short") b.short.push(s); else b.long.push(s)
@@ -2045,7 +2063,7 @@ export class StrategyCoordinator {
     // is incremented for every Real Set produced — that's the dashboard
     // accumulation column.
     try {
-      const { bumpRealPiAccumulation, bumpValidPositions } = await import(
+      const { bumpRealPiAccumulation, bumpValidPositions, bumpAxisPosAccumulation } = await import(
         "@/lib/pi-history",
       )
       const realActiveKeysForVP = await (async () => {
@@ -2062,6 +2080,27 @@ export class StrategyCoordinator {
       for (const s of realSets) {
         const parentKey = s.parentSetKey || s.setKey.split("#")[0]
         bumpRealPiAccumulation(this.connectionId, parentKey, 1, accPipeline)
+
+        // ── Per-axis-Set continuous-count ledger (operator spec) ─────
+        // For axis Sets (the prev × last × cont × outcome × dir
+        // Cartesian fan-out at Main), record the rolling continuous
+        // count of Pis that have actually accumulated onto this axis
+        // bucket. Increment by `s.entryCount` (= baseEC + min(cont,
+        // liveCont) from expandAxisSets) so the ledger is the
+        // continuous-count rolling sum across cycles — exactly the
+        // metric the operator described as "ongoing continuous count
+        // of Pis to be added, counted onto the new sets". Pipelined
+        // alongside the existing accumulation writes for zero added
+        // round-trips.
+        if (s.axisWindows?.axisKey && s.entryCount > 0) {
+          bumpAxisPosAccumulation(
+            this.connectionId,
+            parentKey,
+            s.axisWindows.axisKey,
+            s.entryCount,
+            accPipeline,
+          )
+        }
 
         // ── Variant tuning ──
         // Block (size scaling) / DCA (leverage cap & DDT bias proxy) /
@@ -3302,6 +3341,7 @@ export class StrategyCoordinator {
   private expandAxisSets(
     baseDefault: StrategySet,
     minPF: number,
+    liveCont = 0,
   ): StrategySet[] {
     const axisSets: StrategySet[] = []
     const baseEC = baseDefault.entryCount || 0
@@ -3310,6 +3350,18 @@ export class StrategyCoordinator {
     // Parent baseKey (strip any prior `#variant` / `#axis:*` suffixes)
     // so `parentSetKey` always points at the originating Base Set.
     const parentKey = baseDefault.parentSetKey || baseDefault.setKey.split("#")[0]
+
+    // ── Inherited quality fields used for the synthetic representative entry ─
+    // The Real-stage tuner walks `set.entries` to mutate sizeMultiplier /
+    // leverage per-cycle. Axis Sets used to ship empty `entries: []`,
+    // making the tuner a no-op and the variant aggregates count zero.
+    // Per spec ("ongoing continuous count of Pis to be added, counted
+    // onto the new sets") each axis Set gets ONE faithful pos-coord
+    // projection inherited from the parent Base default — flagged with
+    // `#axis-synth` so downstream consumers can recognise it.
+    const inheritedPF   = baseDefault.avgProfitFactor ?? 1
+    const inheritedDDT  = baseDefault.avgDrawdownTime ?? 0
+    const inheritedConf = baseDefault.avgConfidence   ?? 0
 
     for (const prev of AXIS_PREV) {
       // ── prev FILTER (PF gate on last `prev` completed entries) ─────
@@ -3342,6 +3394,36 @@ export class StrategyCoordinator {
           for (const dir of AXIS_DIRS) {
             for (const outcome of outcomes) {
               const axisKey = axisKeyOf(prev, last, cont, outcome, dir)
+
+              // ── Live continuous-count cap (operator spec) ──────────
+              // The `cont` axis dimension represents "actual + next N-1
+              // positions to accumulate". Per spec we only credit
+              // positions that ACTUALLY exist live this cycle. Cap by
+              // `liveCont` so axis Sets reflect the rolling continuous
+              // count, not a static projection that would over-count
+              // empty slots. Worst case (liveCont = 0) collapses to
+              // `entryCount = baseEC`, growing as positions accrue.
+              const credited = Math.min(cont, Math.max(0, liveCont))
+              const ec = baseEC + credited
+
+              // ── Synthetic representative entry ─────────────────────
+              // One entry per axis Set so:
+              //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
+              //   • Real-stage tuner has something to mutate
+              //   • per-axis Pos-acc ledger has a non-zero delta to record
+              // Quality fields are inherited from the Base default's
+              // realised-history aggregates; positionState carries the
+              // axis tuple so the dashboard can drill in.
+              const synthEntry: StrategySetEntry = {
+                id: `${parentKey}#axis:${axisKey}#axis-synth`,
+                sizeMultiplier: 1,
+                leverage: 1,
+                positionState: `axis:p${prev}|l${last}|c${cont}|${outcome}|${dir}`,
+                profitFactor: inheritedPF,
+                drawdownTime: inheritedDDT,
+                confidence: inheritedConf,
+              }
+
               axisSets.push({
                 setKey:          `${parentKey}#axis:${axisKey}`,
                 parentSetKey:    parentKey,
@@ -3350,19 +3432,16 @@ export class StrategyCoordinator {
                 // Direction is fan-out axis (Cartesian), not inherited.
                 direction:       dir,
                 // Inherited quality fields — axis Sets do not re-evaluate.
-                avgProfitFactor: baseDefault.avgProfitFactor,
-                avgConfidence:   baseDefault.avgConfidence,
-                avgDrawdownTime: baseDefault.avgDrawdownTime,
+                avgProfitFactor: inheritedPF,
+                avgConfidence:   inheritedConf,
+                avgDrawdownTime: inheritedDDT,
                 // Position-count contribution per spec:
                 //   baseEC = parent's COMPLETED historic entry count.
-                //   cont   = OPEN positions to accumulate into this Set
-                //            (the "actual" currently-open one + cont-1
-                //            future ones to be opened across intervals).
-                // Example: continuous=3 ⇒ "add actual and next 2 positions"
-                // ⇒ axis Set's entryCount = baseEC + 3.
-                entryCount:      baseEC + cont,
-                // Empty entries — axis Sets are pure-metadata projections.
-                entries:         [],
+                //   credited = OPEN positions actually accumulated onto
+                //              this Set right now (cap min(cont, liveCont)).
+                entryCount:      ec,
+                // ONE synthetic representative entry — see comment above.
+                entries:         [synthEntry],
                 createdAt:       new Date().toISOString(),
                 axisWindows: {
                   prev,
