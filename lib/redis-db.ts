@@ -199,17 +199,6 @@ export class InlineLocalRedis {
   }
 
   async loadFromDisk(): Promise<boolean> {
-    // ── Safety guard: don't reload snapshot if engine is running ──
-    // In Next.js dev mode, module reloads spawn multiple workers. Each worker
-    // calls initRedis() → loadFromDisk(). If we reload the snapshot while an
-    // engine is running in THIS process, the stale lock value from disk
-    // overwrites the live lock token, causing "ownership loss" and engine crash.
-    const globalCtx = globalThis as any
-    if (globalCtx.__engine_manager_instance?.isEngineRunning) {
-      console.log(`[v0] [Redis Persistence] Skipping reload: engine running in this process`)
-      return false
-    }
-    
     const target = await this.resolveSnapshotPath()
     if (!target) return false
     // Bare specifier — see comment in `resolveSnapshotPath`. Type alias
