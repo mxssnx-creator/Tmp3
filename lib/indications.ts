@@ -150,8 +150,14 @@ export class IndicationEngine {
     const positions: PseudoPosition[] = []
     const positionCost = await this.getPositionCost()
 
+    // Stop-loss grid: operator-spec extension to 3.0 with step 0.25.
+    // Coarser-but-wider sweep (12 values vs the legacy 0.2..2.2/0.1 = 21):
+    // covers the previously-uncovered 2.25..3.0 SL band where wide-stop
+    // / illiquid-pair / news-volatility setups end up sitting, while
+    // still giving the strategy fan-out enough granularity inside the
+    // tight band. The 250-position cap below remains in force.
     for (let tpFactor = 2; tpFactor <= 22; tpFactor++) {
-      for (let slRatio = 0.2; slRatio <= 2.2; slRatio += 0.1) {
+      for (let slRatio = 0.25; slRatio <= 3.0 + 1e-9; slRatio += 0.25) {
         positions.push(
           this.createPseudoPosition(symbol, entryPrice, tpFactor, slRatio, false, positionCost, config.type),
         )

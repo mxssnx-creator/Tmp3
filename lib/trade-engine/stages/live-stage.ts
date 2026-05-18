@@ -5321,8 +5321,28 @@ export async function syncLiveFromPseudo(
     if (!Number.isFinite(rawSL) && !Number.isFinite(rawTP)) return
 
     // Ratio (< 1) → percent; already-percent (≥ 1) → keep as-is.
-    const slPct = Number.isFinite(rawSL) ? (Math.abs(rawSL) < 1 ? rawSL * 100 : rawSL) : undefined
+    let slPct = Number.isFinite(rawSL) ? (Math.abs(rawSL) < 1 ? rawSL * 100 : rawSL) : undefined
     const tpPct = Number.isFinite(rawTP) ? (Math.abs(rawTP) < 1 ? rawTP * 100 : rawTP) : undefined
+
+    // ── Trailing-aware SL pull-through ──────────────────────────────
+    // When the pseudo's trailing-stop machine is ARMED (multi-step
+    // `trailing_active=1` or legacy `trailing_stop_price>0`), the
+    // effective stop level is no longer `stoploss_ratio × fillPrice`
+    // — it's the ratcheted `trailing_stop_price`. Pulling the static
+    // ratio through here would cause every trailing tick to fight
+    // against itself, repeatedly resetting the live SL back to the
+    // origin level. Convert the active trailing stop price into a
+    // live-position-relative percentage by anchoring it to the LIVE
+    // position's actual fill price (entry-side). The percent space
+    // is what `recalculateAndApplySLTP` consumes.
+    const trailingActive =
+      pseudoPos?.trailing_active === "1" ||
+      pseudoPos?.trailing_active === true ||
+      (() => {
+        const ts = parseFloat(String(pseudoPos?.trailing_stop_price || "0"))
+        return Number.isFinite(ts) && ts > 0
+      })()
+    const trailingStopPrice = parseFloat(String(pseudoPos?.trailing_stop_price || "0"))
 
     const livePositions = await getLivePositions(connectionId)
     const matches = livePositions.filter((p: any) => {
@@ -5334,8 +5354,39 @@ export async function syncLiveFromPseudo(
 
     for (const livePos of matches) {
       try {
+        // Translate trailing_stop_price → percent relative to THIS
+        // live position's confirmed fill. Each live position can have
+        // its own fill price (cost-averaging, partial fills) so we
+        // can't pre-compute once — the percent must be derived
+        // per-position. If trailing is active and the price is sane,
+        // use it; otherwise fall back to the static SL ratio.
+        let effectiveSlPct = slPct
+        if (trailingActive && trailingStopPrice > 0) {
+          const fill = Number(livePos.averageExecutionPrice || livePos.entryPrice || 0)
+          if (fill > 0) {
+            const liveSide: "long" | "short" =
+              livePos.direction === "short" || livePos.side === "short" ? "short" : "long"
+            // SL distance (percent of fill). For long: fill > stop → positive.
+            // For short: stop > fill → positive. Both branches yield a
+            // non-negative percent that fits the existing slPct contract
+            // (positive number = "stop X% adverse from entry").
+            const distPct =
+              liveSide === "long"
+                ? ((fill - trailingStopPrice) / fill) * 100
+                : ((trailingStopPrice - fill) / fill) * 100
+            // Guard against degenerate cases — a stored stop that's
+            // already on the wrong side of the fill (shouldn't happen,
+            // but a precision-loss snapshot could trigger it) would
+            // arm an unprotected position. In that case fall back to
+            // the static ratio so we don't widen the stop.
+            if (Number.isFinite(distPct) && distPct > 0) {
+              effectiveSlPct = distPct
+            }
+          }
+        }
+
         await recalculateAndApplySLTP(connectionId, livePos.id, exchangeConnector, {
-          stopLossPct: slPct,
+          stopLossPct: effectiveSlPct,
           takeProfitPct: tpPct,
         })
       } catch (err) {
