@@ -3980,8 +3980,26 @@ export async function reconcileLivePositions(
     // `null` means "skip verification this tick"; the next tick retries.
     const liveOrderIds = await fetchLiveOrderIdSet(exchangeConnector)
 
-    for (const pos of openPositions) {
-      summary.reconciled++
+    // ── Per-position worker (parallelisable) ─────────────────────────
+    // Each iteration is independent at the venue + Redis layer:
+    //   • Redis writes are scoped to `live:positions:{conn}:{id}` and
+    //     the per-symbol-direction lock key — no two positions share
+    //     them.
+    //   • Exchange calls are per-(symbol, direction) and the venue
+    //     serialises its own per-symbol writes.
+    //   • The idempotent `moved:{id}` marker prevents the close-counter
+    //     drift the operator reported even under interleaved execution.
+    // So we can fan the loop body out with bounded concurrency. Returns
+    // a tiny per-position delta that the caller folds into `summary`.
+    type PosDelta = {
+      reconciled: number
+      updated: number
+      closed: number
+      errors: number
+      protectionRearmed: number
+    }
+    const processOne = async (pos: typeof openPositions[number]): Promise<PosDelta> => {
+      const delta: PosDelta = { reconciled: 1, updated: 0, closed: 0, errors: 0, protectionRearmed: 0 }
       try {
         const mapKey = `${normSym(pos.symbol)}|${pos.direction}`
         const exPos = exchangeMap.get(mapKey)
@@ -4001,20 +4019,8 @@ export async function reconcileLivePositions(
           pos.updatedAt = Date.now()
 
           // ── Entry-order fill detection (reconcile path) ───────────────
-          // Two-layer detection so a position is never stuck as "placed"
-          // even when getOrder() lags or returns a stale status:
-          //
-          // Layer 1 — Exchange position present in exchangeMap: The
-          //   exchange returned this symbol+direction in getPositions(),
-          //   which is definitive proof the entry filled. Sync qty/price
-          //   from the exchange position data directly without needing getOrder().
-          //
-          // Layer 2 — getOrder() polling: Confirms via the order status
-          //   and provides more precise filledQty/avgPrice. Also handles
-          //   the rejected/cancelled case so stale records are cleaned up.
           let justFilled = false
           if (pos.status === "placed") {
-            // Layer 1: exchange position proves fill — use it directly.
             const exSize  = parseFloat(String(exPos.size ?? exPos.positionAmt ?? exPos.quantity ?? "0")) || 0
             const exEntry = parseFloat(String(exPos.entryPrice ?? exPos.avgPrice ?? exPos.markPrice ?? "0")) || 0
             if (exSize > 0) {
@@ -4030,14 +4036,12 @@ export async function reconcileLivePositions(
               await incrementOrdersBySymbol(connectionId, pos.symbol, pos.direction, "filled")
             }
 
-            // Layer 2: try getOrder() for more precise data and to catch rejections.
             if (pos.orderId) {
               try {
                 const order = await exchangeConnector.getOrder(pos.symbol, pos.orderId)
                 const statusLower = String(order?.status ?? "").toLowerCase()
                 const orderFilledQty = parseFloat(String(order?.filledQty ?? order?.executedQty ?? "0")) || 0
                 if (order && (statusLower === "filled" || statusLower === "partially_filled" || orderFilledQty > 0)) {
-                  // Prefer getOrder data (more precise) over exchangeMap position data.
                   if (orderFilledQty > 0) {
                     pos.executedQuantity = orderFilledQty
                     pos.remainingQuantity = Math.max(0, pos.quantity - pos.executedQuantity)
@@ -4051,14 +4055,13 @@ export async function reconcileLivePositions(
                     await incrementOrdersBySymbol(connectionId, pos.symbol, pos.direction, "filled")
                   }
                 } else if (statusLower === "cancelled" || statusLower === "canceled" || statusLower === "rejected") {
-                  // Entry order was cancelled/rejected — close the position record.
                   pos.status = "rejected"
                   pos.closeReason = `entry_order_${statusLower}`
                   pos.closedAt = Date.now()
                   pos.updatedAt = Date.now()
                   await savePosition(pos)
-                  summary.updated++
-                  continue
+                  delta.updated++
+                  return delta
                 }
               } catch {
                 /* getOrder() may fail transiently — Layer 1 result stands */
@@ -4066,18 +4069,10 @@ export async function reconcileLivePositions(
             }
           }
 
-          // ── SL/TP self-healing ─────────────────��────────────────────────
-          // Every reconcile cycle we verify protection orders match the
-          // desired levels. updateProtectionOrders() is no-op when nothing
-          // drifted — only fires real REST calls when something changed.
-          //
-          // Skip for positions still awaiting entry fill AND not yet
-          // confirmed by the exchange — placing SL/TP before the position
-          // exists on the exchange will fail with "position not found".
           if (pos.status === "placed") {
             await savePosition(pos)
-            summary.updated++
-            continue
+            delta.updated++
+            return delta
           }
           try {
             const protectionResult = await updateProtectionOrders(
@@ -4086,15 +4081,10 @@ export async function reconcileLivePositions(
               justFilled ? "reconcile_fill_detected" : "reconcile",
               liveOrderIds,
             )
-            // Engine-level rollup: one increment per POSITION (not per
-            // leg) so the counter answers "how many positions had their
-            // control orders touched this tick".
             if (protectionResult.changed) {
-              summary.protectionRearmed++
-              // Persist any protection changes (re-armed ids, cleared due to
-              // liveness-verify) so a serverless restart doesn't lose them.
+              delta.protectionRearmed++
               await savePosition(pos)
-              summary.updated++
+              delta.updated++
             }
           } catch (slTpErr) {
             console.warn(
@@ -4103,18 +4093,6 @@ export async function reconcileLivePositions(
             )
           }
 
-          // ── Proactive close-in-time safety check ─────────────────��─
-          // Even when the exchange-placed reduce-only SL/TP orders are
-          // armed, on a sharp price gap (illiquid pair / news / slow
-          // fill) the exchange may not fire them in time — leaving the
-          // position open past the configured threshold. We compare
-          // mark price vs. desired SL/TP and force-close if breached.
-          //
-          // Implementation lives in `checkAndForceCloseOnSltpCross` so
-          // the same logic runs from `syncWithExchange` (engine loop)
-          // and `recalculateAndApplySLTP` (operator override) too —
-          // the user explicitly asked for the close to happen
-          // "independent of the control orders".
           const crossed = await checkAndForceCloseOnSltpCross(
             connectionId,
             pos,
@@ -4122,13 +4100,13 @@ export async function reconcileLivePositions(
             exchangeConnector,
           )
           if (crossed) {
-            summary.closed++
-            continue // close already persisted by helper
+            delta.closed++
+            return delta
           }
 
-  // ── Max-hold-time safety closer (reconcile path) ────────────
-  const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
-  const openedAt = pos.createdAt || pos.updatedAt || 0
+          // ── Max-hold-time safety closer (reconcile path) ────────────
+          const MAX_HOLD_TIME_MS = resolveMaxHoldMs()
+          const openedAt = pos.createdAt || pos.updatedAt || 0
           const heldMs = Date.now() - openedAt
           if (
             MAX_HOLD_TIME_MS > 0 &&
@@ -4148,19 +4126,14 @@ export async function reconcileLivePositions(
               { positionId: pos.id, heldMs, maxHoldMs: MAX_HOLD_TIME_MS, exitPrice },
             )
             await closeLivePosition(connectionId, pos.id, exitPrice, exchangeConnector, "max_hold_time_exceeded")
-            summary.closed++
-            continue
+            delta.closed++
+            return delta
           }
 
           await savePosition(pos)
-          summary.updated++
+          delta.updated++
         } else {
           // Position closed externally — compute PnL, move to archive.
-          // Exit-price resolution order:
-          //   1. Last markPrice the reconcile loop refreshed from the exchange
-          //   2. averageExecutionPrice (confirmed fill price from original entry)
-          //   3. Redis market_data hash for the symbol (most-recent tick price)
-          //   4. entryPrice as last resort (PnL will read 0 but position is closed)
           let exitPrice = pos.exchangeData?.markPrice || pos.averageExecutionPrice || 0
           if (exitPrice <= 0) {
             try {
@@ -4181,12 +4154,6 @@ export async function reconcileLivePositions(
               (pos.direction === "long" ? exitPrice - avgEntry : avgEntry - exitPrice)
           }
 
-          // Best-effort orphan cleanup: if the position vanished from
-          // the exchange because (e.g.) the TP fired, the SL is now an
-          // orphan reduce-only order with no position to reduce. The
-          // exchange will usually auto-reject any future fill, but the
-          // order can still sit in the book and confuse the operator.
-          // Cancelling here is silent on "already gone".
           if (pos.stopLossOrderId || pos.takeProfitOrderId) {
             const cancellations: Promise<boolean>[] = []
             if (pos.stopLossOrderId) {
@@ -4204,19 +4171,6 @@ export async function reconcileLivePositions(
             pos.takeProfitOrderId = undefined
           }
 
-          // Best-effort market-close on the exchange for positions that
-          // disappeared without a known SL/TP order (e.g. a partial fill
-          // that then stalled, or a network partition that left the entry
-          // order orphaned). If the position is truly gone (SL/TP already
-          // fired) the connector's closePosition() will get a "position
-          // not found" error which is silently swallowed — the only side-
-          // effect is one extra REST call per such reconcile cycle.
-          //
-          // Hard 2s timeout: without it, a hung connector here would block
-          // the entire reconcile loop, delaying every other position's
-          // reconciliation until the venue gave up. 2s is generous for a
-          // healthy exchange (typical close call returns in <500 ms) and
-          // bounded enough that the loop keeps making progress.
           if (pos.executedQuantity > 0 && pos.status !== "placed") {
             try {
               const closeP = exchangeConnector.closePosition(pos.symbol, pos.direction)
@@ -4241,32 +4195,18 @@ export async function reconcileLivePositions(
           })
           pos.updatedAt = Date.now()
 
-          // Reuse the savePosition terminal-archival behaviour inline to
-          // avoid a circular import / extra Redis GET.
           const openIndexKey   = `live:positions:${connectionId}`
           const closedIndexKey = `live:positions:${connectionId}:closed`
           const movedMarker    = `live:positions:${connectionId}:moved:${pos.id}`
 
-          // Persist the updated position, then check the idempotent move
-          // marker so we don't double-archive. Everything after the marker
-          // check is independent — fan it out in a single Promise.all so each
-          // reconciliation pays one RTT window instead of ~7 sequential ones.
           await savePosition(pos)
           const alreadyMoved = await client.get(movedMarker).catch(() => null)
 
           const progKey = `progression:${connectionId}`
-          // Lock + TTL refresh always run (idempotent operations).
           const writes: Promise<any>[] = [
             client.expire(progKey, 7 * 24 * 60 * 60).catch(() => {}),
             client.del(`live:lock:${connectionId}:${pos.symbol}:${pos.direction}`).catch(() => {}),
           ]
-          // Counter increments + index move ONLY when this iteration
-          // is the first one to terminalise the position. The moved
-          // marker is shared with `closeLivePosition()` and
-          // `savePosition()` so an external close → reconcile sweep
-          // never double-counts. This is what was producing the
-          // operator's reported `Positions Closed > Positions Created`
-          // skew (counters drifted on every reconcile re-entry).
           if (!alreadyMoved) {
             writes.push(
               client.hincrby(progKey, "live_positions_closed_count", 1).catch(() => {}),
@@ -4282,16 +4222,46 @@ export async function reconcileLivePositions(
           }
           await Promise.all(writes)
 
-          summary.closed++
+          delta.closed++
         }
       } catch (err) {
-        summary.errors++
+        delta.errors++
         console.warn(
           `${LOG_PREFIX} reconcile per-position error for ${pos.id}:`,
           err instanceof Error ? err.message : String(err),
         )
       }
+      return delta
     }
+
+    // ── Bounded-concurrency streaming pool ───────────────────────────
+    // Streaming (not batch) pool so a slow exchange call on one
+    // position never blocks the next 7 from starting. Concurrency 8
+    // is well below the 50/min order-rate ceiling on every venue we
+    // support and well above the typical sweep size, so the limit
+    // virtually never bites in practice — it exists purely as a
+    // backstop against a pathological burst.
+    const LIVE_RECONCILE_CONCURRENCY = 8
+    const queue = openPositions.slice()
+    const runners: Promise<void>[] = []
+    const aggregate = (d: PosDelta) => {
+      summary.reconciled       += d.reconciled
+      summary.updated          += d.updated
+      summary.closed           += d.closed
+      summary.errors           += d.errors
+      summary.protectionRearmed += d.protectionRearmed
+    }
+    summary.reconciled = 0 // re-counted by aggregate
+    for (let i = 0; i < Math.min(LIVE_RECONCILE_CONCURRENCY, queue.length); i++) {
+      runners.push((async () => {
+        while (true) {
+          const p = queue.shift()
+          if (!p) return
+          aggregate(await processOne(p))
+        }
+      })())
+    }
+    await Promise.all(runners)
 
     if (summary.closed > 0 || summary.updated > 0) {
       console.log(
