@@ -34,9 +34,24 @@ export default function PositionMonitor({ connectionId }: { connectionId: string
     }
 
     fetchPositions()
-    const interval = setInterval(fetchPositions, 1000) // Update every second
+    // Tier-1 perf: visibility-gated polling. Same 1s cadence when the
+    // tab is foregrounded; pauses while hidden so a user with this
+    // dashboard open in a background tab stops thrashing the API at
+    // 60 req/min for pixels they can't see. On revisit a single
+    // catch-up tick fires immediately so the first paint is fresh.
+    const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return
+      fetchPositions()
+    }, 1000)
+    const onVisibility = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "visible") fetchPositions()
+    }
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisibility)
 
-    return () => clearInterval(interval)
+    return () => {
+      clearInterval(interval)
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisibility)
+    }
   }, [connectionId])
 
   return (

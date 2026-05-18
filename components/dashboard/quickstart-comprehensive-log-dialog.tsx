@@ -212,8 +212,24 @@ export function QuickstartComprehensiveLogDialog() {
     clearInterval(pollRef.current)
     if (!open) return
     fetchData()
-    pollRef.current = setInterval(() => fetchData(true), 2000)
-    return () => clearInterval(pollRef.current)
+    // Tier-1 perf: pause the 2s poll when the tab is hidden. On
+    // re-foreground we fire a single immediate catch-up tick so the
+    // first paint shows fresh data.
+    let cancelled = false
+    pollRef.current = setInterval(() => {
+      if (cancelled) return
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return
+      fetchData(true)
+    }, 2000)
+    const onVisibility = () => {
+      if (!cancelled && typeof document !== "undefined" && document.visibilityState === "visible") fetchData(true)
+    }
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisibility)
+    return () => {
+      cancelled = true
+      clearInterval(pollRef.current)
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisibility)
+    }
   }, [open, fetchData])
 
   useEffect(() => {

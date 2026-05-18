@@ -247,12 +247,17 @@ export class RealtimeProcessor {
       const positions = (all || []).filter((p: any) => p?.symbol === symbol)
       if (positions.length === 0) return 0
 
-      // Pre-warm the shared price cache for THIS symbol in one round-trip.
-      // `prefetchMarketDataBatch` is idempotent — calling it with a single
-      // symbol is the same cost as the upstream's batched call, but it
-      // guarantees a fresh price even if a sibling symbol's tick warmed
-      // the cache moments ago for a different pair.
-      await prefetchMarketDataBatch([symbol]).catch(() => { /* non-critical */ })
+      // (Plan-perf #3) The upstream realtime-tick orchestrator calls
+      // `prefetchMarketDataBatch(allWatchlistSymbols)` once before
+      // fanning out to every symbol — that already warmed this
+      // symbol's cache in the same tick. The previous duplicate
+      // `prefetchMarketDataBatch([symbol])` here added one Redis
+      // round-trip per symbol per cycle (10/cycle at 10 symbols) for
+      // zero observable benefit. `getMarketDataCached` reads the same
+      // shared cache and returns the warmed value; if the upstream
+      // batch happened to miss this symbol (e.g. just-added symbol
+      // racing against a tick), it will fall back to a fresh fetch
+      // exactly once for that pair.
 
       // Process all positions for this symbol in parallel. Each call
       // carries the position hash through so the manager skips a second

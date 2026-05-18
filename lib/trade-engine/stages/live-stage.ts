@@ -30,6 +30,7 @@ import { SystemLogger } from "@/lib/system-logger"
 import type { RealPosition } from "./real-stage"
 import { getEngineTimings } from "@/lib/engine-timings"
 import { withTimeout } from "@/lib/async-safety"
+import { getMaxLeverageForExchange } from "@/lib/leverage-policy"
 import {
   newLiveOrderTrace,
   withLiveOrderLogging,
@@ -2217,6 +2218,44 @@ export async function executeLivePosition(
     livePosition.entryPrice = currentPrice
     pushStep(livePosition, "price_fetch", true, `price=${currentPrice}`)
 
+    // ── Operator policy: ALWAYS use venue max leverage ─────────────────
+    // realPosition.leverage carries the per-variant coordination signal
+    // (1, 2, 3, 5x as derived in expandSizeLeverageVariants). That
+    // signal is for INTERNAL strategy ranking only — when actually
+    // placing the order on the venue we override to the connection's
+    // maximum supported leverage. Two safety nets remain armed
+    // downstream:
+    //   1. setLeverage(symbol, max) — venue clamps to per-symbol bracket
+    //   2. VolumeCalculator's balance-based cap — small-balance
+    //      accounts get a lower effective leverage automatically
+    //   3. 101204 "Insufficient margin" auto-halve retry below
+    // The override happens BEFORE the volume call so margin-based
+    // sizing (volumeUsd / leverage) reflects the max we'll actually use.
+    try {
+      const { getConnection: _getConnLev } = await import("@/lib/redis-db")
+      const connRecord = await _getConnLev(connectionId)
+      const venueMax = getMaxLeverageForExchange(connRecord?.exchange)
+      if (venueMax > livePosition.leverage) {
+        const previous = livePosition.leverage
+        livePosition.leverage = venueMax
+        pushStep(
+          livePosition,
+          "leverage_override",
+          true,
+          `coordination=${previous}x → venue_max=${venueMax}x (operator policy)`,
+        )
+      }
+    } catch (err) {
+      // Non-critical: fall through with realPosition.leverage and let
+      // the existing 101204 auto-halve fallback handle margin issues.
+      pushStep(
+        livePosition,
+        "leverage_override",
+        true,
+        `skipped — connection lookup failed (${String(err).slice(0, 60)})`,
+      )
+    }
+
     // ── Step 3: Volume calculation ─────────────────────────────────────────
     // POLICY: minimum volume is ALWAYS enforced �� we never reject a live
     // order for "qty too small". If the calculator returns null or a
@@ -2306,29 +2345,49 @@ export async function executeLivePosition(
     }
 
     // ── Step 4: Configure leverage + margin type on exchange ───────────────
-    if (typeof exchangeConnector.setLeverage === "function") {
-      try {
-        const lev = await exchangeConnector.setLeverage(realPosition.symbol, livePosition.leverage)
-        pushStep(livePosition, "set_leverage", !!lev?.success, lev?.error || `leverage=${livePosition.leverage}`)
-      } catch (err) {
-        pushStep(livePosition, "set_leverage", false, String(err))
-      }
-    } else {
-      pushStep(livePosition, "set_leverage", true, "connector does not expose setLeverage — skipping")
-    }
-
+    // T2.3 perf: parallelize the two pre-flight venue calls. They are
+    // idempotent and independent — `setLeverage` configures the
+    // per-symbol leverage bracket, `setMarginType` configures
+    // cross/isolated. Running them concurrently shaves one full
+    // round-trip off every live entry. Both still complete BEFORE the
+    // order is placed, so the venue sees consistent margin semantics
+    // for the order. Errors are captured per-call and logged
+    // independently — a failure in one does NOT skip the other.
     const marginTypeSetting = (connSettings.margin_type as "cross" | "isolated") || "cross"
     livePosition.marginType = marginTypeSetting
-    if (typeof exchangeConnector.setMarginType === "function") {
-      try {
-        const m = await exchangeConnector.setMarginType(realPosition.symbol, marginTypeSetting)
-        pushStep(livePosition, "set_margin_type", !!m?.success, m?.error || `margin=${marginTypeSetting}`)
-      } catch (err) {
-        pushStep(livePosition, "set_margin_type", false, String(err))
-      }
-    } else {
-      pushStep(livePosition, "set_margin_type", true, "connector does not expose setMarginType — skipping")
-    }
+
+    const setLeveragePromise: Promise<{ ok: boolean; note: string }> =
+      typeof exchangeConnector.setLeverage === "function"
+        ? exchangeConnector
+            .setLeverage(realPosition.symbol, livePosition.leverage)
+            .then((lev: any) => ({
+              ok: !!lev?.success,
+              note: lev?.error || `leverage=${livePosition.leverage}`,
+            }))
+            .catch((err: unknown) => ({ ok: false, note: String(err) }))
+        : Promise.resolve({
+            ok: true,
+            note: "connector does not expose setLeverage — skipping",
+          })
+
+    const setMarginTypePromise: Promise<{ ok: boolean; note: string }> =
+      typeof exchangeConnector.setMarginType === "function"
+        ? exchangeConnector
+            .setMarginType(realPosition.symbol, marginTypeSetting)
+            .then((m: any) => ({
+              ok: !!m?.success,
+              note: m?.error || `margin=${marginTypeSetting}`,
+            }))
+            .catch((err: unknown) => ({ ok: false, note: String(err) }))
+        : Promise.resolve({
+            ok: true,
+            note: "connector does not expose setMarginType — skipping",
+          })
+
+    const [levResult, marginResult] = await Promise.all([setLeveragePromise, setMarginTypePromise])
+    pushStep(livePosition, "set_leverage", levResult.ok, levResult.note)
+    pushStep(livePosition, "set_margin_type", marginResult.ok, marginResult.note)
+
 
     // ── Step 5: Place entry order with retry ─────────────────────����─────────
     const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
@@ -2778,7 +2837,7 @@ export async function executeLivePosition(
         extra: { orderId: livePosition.orderId, attempts: placeAttempt },
       })
     } else {
-      // D) Final guard: fill unconfirmed but order was accepted — treat as filled
+      // D) Final guard: fill unconfirmed but order was accepted �� treat as filled
       // with computedVolume so SL/TP can be placed. The position is "open" on the
       // exchange (order went to market); protection orders are reduce-only so no
       // new risk is added. Reconcile will correct executedQty on next tick.
@@ -5321,8 +5380,28 @@ export async function syncLiveFromPseudo(
     if (!Number.isFinite(rawSL) && !Number.isFinite(rawTP)) return
 
     // Ratio (< 1) → percent; already-percent (≥ 1) → keep as-is.
-    const slPct = Number.isFinite(rawSL) ? (Math.abs(rawSL) < 1 ? rawSL * 100 : rawSL) : undefined
+    let slPct = Number.isFinite(rawSL) ? (Math.abs(rawSL) < 1 ? rawSL * 100 : rawSL) : undefined
     const tpPct = Number.isFinite(rawTP) ? (Math.abs(rawTP) < 1 ? rawTP * 100 : rawTP) : undefined
+
+    // ── Trailing-aware SL pull-through ──────────────────────────────
+    // When the pseudo's trailing-stop machine is ARMED (multi-step
+    // `trailing_active=1` or legacy `trailing_stop_price>0`), the
+    // effective stop level is no longer `stoploss_ratio × fillPrice`
+    // — it's the ratcheted `trailing_stop_price`. Pulling the static
+    // ratio through here would cause every trailing tick to fight
+    // against itself, repeatedly resetting the live SL back to the
+    // origin level. Convert the active trailing stop price into a
+    // live-position-relative percentage by anchoring it to the LIVE
+    // position's actual fill price (entry-side). The percent space
+    // is what `recalculateAndApplySLTP` consumes.
+    const trailingActive =
+      pseudoPos?.trailing_active === "1" ||
+      pseudoPos?.trailing_active === true ||
+      (() => {
+        const ts = parseFloat(String(pseudoPos?.trailing_stop_price || "0"))
+        return Number.isFinite(ts) && ts > 0
+      })()
+    const trailingStopPrice = parseFloat(String(pseudoPos?.trailing_stop_price || "0"))
 
     const livePositions = await getLivePositions(connectionId)
     const matches = livePositions.filter((p: any) => {
@@ -5334,8 +5413,39 @@ export async function syncLiveFromPseudo(
 
     for (const livePos of matches) {
       try {
+        // Translate trailing_stop_price → percent relative to THIS
+        // live position's confirmed fill. Each live position can have
+        // its own fill price (cost-averaging, partial fills) so we
+        // can't pre-compute once — the percent must be derived
+        // per-position. If trailing is active and the price is sane,
+        // use it; otherwise fall back to the static SL ratio.
+        let effectiveSlPct = slPct
+        if (trailingActive && trailingStopPrice > 0) {
+          const fill = Number(livePos.averageExecutionPrice || livePos.entryPrice || 0)
+          if (fill > 0) {
+            const liveSide: "long" | "short" =
+              livePos.direction === "short" ? "short" : "long"
+            // SL distance (percent of fill). For long: fill > stop → positive.
+            // For short: stop > fill → positive. Both branches yield a
+            // non-negative percent that fits the existing slPct contract
+            // (positive number = "stop X% adverse from entry").
+            const distPct =
+              liveSide === "long"
+                ? ((fill - trailingStopPrice) / fill) * 100
+                : ((trailingStopPrice - fill) / fill) * 100
+            // Guard against degenerate cases — a stored stop that's
+            // already on the wrong side of the fill (shouldn't happen,
+            // but a precision-loss snapshot could trigger it) would
+            // arm an unprotected position. In that case fall back to
+            // the static ratio so we don't widen the stop.
+            if (Number.isFinite(distPct) && distPct > 0) {
+              effectiveSlPct = distPct
+            }
+          }
+        }
+
         await recalculateAndApplySLTP(connectionId, livePos.id, exchangeConnector, {
-          stopLossPct: slPct,
+          stopLossPct: effectiveSlPct,
           takeProfitPct: tpPct,
         })
       } catch (err) {

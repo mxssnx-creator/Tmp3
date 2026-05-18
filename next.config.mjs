@@ -10,6 +10,20 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
+  // ── Tier-3 perf: prod-only console removal ───────────────────────
+  // Strips `console.log` / `console.debug` / `console.info` from
+  // production client + server bundles, keeping `console.error` and
+  // `console.warn` for crash diagnostics. Dev mode is untouched, so
+  // local debugging still sees `[v0]` traces, hot-reload logs, etc.
+  // The volume of strategy/coordination logs in this codebase is
+  // substantial — each call is a serialisation + I/O cost on the
+  // hot path that we don't want shipping to production users.
+  compiler: {
+    removeConsole:
+      process.env.NODE_ENV === "production"
+        ? { exclude: ["error", "warn"] }
+        : false,
+  },
   experimental: {
     serverActions: {
       allowedOrigins: ["*"],

@@ -630,7 +630,12 @@ export class IndicationStateManager {
     try {
       // Define ALL possible configurations (UNLIMITED sets)
       const tpFactors = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
-      const slRatios = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+      // Stop-loss grid: operator-spec — 0.25..3.0 step 0.25 (12 values).
+      // Replaces the old 0.2..1.5/0.1 grid; extends the upper band from
+      // 1.5 to 3.0 so wide-stop / news-volatility setups get covered,
+      // and quantises to 0.25 steps so the per-direction Set count stays
+      // tractable (11 TP × 12 SL × 4 trailing = 528 Sets per symbol).
+      const slRatios = [0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00]
       const trailingOptions = [
         { enabled: false, start: null, stop: null },
         { enabled: true, start: 0.3, stop: 0.1 },
@@ -729,9 +734,11 @@ export class IndicationStateManager {
     try {
       // Define ALL possible configurations (UNLIMITED sets)
       const tpFactors = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
-      const slRatios = [
-        0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2,
-      ]
+      // Stop-loss grid: operator-spec — 0.25..3.0 step 0.25 (12 values).
+      // Aligns the non-optimal set with the optimal/advanced set so a
+      // single (TP, SL) point exists in both keyspaces (avoids holes
+      // where a Set is created in one keyspace but not the other).
+      const slRatios = [0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00]
       const trailingOptions = [
         { enabled: false, start: null, stop: null },
         { enabled: true, start: 0.3, stop: 0.1 },
@@ -1044,9 +1051,10 @@ export class IndicationStateManager {
     lastPartRatio: number,
   ): Promise<void> {
     const tpFactors = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
-    const slRatios = [
-      0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2,
-    ]
+    // Stop-loss grid: operator-spec — 0.25..3.0 step 0.25 (12 values).
+    // Same grid as the optimal/advanced and non-optimal generators so
+    // every (TP, SL) coordinate exists symmetrically across keyspaces.
+    const slRatios = [0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00]
     const trailingOptions = [
       { enabled: false },
       { enabled: true, start: 0.3, stop: 0.1 },

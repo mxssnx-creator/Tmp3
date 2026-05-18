@@ -226,23 +226,51 @@ export function ConnectionSettingsDialog({
               typeof coord.blockMaxStack === "number"
                 ? coord.blockMaxStack
                 : DEFAULT_COORDINATION_SETTINGS.blockMaxStack,
-            // ── Prev-PI threshold hydrate ───────────────────────────
-            // Two persistence paths: the new nested `coord.prevPiMinCount`
+            // ── Prev-pos threshold hydrate ──────────────────────────
+            // Two persistence paths: the new nested `coord.prevPosMinCount`
             // (saved alongside other coordination knobs) and the flat
-            // top-level `settings.prevPiMinCount` (read by the engine
+            // top-level `settings.prevPosMinCount` (read by the engine
             // and `getStrategyTracking`). Hydrate from either, prefer
             // the flat value because that's what the engine actually
-            // reads at Base creation.
-            prevPiMinCount: (() => {
-              const flat = Number((settings as Record<string, unknown>).prevPiMinCount)
+            // reads at Base creation. We also accept the legacy
+            // `prevPiMinCount` key (pre-rename) at both nesting levels
+            // so an upgrade-in-place doesn't reset operator tuning.
+            prevPosMinCount: (() => {
+              const s = settings as Record<string, unknown>
+              const c = coord as Record<string, unknown>
+              const flat = Number(s.prevPosMinCount ?? s.prevPiMinCount)
               if (Number.isFinite(flat) && flat >= 1) {
                 return Math.min(50, Math.floor(flat))
               }
-              const nested = Number((coord as Record<string, unknown>).prevPiMinCount)
+              const nested = Number(c.prevPosMinCount ?? c.prevPiMinCount)
               if (Number.isFinite(nested) && nested >= 1) {
                 return Math.min(50, Math.floor(nested))
               }
-              return DEFAULT_COORDINATION_SETTINGS.prevPiMinCount
+              return DEFAULT_COORDINATION_SETTINGS.prevPosMinCount
+            })(),
+            // ── Stage validation min-positions hydrate (5-50 step 5) ─
+            // Same dual-path hydrate as prevPosMinCount: prefer flat
+            // top-level (engine reads it cheaply), fall back to nested
+            // coordination settings, fall back to spec default. Snap
+            // to the 5-step grid so legacy free-typed values cannot
+            // bypass the slider granularity.
+            mainEvalPosCount: (() => {
+              const snap = (n: number) =>
+                Math.min(50, Math.max(5, Math.round(n / 5) * 5))
+              const flat = Number((settings as Record<string, unknown>).mainEvalPosCount)
+              if (Number.isFinite(flat) && flat >= 1) return snap(flat)
+              const nested = Number((coord as Record<string, unknown>).mainEvalPosCount)
+              if (Number.isFinite(nested) && nested >= 1) return snap(nested)
+              return DEFAULT_COORDINATION_SETTINGS.mainEvalPosCount
+            })(),
+            realEvalPosCount: (() => {
+              const snap = (n: number) =>
+                Math.min(50, Math.max(5, Math.round(n / 5) * 5))
+              const flat = Number((settings as Record<string, unknown>).realEvalPosCount)
+              if (Number.isFinite(flat) && flat >= 1) return snap(flat)
+              const nested = Number((coord as Record<string, unknown>).realEvalPosCount)
+              if (Number.isFinite(nested) && nested >= 1) return snap(nested)
+              return DEFAULT_COORDINATION_SETTINGS.realEvalPosCount
             })(),
           })
         }
@@ -334,7 +362,12 @@ export function ConnectionSettingsDialog({
           // Flat top-level mirror so the engine + `getStrategyTracking`
           // can read it as a plain `connection_settings` HASH field
           // without parsing the nested coordination JSON every cycle.
-          prevPiMinCount: coordination.prevPiMinCount,
+          prevPosMinCount: coordination.prevPosMinCount,
+          // Flat top-level mirror for the new stage-validation knobs so
+          // the engine picks them up via `connection_settings:{conn}`
+          // without parsing the nested coordination JSON every cycle.
+          mainEvalPosCount: coordination.mainEvalPosCount,
+          realEvalPosCount: coordination.realEvalPosCount,
       }
 
       const [settingsRes, indRes] = await Promise.all([

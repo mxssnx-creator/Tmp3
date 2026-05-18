@@ -75,9 +75,27 @@ export interface CoordinationSettings {
    * fresh boots can produce trades immediately. At/above the threshold
    * the engine engages historic PF min-blend and Real-stage size/leverage
    * tuning. Default 5 = smallest statistically meaningful denominator.
-   * Backed by `connection_settings:{conn}.prevPiMinCount`.
+   * Backed by `connection_settings:{conn}.prevPosMinCount`.
    */
-  prevPiMinCount: number // 1..50, default 5
+  prevPosMinCount: number // 1..50, default 5
+
+  /**
+   * ── Main-stage validation min position-count ───────────────────────
+   * Operator spec: At Main, only Base Sets whose `entryCount >=
+   * mainEvalPosCount` are run through PF + DDT validation. Sets with
+   * fewer completed pseudo-positions are SKIPPED (not counted as passed,
+   * not promoted) — they re-enter the validation pool on subsequent
+   * cycles once enough positions have closed.
+   * Range 5..50 step 5, default 15.
+   */
+  mainEvalPosCount: number
+
+  /**
+   * ── Real-stage validation min position-count ───────────────────────
+   * Same semantics as `mainEvalPosCount` but applied at Real (Main →
+   * Real promotion). Range 5..50 step 5, default 10.
+   */
+  realEvalPosCount: number
 }
 
 /** Spec-aligned defaults — match the constants in strategy-coordinator.ts. */
@@ -96,7 +114,9 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
   },
   blockVolumeRatio: 1.0,
   blockMaxStack:    3,
-  prevPiMinCount:   5,
+  prevPosMinCount:   5,
+  mainEvalPosCount: 15,
+  realEvalPosCount: 10,
 }
 
 interface StrategyCoordinationSectionProps {
@@ -613,7 +633,7 @@ export function StrategyCoordinationSection({
           <div className="rounded-lg border border-border/60 p-3 space-y-2">
             <div className="flex items-center justify-between gap-3">
               <Label className="text-sm font-semibold">
-                Min closed PIs for blend
+                Min closed positions for blend
               </Label>
               <Badge variant="secondary" className="text-[10px] tabular-nums">
                 default 5
@@ -621,17 +641,17 @@ export function StrategyCoordinationSection({
             </div>
             <div className="flex items-center gap-3 pt-1">
               <Slider
-                value={[value.prevPiMinCount]}
+                value={[value.prevPosMinCount]}
                 min={1}
                 max={50}
                 step={1}
                 onValueChange={(v) =>
-                  onChange({ ...value, prevPiMinCount: v[0] })
+                  onChange({ ...value, prevPosMinCount: v[0] })
                 }
                 className="flex-1"
               />
               <span className="text-xs font-semibold tabular-nums w-8 text-right">
-                {value.prevPiMinCount}
+                {value.prevPosMinCount}
               </span>
             </div>
             <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
@@ -643,6 +663,108 @@ export function StrategyCoordinationSection({
               size). Counts and live status are surfaced on the Strategy
               Pipeline dashboard tile.
             </p>
+          </div>
+        </CardContent>
+      </Card>
+      {/* ── Stage Validation Position-Count card ─────────────────────
+          Operator spec:
+            • Main evaluates Base with PF + DDT for X pre pseudo
+              positions per Set (min positions to validate). Default 15.
+            • Real evaluates Main the same way. Default 10.
+          If a Set has fewer positions than the threshold it is SKIPPED
+          (not validated, not promoted, no count bump) — re-evaluated
+          on subsequent cycles once enough positions accumulate. */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <CardTitle className="text-sm">
+                Stage Validation — Min Positions per Set
+              </CardTitle>
+              <CardDescription className="text-xs">
+                Minimum completed pseudo-positions a Set must contain
+                before its <strong>profit-factor</strong> and{" "}
+                <strong>drawdown-time</strong> are evaluated for promotion
+                to the next stage. Below the threshold the Set is
+                <em> skipped</em> (not validated, not counted) — it
+                re-enters the validation pool on subsequent cycles once
+                enough positions have closed. Drawdown-time ceiling at
+                Main + Real is <strong>5 hours</strong>.
+              </CardDescription>
+            </div>
+            <Badge variant="outline" className="text-[10px] tabular-nums">
+              5–50 step 5
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {/* Main */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <Label className="text-sm font-semibold">
+                  Main — Min positions to validate
+                </Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Base → Main: a Base Set is validated against{" "}
+                  <span className="font-mono text-[11px]">minPF</span> and{" "}
+                  <span className="font-mono text-[11px]">maxDDT (5h)</span>{" "}
+                  only when its entry count meets this threshold.
+                </p>
+              </div>
+              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                default 15
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.mainEvalPosCount]}
+                min={5}
+                max={50}
+                step={5}
+                onValueChange={(v) =>
+                  onChange({ ...value, mainEvalPosCount: v[0] })
+                }
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-8 text-right">
+                {value.mainEvalPosCount}
+              </span>
+            </div>
+          </div>
+          {/* Real */}
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <Label className="text-sm font-semibold">
+                  Real — Min positions to validate
+                </Label>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Main → Real: a Main Set is validated against{" "}
+                  <span className="font-mono text-[11px]">minPF</span> and{" "}
+                  <span className="font-mono text-[11px]">maxDDT (5h)</span>{" "}
+                  only when its entry count meets this threshold.
+                </p>
+              </div>
+              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                default 10
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.realEvalPosCount]}
+                min={5}
+                max={50}
+                step={5}
+                onValueChange={(v) =>
+                  onChange({ ...value, realEvalPosCount: v[0] })
+                }
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-8 text-right">
+                {value.realEvalPosCount}
+              </span>
+            </div>
           </div>
         </CardContent>
       </Card>

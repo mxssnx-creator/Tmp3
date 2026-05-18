@@ -152,8 +152,8 @@ export interface StrategySet {
   /**
    * ── Prev-PI snapshot attached at Base creation ─────────────────────
    *
-   * Per operator spec: "make sure strategies are evaluating prev pis and
-   * profitfactors min from historic … prev pis cnts are working and
+   * Per operator spec: "make sure strategies are evaluating prev pos and
+   * profitfactors min from historic … prev pos cnts are working and
    * added to settings,strategy".
    *
    * Populated by `createBaseSets` from `pi_history:{conn}:{symbol}:{type}:{dir}`
@@ -163,16 +163,16 @@ export interface StrategySet {
    *
    * Two consumers:
    *   1. createBaseSets uses `profitFactor` to MIN-blend the Set's
-   *      `avgProfitFactor` when `count >= prevPiMinCount`. This is the
-   *      "evaluating prev pis and profitfactors min from historic"
+   *      `avgProfitFactor` when `count >= prevPosMinCount`. This is the
+   *      "evaluating prev pos and profitfactors min from historic"
    *      requirement — historic underperformance pulls the bar down so
    *      Base→Main filters reject it.
    *   2. evaluateRealSets uses `successRate`/`profitFactor` to TUNE
    *      `entries[].sizeMultiplier` and `leverage` per variant — the
-   *      "Real stage … accumulation for pis cnts sets … relying to
+   *      "Real stage … accumulation for pos cnts sets … relying to
    *      their base sets configs independent" path.
    */
-  prevPi?: {
+  prevPos?: {
     count: number
     successRate: number
     profitFactor: number
@@ -281,6 +281,51 @@ const AXIS_LAST     = [1, 2, 3, 4]         as const
 const AXIS_CONT     = [1, 2, 3, 4, 5, 6, 7, 8] as const
 const AXIS_DIRS     = ["long", "short"]    as const
 
+/**
+ * ── Plan-perf Tier 2: precomputed axisKey table ────────────────────
+ *
+ * The axis-fan-out hot path inside `expandAxisSets` builds an axisKey
+ * string per (prev, last, cont, outcome, dir) tuple. With 5 × 4 × 8 ×
+ * 2 × 2 = 640 possible tuples, recomputing the template-literal on
+ * every Base Set's fan-out (called per (symbol × cycle)) was wasted
+ * work — the keys are pure functions of the axis tuple values, never
+ * change at runtime.
+ *
+ * We pre-build the full key table once at module load and look up by
+ * (prev, last, cont, outcome, dir) using a flat numeric index. This
+ * cuts ~640 string allocations + ~5 concatenations each off every
+ * Base-Set fan-out call. At 10 symbols × ~30 base Sets × 1 cycle/sec
+ * that's ~190k string allocations/sec eliminated (when the cache
+ * misses; on hits we already short-circuit).
+ *
+ * The encoding (`p${prev}_l${last}_c${cont}_o${outcome}_d${dir}`) is
+ * preserved verbatim so existing setKey-derived consumers (Redis
+ * keys, `parentSetKey` chain reconstruction, dashboard groupings)
+ * continue to match exactly.
+ */
+const AXIS_OUTCOMES = ["pos", "neg"] as const
+type AxisOutcome = (typeof AXIS_OUTCOMES)[number]
+type AxisDir = (typeof AXIS_DIRS)[number]
+const AXIS_KEY_TABLE: ReadonlyMap<string, string> = (() => {
+  const m = new Map<string, string>()
+  for (const prev of AXIS_PREV) {
+    for (const last of AXIS_LAST) {
+      for (const cont of AXIS_CONT) {
+        for (const outcome of AXIS_OUTCOMES) {
+          for (const dir of AXIS_DIRS) {
+            const k = `${prev}|${last}|${cont}|${outcome}|${dir}`
+            m.set(k, `p${prev}_l${last}_c${cont}_o${outcome}_d${dir}`)
+          }
+        }
+      }
+    }
+  }
+  return m
+})()
+function axisKeyOf(prev: number, last: number, cont: number, outcome: AxisOutcome, dir: AxisDir): string {
+  return AXIS_KEY_TABLE.get(`${prev}|${last}|${cont}|${outcome}|${dir}`)!
+}
+
 export interface StrategyCoordinatorConfig {
   maxEntriesPerSet?: number   // Default 250 (entries inside one Set)
   maxLiveSets?: number        // Default: max per exchange type (e.g. 500 for bybit, 150 for okx)
@@ -352,6 +397,25 @@ export class StrategyCoordinator {
      */
     blockVolumeRatio: number
     blockMaxStack:    number
+    /**
+     * ── Stage-validation min-position thresholds (operator spec) ──────
+     *
+     * `mainEvalPosCount` — minimum `entryCount` a Base Set must contain
+     *   before its profitFactor + drawdownTime are evaluated for
+     *   promotion to Main. Below this threshold the Set is SKIPPED at
+     *   Main (not validated, not counted as passed). Range 5..50 step 5,
+     *   default 15.
+     *
+     * `realEvalPosCount` — same semantics for Main → Real. Default 10.
+     *
+     * Skipping (rather than failing) is intentional: low-position Sets
+     * naturally re-enter the validation pool on subsequent cycles once
+     * enough pseudo-positions have closed. This matches the operator's
+     * "if less pos exist in set then do not validate" requirement and
+     * preserves count integrity (no false-negative `passed_sets` writes).
+     */
+    mainEvalPosCount: number
+    realEvalPosCount: number
   } = {
     axes: {
       prev:  { enabled: true,  maxWindow: 12 },
@@ -367,6 +431,8 @@ export class StrategyCoordinator {
     },
     blockVolumeRatio: 1.0,
     blockMaxStack:    3,
+    mainEvalPosCount: 15,
+    realEvalPosCount: 10,
   }
   private _coordinationLoadedAt = 0
   private readonly _coordinationTtlMs = 5_000
@@ -382,6 +448,67 @@ export class StrategyCoordinator {
    * fresh fetch instead of trusting old data.
    */
   private _activeKeysCache: { keys: Set<string>; cycleAt: number } | null = null
+
+  /**
+   * ── Plan-perf Tier 1: parsed-fingerprint LRU ───────────────────────
+   *
+   * The fpCache stored in Redis is keyed by `fingerprint → JSON.stringify(set)`.
+   * Until this perf pass, every cache HIT cost a full `JSON.parse` of a
+   * ~1-4 KB payload — at the upper bound (10 symbols × ~80 variant fps
+   * each × 1 cycle/sec) that's ~800 parses/sec, dominating createMainSets
+   * CPU. This in-process LRU stores the already-parsed StrategySet so a
+   * cache hit costs O(1).
+   *
+   * Keyed by `fingerprint` directly: fingerprints are deterministic and
+   * already encode {connectionId, symbol, baseConfig, variant, posCtx}
+   * so collisions across connections/symbols are impossible by
+   * construction.
+   *
+   * Capped at 4 096 entries (≈10 connections × 10 symbols × 40 variants).
+   * Eviction is "delete oldest insertion" via Map iteration order.
+   *
+   * Sets are stored by REFERENCE — callers MUST treat them as
+   * read-only. createMainSets only reads, never mutates, so this is
+   * safe. If a future caller needs to mutate, they should clone the
+   * returned record explicitly.
+   */
+  private static readonly _FP_LRU_MAX = 4_096
+  private static _fpLru: Map<string, StrategySet> = new Map()
+  private static _fpLruGet(fp: string): StrategySet | undefined {
+    const hit = StrategyCoordinator._fpLru.get(fp)
+    if (hit !== undefined) {
+      // Touch: re-insert to the back so it survives eviction longer.
+      StrategyCoordinator._fpLru.delete(fp)
+      StrategyCoordinator._fpLru.set(fp, hit)
+    }
+    return hit
+  }
+  private static _fpLruSet(fp: string, set: StrategySet): void {
+    if (StrategyCoordinator._fpLru.size >= StrategyCoordinator._FP_LRU_MAX) {
+      const oldest = StrategyCoordinator._fpLru.keys().next().value
+      if (oldest !== undefined) StrategyCoordinator._fpLru.delete(oldest)
+    }
+    StrategyCoordinator._fpLru.set(fp, set)
+  }
+
+  /**
+   * 30-second per-instance cache for `connection_settings.prevPosMinCount`.
+   *
+   * Plan-perf #2: this HGETALL was firing once per (symbol, cycle) inside
+   * `createBaseSets`. At 10 symbols × ~1 cycle/sec that's 10 redundant
+   * full-hash reads/sec for a value that the operator changes through a
+   * settings dialog (i.e. every ~hour at most). Coalesced to a 30-second
+   * lifetime: shared across all symbols on this instance, refreshed
+   * cheaply, and far more responsive than the natural cadence of the
+   * underlying setting.
+   *
+   * Cache holds the *parsed* int (not the raw hash) so the read path is
+   * branch-free. Sentinel `-1` means "not yet loaded" — first read loads
+   * synchronously, subsequent symbol cycles reuse without I/O.
+   */
+  private _prevPosMinCountValue = -1
+  private _prevPosMinCountAt = 0
+  private readonly _prevPosMinCountTtlMs = 30_000
 
   // ── Profit factor thresholds per stage (system-wide defaults) ──────
   //
@@ -440,22 +567,22 @@ export class StrategyCoordinator {
       description: "One Set per (indication_type × direction) — all qualifying",
     },
     main: {
-      maxDrawdownTime: 180,   // 3 hours — aligned to short-duration trade profile
+      maxDrawdownTime: 300,   // 5 hours — operator spec, validation ceiling at Main
       minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.5,        // advisory only
-      description: "Sets promoted from BASE with profitFactor >= main-threshold + DDT <= 3h",
+      description: "Sets promoted from BASE with profitFactor >= main-threshold + DDT <= 5h, gated by minPositions",
     },
     real: {
-      maxDrawdownTime: 180,   // 3 hours — consistent with MAIN
+      maxDrawdownTime: 300,   // 5 hours — operator spec, validation ceiling at Real
       minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.65,       // advisory only
-      description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= 3h",
+      description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= 5h, gated by minPositions",
     },
     live: {
-      maxDrawdownTime: 180,   // 3 hours — ensures REAL sets flow through to LIVE
+      maxDrawdownTime: 300,   // 5 hours — aligned with Main + Real
       minProfitFactor: 1.0,   // spec default — operator-tunable
       confidence: 0.65,       // advisory only
-      description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= 3h) ready for live trading",
+      description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= 5h) ready for live trading",
     },
   }
 
@@ -567,6 +694,31 @@ export class StrategyCoordinator {
           ? Math.min(8, Math.max(2, Math.round(stackRaw)))
           : this._coordinationSettings.blockMaxStack
 
+        // ── Stage-validation min-position counts (operator spec) ─────
+        // 5..50 step 5, defaults 15 (Main) / 10 (Real). Snap to the
+        // 5-step grid so a value typed via API doesn't bypass slider
+        // granularity. Two persistence paths supported:
+        //   1. Nested  coord.{mainEvalPosCount,realEvalPosCount}
+        //   2. Flat    settings.{mainEvalPosCount,realEvalPosCount}
+        //      (top-level mirror written by the dialog for cheap reads)
+        const snapPosCount = (raw: unknown, fallback: number): number => {
+          const n = Number(raw)
+          if (!Number.isFinite(n) || n < 5) return fallback
+          return Math.min(50, Math.max(5, Math.round(n / 5) * 5))
+        }
+        const mainEvalRaw =
+          coord.mainEvalPosCount ??
+          coord.main_eval_pos_count ??
+          (settings as any).mainEvalPosCount ??
+          this._coordinationSettings.mainEvalPosCount
+        const realEvalRaw =
+          coord.realEvalPosCount ??
+          coord.real_eval_pos_count ??
+          (settings as any).realEvalPosCount ??
+          this._coordinationSettings.realEvalPosCount
+        const mainEvalPosCount = snapPosCount(mainEvalRaw, this._coordinationSettings.mainEvalPosCount)
+        const realEvalPosCount = snapPosCount(realEvalRaw, this._coordinationSettings.realEvalPosCount)
+
         // Merge with defaults so a partial UI save doesn't strip toggles.
         this._coordinationSettings = {
           axes: {
@@ -583,6 +735,8 @@ export class StrategyCoordinator {
           },
           blockVolumeRatio: ratio,
           blockMaxStack:    stack,
+          mainEvalPosCount,
+          realEvalPosCount,
         }
       }
     } catch (err) {
@@ -818,16 +972,16 @@ export class StrategyCoordinator {
     const maxEntries = this.config.maxEntriesPerSet || 250
 
     // ── Prev-PI batch prefetch (one round-trip, all (type×dir) buckets) ──
-    // Per spec: strategies must "evaluate prev pis and profitfactors min
-    // from historic … prev pis cnts are working and added to settings,
+    // Per spec: strategies must "evaluate prev pos and profitfactors min
+    // from historic … prev pos cnts are working and added to settings,
     // strategy". We fetch the lifetime success/PF/DDT for every (type,
     // direction) bucket this symbol is about to produce a Base Set for,
     // then attach + min-blend below. Fresh boots / new buckets return
     // {count:0, ...} which is treated as "no signal yet" → no blend.
-    let piMap: Map<string, import("@/lib/pi-history").PiHistoryStats> = new Map()
-    let prevPiMinCount = 5
+    let posMap: Map<string, import("@/lib/pos-history").PosHistoryStats> = new Map()
+    let prevPosMinCount = 5
     try {
-      const { getPiHistoryBatch } = await import("@/lib/pi-history")
+      const { getPosHistoryBatch } = await import("@/lib/pos-history")
       const pairs = Array.from(setMap.values()).map((g) => ({
         indicationType: g.indicationType,
         direction: g.direction,
@@ -835,17 +989,33 @@ export class StrategyCoordinator {
       // Operator-tunable threshold (Settings → Strategies → Coordination).
       // Read from connection_settings hash; fall back to 5 (≈ statistical
       // smallest meaningful win-rate denominator).
+      //
+      // 30-second per-instance cache: the operator changes this through a
+      // settings dialog, so the natural cadence is ~hourly at fastest. Per-
+      // symbol-per-cycle HGETALLs were costing 10 round-trips/sec at 10
+      // symbols for a value that almost never moves. The settings dirty-
+      // flag broadcast is independent of this cache, so a save still gets
+      // picked up within one realtime tick *of the next refresh window*
+      // — the cap matches the responsiveness of every other settings
+      // value on this code path.
       try {
-        const client = getRedisClient()
-        const cs = (await client.hgetall(
-          `connection_settings:${this.connectionId}`,
-        )) as Record<string, string>
-        const v = Number(cs?.prevPiMinCount || "")
-        if (Number.isFinite(v) && v >= 1) prevPiMinCount = Math.min(50, Math.floor(v))
+        const cachedAge = Date.now() - this._prevPosMinCountAt
+        if (this._prevPosMinCountValue >= 0 && cachedAge < this._prevPosMinCountTtlMs) {
+          prevPosMinCount = this._prevPosMinCountValue
+        } else {
+          const client = getRedisClient()
+          const cs = (await client.hgetall(
+            `connection_settings:${this.connectionId}`,
+          )) as Record<string, string>
+          const v = Number(cs?.prevPosMinCount || cs?.prevPiMinCount || "")
+          if (Number.isFinite(v) && v >= 1) prevPosMinCount = Math.min(50, Math.floor(v))
+          this._prevPosMinCountValue = prevPosMinCount
+          this._prevPosMinCountAt = Date.now()
+        }
       } catch { /* default stays */ }
-      piMap = await getPiHistoryBatch(this.connectionId, symbol, pairs, prevPiMinCount)
-    } catch (piErr) {
-      console.warn(`[v0] [StrategyFlow] ${symbol} prev-PI prefetch failed:`, piErr)
+      posMap = await getPosHistoryBatch(this.connectionId, symbol, pairs, prevPosMinCount)
+    } catch (posErr) {
+      console.warn(`[v0] [StrategyFlow] ${symbol} prev-pos prefetch failed:`, posErr)
     }
 
     // Multi-step trailing matrix — `[]` (= no fan-out) collapses to legacy
@@ -894,17 +1064,17 @@ export class StrategyCoordinator {
         const avgConf = entries.reduce((s, e) => s + e.confidence, 0) / entries.length
 
         // ── Prev-PI min-blend on avgProfitFactor ─────────────────────────
-        // Operator spec: "evaluating prev pis and profitfactors min from
-        // historic". When the historic bucket has at least `prevPiMinCount`
+        // Operator spec: "evaluating prev pos and profitfactors min from
+        // historic". When the historic bucket has at least `prevPosMinCount`
         // closed positions, the Set's avgProfitFactor becomes the MIN of
         // (live indication PF, historic realised PF). Underperforming
         // historic regimes thus pull the bar DOWN so the Base→Main filter
         // rejects them. When the bucket has insufficient data we leave the
         // raw indication-derived PF untouched (= bootstrap path).
-        const piStats = piMap.get(`${group.indicationType}|${group.direction}`)
-        const blendActive = !!piStats && piStats.count >= prevPiMinCount
+        const posStats = posMap.get(`${group.indicationType}|${group.direction}`)
+        const blendActive = !!posStats && posStats.count >= prevPosMinCount
         const avgPF = blendActive
-          ? Math.min(rawAvgPF, piStats!.profitFactor)
+          ? Math.min(rawAvgPF, posStats!.profitFactor)
           : rawAvgPF
 
 
@@ -925,15 +1095,15 @@ export class StrategyCoordinator {
               stepRatio: variant.stepRatio,
             },
           }),
-          // Attach prev-PI snapshot so Main/Real propagation paths can
+          // Attach prev-pos snapshot so Main/Real propagation paths can
           // reach it without re-fetching. Always carry the field even
           // when count==0 — keeps downstream null-checking simple.
-          ...(piStats && piStats.count > 0 && {
-            prevPi: {
-              count: piStats.count,
-              successRate: piStats.successRate,
-              profitFactor: piStats.profitFactor,
-              avgDDT: piStats.avgDDT,
+          ...(posStats && posStats.count > 0 && {
+            prevPos: {
+              count: posStats.count,
+              successRate: posStats.successRate,
+              profitFactor: posStats.profitFactor,
+              avgDDT: posStats.avgDDT,
             },
           }),
         }
@@ -1134,6 +1304,18 @@ export class StrategyCoordinator {
     const ctx = posCtx ?? this.neutralPositionContext()
     const mainSets: StrategySet[] = []
 
+    // ── Stage-validation min-position threshold (operator spec) ────
+    // "Main has to evaluate from stage Base with profitfactor for X
+    //  pre pseudo positions for specific config … if less pos exist
+    //  in set then do not validate."
+    // Sets below the threshold are SKIPPED (silent continue) — they
+    // re-enter the validation pool on subsequent cycles once their
+    // entryCount climbs. Tracked via a single counter so the dashboard
+    // can surface "skipped due to insufficient positions" without
+    // polluting the passed/failed buckets.
+    const mainMinPos = this._coordinationSettings.mainEvalPosCount
+    let skippedLowPos = 0
+
     // ── 1. Fingerprint-cache lookup ────────────────────────────────────────
     // Fetch last cycle's fingerprint map up-front. `fpCacheKey` stores a
     // per-symbol hash of { fingerprint: JSON.stringify(set) } entries. We
@@ -1165,6 +1347,36 @@ export class StrategyCoordinator {
     const defaultByBaseKey = new Map<string, StrategySet>()
 
     for (const baseSet of baseSets) {
+      // ── Min-positions gate (operator spec, systemwide fix) ──────
+      // Skip Sets that don't yet have enough completed pseudo-positions
+      // to support a meaningful PF + DDT validation. Counted but not
+      // passed/failed — these will be re-validated on subsequent cycles
+      // as their position count grows.
+      //
+      // Counts considered (in order of authority):
+      //   • baseSet.entryCount  — entries built THIS cycle from live
+      //                           indications (size 0..maxEntries).
+      //   • baseSet.prevPos.count — closed historic positions in the
+      //                           matching (type × direction) bucket,
+      //                           populated by the prehistoric writer
+      //                           via recordPosClosed (see
+      //                           ConfigSetProcessor.processStrategyConfigs).
+      //
+      // We take the MAX. The historic count is the user's "prev logical
+      // data" — the moment prehistoric finishes, every Set whose regime
+      // has ≥mainEvalPosCount historic closes IMMEDIATELY qualifies for
+      // Main evaluation, even if the live indication group on the very
+      // first realtime cycle is only 1-2 entries large. This is the
+      // direct fix for "no sets evaluated → because prehistoric was
+      // building prev logical data but the gate ignored it".
+      const liveCount    = baseSet.entryCount ?? baseSet.entries?.length ?? 0
+      const histCount    = baseSet.prevPos?.count ?? 0
+      const setPosCount  = Math.max(liveCount, histCount)
+      if (setPosCount < mainMinPos) {
+        skippedLowPos++
+        continue
+      }
+
       // Base-level validation — P0-2: PF + DDT are the ONLY filter axes.
       // Confidence is advisory metadata (used by Live stage's trailing-
       // variant selector) and is NOT a gate here. A high-PF / low-DDT
@@ -1192,25 +1404,31 @@ export class StrategyCoordinator {
         // Cache hit — reuse the cached Set verbatim. This is the "IF NOT
         // ALREADY CREATED" path the user asked for.
         if (fpCache[fingerprint]) {
-          try {
-            const cached = JSON.parse(fpCache[fingerprint]) as StrategySet
-            // Sanity-check the cached record before reusing it
-            if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
-              // Re-attach the parent's trailing profile in case the cached
-              // payload was written before the profile field existed
-              // (operators upgrading mid-cycle keep working).
-              if (baseSet.trailingProfile && !cached.trailingProfile) {
-                cached.trailingProfile = baseSet.trailingProfile
-              }
-              mainSets.push(cached)
-              // Capture the `default` Main variant for downstream
-              // Position-Count Cartesian fan-out (even on cache hit).
-              if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, cached)
-              nextFpCache[fingerprint] = fpCache[fingerprint]
-              reused++
-              continue
+          // Tier-1 perf: parsed-fingerprint LRU avoids JSON.parse on
+          // every hit. Falls through to JSON.parse on LRU miss; the
+          // parsed result is then memoised so the next hit is O(1).
+          let cached = StrategyCoordinator._fpLruGet(fingerprint)
+          if (cached === undefined) {
+            try {
+              cached = JSON.parse(fpCache[fingerprint]) as StrategySet
+              if (cached) StrategyCoordinator._fpLruSet(fingerprint, cached)
+            } catch { /* fall through — regenerate on parse failure */ }
+          }
+          if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
+            // Re-attach the parent's trailing profile in case the cached
+            // payload was written before the profile field existed
+            // (operators upgrading mid-cycle keep working).
+            if (baseSet.trailingProfile && !cached.trailingProfile) {
+              cached.trailingProfile = baseSet.trailingProfile
             }
-          } catch { /* fall through — regenerate on parse failure */ }
+            mainSets.push(cached)
+            // Capture the `default` Main variant for downstream
+            // Position-Count Cartesian fan-out (even on cache hit).
+            if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, cached)
+            nextFpCache[fingerprint] = fpCache[fingerprint]
+            reused++
+            continue
+          }
         }
 
         // Cache miss — build a fresh related Set from this profile.
@@ -1236,7 +1454,26 @@ export class StrategyCoordinator {
         // ~4KB per entry (the bulky `entries` array is already pruned to
         // maxEntries upstream; we stringify the whole Set for fidelity).
         nextFpCache[fingerprint] = JSON.stringify(built)
+        // Tier-1 perf: also seed the parsed-fp LRU so subsequent
+        // cycles' hits skip JSON.parse entirely. `built` is freshly
+        // built and treated as read-only by all downstream consumers
+        // (createMainSets/evaluateRealSets only read fields).
+        StrategyCoordinator._fpLruSet(fingerprint, built)
       }
+    }
+
+    // ── Log min-pos skip count (diagnostic) ───────────────────────
+    // Surface the number of Base Sets that didn't meet `mainEvalPosCount`
+    // at this cycle so the operator can see when the threshold is
+    // throttling promotion. Non-critical; debug level.
+    if (skippedLowPos > 0) {
+      logProgressionEvent(
+        this.connectionId,
+        "main_stage",
+        "debug",
+        `Main min-pos gate skipped ${skippedLowPos}/${baseSets.length} (threshold=${mainMinPos})`,
+        { symbol, skippedLowPos, threshold: mainMinPos, baseTotal: baseSets.length },
+      ).catch(() => {})
     }
 
     // ── 3. Position-Count Cartesian fan-out (operator spec) ──────────
@@ -1258,8 +1495,17 @@ export class StrategyCoordinator {
     let axisSetsAdded = 0
     if (defaultByBaseKey.size > 0) {
       const minPF = metrics.minProfitFactor   // Same gate as Base→Main
+      // Live continuous-count snapshot from the **per-symbol** position
+      // context (continuousCount on `symbolCtx` was already patched to
+      // `ctx.perSymbolOpen[symbol]` at line ~1339). Capping each axis
+      // Set's `entryCount` by this value (inside expandAxisSets) is what
+      // makes the axis fan-out reflect the operator-spec'd "ongoing
+      // continuous count of Pis to be added, counted onto the new sets"
+      // instead of static projections. Per-symbol is correct because
+      // axis Sets and their hedge bucketing are scoped to one symbol.
+      const liveCont = symbolCtx?.continuousCount ?? 0
       for (const defaultSet of defaultByBaseKey.values()) {
-        const expanded = this.expandAxisSets(defaultSet, minPF)
+        const expanded = this.expandAxisSets(defaultSet, minPF, liveCont)
         for (const axisSet of expanded) {
           mainSets.push(axisSet)
           axisSetsAdded++
@@ -1270,10 +1516,11 @@ export class StrategyCoordinator {
         // has been projected into the operator-spec'd Cartesian product
         // (prev × last × cont × direction). This is the "additional Sets"
         // creation per the strategy flow spec.
-        logProgressionEvent(this.connectionId, "main_stage", "debug", `Axis fan-out: +${axisSetsAdded}`, {
+        logProgressionEvent(this.connectionId, "main_stage", "debug", `Axis fan-out: +${axisSetsAdded} liveCont=${liveCont}`, {
           symbol,
           axisSets: axisSetsAdded,
           defaults: defaultByBaseKey.size,
+          liveCont,
         }).catch(() => {}) // non-critical
       }
     }
@@ -1638,7 +1885,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 3: REAL ───────────────────────────────────────────────────────────
+  // ─── STAGE 3: REAL ────────────────────────────────────────────────────────��──
 
   /**
    * Promote MAIN Sets with avgProfitFactor >= 1.4 to REAL.
@@ -1656,15 +1903,45 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.real
 
+    // ── Stage-validation min-position threshold (operator spec, systemwide fix) ────
+    // Same semantics as Main: Sets below `realEvalPosCount` are
+    // SKIPPED — they're not validated against PF/DDT and not promoted
+    // to Real. Default 10. Re-evaluated on subsequent cycles once
+    // entryCount accumulates.
+    //
+    // Symmetric with the Main gate: we take MAX(entryCount, prevPos.count)
+    // so historic closes (populated by ConfigSetProcessor →
+    // recordPosClosed during prehistoric) qualify a Set for Real
+    // evaluation even when the live cycle's entry count is small.
+    // This guarantees Real becomes productive immediately after
+    // prehistoric finishes its first pass.
+    const realMinPos = this._coordinationSettings.realEvalPosCount
+    const beforePosGate = mainSets.length
+    const mainSetsEligible = mainSets.filter((s) => {
+      const live = s.entryCount ?? s.entries?.length ?? 0
+      const hist = s.prevPos?.count ?? 0
+      return Math.max(live, hist) >= realMinPos
+    })
+    const skippedRealLowPos = beforePosGate - mainSetsEligible.length
+    if (skippedRealLowPos > 0) {
+      logProgressionEvent(
+        this.connectionId,
+        "real_stage",
+        "debug",
+        `Real min-pos gate skipped ${skippedRealLowPos}/${beforePosGate} (threshold=${realMinPos})`,
+        { symbol, skippedLowPos: skippedRealLowPos, threshold: realMinPos, mainTotal: beforePosGate },
+      ).catch(() => {})
+    }
+
     // P0-2: Real filter axes are PF-min + DDT-max ONLY. Confidence is
     // advisory metadata and is not part of the filter predicate.
-    const realQualifying = mainSets.filter(
+    const realQualifying = mainSetsEligible.filter(
       (s) =>
         s.avgProfitFactor >= metrics.minProfitFactor &&
         s.avgDrawdownTime <= metrics.maxDrawdownTime,
     )
 
-    // ── PRIORITY SORT: better Sets first ──────────────────────────────
+    // ── PRIORITY SORT: better Sets first ─────────────────��────────────
     // Per user spec: "arrange so that better Sets have priority". We sort
     // descending by `avgProfitFactor` �� the same metric Live uses for its
     // top-N selection at line 1182 — so when the downstream Live stage
@@ -1707,7 +1984,15 @@ export class StrategyCoordinator {
       if (!dir || !s.axisWindows) { passthrough.push(s); continue }
       const aw = s.axisWindows
       const outcome = aw.outcome ?? "pos"
-      const bucketKey = `${symbol}|${s.indicationType}|p${aw.prev}|l${aw.last}|c${aw.cont}|o${outcome}`
+      // ── Per-Base hedge isolation (operator spec) ────────────────────
+      // Spec: "long, short hedge based on Base sets with INDEPENDENT
+      // configs". Bucket identity must be per-parent-Base so axis Sets
+      // from different Base configs do NOT cancel each other. Without
+      // the parentSetKey prefix, two long axis Sets from Base A and an
+      // unrelated short axis Set from Base B (sharing the same axis
+      // tuple) would netting to 1 long survivor — which is wrong.
+      const parentKey = s.parentSetKey ?? s.setKey.split("#")[0]
+      const bucketKey = `${parentKey}|${symbol}|${s.indicationType}|p${aw.prev}|l${aw.last}|c${aw.cont}|o${outcome}`
       let b = hedgeBuckets.get(bucketKey)
       if (!b) { b = { long: [], short: [] }; hedgeBuckets.set(bucketKey, b) }
       if (dir === "short") b.short.push(s); else b.long.push(s)
@@ -1748,21 +2033,21 @@ export class StrategyCoordinator {
     // Resolve the cap with this precedence:
     //   1. Operator-set `maxRealSets` in Settings → System (Redis app_settings)
     //   2. Per-instance config override (if any caller passed one)
-    // ── Real Sets cap ────────────────────────────────────────────────
+    // ── Real Sets cap ─────────────────────────────────────────────���──
     // Per-spec: Strategies (Real Sets) are unlimited. Previously we
     // clamped to `maxRealSets` (default 12000); now we pass all
     // qualifying Real Sets to the Live stage. The operator still gates
     // via preset inclusion, profit-factor minimums, and coordination
-    // toggles — removing this funnel cap lifts the ceiling without
+    // toggles ��� removing this funnel cap lifts the ceiling without
     // sacrificing control.
     // For future use: if we need to re-cap (e.g. for perf), read the
     // operator's `maxRealSets` setting and apply it here. For now,
     // slice(0, Infinity) is a no-op.
     const realSets = realPostHedge.slice(0, this.config.maxRealSets ?? Infinity)
 
-    // ── Real-stage tuner — per-variant adjustments from Base prev-PI ──
+    // ── Real-stage tuner — per-variant adjustments from Base prev-pos ──
     //
-    // Operator spec: "at stage Real, do the accumulation for pis cnts
+    // Operator spec: "at stage Real, do the accumulation for pos cnts
     // sets relying to their base sets configs INDEPENDENT" + "Adjust
     // strategies Block, DCA, pos coord, ratios, volume".
     //
@@ -1778,8 +2063,8 @@ export class StrategyCoordinator {
     // is incremented for every Real Set produced — that's the dashboard
     // accumulation column.
     try {
-      const { bumpRealPiAccumulation, bumpValidPositions } = await import(
-        "@/lib/pi-history",
+      const { bumpRealPosAccumulation, bumpValidPositions, bumpAxisPosAccumulation } = await import(
+        "@/lib/pos-history",
       )
       const realActiveKeysForVP = await (async () => {
         try {
@@ -1794,21 +2079,42 @@ export class StrategyCoordinator {
       const accPipeline = getRedisClient().multi()
       for (const s of realSets) {
         const parentKey = s.parentSetKey || s.setKey.split("#")[0]
-        bumpRealPiAccumulation(this.connectionId, parentKey, 1, accPipeline)
+        bumpRealPosAccumulation(this.connectionId, parentKey, 1, accPipeline)
+
+        // ── Per-axis-Set continuous-count ledger (operator spec) ─────
+        // For axis Sets (the prev × last × cont × outcome × dir
+        // Cartesian fan-out at Main), record the rolling continuous
+        // count of Pis that have actually accumulated onto this axis
+        // bucket. Increment by `s.entryCount` (= baseEC + min(cont,
+        // liveCont) from expandAxisSets) so the ledger is the
+        // continuous-count rolling sum across cycles — exactly the
+        // metric the operator described as "ongoing continuous count
+        // of Pis to be added, counted onto the new sets". Pipelined
+        // alongside the existing accumulation writes for zero added
+        // round-trips.
+        if (s.axisWindows?.axisKey && s.entryCount > 0) {
+          bumpAxisPosAccumulation(
+            this.connectionId,
+            parentKey,
+            s.axisWindows.axisKey,
+            s.entryCount,
+            accPipeline,
+          )
+        }
 
         // ── Variant tuning ──
         // Block (size scaling) / DCA (leverage cap & DDT bias proxy) /
         // pos-coord axis Sets (entries[].sizeMultiplier) / default+trailing
         // (size only). All clamped to operator-safe bounds.
-        const pi = s.prevPi
-        if (pi && pi.count > 0) {
+        const pos = s.prevPos
+        if (pos && pos.count > 0) {
           // Bias factor in [0.6, 1.4] derived from successRate (0.45 = neutral).
           // Maps PF ≥ 1.5 → boost, PF < 0.8 → cut. Smooth so small PF wobbles
           // don't cause jagged size jumps cycle-over-cycle.
-          const sr = Math.max(0, Math.min(1, pi.successRate))
-          const pfBias = pi.profitFactor <= 0
+          const sr = Math.max(0, Math.min(1, pos.successRate))
+          const pfBias = pos.profitFactor <= 0
             ? 0.85
-            : Math.max(0.6, Math.min(1.4, 0.7 + 0.5 * Math.tanh(pi.profitFactor - 1.0)))
+            : Math.max(0.6, Math.min(1.4, 0.7 + 0.5 * Math.tanh(pos.profitFactor - 1.0)))
           const sigBias = Math.max(0.7, Math.min(1.3, 0.7 + 1.2 * sr))
           const combined = (pfBias + sigBias) / 2
 
@@ -2219,7 +2525,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����──────────��──────��──────────────────────���────────
+  // ─── STAGE 4: LIVE ─────────����──────────��─────����──────────────────────���────────
 
   /**
    * Select the best 500 Sets from REAL for live trading.
@@ -3035,6 +3341,7 @@ export class StrategyCoordinator {
   private expandAxisSets(
     baseDefault: StrategySet,
     minPF: number,
+    liveCont = 0,
   ): StrategySet[] {
     const axisSets: StrategySet[] = []
     const baseEC = baseDefault.entryCount || 0
@@ -3044,58 +3351,114 @@ export class StrategyCoordinator {
     // so `parentSetKey` always points at the originating Base Set.
     const parentKey = baseDefault.parentSetKey || baseDefault.setKey.split("#")[0]
 
+    // ── Inherited quality fields used for the synthetic representative entry ─
+    // The Real-stage tuner walks `set.entries` to mutate sizeMultiplier /
+    // leverage per-cycle. Axis Sets used to ship empty `entries: []`,
+    // making the tuner a no-op and the variant aggregates count zero.
+    // Per spec ("ongoing continuous count of Pis to be added, counted
+    // onto the new sets") each axis Set gets ONE faithful pos-coord
+    // projection inherited from the parent Base default — flagged with
+    // `#axis-synth` so downstream consumers can recognise it.
+    const inheritedPF   = baseDefault.avgProfitFactor ?? 1
+    const inheritedDDT  = baseDefault.avgDrawdownTime ?? 0
+    const inheritedConf = baseDefault.avgConfidence   ?? 0
+
     for (const prev of AXIS_PREV) {
       // ── prev FILTER (PF gate on last `prev` completed entries) ─────
+      // Spec: prev "acts as a PF filter on the parent's last N completed
+      // entries". When the parent does not yet have N completed entries
+      // (warming up / fresh symbol), the filter is *undefined* — there
+      // is nothing to evaluate yet — and we ADMIT the prev row neutrally.
+      // The fan-out's purpose is the position-count axis (cont × dir);
+      // suppressing it during bootstrap collapses Main count to Base
+      // count, which is exactly the symptom we're fixing here. Once the
+      // parent accumulates ≥ N completed entries, the PF gate engages
+      // and the filter starts pruning legitimately.
       const prevMeanPF = this.meanPFOfLastN(entries, prev)
-      if (prevMeanPF === null) continue          // insufficient data
-      if (prevMeanPF < minPF)  continue          // PF gate failed → skip whole prev row
+      if (prevMeanPF !== null && prevMeanPF < minPF) continue // gate engaged → skip whole prev row
 
       for (const last of AXIS_LAST) {
-        // ── last OUTCOME SPLIT (single realised outcome per cycle) ───
+        // ── last OUTCOME SPLIT ───────────────────────────────────────
+        // Spec: emit ONE Set per `last` value tagged with the realised
+        // pos/neg outcome based on parent's last M completed entries'
+        // meanPF. When parent does not yet have M completed entries
+        // (warming up), the outcome is *undefined* — we emit BOTH
+        // `pos` AND `neg` projections so neither side is suppressed
+        // during bootstrap. Once the parent accumulates ≥ M entries
+        // the outcome resolves to a single side per cycle as before.
         const lastMeanPF = this.meanPFOfLastN(entries, last)
-        if (lastMeanPF === null) continue        // insufficient data
-        const outcome: "pos" | "neg" = lastMeanPF >= 1.0 ? "pos" : "neg"
+        const outcomes: Array<"pos" | "neg"> =
+          lastMeanPF === null ? ["pos", "neg"] : [lastMeanPF >= 1.0 ? "pos" : "neg"]
 
         for (const cont of AXIS_CONT) {
           for (const dir of AXIS_DIRS) {
-            const axisKey = `p${prev}_l${last}_c${cont}_o${outcome}_d${dir}`
-            axisSets.push({
-              setKey:          `${parentKey}#axis:${axisKey}`,
-              parentSetKey:    parentKey,
-              variant:         "default",
-              indicationType:  baseDefault.indicationType,
-              // Direction is fan-out axis (Cartesian), not inherited.
-              direction:       dir,
-              // Inherited quality fields — axis Sets do not re-evaluate.
-              avgProfitFactor: baseDefault.avgProfitFactor,
-              avgConfidence:   baseDefault.avgConfidence,
-              avgDrawdownTime: baseDefault.avgDrawdownTime,
-              // Position-count contribution per spec:
-              //   baseEC = parent's COMPLETED historic entry count.
-              //   cont   = OPEN positions to accumulate into this Set
-              //            (the "actual" currently-open one + cont-1
-              //            future ones to be opened across intervals).
-              // Example: continuous=3 ⇒ "add actual and next 2 positions"
-              // ⇒ axis Set's entryCount = baseEC + 3.
-              entryCount:      baseEC + cont,
-              // Empty entries — axis Sets are pure-metadata projections.
-              entries:         [],
-              createdAt:       new Date().toISOString(),
-              axisWindows: {
-                prev,
-                last,
-                cont,
-                pause:     0,
-                direction: dir,
-                axisKey,
-                outcome,
-              },
-              trailingProfile: baseDefault.trailingProfile,
-              // Carry parent's prev-PI snapshot through the axis fan-out
-              // unchanged — same realised-history regime applies to every
-              // axis projection of the same Base Set.
-              ...(baseDefault.prevPi && { prevPi: baseDefault.prevPi }),
-            })
+            for (const outcome of outcomes) {
+              const axisKey = axisKeyOf(prev, last, cont, outcome, dir)
+
+              // ── Live continuous-count cap (operator spec) ──────────
+              // The `cont` axis dimension represents "actual + next N-1
+              // positions to accumulate". Per spec we only credit
+              // positions that ACTUALLY exist live this cycle. Cap by
+              // `liveCont` so axis Sets reflect the rolling continuous
+              // count, not a static projection that would over-count
+              // empty slots. Worst case (liveCont = 0) collapses to
+              // `entryCount = baseEC`, growing as positions accrue.
+              const credited = Math.min(cont, Math.max(0, liveCont))
+              const ec = baseEC + credited
+
+              // ── Synthetic representative entry ─────────────────────
+              // One entry per axis Set so:
+              //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
+              //   • Real-stage tuner has something to mutate
+              //   • per-axis Pos-acc ledger has a non-zero delta to record
+              // Quality fields are inherited from the Base default's
+              // realised-history aggregates; positionState carries the
+              // axis tuple so the dashboard can drill in.
+              const synthEntry: StrategySetEntry = {
+                id: `${parentKey}#axis:${axisKey}#axis-synth`,
+                sizeMultiplier: 1,
+                leverage: 1,
+                positionState: `axis:p${prev}|l${last}|c${cont}|${outcome}|${dir}`,
+                profitFactor: inheritedPF,
+                drawdownTime: inheritedDDT,
+                confidence: inheritedConf,
+              }
+
+              axisSets.push({
+                setKey:          `${parentKey}#axis:${axisKey}`,
+                parentSetKey:    parentKey,
+                variant:         "default",
+                indicationType:  baseDefault.indicationType,
+                // Direction is fan-out axis (Cartesian), not inherited.
+                direction:       dir,
+                // Inherited quality fields — axis Sets do not re-evaluate.
+                avgProfitFactor: inheritedPF,
+                avgConfidence:   inheritedConf,
+                avgDrawdownTime: inheritedDDT,
+                // Position-count contribution per spec:
+                //   baseEC = parent's COMPLETED historic entry count.
+                //   credited = OPEN positions actually accumulated onto
+                //              this Set right now (cap min(cont, liveCont)).
+                entryCount:      ec,
+                // ONE synthetic representative entry — see comment above.
+                entries:         [synthEntry],
+                createdAt:       new Date().toISOString(),
+                axisWindows: {
+                  prev,
+                  last,
+                  cont,
+                  pause:     0,
+                  direction: dir,
+                  axisKey,
+                  outcome,
+                },
+                trailingProfile: baseDefault.trailingProfile,
+                // Carry parent's prev-pos snapshot through the axis fan-out
+                // unchanged — same realised-history regime applies to every
+                // axis projection of the same Base Set.
+                ...(baseDefault.prevPos && { prevPos: baseDefault.prevPos }),
+              })
+            }
           }
         }
       }
@@ -3186,7 +3549,7 @@ export class StrategyCoordinator {
    * Deterministic fingerprint of {base Set × variant × position context}.
    * Drives the "IF NOT ALREADY CREATED" dedup check.
    *
-   * ── Bucket ranges (P0-3, spec-aligned) ─────────────────────────────
+   * ── Bucket ranges (P0-3, spec-aligned) ─��───────────────────────────
    * Spec ranges:
    *   - Prev Positions         1-12   (13 buckets 0-12)
    *   - Last Positions W/L     1-4    (5 buckets each 0-4)
@@ -3320,11 +3683,11 @@ export class StrategyCoordinator {
       entryCount:      capped.length,
       entries:         capped,
       createdAt:       new Date().toISOString(),
-      // Propagate prev-PI snapshot from parent Base Set unchanged. Real
+      // Propagate prev-pos snapshot from parent Base Set unchanged. Real
       // stage uses it to tune size/leverage; Live stage uses it for
       // ranking. We never recompute here — the Base-stage snapshot is
       // canonical for this Run cycle.
-      ...(baseSet.prevPi && { prevPi: baseSet.prevPi }),
+      ...(baseSet.prevPos && { prevPos: baseSet.prevPos }),
     }
   }
 

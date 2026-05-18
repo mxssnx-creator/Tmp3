@@ -1,5 +1,15 @@
 /**
- * Position-Indication (PI) History — lifetime, atomic, hot-path-safe.
+ * Position (Pos) History — lifetime, atomic, hot-path-safe.
+ *
+ * Naming note: this module used to be called "PI history" / "Pi history",
+ * which was a misnomer — every counter here tracks a closed POSITION,
+ * not a "Pi". All exports were renamed: `PosHistoryStats`,
+ * `recordPosClosed`, `getPosHistory`, `getPosHistoryOverall`,
+ * `getPosHistoryBatch`, `bumpRealPosAccumulation`, `getRealPosAccumulation`,
+ * `bumpAxisPosAccumulation`, `getAxisPosAccumulation`. Persisted Redis
+ * key prefixes (`pi_history:`, `real_pi_acc:`, `axis_pos_acc:`) are
+ * intentionally KEPT so existing live deployments do not silently drop
+ * their accumulated history on deploy — the rename is code-side only.
  *
  * ── WHY THIS EXISTS ───────────────────────────────────────────────────
  * The auto-indication engine reads a `position_history:*` blob to gate
@@ -15,7 +25,7 @@
  *   pi_history:{conn}:{symbol}:{indicationType}:{direction}
  *
  * Fields (all integers — `hincrby` atomic, scaled where noted):
- *   count          total closed PIs
+ *   count          total closed positions
  *   wins           closed with pnl > 0
  *   losses         closed with pnl <= 0
  *   pf_num_x1000   ∑ max(0, pnl)  × 1000  (gross profit, scaled)
@@ -43,7 +53,7 @@ const OVERALL_BUCKET = "_overall"
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-export interface PiHistoryStats {
+export interface PosHistoryStats {
   /** Number of closed positions seen for this bucket. 0 means "no data". */
   count: number
   /** Wins / count, or 0 when count == 0. */
@@ -60,7 +70,7 @@ export interface PiHistoryStats {
   hasSignal: boolean
 }
 
-const EMPTY: PiHistoryStats = {
+const EMPTY: PosHistoryStats = {
   count: 0,
   successRate: 0,
   profitFactor: 0,
@@ -69,6 +79,11 @@ const EMPTY: PiHistoryStats = {
 }
 
 // ── Key builders ───────────────────────────────────────────────────────
+//
+// NOTE: the persisted prefix is still `pi_history:` on purpose — see the
+// header docstring. Renaming the prefix would orphan every live
+// deployment's accumulated history. The code-side rename to `Pos`
+// only touches identifiers and field/type names.
 
 function hashKey(
   connectionId: string,
@@ -85,7 +100,7 @@ function overallKey(connectionId: string): string {
 
 // ── Writer ─────────────────────────────────────────────────────────────
 
-export interface RecordPiClosedInput {
+export interface RecordPosClosedInput {
   connectionId: string
   symbol: string
   /** Indication type that originated the position (e.g. "direction" / "active" / "auto"). */
@@ -98,7 +113,7 @@ export interface RecordPiClosedInput {
   /**
    * Optional Redis pipeline. When provided we COMPOSE the writes into the
    * caller's existing pipeline so a single round-trip carries the full
-   * close path (status flip + PI history + Set append). When absent we
+   * close path (status flip + Pos history + Set append). When absent we
    * issue our own pipeline. Either way the ops are atomic w.r.t. each
    * other for a given close.
    */
@@ -106,7 +121,7 @@ export interface RecordPiClosedInput {
 }
 
 /**
- * Record one CLOSED position into PI history.
+ * Record one CLOSED position into Pos history.
  *
  * Caller contract:
  *   • Call exactly once per close (closePosition path).
@@ -118,7 +133,7 @@ export interface RecordPiClosedInput {
  * pipeline.exec() failure (if any) propagate so callers using their own
  * pipeline observe the same atomicity story.
  */
-export function recordPiClosed(input: RecordPiClosedInput): void {
+export function recordPosClosed(input: RecordPosClosedInput): void {
   const {
     connectionId,
     symbol,
@@ -162,9 +177,9 @@ export function recordPiClosed(input: RecordPiClosedInput): void {
   client.expire(k, TTL_SECONDS)
 
   // Connection-level rollup so callers that don't yet know the symbol/
-  // type triple (e.g. dashboard "any-symbol prev-PI" tile) still see a
-  // useful aggregate. We keep both writes in the same pipeline so the
-  // pair atomically stays consistent.
+  // type triple (e.g. dashboard "any-symbol prev-position" tile) still
+  // see a useful aggregate. We keep both writes in the same pipeline so
+  // the pair atomically stays consistent.
   const o = overallKey(connectionId)
   client.hincrby(o, "count",  1)
   client.hincrby(o, win ? "wins" : "losses", 1)
@@ -185,7 +200,7 @@ export function recordPiClosed(input: RecordPiClosedInput): void {
 function deriveStats(
   hash: Record<string, string> | null | undefined,
   threshold: number,
-): PiHistoryStats {
+): PosHistoryStats {
   if (!hash) return EMPTY
   const count  = Number(hash.count  || "0")
   if (count <= 0) return EMPTY
@@ -207,19 +222,19 @@ function deriveStats(
 }
 
 /**
- * Fetch the per-(symbol × type × direction) PI history.
+ * Fetch the per-(symbol × type × direction) Pos history.
  *
  * Returns {count: 0, ...} when the bucket has no data — callers must
  * always be tolerant of "no signal yet" since fresh boots and new
  * symbol/direction pairs start empty.
  */
-export async function getPiHistory(
+export async function getPosHistory(
   connectionId: string,
   symbol: string,
   indicationType: string,
   direction: "long" | "short",
   threshold = 5,
-): Promise<PiHistoryStats> {
+): Promise<PosHistoryStats> {
   try {
     const client = getRedisClient()
     const hash = (await client.hgetall(
@@ -232,10 +247,10 @@ export async function getPiHistory(
 }
 
 /** Connection-level rollup across all symbol/type/direction buckets. */
-export async function getPiHistoryOverall(
+export async function getPosHistoryOverall(
   connectionId: string,
   threshold = 5,
-): Promise<PiHistoryStats> {
+): Promise<PosHistoryStats> {
   try {
     const client = getRedisClient()
     const hash = (await client.hgetall(overallKey(connectionId))) as Record<
@@ -252,13 +267,13 @@ export async function getPiHistoryOverall(
  * Fetch many buckets in one round-trip. Used by createBaseSets to grab
  * (symbol × every (type, direction)) pair without N+1 hgetalls.
  */
-export async function getPiHistoryBatch(
+export async function getPosHistoryBatch(
   connectionId: string,
   symbol: string,
   pairs: Array<{ indicationType: string; direction: "long" | "short" }>,
   threshold = 5,
-): Promise<Map<string, PiHistoryStats>> {
-  const out = new Map<string, PiHistoryStats>()
+): Promise<Map<string, PosHistoryStats>> {
+  const out = new Map<string, PosHistoryStats>()
   if (pairs.length === 0) return out
   try {
     const client = getRedisClient()
@@ -285,16 +300,19 @@ export async function getPiHistoryBatch(
 // ── Per-Base accumulation counter (Real-stage independence) ───────────
 //
 // At Real stage we need a per-Base, per-stage counter — the operator
-// spec says "for each Base Set's PIs cnts Sets … relying to their base
-// sets configs INDEPENDENT". This is the persisted ledger backing the
-// Strategy Pipeline UI's per-Base accumulation column.
+// spec says "for each Base Set's positions cnts Sets … relying to their
+// base sets configs INDEPENDENT". This is the persisted ledger backing
+// the Strategy Pipeline UI's per-Base accumulation column.
+//
+// Persisted prefix kept as `real_pi_acc:` for backwards compatibility
+// with already-running deployments — see header docstring.
 
 /**
- * Increment the lifetime Real-stage PI accumulation counter for a Base
+ * Increment the lifetime Real-stage Pos accumulation counter for a Base
  * Set. Composes into an external pipeline when provided, otherwise
  * fires its own one-shot pipeline.
  */
-export function bumpRealPiAccumulation(
+export function bumpRealPosAccumulation(
   connectionId: string,
   baseSetKey: string,
   delta = 1,
@@ -311,7 +329,7 @@ export function bumpRealPiAccumulation(
 }
 
 /** Read full per-Base Real-stage accumulation map for the dashboard. */
-export async function getRealPiAccumulation(
+export async function getRealPosAccumulation(
   connectionId: string,
 ): Promise<Record<string, number>> {
   try {
@@ -328,9 +346,69 @@ export async function getRealPiAccumulation(
   }
 }
 
+// ── Per-axis-Set continuous-count ledger (Main "additional Pos-Count Sets") ───
+//
+// Operator spec: "the ongoing continuous count of positions. To be
+// added, counted onto the new sets". Each Main axis Set (the
+// prev × last × cont × outcome × dir Cartesian fan-out) needs its own
+// rolling count of how many live continuous positions have actually
+// accumulated onto it across cycles. Independent from
+// `real_pi_acc:{conn}` (which is per-Base aggregate) so the dashboard
+// can drill in to a specific axis bucket within a Base.
+//
+// Field key:  `${parentSetKey}|${axisKey}`
+//   - parentSetKey isolates Bases (each Base Set has its own configs)
+//   - axisKey already encodes (prev,last,cont,dir,outcome) tuple
+//
+// HASH per connection with hincrby semantics + sliding 90-day TTL,
+// pipeline-friendly to be batched alongside the Real tuner's
+// existing accumulation pipeline.
+
+/**
+ * Increment per-axis-Set continuous-count accumulation. Designed to be
+ * called once per cycle per surviving axis Set with `delta` set to the
+ * Set's current `entryCount` (= baseEC + min(cont, liveCont)). Composes
+ * into an external pipeline when provided.
+ */
+export function bumpAxisPosAccumulation(
+  connectionId: string,
+  parentSetKey: string,
+  axisKey: string,
+  delta = 1,
+  externalPipeline?: ReturnType<ReturnType<typeof getRedisClient>["multi"]>,
+): void {
+  if (!connectionId || !parentSetKey || !axisKey || delta <= 0) return
+  const key = `axis_pos_acc:${connectionId}`
+  const field = `${parentSetKey}|${axisKey}`
+  const client = externalPipeline ?? getRedisClient().multi()
+  client.hincrby(key, field, delta)
+  client.expire(key, TTL_SECONDS)
+  if (!externalPipeline) {
+    ;(client as any).exec().catch(() => {})
+  }
+}
+
+/** Read full per-axis accumulation map (for the Strategy Pipeline UI). */
+export async function getAxisPosAccumulation(
+  connectionId: string,
+): Promise<Record<string, number>> {
+  try {
+    const client = getRedisClient()
+    const hash = (await client.hgetall(`axis_pos_acc:${connectionId}`)) as Record<
+      string,
+      string
+    >
+    const out: Record<string, number> = {}
+    for (const [k, v] of Object.entries(hash || {})) out[k] = Number(v) || 0
+    return out
+  } catch {
+    return {}
+  }
+}
+
 // ── Valid Positions Counters ───────────────────────────────────────────
 //
-// Separate from PI history: these track LIVE-promoted Sets (positions
+// Separate from Pos history: these track LIVE-promoted Sets (positions
 // the engine considers "valid" — i.e. surviving Real and reaching Live).
 // One HASH per connection with rollup fields the dashboard renders.
 

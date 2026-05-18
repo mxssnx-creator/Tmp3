@@ -76,7 +76,7 @@ export class TradingEngine {
     volumeFactor?: number,
     indicationType?: "direction" | "move" | "active",
   ): Promise<TradingPosition> {
-    const finalLeverage = leverage || 150 // Use maximum leverage by default
+    const finalLeverage = leverage || 150 // Default to BingX max (150x); call sites should pass explicit max via getMaxLeverageForExchange()
     const finalPositionSide = positionSide || (side === "buy" ? "long" : "short")
 
     const volumeCalc = volumeFactor ? this.calculateVolume(volume, volumeFactor) : null

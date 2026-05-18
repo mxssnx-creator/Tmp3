@@ -102,7 +102,7 @@ interface StrategyTracking {
     byDirection: Record<string, number>
     byType: Record<string, number>
   }
-  prevPi?: {
+  prevPos?: {
     count: number
     successRate: number
     profitFactor: number
@@ -263,41 +263,41 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
                 </div>
               </div>
             )}
-            {data.prevPi && (
+            {data.prevPos && (
               <div className="mt-4 rounded-md border border-primary/30 bg-primary/[0.04] p-3">
                 <div className="mb-2 flex items-baseline justify-between">
                   <div className="text-[11px] uppercase tracking-wide text-primary/80 font-semibold">
-                    Prev-PI Influence
+                    Prev-Pos Influence
                     <Badge
-                      variant={data.prevPi.active ? "default" : "outline"}
+                      variant={data.prevPos.active ? "default" : "outline"}
                       className="ml-2 font-mono text-[10px]"
                     >
-                      {data.prevPi.active ? "ACTIVE" : "BOOTSTRAPPING"}
+                      {data.prevPos.active ? "ACTIVE" : "BOOTSTRAPPING"}
                     </Badge>
                   </div>
                   <div className="text-[10px] text-muted-foreground">
-                    threshold ≥ {data.prevPi.minCount} closed PIs
+                    threshold ≥ {data.prevPos.minCount} closed positions
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                   <Metric
-                    label="Closed PIs"
-                    value={data.prevPi.count}
+                    label="Closed Positions"
+                    value={data.prevPos.count}
                     hint="Total closed pseudo-positions accumulated across the run. Below threshold means the engine is in bootstrap mode (no historic blend)."
                   />
                   <Metric
                     label="Success Rate"
-                    value={`${(data.prevPi.successRate * 100).toFixed(1)}%`}
+                    value={`${(data.prevPos.successRate * 100).toFixed(1)}%`}
                     hint="Wins / total. Drives Real-stage size/leverage tuning per (symbol×type×direction)."
                   />
                   <Metric
                     label="Profit Factor"
-                    value={data.prevPi.profitFactor.toFixed(3)}
+                    value={data.prevPos.profitFactor.toFixed(3)}
                     hint="Gross profit / gross loss. Used as MIN-blend against indication PF at Base when above threshold."
                   />
                   <Metric
                     label="Avg DDT (min)"
-                    value={Math.round(data.prevPi.avgDDT)}
+                    value={Math.round(data.prevPos.avgDDT)}
                     hint="Average position drawdown duration in minutes."
                   />
                 </div>

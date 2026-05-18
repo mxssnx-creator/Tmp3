@@ -65,20 +65,35 @@ export class BingXConnector extends BaseExchangeConnector {
     }
 
     try {
+      // NTP-style midpoint sync: capture local time around the request
+      // and assume symmetric latency. The previous implementation used
+      // Date.now() AFTER the await, which biased the offset by one
+      // round-trip — on a Vercel→BingX link that's typically 200-600 ms,
+      // and the venue enforces a strict ±1000 ms timestamp window. Once
+      // the cached offset drifts past that window every signed request
+      // fails with "timestamp is invalid" (code 109400), as observed in
+      // engine reconcile cycles. Midpoint estimation halves the worst-
+      // case error and keeps the offset well inside the window even on
+      // slow links.
+      const t0 = Date.now()
       const response = await fetch(`${this.getBaseUrl()}/openApi/v1/public/time`, {
         method: "GET",
         headers: { "Content-Type": "application/json" },
       })
+      const t1 = Date.now()
       const data = await response.json()
       if (data.code === 0 || data.code === "0") {
         const serverTime = Number(data.data?.serverTime || data.serverTime || data.time || 0)
         if (serverTime > 0) {
-          this.timeOffset = serverTime - Date.now()
+          // Server reported its time at some point during [t0, t1].
+          // Best estimate: midpoint of the request window.
+          const localMidpoint = t0 + (t1 - t0) / 2
+          this.timeOffset = serverTime - localMidpoint
           this.lastTimeSync = now
           if (Math.abs(this.timeOffset) > 100) {
             this.log(
-              `[v0] Server time sync: offset=${this.timeOffset}ms ` +
-              `(server=${serverTime}, local=${Date.now()})`,
+              `[v0] Server time sync: offset=${this.timeOffset.toFixed(0)}ms ` +
+                `(server=${serverTime}, localMid=${localMidpoint.toFixed(0)}, rtt=${t1 - t0}ms)`,
             )
           }
         }
@@ -97,6 +112,33 @@ export class BingXConnector extends BaseExchangeConnector {
   private getTimestamp(): number {
     return Date.now() + this.timeOffset
   }
+
+  /**
+   * Detects "timestamp is invalid" responses (BingX code 109400 with a
+   * timestamp-shaped message) and force-resyncs the server-time offset.
+   * Returns true if the caller should retry the request once.
+   *
+   * Two ways to hit this in production despite the up-front sync:
+   *  1) Multiple signed requests fire in the same tick before the first
+   *     `syncServerTime()` resolves; they all use a stale cached offset.
+   *  2) The local clock drifts between syncs (we re-sync every 5 min,
+   *     but a containers' clock can step on cgroup migration or VM
+   *     suspend/resume). The cached offset is then off by minutes.
+   *
+   * Force-resyncing on this exact error code recovers within one extra
+   * round-trip rather than blocking until the next 5-min interval.
+   */
+  private async resyncOnTimestampError(data: any): Promise<boolean> {
+    const code = String(data?.code ?? "")
+    const msg  = String(data?.msg ?? "").toLowerCase()
+    if (code === "109400" && msg.includes("timestamp")) {
+      this.lastTimeSync = 0 // force a resync on next call
+      await this.syncServerTime()
+      return true
+    }
+    return false
+  }
+
 
   private getSignature(params: Record<string, any>): string {
     // Kept only for the one remaining helper that doesn't need the query
@@ -553,6 +595,36 @@ export class BingXConnector extends BaseExchangeConnector {
       const data = await this.safeJson(response)
 
       if (!this.isBingXSuccess(data.code)) {
+        // First: handle "timestamp is invalid" (cached-offset drift)
+        // by force-resyncing the server-time offset and retrying once.
+        // Distinguished from the hedge-mode 109400 below by checking
+        // the message text. If we recovered, fall through to success
+        // path with the retry response.
+        if (await this.resyncOnTimestampError(data)) {
+          params.timestamp = this.getTimestamp()
+          const { signature: tsRetrySig, queryString: tsRetryQs } = this.signParams(params)
+          const tsRetryUrl = `${this.getBaseUrl()}${endpoint}?${tsRetryQs}&signature=${tsRetrySig}`
+          const tsRetryResp = await this.rateLimitedFetch(tsRetryUrl, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const tsRetryData = await this.safeJson(tsRetryResp)
+          if (this.isBingXSuccess(tsRetryData.code)) {
+            const info = tsRetryData.data?.order || tsRetryData.data || {}
+            const id = info.orderId || info.id || tsRetryData.data?.orderId
+            this.log(`✓ Order placed on retry (timestamp resync): ${id}`)
+            return { success: true, orderId: id ? String(id) : undefined }
+          }
+          // Resync didn't fix it; fall through with the retry response
+          // so the operator sees the real underlying error.
+          Object.assign(data, tsRetryData)
+          if (this.isBingXSuccess(data.code)) {
+            const info = data.data?.order || data.data || {}
+            const id = info.orderId || info.id || data.data?.orderId
+            return { success: true, orderId: id ? String(id) : undefined }
+          }
+        }
+
         // Special-case: 109400 "In the Hedge mode, the 'ReduceOnly' field
         // can not be filled." A misrouted reduceOnly slipped through; strip
         // it and retry once. Hedge mode's reduce-only semantic is carried
@@ -728,6 +800,30 @@ export class BingXConnector extends BaseExchangeConnector {
       // not propagated from the caller and `reduceOnly` ended up on a
       // hedge-mode request anyway. Strip it and retry once.
       if (!this.isBingXSuccess(data.code)) {
+        // First: handle "timestamp is invalid" (cached-offset drift)
+        // by force-resyncing and retrying once. Same rationale as
+        // placeOrder; the engine fires many SL/TP placement requests
+        // in parallel during a reconcile sweep, and they all see the
+        // pre-sync stale offset.
+        if (await this.resyncOnTimestampError(data)) {
+          params.timestamp = this.getTimestamp()
+          const { signature: tsSig, queryString: tsQs } = this.signParams(params)
+          const tsUrl = `${this.getBaseUrl()}${endpoint}?${tsQs}&signature=${tsSig}`
+          const tsResp = await this.rateLimitedFetch(tsUrl, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          const tsData = await this.safeJson(tsResp)
+          if (this.isBingXSuccess(tsData.code)) {
+            const info = tsData.data?.order || tsData.data || {}
+            return {
+              success: true,
+              orderId: String(info.orderId ?? info.orderID ?? ""),
+            }
+          }
+          Object.assign(data, tsData)
+        }
+
         const reduceOnlyHedgeConflict =
           String(data.code) === "109400" ||
           /reduceonly.*hedge|hedge.*reduceonly/i.test(String(data.msg || ""))
@@ -1249,19 +1345,31 @@ export class BingXConnector extends BaseExchangeConnector {
       // leverage-mismatch. Fire both LONG and SHORT side updates in parallel
       // so hedge-mode accounts have matching leverage on both sides.
       const updateForSide = async (side: "LONG" | "SHORT") => {
-        const params: Record<string, string> = {
+        const buildParams = (): Record<string, string> => ({
           symbol: bingxSymbol,
           side,
           leverage: String(leverage),
           timestamp: String(this.getTimestamp()),
-        }
-        const { signature, queryString: signedQs } = this.signParams(params)
-        const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${signedQs}&signature=${signature}`
-        const response = await this.rateLimitedFetch(url, {
-          method: "POST",
-          headers: { "X-BX-APIKEY": this.credentials.apiKey },
         })
-        const data = await this.safeJson(response)
+        const sendOnce = async (params: Record<string, string>) => {
+          const { signature, queryString: signedQs } = this.signParams(params)
+          const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/leverage?${signedQs}&signature=${signature}`
+          const response = await this.rateLimitedFetch(url, {
+            method: "POST",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey },
+          })
+          return this.safeJson(response)
+        }
+        let data = await sendOnce(buildParams())
+        // One-shot resync-and-retry on cached-offset drift. The
+        // first sync we do at the top of setLeverage is fine, but
+        // when the engine fires many setLeverage calls in parallel
+        // (one per symbol on adoption sweep), they all see the
+        // stale offset until the first response lands. The retry
+        // recovers without making the engine reschedule.
+        if (!this.isBingXSuccess(data?.code) && (await this.resyncOnTimestampError(data))) {
+          data = await sendOnce(buildParams())
+        }
         return { side, ok: this.isBingXSuccess(data.code), data }
       }
 
@@ -1299,22 +1407,25 @@ export class BingXConnector extends BaseExchangeConnector {
       const bingxSymbol = this.toBingXSymbol(symbol)
       this.log(`Setting margin type to ${marginType} for ${bingxSymbol}`)
 
-      const params: Record<string, string> = {
+      const buildParams = (): Record<string, string> => ({
         symbol: bingxSymbol,
         marginType: marginType === "cross" ? "CROSSED" : "ISOLATED",
         timestamp: String(this.getTimestamp()),
-      }
-
-      const { signature, queryString: signedQs } = this.signParams(params)
-      // Perp: /openApi/swap/v2/trade/marginType (not v3).
-      const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${signedQs}&signature=${signature}`
-
-      const response = await this.rateLimitedFetch(url, {
-        method: "POST",
-        headers: { "X-BX-APIKEY": this.credentials.apiKey },
       })
-
-      const data = await this.safeJson(response)
+      const sendOnce = async (params: Record<string, string>) => {
+        const { signature, queryString: signedQs } = this.signParams(params)
+        const url = `${this.getBaseUrl()}/openApi/swap/v2/trade/marginType?${signedQs}&signature=${signature}`
+        const response = await this.rateLimitedFetch(url, {
+          method: "POST",
+          headers: { "X-BX-APIKEY": this.credentials.apiKey },
+        })
+        return this.safeJson(response)
+      }
+      let data = await sendOnce(buildParams())
+      // Retry-once on cached-offset drift, same rationale as setLeverage.
+      if (!this.isBingXSuccess(data?.code) && (await this.resyncOnTimestampError(data))) {
+        data = await sendOnce(buildParams())
+      }
 
       if (!this.isBingXSuccess(data.code)) {
         // Margin-type-unchanged is not a real error on BingX; ignore code 101404.

@@ -393,22 +393,50 @@ async function testMarketOrderPlacement(
     // Get balances first
     const connResult = await connector.testConnection()
     const balance = parseFloat(connResult.balance || "0")
-    
-    if (balance < 10) {
+
+    // Operator-spec: test with MINIMAL volume on whatever balance is
+    // available. Previously this returned a synthetic "skipped"
+    // failure on balance < 10 USDT, which masked real placement
+    // bugs on accounts that float a tight balance. Now we only
+    // skip on a truly empty account (< 1 USDT covers the rounding
+    // edge case where the venue reports 0.99 due to fees in flight).
+    if (balance < 1) {
       return {
         testName: "Market Order Placement",
         success: false,
         duration: Date.now() - start,
-        details: `Balance too low for live market order (${balance} USDT, need >= 10)`,
-        error: "Skipped - insufficient balance. Order placement infrastructure verified on balance check.",
+        details: `Balance is empty (${balance} USDT) — cannot test market order placement`,
+        error: "Skipped - account is unfunded.",
       }
     }
 
-    // Try low-cost symbols with very small quantities
+    // Try low-cost symbols with the smallest viable quantity per
+    // symbol. Per operator policy ("always use max leverage,
+    // everywhere"), the connector is set to the venue maximum
+    // (BingX → 150x) just below; with ≥1 USDT free margin and
+    // 150x leverage these all have margin requirements well under
+    // 1 USDT, so they'll fit on a barely-funded account once the
+    // venue's per-symbol min notional is satisfied.
+    try {
+      const { getMaxLeverageForExchange } = await import("@/lib/leverage-policy")
+      const venueMax = getMaxLeverageForExchange(connection.exchange)
+      // Try several symbols — pick the first that accepts the
+      // setLeverage call. setLeverage can fail on per-symbol bracket
+      // limits, so we apply it on the symbol that actually places
+      // the order inside the loop below as well (idempotent).
+      for (const sym of ["DOGE/USDT", "SHIB/USDT", "PEPE/USDT", "BTC/USDT"]) {
+        try { await connector.setLeverage?.(sym, venueMax); break } catch {}
+      }
+      console.log(`${LOG_PREFIX} Venue max leverage applied: ${venueMax}x`)
+    } catch (e) {
+      console.log(`${LOG_PREFIX} setLeverage best-effort failed:`, e)
+    }
+
     const testCases = [
-      { symbol: "SHIB/USDT", qty: 10 },
-      { symbol: "DOGE/USDT", qty: 1 },
-      { symbol: "BTC/USDT", qty: 0.0001 },
+      { symbol: "DOGE/USDT", qty: 1 },        // ≈ $0.10 notional
+      { symbol: "SHIB/USDT", qty: 100000 },   // ≈ $1 notional
+      { symbol: "PEPE/USDT", qty: 100000 },   // ≈ $1 notional
+      { symbol: "BTC/USDT", qty: 0.0001 },    // ≈ $10 notional (last resort)
     ]
 
     let result = null
