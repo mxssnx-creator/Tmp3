@@ -28,6 +28,24 @@ export interface PseudoPosition {
   result?: number // PnL percentage when closed
   exit_time?: string
   exit_price?: number
+  /**
+   * Direction of the trade — only carried on the in-memory PseudoPosition
+   * shape used by the prehistoric calculator (see
+   * ConfigSetProcessor.calculateStrategyPositions). The serialized
+   * "|"-delimited Set entry does NOT include direction; this field exists
+   * so the prehistoric write path can call recordPiClosed() with the
+   * correct (long|short) bucket before persisting. See the systemwide
+   * fix in commit history for "no sets evaluated → prehistoric fills
+   * pi_history".
+   */
+  direction?: "long" | "short"
+  /**
+   * Indication type that drove this prehistoric position (e.g.
+   * "MA_Cross", "RSI_Band"). Mirrors `StrategyConfig.type`. Only used
+   * by the prehistoric write path to bucket into the correct
+   * (symbol × type × direction) PI hash.
+   */
+  indication_type?: string
 }
 
 export interface StrategyStats {

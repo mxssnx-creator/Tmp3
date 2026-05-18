@@ -1347,14 +1347,31 @@ export class StrategyCoordinator {
     const defaultByBaseKey = new Map<string, StrategySet>()
 
     for (const baseSet of baseSets) {
-      // ── Min-positions gate (operator spec) ──────────────────────
+      // ── Min-positions gate (operator spec, systemwide fix) ──────
       // Skip Sets that don't yet have enough completed pseudo-positions
       // to support a meaningful PF + DDT validation. Counted but not
       // passed/failed — these will be re-validated on subsequent cycles
-      // as their entryCount grows. `entryCount` reflects realised
-      // completed positions per the Set spec; Sets with `entries.length`
-      // mismatch fall back to the array length.
-      const setPosCount = baseSet.entryCount ?? baseSet.entries?.length ?? 0
+      // as their position count grows.
+      //
+      // Counts considered (in order of authority):
+      //   • baseSet.entryCount  — entries built THIS cycle from live
+      //                           indications (size 0..maxEntries).
+      //   • baseSet.prevPi.count — closed historic positions in the
+      //                           matching (type × direction) bucket,
+      //                           populated by the prehistoric writer
+      //                           via recordPiClosed (see
+      //                           ConfigSetProcessor.processStrategyConfigs).
+      //
+      // We take the MAX. The historic count is the user's "prev logical
+      // data" — the moment prehistoric finishes, every Set whose regime
+      // has ≥mainEvalPosCount historic closes IMMEDIATELY qualifies for
+      // Main evaluation, even if the live indication group on the very
+      // first realtime cycle is only 1-2 entries large. This is the
+      // direct fix for "no sets evaluated → because prehistoric was
+      // building prev logical data but the gate ignored it".
+      const liveCount    = baseSet.entryCount ?? baseSet.entries?.length ?? 0
+      const histCount    = baseSet.prevPi?.count ?? 0
+      const setPosCount  = Math.max(liveCount, histCount)
       if (setPosCount < mainMinPos) {
         skippedLowPos++
         continue
@@ -1876,16 +1893,24 @@ export class StrategyCoordinator {
 
     const metrics = this.METRICS.real
 
-    // ── Stage-validation min-position threshold (operator spec) ────
+    // ── Stage-validation min-position threshold (operator spec, systemwide fix) ────
     // Same semantics as Main: Sets below `realEvalPosCount` are
     // SKIPPED — they're not validated against PF/DDT and not promoted
     // to Real. Default 10. Re-evaluated on subsequent cycles once
     // entryCount accumulates.
+    //
+    // Symmetric with the Main gate: we take MAX(entryCount, prevPi.count)
+    // so historic closes (populated by ConfigSetProcessor →
+    // recordPiClosed during prehistoric) qualify a Set for Real
+    // evaluation even when the live cycle's entry count is small.
+    // This guarantees Real becomes productive immediately after
+    // prehistoric finishes its first pass.
     const realMinPos = this._coordinationSettings.realEvalPosCount
     const beforePosGate = mainSets.length
     const mainSetsEligible = mainSets.filter((s) => {
-      const pc = s.entryCount ?? s.entries?.length ?? 0
-      return pc >= realMinPos
+      const live = s.entryCount ?? s.entries?.length ?? 0
+      const hist = s.prevPi?.count ?? 0
+      return Math.max(live, hist) >= realMinPos
     })
     const skippedRealLowPos = beforePosGate - mainSetsEligible.length
     if (skippedRealLowPos > 0) {
@@ -3445,7 +3470,7 @@ export class StrategyCoordinator {
    * Deterministic fingerprint of {base Set × variant × position context}.
    * Drives the "IF NOT ALREADY CREATED" dedup check.
    *
-   * ── Bucket ranges (P0-3, spec-aligned) ─────────────────────────────
+   * ── Bucket ranges (P0-3, spec-aligned) ─��───────────────────────────
    * Spec ranges:
    *   - Prev Positions         1-12   (13 buckets 0-12)
    *   - Last Positions W/L     1-4    (5 buckets each 0-4)
