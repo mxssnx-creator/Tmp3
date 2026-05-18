@@ -5371,6 +5371,14 @@ export async function syncLiveFromPseudo(
   exchangeConnector: any,
 ): Promise<void> {
   try {
+    // ── System tracking validation ──
+    // Only sync positions created by this system. Skip foreign/manual orders.
+    const trackingId = String(pseudoPos?.system_tracking_id || "").trim()
+    if (!trackingId.startsWith("sys-") || trackingId.length <= 10) {
+      // Silent skip - don't log every foreign position on every tick
+      return
+    }
+
     const symbol = String(pseudoPos?.symbol || "").toUpperCase()
     const side: "long" | "short" = pseudoPos?.side === "short" ? "short" : "long"
     if (!symbol) return

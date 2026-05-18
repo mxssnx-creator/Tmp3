@@ -1294,7 +1294,7 @@ export async function getConnection(id: string): Promise<any | null> {
 // ops per poll per component. A short TTL (1.5s) dedupes bursts without
 // introducing user-visible staleness (all writes invalidate the cache
 // immediately via `invalidateConnectionsCache()`).
-// ────────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────���───────────────────────────────────────
 const __CONN_CACHE_TTL_MS = 1500
 let __connCache: { at: number; value: any[] } | null = null
 let __connInflight: Promise<any[]> | null = null
@@ -2503,4 +2503,16 @@ export function saveDatabaseSnapshotSync(): boolean {
   const client = getRedisClient()
   client.saveToDiskSync()
   return true
+}
+
+/**
+ * Verify that a position was created by this system using system_tracking_id.
+ * Prevents modifications to manually-entered or foreign orders.
+ * @returns true if position has valid sys-* tracking ID, false otherwise
+ */
+export function isSystemCreatedPosition(position: Record<string, string> | null | undefined): boolean {
+  if (!position) return false
+  const trackingId = String(position.system_tracking_id || "").trim()
+  // System tracking IDs follow format: sys-{connId}-{timestamp}-{random}
+  return trackingId.startsWith("sys-") && trackingId.length > 10
 }
