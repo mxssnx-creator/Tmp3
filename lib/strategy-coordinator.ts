@@ -1346,29 +1346,20 @@ export class StrategyCoordinator {
     // cache-miss paths populate this map so reuses still trigger fan-out.
     const defaultByBaseKey = new Map<string, StrategySet>()
 
+    // ── 2. Base/variant async processing ────────────────────────────────────
+    // Process all baseSet × variant combinations in parallel for faster throughput.
+    // Each combination calls the async buildVariantSet, which previously ran
+    // sequentially. Now they all start together and resolve concurrently.
+    const buildTasks: Promise<{
+      baseSet: StrategySet
+      profile: any
+      built: StrategySet | null
+      fingerprint: string
+      cachedSet: StrategySet | null
+    }>[] = []
+
     for (const baseSet of baseSets) {
       // ── Min-positions gate (operator spec, systemwide fix) ──────
-      // Skip Sets that don't yet have enough completed pseudo-positions
-      // to support a meaningful PF + DDT validation. Counted but not
-      // passed/failed — these will be re-validated on subsequent cycles
-      // as their position count grows.
-      //
-      // Counts considered (in order of authority):
-      //   • baseSet.entryCount  — entries built THIS cycle from live
-      //                           indications (size 0..maxEntries).
-      //   • baseSet.prevPos.count — closed historic positions in the
-      //                           matching (type × direction) bucket,
-      //                           populated by the prehistoric writer
-      //                           via recordPosClosed (see
-      //                           ConfigSetProcessor.processStrategyConfigs).
-      //
-      // We take the MAX. The historic count is the user's "prev logical
-      // data" — the moment prehistoric finishes, every Set whose regime
-      // has ≥mainEvalPosCount historic closes IMMEDIATELY qualifies for
-      // Main evaluation, even if the live indication group on the very
-      // first realtime cycle is only 1-2 entries large. This is the
-      // direct fix for "no sets evaluated → because prehistoric was
-      // building prev logical data but the gate ignored it".
       const liveCount    = baseSet.entryCount ?? baseSet.entries?.length ?? 0
       const histCount    = baseSet.prevPos?.count ?? 0
       const setPosCount  = Math.max(liveCount, histCount)
@@ -1377,89 +1368,66 @@ export class StrategyCoordinator {
         continue
       }
 
-      // Base-level validation — P0-2: PF + DDT are the ONLY filter axes.
-      // Confidence is advisory metadata (used by Live stage's trailing-
-      // variant selector) and is NOT a gate here. A high-PF / low-DDT
-      // base Set with low confidence STILL promotes to Main for
-      // downstream variant expansion.
+      // Base-level validation
       if (baseSet.avgProfitFactor < metrics.minProfitFactor) continue
       if (baseSet.avgDrawdownTime > metrics.maxDrawdownTime) continue
 
-      // ── Multi-step trailing: collapse Main expansion to `default` ──
-      // When the Base Set already carries an explicit `trailingProfile`
-      // (multi-step path), the Set's trailing semantics are already
-      // determined and re-expanding to the legacy "trailing"/"block"/"dca"
-      // variants here would (a) double-count the trailing axis and
-      // (b) blow up the Set count multiplicatively. We keep the
-      // `default` variant only — block/dca are still produced by the
-      // legacy non-trailing Base Sets that exist when the operator has
-      // pruned the trailing matrix.
       const variantsForThisBase = baseSet.trailingProfile
         ? activeVariants.filter((p) => p.name === "default")
         : activeVariants
 
       for (const profile of variantsForThisBase) {
-        const fingerprint = this.variantFingerprint(baseSet, profile.name, ctx)
+        // Spawn async build task for this variant
+        buildTasks.push((async () => {
+          const fingerprint = this.variantFingerprint(baseSet, profile.name, ctx)
+          let cachedSet: StrategySet | null = null
 
-        // Cache hit — reuse the cached Set verbatim. This is the "IF NOT
-        // ALREADY CREATED" path the user asked for.
-        if (fpCache[fingerprint]) {
-          // Tier-1 perf: parsed-fingerprint LRU avoids JSON.parse on
-          // every hit. Falls through to JSON.parse on LRU miss; the
-          // parsed result is then memoised so the next hit is O(1).
-          let cached = StrategyCoordinator._fpLruGet(fingerprint)
-          if (cached === undefined) {
-            try {
-              cached = JSON.parse(fpCache[fingerprint]) as StrategySet
-              if (cached) StrategyCoordinator._fpLruSet(fingerprint, cached)
-            } catch { /* fall through — regenerate on parse failure */ }
-          }
-          if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
-            // Re-attach the parent's trailing profile in case the cached
-            // payload was written before the profile field existed
-            // (operators upgrading mid-cycle keep working).
-            if (baseSet.trailingProfile && !cached.trailingProfile) {
-              cached.trailingProfile = baseSet.trailingProfile
+          // Check fingerprint cache (fast path)
+          if (fpCache[fingerprint]) {
+            let cached = StrategyCoordinator._fpLruGet(fingerprint)
+            if (cached === undefined) {
+              try {
+                cached = JSON.parse(fpCache[fingerprint]) as StrategySet
+                if (cached) StrategyCoordinator._fpLruSet(fingerprint, cached)
+              } catch { /* fall through — regenerate on parse failure */ }
             }
-            mainSets.push(cached)
-            // Capture the `default` Main variant for downstream
-            // Position-Count Cartesian fan-out (even on cache hit).
-            if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, cached)
-            nextFpCache[fingerprint] = fpCache[fingerprint]
-            reused++
-            continue
+            if (cached && Array.isArray(cached.entries) && cached.entries.length > 0) {
+              if (baseSet.trailingProfile && !cached.trailingProfile) {
+                cached.trailingProfile = baseSet.trailingProfile
+              }
+              cachedSet = cached
+              nextFpCache[fingerprint] = fpCache[fingerprint]
+            }
           }
-        }
 
-        // Cache miss — build a fresh related Set from this profile.
-        // We thread `symbolCtx` through so the freshly-built Set carries an
-        // accurate `axisWindows` snapshot (prev/last/cont/pause) for
-        // downstream stats dimensioning. The `cont` axis uses the per-symbol
-        // open count (from symbolCtx) so Stats reflects the same reality as
-        // the block gate. Cached Sets keep the axis window from the cycle
-        // they were materialised in (this is the correct semantics — the gate
-        // that admitted them was based on *that* ctx).
-        const built = await this.buildVariantSet(baseSet, profile, metrics, maxEntries, symbolCtx)
-        if (!built) continue
+          // If not cached, build fresh
+          let built: StrategySet | null = null
+          if (!cachedSet) {
+            built = await this.buildVariantSet(baseSet, profile, metrics, maxEntries, symbolCtx)
+            if (built) {
+              if (baseSet.trailingProfile) built.trailingProfile = baseSet.trailingProfile
+              nextFpCache[fingerprint] = JSON.stringify(built)
+              StrategyCoordinator._fpLruSet(fingerprint, built)
+            }
+          }
 
-        // Propagate Base's trailingProfile to the freshly-built Main Set
-        // so Real/Live can read it without traversing back to Base.
-        if (baseSet.trailingProfile) built.trailingProfile = baseSet.trailingProfile
-
-        mainSets.push(built)
-        // Capture the `default` Main variant for downstream Position-
-        // Count Cartesian fan-out (see expandAxisSets call below).
-        if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, built)
-        // Store a compact serialisation in the fingerprint cache. Capped at
-        // ~4KB per entry (the bulky `entries` array is already pruned to
-        // maxEntries upstream; we stringify the whole Set for fidelity).
-        nextFpCache[fingerprint] = JSON.stringify(built)
-        // Tier-1 perf: also seed the parsed-fp LRU so subsequent
-        // cycles' hits skip JSON.parse entirely. `built` is freshly
-        // built and treated as read-only by all downstream consumers
-        // (createMainSets/evaluateRealSets only read fields).
-        StrategyCoordinator._fpLruSet(fingerprint, built)
+          return { baseSet, profile, built, fingerprint, cachedSet }
+        })())
       }
+    }
+
+    // ── Await all async builds to complete ───────────────────────────────
+    const results = await Promise.all(buildTasks)
+    
+    // ── Process results and populate mainSets ────────────────────────────
+    for (const result of results) {
+      const { baseSet, profile, built, cachedSet } = result
+      const set = cachedSet || built
+      if (!set) continue
+
+      mainSets.push(set)
+      if (profile.name === "default") defaultByBaseKey.set(baseSet.setKey, set)
+      if (cachedSet) reused++
     }
 
     // ── Log min-pos skip count (diagnostic) ───────────────────────
