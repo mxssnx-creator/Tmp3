@@ -326,6 +326,16 @@ export class InlineLocalRedis {
     if (InlineLocalRedis.persistenceTickStarted) return true
     InlineLocalRedis.persistenceTickStarted = true
 
+    // ── Dev-mode optimization: disable periodic snapshots ──
+    // In Next.js dev mode, module reloads + multiple workers independently
+    // load/save snapshots, causing stale lock values to overwrite live engine
+    // lock tokens → "ownership loss" crashes every ~75s. In dev, disable
+    // periodic snapshots; in production, the 5-minute cycle is safe.
+    if (process.env.NODE_ENV === "development") {
+      console.log(`[v0] [Redis] Dev mode: periodic snapshot disabled to prevent lock churn`)
+      return true // Mark as started so we don't retry
+    }
+
     // 5-minute snapshot tick. unref() so this timer never holds the
     // process open during a graceful exit.
     const FIVE_MIN_MS = 5 * 60 * 1000
