@@ -103,7 +103,15 @@ export class DatabaseFiller {
         for (const ind of typeInds) {
           await client.lpush(key, JSON.stringify(ind))
         }
-        await client.ltrim(key, 0, 4999)
+        // Cap at 1000 (down from 5000) — dashboard reads at most ~50 at a
+        // time and these lists explode under prehistoric (one entry per
+        // candle × per type). Lower cap shrinks the in-memory snapshot
+        // without affecting any consumer behaviour.
+        await client.ltrim(key, 0, 999)
+        // 24h TTL: prehistoric per-symbol×type fills are diagnostic only,
+        // never durable state. Without the TTL, cancelled/abandoned
+        // symbols leak forever.
+        await client.expire(key, 86400).catch(() => 0)
       }
 
       // Store in overall symbol list
@@ -111,7 +119,8 @@ export class DatabaseFiller {
       for (const ind of indications) {
         await client.lpush(symbolKey, JSON.stringify(ind))
       }
-      await client.ltrim(symbolKey, 0, 9999)
+      await client.ltrim(symbolKey, 0, 1999) // 2k cap (down from 10k)
+      await client.expire(symbolKey, 86400).catch(() => 0)
 
       // Update indication counts hash
       const countsKey = `indications:${this.connectionId}:counts`
@@ -147,7 +156,8 @@ export class DatabaseFiller {
         for (const strat of stageStrats) {
           await client.lpush(key, JSON.stringify(strat))
         }
-        await client.ltrim(key, 0, 4999)
+        await client.ltrim(key, 0, 999) // 1k cap (down from 5k); see indications block above
+        await client.expire(key, 86400).catch(() => 0)
       }
 
       // Store in overall symbol list
@@ -155,7 +165,8 @@ export class DatabaseFiller {
       for (const strat of strategies) {
         await client.lpush(symbolKey, JSON.stringify(strat))
       }
-      await client.ltrim(symbolKey, 0, 9999)
+      await client.ltrim(symbolKey, 0, 1999) // 2k cap (down from 10k)
+      await client.expire(symbolKey, 86400).catch(() => 0)
 
       // Update strategy counts hash
       const countsKey = `strategies:${this.connectionId}:counts`

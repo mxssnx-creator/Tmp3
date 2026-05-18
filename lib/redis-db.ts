@@ -1740,7 +1740,15 @@ export async function saveIndication(indication: any): Promise<void> {
     updated_at: new Date().toISOString(),
   })
   
-  await client.hset(`indication:${id}`, data)
+  const key = `indication:${id}`
+  await client.hset(key, data)
+  // Bound retention: prehistoric/realtime can mint hundreds of thousands
+  // of these. Without a TTL the in-process Redis snapshot grows
+  // unbounded (observed 295k keys / 39MB after a few quickstart runs)
+  // and dev memory blows past the 6GB heap. 24h is plenty for any
+  // dashboard/debug consumer; the `indications:{connId}:*` lists
+  // (lib/indication-evaluator.ts) are the durable view.
+  await client.expire(key, 86400).catch(() => 0)
 }
 
 // ========== Strategy Operations ==========
