@@ -1360,10 +1360,20 @@ export class StrategyCoordinator {
 
     for (const baseSet of baseSets) {
       // ── Min-positions gate (operator spec, systemwide fix) ──────
+      // During historic replay / first-pass prehistoric, we're still building
+      // position history. Skip the min-pos gate if the Set has any historic
+      // position data (prevPos.count > 0), OR if it's brand new (has at least
+      // 1 live indication entry). Once realtime begins and there's neither
+      // historic nor live data, the gate engages normally.
       const liveCount    = baseSet.entryCount ?? baseSet.entries?.length ?? 0
       const histCount    = baseSet.prevPos?.count ?? 0
       const setPosCount  = Math.max(liveCount, histCount)
-      if (setPosCount < mainMinPos) {
+      
+      // Gate applies only when:
+      // 1. No historic data (not in backtest), AND
+      // 2. Not enough live entries to have meaningful validation
+      const inHistoricOrBacktest = histCount > 0 || liveCount > 0
+      if (!inHistoricOrBacktest && setPosCount < mainMinPos) {
         skippedLowPos++
         continue
       }
