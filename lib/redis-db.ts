@@ -199,6 +199,18 @@ export class InlineLocalRedis {
   }
 
   async loadFromDisk(): Promise<boolean> {
+    // ── Safety guard: prevent snapshot reload if engine is running ──
+    // In dev mode, multiple Next.js workers each call initRedis()
+    // independently. Each worker loads the snapshot, which can overwrite
+    // lock values held by a live engine in a different worker. This causes
+    // "ownership loss" crashes. Check the global flag published by the
+    // trade-engine coordinator; if ANY engine is active, skip the reload.
+    const globalCtx = globalThis as any
+    if (globalCtx.__engine_manager_instance?.isEngineRunning) {
+      console.log(`[v0] [Redis] Snapshot reload skipped: engine running in this process`)
+      return false
+    }
+
     const target = await this.resolveSnapshotPath()
     if (!target) return false
     // Bare specifier — see comment in `resolveSnapshotPath`. Type alias
