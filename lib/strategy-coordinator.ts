@@ -3081,56 +3081,73 @@ export class StrategyCoordinator {
 
     for (const prev of AXIS_PREV) {
       // ── prev FILTER (PF gate on last `prev` completed entries) ─────
+      // Spec: prev "acts as a PF filter on the parent's last N completed
+      // entries". When the parent does not yet have N completed entries
+      // (warming up / fresh symbol), the filter is *undefined* — there
+      // is nothing to evaluate yet — and we ADMIT the prev row neutrally.
+      // The fan-out's purpose is the position-count axis (cont × dir);
+      // suppressing it during bootstrap collapses Main count to Base
+      // count, which is exactly the symptom we're fixing here. Once the
+      // parent accumulates ≥ N completed entries, the PF gate engages
+      // and the filter starts pruning legitimately.
       const prevMeanPF = this.meanPFOfLastN(entries, prev)
-      if (prevMeanPF === null) continue          // insufficient data
-      if (prevMeanPF < minPF)  continue          // PF gate failed → skip whole prev row
+      if (prevMeanPF !== null && prevMeanPF < minPF) continue // gate engaged → skip whole prev row
 
       for (const last of AXIS_LAST) {
-        // ── last OUTCOME SPLIT (single realised outcome per cycle) ───
+        // ── last OUTCOME SPLIT ───────────────────────────────────────
+        // Spec: emit ONE Set per `last` value tagged with the realised
+        // pos/neg outcome based on parent's last M completed entries'
+        // meanPF. When parent does not yet have M completed entries
+        // (warming up), the outcome is *undefined* — we emit BOTH
+        // `pos` AND `neg` projections so neither side is suppressed
+        // during bootstrap. Once the parent accumulates ≥ M entries
+        // the outcome resolves to a single side per cycle as before.
         const lastMeanPF = this.meanPFOfLastN(entries, last)
-        if (lastMeanPF === null) continue        // insufficient data
-        const outcome: "pos" | "neg" = lastMeanPF >= 1.0 ? "pos" : "neg"
+        const outcomes: Array<"pos" | "neg"> =
+          lastMeanPF === null ? ["pos", "neg"] : [lastMeanPF >= 1.0 ? "pos" : "neg"]
 
         for (const cont of AXIS_CONT) {
           for (const dir of AXIS_DIRS) {
-            const axisKey = `p${prev}_l${last}_c${cont}_o${outcome}_d${dir}`
-            axisSets.push({
-              setKey:          `${parentKey}#axis:${axisKey}`,
-              parentSetKey:    parentKey,
-              variant:         "default",
-              indicationType:  baseDefault.indicationType,
-              // Direction is fan-out axis (Cartesian), not inherited.
-              direction:       dir,
-              // Inherited quality fields — axis Sets do not re-evaluate.
-              avgProfitFactor: baseDefault.avgProfitFactor,
-              avgConfidence:   baseDefault.avgConfidence,
-              avgDrawdownTime: baseDefault.avgDrawdownTime,
-              // Position-count contribution per spec:
-              //   baseEC = parent's COMPLETED historic entry count.
-              //   cont   = OPEN positions to accumulate into this Set
-              //            (the "actual" currently-open one + cont-1
-              //            future ones to be opened across intervals).
-              // Example: continuous=3 ⇒ "add actual and next 2 positions"
-              // ⇒ axis Set's entryCount = baseEC + 3.
-              entryCount:      baseEC + cont,
-              // Empty entries — axis Sets are pure-metadata projections.
-              entries:         [],
-              createdAt:       new Date().toISOString(),
-              axisWindows: {
-                prev,
-                last,
-                cont,
-                pause:     0,
-                direction: dir,
-                axisKey,
-                outcome,
-              },
-              trailingProfile: baseDefault.trailingProfile,
-              // Carry parent's prev-PI snapshot through the axis fan-out
-              // unchanged — same realised-history regime applies to every
-              // axis projection of the same Base Set.
-              ...(baseDefault.prevPi && { prevPi: baseDefault.prevPi }),
-            })
+            for (const outcome of outcomes) {
+              const axisKey = `p${prev}_l${last}_c${cont}_o${outcome}_d${dir}`
+              axisSets.push({
+                setKey:          `${parentKey}#axis:${axisKey}`,
+                parentSetKey:    parentKey,
+                variant:         "default",
+                indicationType:  baseDefault.indicationType,
+                // Direction is fan-out axis (Cartesian), not inherited.
+                direction:       dir,
+                // Inherited quality fields — axis Sets do not re-evaluate.
+                avgProfitFactor: baseDefault.avgProfitFactor,
+                avgConfidence:   baseDefault.avgConfidence,
+                avgDrawdownTime: baseDefault.avgDrawdownTime,
+                // Position-count contribution per spec:
+                //   baseEC = parent's COMPLETED historic entry count.
+                //   cont   = OPEN positions to accumulate into this Set
+                //            (the "actual" currently-open one + cont-1
+                //            future ones to be opened across intervals).
+                // Example: continuous=3 ⇒ "add actual and next 2 positions"
+                // ⇒ axis Set's entryCount = baseEC + 3.
+                entryCount:      baseEC + cont,
+                // Empty entries — axis Sets are pure-metadata projections.
+                entries:         [],
+                createdAt:       new Date().toISOString(),
+                axisWindows: {
+                  prev,
+                  last,
+                  cont,
+                  pause:     0,
+                  direction: dir,
+                  axisKey,
+                  outcome,
+                },
+                trailingProfile: baseDefault.trailingProfile,
+                // Carry parent's prev-PI snapshot through the axis fan-out
+                // unchanged — same realised-history regime applies to every
+                // axis projection of the same Base Set.
+                ...(baseDefault.prevPi && { prevPi: baseDefault.prevPi }),
+              })
+            }
           }
         }
       }
