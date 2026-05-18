@@ -95,6 +95,21 @@ interface StrategyTracking {
     avgProfitFactor: number
     cap: number
   }
+  validPositions?: {
+    overall: number
+    combined: number
+    bySymbol: Record<string, number>
+    byDirection: Record<string, number>
+    byType: Record<string, number>
+  }
+  prevPi?: {
+    count: number
+    successRate: number
+    profitFactor: number
+    avgDDT: number
+    minCount: number
+    active: boolean
+  }
 }
 
 const fetcher = (url: string) => fetch(url, { cache: "no-store" }).then((r) => r.json())
@@ -156,7 +171,142 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
         </CardContent>
       </Card>
 
-      {/* ── BASE STAGE ───────────────────────────────────────────────── */}
+      {/* ── VALID POSITIONS COUNTS (operator spec) ──────────────────────
+          "add to statistics and overviews.. Valid Positions Counts ..
+           Overall, Combined (Accumulated)."
+          One Real Set produced = one tick on the lifetime counter.
+          "Combined" filters to those whose parent Base is currently
+          running (= alive accumulation).
+          ───────────────────────────────────────────────────────────── */}
+      {data.validPositions && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <Layers className="h-4 w-4" />
+              Valid Positions Counts
+              <Badge variant="outline" className="ml-auto font-mono text-[10px]">
+                LIFETIME · ACCUMULATED
+              </Badge>
+            </CardTitle>
+            <p className="text-xs text-muted-foreground">
+              Real-stage Sets that survived PF/DDT filters — the engine&apos;s
+              valid trading signals. Overall is lifetime; Combined is the
+              currently-running subset.
+            </p>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <Metric
+                label="Overall"
+                value={data.validPositions.overall}
+                hint="Lifetime count of Real Sets ever produced (cumulative across cycles)."
+              />
+              <Metric
+                label="Combined"
+                value={data.validPositions.combined}
+                accent="success"
+                hint="Sets whose parent Base setKey is currently in active_config_keys (running right now). This is the accumulated 'alive' total."
+              />
+              <Metric
+                label="Long"
+                value={data.validPositions.byDirection.long ?? 0}
+                hint="Valid positions oriented long (cumulative)."
+              />
+              <Metric
+                label="Short"
+                value={data.validPositions.byDirection.short ?? 0}
+                hint="Valid positions oriented short (cumulative)."
+              />
+            </div>
+            {Object.keys(data.validPositions.bySymbol).length > 0 && (
+              <div className="mt-4">
+                <div className="mb-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+                  By Symbol
+                </div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
+                  {Object.entries(data.validPositions.bySymbol)
+                    .sort(([, a], [, b]) => Number(b) - Number(a))
+                    .slice(0, 12)
+                    .map(([sym, n]) => (
+                      <div
+                        key={sym}
+                        className="flex items-center justify-between rounded-md border bg-muted/30 px-2 py-1.5"
+                      >
+                        <span className="font-mono text-[11px] text-muted-foreground">
+                          {sym}
+                        </span>
+                        <span className="font-mono text-sm tabular-nums">
+                          {n}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
+            {Object.keys(data.validPositions.byType).length > 0 && (
+              <div className="mt-3">
+                <div className="mb-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+                  By Indication Type
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {Object.entries(data.validPositions.byType)
+                    .sort(([, a], [, b]) => Number(b) - Number(a))
+                    .map(([type, n]) => (
+                      <Badge
+                        key={type}
+                        variant="secondary"
+                        className="font-mono"
+                      >
+                        {type}: {n}
+                      </Badge>
+                    ))}
+                </div>
+              </div>
+            )}
+            {data.prevPi && (
+              <div className="mt-4 rounded-md border border-primary/30 bg-primary/[0.04] p-3">
+                <div className="mb-2 flex items-baseline justify-between">
+                  <div className="text-[11px] uppercase tracking-wide text-primary/80 font-semibold">
+                    Prev-PI Influence
+                    <Badge
+                      variant={data.prevPi.active ? "default" : "outline"}
+                      className="ml-2 font-mono text-[10px]"
+                    >
+                      {data.prevPi.active ? "ACTIVE" : "BOOTSTRAPPING"}
+                    </Badge>
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">
+                    threshold ≥ {data.prevPi.minCount} closed PIs
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  <Metric
+                    label="Closed PIs"
+                    value={data.prevPi.count}
+                    hint="Total closed pseudo-positions accumulated across the run. Below threshold means the engine is in bootstrap mode (no historic blend)."
+                  />
+                  <Metric
+                    label="Success Rate"
+                    value={`${(data.prevPi.successRate * 100).toFixed(1)}%`}
+                    hint="Wins / total. Drives Real-stage size/leverage tuning per (symbol×type×direction)."
+                  />
+                  <Metric
+                    label="Profit Factor"
+                    value={data.prevPi.profitFactor.toFixed(3)}
+                    hint="Gross profit / gross loss. Used as MIN-blend against indication PF at Base when above threshold."
+                  />
+                  <Metric
+                    label="Avg DDT (min)"
+                    value={Math.round(data.prevPi.avgDDT)}
+                    hint="Average position drawdown duration in minutes."
+                  />
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="flex items-center gap-2 text-sm">
@@ -211,7 +361,7 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
         </CardContent>
       </Card>
 
-      {/* ── MAIN STAGE ───────────────────────────────────────────────── */}
+      {/* ── MAIN STAGE ──────────────────��────────────────────────────── */}
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="flex items-center gap-2 text-sm">

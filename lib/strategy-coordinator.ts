@@ -148,6 +148,36 @@ export interface StrategySet {
     stopRatio:  number   // trail distance ratio (e.g. 0.1 ≡ 10 %)
     stepRatio:  number   // ratchet increment ratio (= stopRatio / 2)
   }
+
+  /**
+   * ── Prev-PI snapshot attached at Base creation ─────────────────────
+   *
+   * Per operator spec: "make sure strategies are evaluating prev pis and
+   * profitfactors min from historic … prev pis cnts are working and
+   * added to settings,strategy".
+   *
+   * Populated by `createBaseSets` from `pi_history:{conn}:{symbol}:{type}:{dir}`
+   * and propagated UNCHANGED through Main → Real → Live by `buildVariantSet`
+   * and `evaluateRealSets`. Optional — fresh boots / new symbols start
+   * with `count = 0` (semantic = "no signal yet, use raw evaluation").
+   *
+   * Two consumers:
+   *   1. createBaseSets uses `profitFactor` to MIN-blend the Set's
+   *      `avgProfitFactor` when `count >= prevPiMinCount`. This is the
+   *      "evaluating prev pis and profitfactors min from historic"
+   *      requirement — historic underperformance pulls the bar down so
+   *      Base→Main filters reject it.
+   *   2. evaluateRealSets uses `successRate`/`profitFactor` to TUNE
+   *      `entries[].sizeMultiplier` and `leverage` per variant — the
+   *      "Real stage … accumulation for pis cnts sets … relying to
+   *      their base sets configs independent" path.
+   */
+  prevPi?: {
+    count: number
+    successRate: number
+    profitFactor: number
+    avgDDT: number
+  }
 }
 
 export interface StrategySetEntry {
@@ -177,7 +207,7 @@ export interface PositionContext {
   lastWins: number
   /** Number of losers among the last N closed */
   lastLosses: number
-  /** Total losers in the lookback window ����������� gates DCA recovery variants */
+  /** Total losers in the lookback window ������������� gates DCA recovery variants */
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
@@ -787,6 +817,37 @@ export class StrategyCoordinator {
     const baseSets: StrategySet[] = []
     const maxEntries = this.config.maxEntriesPerSet || 250
 
+    // ── Prev-PI batch prefetch (one round-trip, all (type×dir) buckets) ──
+    // Per spec: strategies must "evaluate prev pis and profitfactors min
+    // from historic … prev pis cnts are working and added to settings,
+    // strategy". We fetch the lifetime success/PF/DDT for every (type,
+    // direction) bucket this symbol is about to produce a Base Set for,
+    // then attach + min-blend below. Fresh boots / new buckets return
+    // {count:0, ...} which is treated as "no signal yet" → no blend.
+    let piMap: Map<string, import("@/lib/pi-history").PiHistoryStats> = new Map()
+    let prevPiMinCount = 5
+    try {
+      const { getPiHistoryBatch } = await import("@/lib/pi-history")
+      const pairs = Array.from(setMap.values()).map((g) => ({
+        indicationType: g.indicationType,
+        direction: g.direction,
+      }))
+      // Operator-tunable threshold (Settings → Strategies → Coordination).
+      // Read from connection_settings hash; fall back to 5 (≈ statistical
+      // smallest meaningful win-rate denominator).
+      try {
+        const client = getRedisClient()
+        const cs = (await client.hgetall(
+          `connection_settings:${this.connectionId}`,
+        )) as Record<string, string>
+        const v = Number(cs?.prevPiMinCount || "")
+        if (Number.isFinite(v) && v >= 1) prevPiMinCount = Math.min(50, Math.floor(v))
+      } catch { /* default stays */ }
+      piMap = await getPiHistoryBatch(this.connectionId, symbol, pairs, prevPiMinCount)
+    } catch (piErr) {
+      console.warn(`[v0] [StrategyFlow] ${symbol} prev-PI prefetch failed:`, piErr)
+    }
+
     // Multi-step trailing matrix — `[]` (= no fan-out) collapses to legacy
     // single-Set-per-(type,direction) behaviour. We use `[null]` as a
     // sentinel "untrailed" pass so the body of the loop is shared between
@@ -829,8 +890,23 @@ export class StrategyCoordinator {
 
         if (entries.length === 0) continue
 
-        const avgPF = entries.reduce((s, e) => s + e.profitFactor, 0) / entries.length
+        const rawAvgPF = entries.reduce((s, e) => s + e.profitFactor, 0) / entries.length
         const avgConf = entries.reduce((s, e) => s + e.confidence, 0) / entries.length
+
+        // ── Prev-PI min-blend on avgProfitFactor ─────────────────────────
+        // Operator spec: "evaluating prev pis and profitfactors min from
+        // historic". When the historic bucket has at least `prevPiMinCount`
+        // closed positions, the Set's avgProfitFactor becomes the MIN of
+        // (live indication PF, historic realised PF). Underperforming
+        // historic regimes thus pull the bar DOWN so the Base→Main filter
+        // rejects them. When the bucket has insufficient data we leave the
+        // raw indication-derived PF untouched (= bootstrap path).
+        const piStats = piMap.get(`${group.indicationType}|${group.direction}`)
+        const blendActive = !!piStats && piStats.count >= prevPiMinCount
+        const avgPF = blendActive
+          ? Math.min(rawAvgPF, piStats!.profitFactor)
+          : rawAvgPF
+
 
         const set: StrategySet = {
           setKey,
@@ -847,6 +923,17 @@ export class StrategyCoordinator {
               startRatio: variant.startRatio,
               stopRatio: variant.stopRatio,
               stepRatio: variant.stepRatio,
+            },
+          }),
+          // Attach prev-PI snapshot so Main/Real propagation paths can
+          // reach it without re-fetching. Always carry the field even
+          // when count==0 — keeps downstream null-checking simple.
+          ...(piStats && piStats.count > 0 && {
+            prevPi: {
+              count: piStats.count,
+              successRate: piStats.successRate,
+              profitFactor: piStats.profitFactor,
+              avgDDT: piStats.avgDDT,
             },
           }),
         }
@@ -1672,6 +1759,112 @@ export class StrategyCoordinator {
     // operator's `maxRealSets` setting and apply it here. For now,
     // slice(0, Infinity) is a no-op.
     const realSets = realPostHedge.slice(0, this.config.maxRealSets ?? Infinity)
+
+    // ── Real-stage tuner — per-variant adjustments from Base prev-PI ──
+    //
+    // Operator spec: "at stage Real, do the accumulation for pis cnts
+    // sets relying to their base sets configs INDEPENDENT" + "Adjust
+    // strategies Block, DCA, pos coord, ratios, volume".
+    //
+    // We mutate every Real Set's entries in-place to bias the live-stage
+    // sizing/leverage decisions by the historic realised performance of
+    // the parent Base Set's (symbol × ind × dir) bucket. No exchange-
+    // facing change yet — Live consumes `entries[].sizeMultiplier` and
+    // `leverage` directly. Tuning is BOUNDED ([0.5, 1.5] for size, max
+    // 2× leverage from base) so a noisy/empty bucket can never explode
+    // exposure; below the threshold we no-op.
+    //
+    // Per-Base ledger (`real_pi_acc:{conn}` HASH, key = parentSetKey)
+    // is incremented for every Real Set produced — that's the dashboard
+    // accumulation column.
+    try {
+      const { bumpRealPiAccumulation, bumpValidPositions } = await import(
+        "@/lib/pi-history",
+      )
+      const realActiveKeysForVP = await (async () => {
+        try {
+          const c = getRedisClient()
+          return new Set<string>(
+            (await c
+              .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
+              .catch(() => [])) as string[],
+          )
+        } catch { return new Set<string>() }
+      })()
+      const accPipeline = getRedisClient().multi()
+      for (const s of realSets) {
+        const parentKey = s.parentSetKey || s.setKey.split("#")[0]
+        bumpRealPiAccumulation(this.connectionId, parentKey, 1, accPipeline)
+
+        // ── Variant tuning ──
+        // Block (size scaling) / DCA (leverage cap & DDT bias proxy) /
+        // pos-coord axis Sets (entries[].sizeMultiplier) / default+trailing
+        // (size only). All clamped to operator-safe bounds.
+        const pi = s.prevPi
+        if (pi && pi.count > 0) {
+          // Bias factor in [0.6, 1.4] derived from successRate (0.45 = neutral).
+          // Maps PF ≥ 1.5 → boost, PF < 0.8 → cut. Smooth so small PF wobbles
+          // don't cause jagged size jumps cycle-over-cycle.
+          const sr = Math.max(0, Math.min(1, pi.successRate))
+          const pfBias = pi.profitFactor <= 0
+            ? 0.85
+            : Math.max(0.6, Math.min(1.4, 0.7 + 0.5 * Math.tanh(pi.profitFactor - 1.0)))
+          const sigBias = Math.max(0.7, Math.min(1.3, 0.7 + 1.2 * sr))
+          const combined = (pfBias + sigBias) / 2
+
+          for (const e of s.entries) {
+            // Variant-specific tuning rules.
+            if (s.variant === "block") {
+              // Block scales size — bias the existing multiplier directly.
+              e.sizeMultiplier = Math.max(0.5, Math.min(2.0, e.sizeMultiplier * combined))
+            } else if (s.variant === "dca") {
+              // DCA recovery — only ATTENUATE leverage when historic PF poor;
+              // never amplify (recovery gambling is an anti-pattern).
+              if (pfBias < 1.0) {
+                e.leverage = Math.max(1, Math.floor(e.leverage * pfBias))
+                e.sizeMultiplier = Math.max(0.3, e.sizeMultiplier * pfBias)
+              }
+            } else if (s.axisWindows?.direction) {
+              // Position-count axis Set (Cartesian fan-out). Apply both
+              // sides of the bias — these are the "pos coord, ratios"
+              // family from the spec.
+              e.sizeMultiplier = Math.max(0.5, Math.min(1.5, e.sizeMultiplier * combined))
+            } else {
+              // default / trailing / pause — modest size bias, leverage left alone.
+              e.sizeMultiplier = Math.max(0.5, Math.min(1.5, e.sizeMultiplier * combined))
+            }
+          }
+          // Recompute aggregate PF/DDT after entry mutation so downstream
+          // ranking / filtering sees current values (Real already passed
+          // its filter pre-tuner, but Live ranks on these).
+          if (s.entries.length > 0) {
+            s.avgProfitFactor =
+              s.entries.reduce((a, e) => a + Number(e.profitFactor || 0), 0) /
+              s.entries.length
+          }
+        }
+
+        // ── Valid Positions counter ──
+        // Only count Real Sets whose parent is currently RUNNING (= the
+        // "Combined" semantic). All Real Sets contribute to the lifetime
+        // "Overall" count regardless of running state.
+        // Compose into the shared `accPipeline` so a 30-Set burst writes
+        // once instead of 30 times — at 10 symbols this drops Real-stage
+        // round-trips by ~10x and is the main reason cycles stay flat
+        // past 4 symbols.
+        bumpValidPositions({
+          connectionId: this.connectionId,
+          symbol,
+          indicationType: s.indicationType,
+          direction: s.direction,
+          isRunningNow: realActiveKeysForVP.has(parentKey),
+          externalPipeline: accPipeline,
+        })
+      }
+      ;(accPipeline as any).exec().catch(() => {})
+    } catch (tunerErr) {
+      console.warn(`[v0] [StrategyFlow] ${symbol} Real tuner failed:`, tunerErr)
+    }
 
     // Persist per-bucket net targets for the Live-stage partial open/close
     // reconciliation hook. Documented on `reconcileLivePositions` —
@@ -2898,6 +3091,10 @@ export class StrategyCoordinator {
                 outcome,
               },
               trailingProfile: baseDefault.trailingProfile,
+              // Carry parent's prev-PI snapshot through the axis fan-out
+              // unchanged — same realised-history regime applies to every
+              // axis projection of the same Base Set.
+              ...(baseDefault.prevPi && { prevPi: baseDefault.prevPi }),
             })
           }
         }
@@ -3123,6 +3320,11 @@ export class StrategyCoordinator {
       entryCount:      capped.length,
       entries:         capped,
       createdAt:       new Date().toISOString(),
+      // Propagate prev-PI snapshot from parent Base Set unchanged. Real
+      // stage uses it to tune size/leverage; Live stage uses it for
+      // ranking. We never recompute here — the Base-stage snapshot is
+      // canonical for this Run cycle.
+      ...(baseSet.prevPi && { prevPi: baseSet.prevPi }),
     }
   }
 

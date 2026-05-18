@@ -64,6 +64,20 @@ export interface CoordinationSettings {
   // (gate closes at n ≥ blockMaxStack) so the stacking is bounded.
   blockVolumeRatio: number // 0.25..3.0 per spec band (UI clamps; engine re-clamps)
   blockMaxStack:    number // 2..8 (gate uses `n < blockMaxStack`)
+
+  /**
+   * ── Prev-PI threshold (operator spec) ──────────────────────────────
+   *
+   * Activation threshold for the historic-PI blend at Base stage and
+   * the per-variant Real-stage tuner. Below this many CLOSED positions
+   * in the (symbol × indicationType × direction) bucket, the engine
+   * runs in BOOTSTRAP mode (= raw indication PF, no historic blend) so
+   * fresh boots can produce trades immediately. At/above the threshold
+   * the engine engages historic PF min-blend and Real-stage size/leverage
+   * tuning. Default 5 = smallest statistically meaningful denominator.
+   * Backed by `connection_settings:{conn}.prevPiMinCount`.
+   */
+  prevPiMinCount: number // 1..50, default 5
 }
 
 /** Spec-aligned defaults — match the constants in strategy-coordinator.ts. */
@@ -82,6 +96,7 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
   },
   blockVolumeRatio: 1.0,
   blockMaxStack:    3,
+  prevPiMinCount:   5,
 }
 
 interface StrategyCoordinationSectionProps {
@@ -549,6 +564,85 @@ export function StrategyCoordinationSection({
                 {value.blockMaxStack}
               </span>
             </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ── Prev-PI Influence card ───────────────────────────────────
+          Operator spec: "make sure strategies are evaluating prev pis
+          and profitfactors min from historic … prev pis cnts are
+          working and added to settings,strategy".
+
+          One number — the activation threshold below which the engine
+          runs in BOOTSTRAP mode (raw indication PF, no historic blend).
+          At/above the threshold, Base avgProfitFactor becomes the MIN
+          of (live PF, historic PF) and Real-stage size/leverage tuning
+          activates per (symbol × indicationType × direction). */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <CardTitle className="text-sm">
+                Prev-PI Influence — Historic Blend Threshold
+              </CardTitle>
+              <CardDescription className="text-xs">
+                Activation gate for the historic-PF blend at Base and the
+                Real-stage size/leverage tuner. Below this many CLOSED
+                positions in the{" "}
+                <span className="font-mono text-[11px]">
+                  (symbol × indicationType × direction)
+                </span>{" "}
+                bucket the engine runs in <strong>bootstrap</strong> mode
+                (raw indication PF, no blend) so fresh boots can produce
+                trades immediately. At/above the threshold the engine
+                MIN-blends realised PF into{" "}
+                <span className="font-mono text-[11px]">
+                  avgProfitFactor
+                </span>{" "}
+                — historic underperformance pulls the bar down so Base
+                → Main filters reject it. Default 5 = smallest
+                statistically meaningful denominator.
+              </CardDescription>
+            </div>
+            <Badge variant="outline" className="text-[10px] tabular-nums">
+              1–50
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <Label className="text-sm font-semibold">
+                Min closed PIs for blend
+              </Label>
+              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                default 5
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.prevPiMinCount]}
+                min={1}
+                max={50}
+                step={1}
+                onValueChange={(v) =>
+                  onChange({ ...value, prevPiMinCount: v[0] })
+                }
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-8 text-right">
+                {value.prevPiMinCount}
+              </span>
+            </div>
+            <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
+              Lower = engages historic blend faster (small samples can be
+              noisy). Higher = waits for more data before letting history
+              influence current decisions. The Real-stage tuner uses the
+              same threshold to gate per-variant size/leverage adjustments
+              (Block size scaling, DCA leverage capping, Pos-coord axis
+              size). Counts and live status are surfaced on the Strategy
+              Pipeline dashboard tile.
+            </p>
           </div>
         </CardContent>
       </Card>
