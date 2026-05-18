@@ -30,6 +30,7 @@ import { SystemLogger } from "@/lib/system-logger"
 import type { RealPosition } from "./real-stage"
 import { getEngineTimings } from "@/lib/engine-timings"
 import { withTimeout } from "@/lib/async-safety"
+import { getMaxLeverageForExchange } from "@/lib/leverage-policy"
 import {
   newLiveOrderTrace,
   withLiveOrderLogging,
@@ -2216,6 +2217,44 @@ export async function executeLivePosition(
     }
     livePosition.entryPrice = currentPrice
     pushStep(livePosition, "price_fetch", true, `price=${currentPrice}`)
+
+    // ── Operator policy: ALWAYS use venue max leverage ─────────────────
+    // realPosition.leverage carries the per-variant coordination signal
+    // (1, 2, 3, 5x as derived in expandSizeLeverageVariants). That
+    // signal is for INTERNAL strategy ranking only — when actually
+    // placing the order on the venue we override to the connection's
+    // maximum supported leverage. Two safety nets remain armed
+    // downstream:
+    //   1. setLeverage(symbol, max) — venue clamps to per-symbol bracket
+    //   2. VolumeCalculator's balance-based cap — small-balance
+    //      accounts get a lower effective leverage automatically
+    //   3. 101204 "Insufficient margin" auto-halve retry below
+    // The override happens BEFORE the volume call so margin-based
+    // sizing (volumeUsd / leverage) reflects the max we'll actually use.
+    try {
+      const { getConnection: _getConnLev } = await import("@/lib/redis-db")
+      const connRecord = await _getConnLev(connectionId)
+      const venueMax = getMaxLeverageForExchange(connRecord?.exchange)
+      if (venueMax > livePosition.leverage) {
+        const previous = livePosition.leverage
+        livePosition.leverage = venueMax
+        pushStep(
+          livePosition,
+          "leverage_override",
+          true,
+          `coordination=${previous}x → venue_max=${venueMax}x (operator policy)`,
+        )
+      }
+    } catch (err) {
+      // Non-critical: fall through with realPosition.leverage and let
+      // the existing 101204 auto-halve fallback handle margin issues.
+      pushStep(
+        livePosition,
+        "leverage_override",
+        true,
+        `skipped — connection lookup failed (${String(err).slice(0, 60)})`,
+      )
+    }
 
     // ── Step 3: Volume calculation ─────────────────────────────────────────
     // POLICY: minimum volume is ALWAYS enforced �� we never reject a live

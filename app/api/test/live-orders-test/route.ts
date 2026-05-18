@@ -411,10 +411,27 @@ async function testMarketOrderPlacement(
     }
 
     // Try low-cost symbols with the smallest viable quantity per
-    // symbol. With ≥1 USDT free margin and 10x leverage these all
-    // have notional < 1 USDT × 10 = 10 USDT, so they'll fit even
-    // on a barely-funded account once the venue's per-symbol min
-    // notional is satisfied.
+    // symbol. Per operator policy ("always use max leverage,
+    // everywhere"), the connector is set to the venue maximum
+    // (BingX → 150x) just below; with ≥1 USDT free margin and
+    // 150x leverage these all have margin requirements well under
+    // 1 USDT, so they'll fit on a barely-funded account once the
+    // venue's per-symbol min notional is satisfied.
+    try {
+      const { getMaxLeverageForExchange } = await import("@/lib/leverage-policy")
+      const venueMax = getMaxLeverageForExchange(connection.exchange)
+      // Try several symbols — pick the first that accepts the
+      // setLeverage call. setLeverage can fail on per-symbol bracket
+      // limits, so we apply it on the symbol that actually places
+      // the order inside the loop below as well (idempotent).
+      for (const sym of ["DOGE/USDT", "SHIB/USDT", "PEPE/USDT", "BTC/USDT"]) {
+        try { await connector.setLeverage?.(sym, venueMax); break } catch {}
+      }
+      console.log(`${LOG_PREFIX} Venue max leverage applied: ${venueMax}x`)
+    } catch (e) {
+      console.log(`${LOG_PREFIX} setLeverage best-effort failed:`, e)
+    }
+
     const testCases = [
       { symbol: "DOGE/USDT", qty: 1 },        // ≈ $0.10 notional
       { symbol: "SHIB/USDT", qty: 100000 },   // ≈ $1 notional

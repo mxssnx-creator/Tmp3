@@ -3,6 +3,7 @@ import { dbCoordinator } from "@/lib/database-coordinator"
 import { ExchangeConnectorFactory } from "@/lib/exchange-connectors/factory"
 import { IndicatorCalculator } from "@/lib/indicators/calculator"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { getMaxLeverageForConnection } from "@/lib/leverage-policy"
 
 /**
  * Trade Execution Orchestrator
@@ -123,6 +124,13 @@ export class TradeExecutionOrchestrator {
       })
 
       // Step 8: Create or update position
+      // Operator policy: persist the *venue max* leverage for this exchange
+      // (e.g. BingX → 150x). Strategy-derived per-variant leverage is an
+      // internal coordination signal and must not appear on actual
+      // executed positions. The single source of truth is
+      // `getMaxLeverageForConnection`; the venue still applies its own
+      // per-symbol bracket via setLeverage downstream so this is safe.
+      const maxLeverage = await getMaxLeverageForConnection(connectionId)
       const newPosition = {
         id: `pos_${Date.now()}`,
         connectionId,
@@ -132,7 +140,7 @@ export class TradeExecutionOrchestrator {
         entryPrice: orderResult.entryPrice || 0,
         currentPrice: orderResult.entryPrice || 0,
         unrealizedPnl: 0,
-        leverage: 1,
+        leverage: maxLeverage,
         status: "open",
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
@@ -497,6 +505,10 @@ export class TradeExecutionOrchestrator {
             createdAt: new Date().toISOString(),
           })
 
+          // Operator policy: store venue max leverage on the persisted
+          // position so reconciliation/UI render the actual margin
+          // semantics. Resolved once per batch via the connection lookup.
+          const batchMaxLeverage = await getMaxLeverageForConnection(connectionId)
           await dbCoordinator.storePosition(connectionId, symbol, {
             id: `pos_${Date.now()}`,
             connectionId,
@@ -506,7 +518,7 @@ export class TradeExecutionOrchestrator {
             entryPrice: order.price,
             currentPrice: order.price,
             unrealizedPnl: 0,
-            leverage: 1,
+            leverage: batchMaxLeverage,
             status: "open",
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
