@@ -66,6 +66,7 @@ import {
   Zap,
   Boxes,
   Layers,
+  TrendingUp,
 } from "lucide-react"
 import { useExchange } from "@/lib/exchange-context"
 
@@ -185,6 +186,10 @@ export function QuickstartOptionsBar() {
   const [volumeFactor, setVolumeFactor] = useState<number>(1)
   const [blockEnabled, setBlockEnabled] = useState(true)
   const [dcaEnabled, setDcaEnabled] = useState(true)
+  // Trailing-stop master variant gate. Engine-side default is also true
+  // (`coord.variants.trailing !== false` in strategy-coordinator), so an
+  // operator who never touches this control still gets trailing.
+  const [trailingEnabled, setTrailingEnabled] = useState(true)
 
   // Per-field save status — drives the inline chip. We track a single
   // shared status because the operator typically only mutates one knob
@@ -265,10 +270,11 @@ export function QuickstartOptionsBar() {
           settings.coordinationSettings ||
           {}
         const variants = coord.variants || {}
-        // Defaults: block ON, dca ON — matches the engine-side defaults
-        // in `lib/strategy-coordinator.ts`. Use `!== false` so absent
-        // keys default to true (don't surprise operators who never
-        // touched coordination).
+        // Defaults: trailing ON, block ON, dca ON — matches the engine-side
+        // defaults in `lib/strategy-coordinator.ts`. Use `!== false` so absent
+        // keys default to true (don't surprise operators who never touched
+        // coordination — the previous run was already trailing).
+        setTrailingEnabled(variants.trailing !== false)
         setBlockEnabled(variants.block !== false)
         setDcaEnabled(variants.dca !== false)
       }
@@ -406,17 +412,35 @@ export function QuickstartOptionsBar() {
     [debouncedSaveLive],
   )
 
-  const handleBlockChange = useCallback(
+  const handleTrailingChange = useCallback(
     (next: boolean) => {
-      setBlockEnabled(next)
-      // Merge with the current dcaEnabled so PATCH doesn't drop it.
+      setTrailingEnabled(next)
+      // Merge with the current Block + DCA flags so PATCH doesn't drop
+      // them. The variants object is replace-merged in connection
+      // settings, so any unspecified key would be set back to default
+      // (= true) on the server, but we send all three explicitly to
+      // make the wire shape match the dashboard's mental model.
       debouncedSaveCoord({
         coordination_settings: {
-          variants: { block: next, dca: dcaEnabled },
+          variants: { trailing: next, block: blockEnabled, dca: dcaEnabled },
         },
       })
     },
-    [dcaEnabled, debouncedSaveCoord],
+    [blockEnabled, dcaEnabled, debouncedSaveCoord],
+  )
+
+  const handleBlockChange = useCallback(
+    (next: boolean) => {
+      setBlockEnabled(next)
+      // Merge with the current trailing + dca flags so PATCH doesn't
+      // drop them.
+      debouncedSaveCoord({
+        coordination_settings: {
+          variants: { trailing: trailingEnabled, block: next, dca: dcaEnabled },
+        },
+      })
+    },
+    [trailingEnabled, dcaEnabled, debouncedSaveCoord],
   )
 
   const handleDcaChange = useCallback(
@@ -424,11 +448,11 @@ export function QuickstartOptionsBar() {
       setDcaEnabled(next)
       debouncedSaveCoord({
         coordination_settings: {
-          variants: { block: blockEnabled, dca: next },
+          variants: { trailing: trailingEnabled, block: blockEnabled, dca: next },
         },
       })
     },
-    [blockEnabled, debouncedSaveCoord],
+    [trailingEnabled, blockEnabled, debouncedSaveCoord],
   )
 
   // ── render helpers ───────────────────────────────────────────────────
@@ -635,7 +659,7 @@ export function QuickstartOptionsBar() {
               </div>
             </div>
 
-            {/* ── Row 3: Strategies Pos. Counts (Block + DCA) ────────── */}
+            {/* ── Row 3: Strategies Pos. Counts (Trailing + Block + DCA) ── */}
             <div
               className={`rounded-md border bg-card p-2 ${disabled ? "opacity-60" : ""}`}
             >
@@ -648,7 +672,31 @@ export function QuickstartOptionsBar() {
                   per-variant gate toggles
                 </span>
               </div>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-3 gap-2">
+                {/* Trailing — placed first per operator spec: it gates the
+                    trailing-stop ratchet on every Set (multi-step state
+                    machine in pseudo-position-manager and the live SL
+                    pull-through in syncLiveFromPseudo). When OFF, Sets
+                    fall back to a static SL at `stoploss_ratio × fillPrice`
+                    and the live exchange SL stops getting ratcheted. */}
+                <div className="flex items-center justify-between gap-2 rounded bg-muted/30 px-2 py-1.5">
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-semibold text-foreground flex items-center gap-1">
+                      <TrendingUp className="w-3 h-3 text-foreground/70" />
+                      Trailing
+                    </div>
+                    <div className="text-[9px] text-muted-foreground leading-tight">
+                      Ratcheting stop-loss
+                    </div>
+                  </div>
+                  <Switch
+                    checked={trailingEnabled}
+                    disabled={disabled}
+                    onCheckedChange={handleTrailingChange}
+                    aria-label="Trailing-stop variant"
+                  />
+                </div>
+
                 {/* Block */}
                 <div className="flex items-center justify-between gap-2 rounded bg-muted/30 px-2 py-1.5">
                   <div className="min-w-0">
