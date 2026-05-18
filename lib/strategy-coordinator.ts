@@ -1954,11 +1954,18 @@ export class StrategyCoordinator {
     // the NET direction per bucket so Live only opens positions where the
     // realised signal is asymmetric.
     //
+    // EXCEPTION: Axis Sets (position-count fan-out projections) are NOT
+    // subject to netting. Each axis Set represents a valid position-count
+    // configuration and both long/short should flow to Live independently.
+    // Netting axis Sets would eliminate the entire position-count range
+    // being tested (e.g., if cont=3 long and short both exist, netting
+    // them cancels the intent to test cont=3 in both directions).
+    // Profile-variant Sets (default, trailing, block, DCA) still participate
+    // in netting since their long/short pairs represent hedging signal.
+    //
     // Bucket identity: `${symbol}|${ind}|p${prev}|l${last}|c${cont}|o${outcome}`
-    //   • Axis Sets only (those with `axisWindows.direction` populated).
-    //     Profile-variant Sets and legacy non-axis Sets pass through
-    //     unchanged — their direction-asymmetry is encoded elsewhere and
-    //     netting them would lose signal.
+    //   • Profile-variant Sets (no `axisWindows.direction`): participate in netting
+    //   • Axis Sets: pass through unchanged — SKIP netting entirely
     //   • Outcome is part of the bucket: pos and neg Sets represent
     //     different realised market regimes and must NOT cancel each
     //     other.
@@ -1974,31 +1981,36 @@ export class StrategyCoordinator {
     type HedgeBucket = { long: StrategySet[]; short: StrategySet[] }
     const hedgeBuckets = new Map<string, HedgeBucket>()
     const passthrough: StrategySet[] = []
+    const axisPassthrough: StrategySet[] = []
     let axisSetsCounted = 0
     for (const s of realSorted) {
       const dir = s.axisWindows?.direction
-      if (!dir || !s.axisWindows) { passthrough.push(s); continue }
+      if (!dir || !s.axisWindows) { 
+        passthrough.push(s)
+        continue 
+      }
+      // Axis Sets bypass hedge netting — each axis tuple is a valid config
+      axisPassthrough.push(s)
       axisSetsCounted++
-      const aw = s.axisWindows
-      const outcome = aw.outcome ?? "pos"
-      // ── Per-Base hedge isolation (operator spec) ────────────────────
-      // Spec: "long, short hedge based on Base sets with INDEPENDENT
-      // configs". Bucket identity must be per-parent-Base so axis Sets
-      // from different Base configs do NOT cancel each other. Without
-      // the parentSetKey prefix, two long axis Sets from Base A and an
-      // unrelated short axis Set from Base B (sharing the same axis
-      // tuple) would netting to 1 long survivor — which is wrong.
-      const parentKey = s.parentSetKey ?? s.setKey.split("#")[0]
-      const bucketKey = `${parentKey}|${symbol}|${s.indicationType}|p${aw.prev}|l${aw.last}|c${aw.cont}|o${outcome}`
-      let b = hedgeBuckets.get(bucketKey)
-      if (!b) { b = { long: [], short: [] }; hedgeBuckets.set(bucketKey, b) }
-      if (dir === "short") b.short.push(s); else b.long.push(s)
     }
-    console.log(`[v0] [RealStage] ${symbol}: realSorted=${realSorted.length} axisSetsCounted=${axisSetsCounted} passthrough=${passthrough.length}`)
+    console.log(`[v0] [RealStage] ${symbol}: realSorted=${realSorted.length} axisSetsCounted=${axisSetsCounted} profileVariants=${passthrough.length}`)
 
     const netted: StrategySet[] = []
     const netTargetWrites: Record<string, string> = {}
     let netCancelled = 0
+    for (const s of passthrough) {
+      const aw = s.axisWindows
+      if (!aw) { netted.push(s); continue }
+      const outcome = aw.outcome ?? "pos"
+      const parentKey = s.parentSetKey ?? s.setKey.split("#")[0]
+      const bucketKey = `${parentKey}|${symbol}|${s.indicationType}|p${aw.prev}|l${aw.last}|c${aw.cont}|o${outcome}`
+      let b = hedgeBuckets.get(bucketKey)
+      if (!b) { b = { long: [], short: [] }; hedgeBuckets.set(bucketKey, b) }
+      const dir = s.direction ?? "long"
+      if (dir === "short") b.short.push(s); else b.long.push(s)
+    }
+
+    // Apply hedge netting only to profile-variant Sets
     for (const [bucketKey, b] of hedgeBuckets) {
       const L = b.long.length
       const S = b.short.length
@@ -2016,9 +2028,9 @@ export class StrategyCoordinator {
       netTargetWrites[bucketKey] = `${winnerDir}:${remainder}`
     }
 
-    console.log(`[v0] [RealStage] ${symbol}: hedgeBuckets=${hedgeBuckets.size} netted=${netted.length} cancelled=${netCancelled}`)
+    console.log(`[v0] [RealStage] ${symbol}: profileNetting: hedgeBuckets=${hedgeBuckets.size} netted=${netted.length} cancelled=${netCancelled} axisPass=${axisPassthrough.length}`)
 
-    const realPostHedge = [...passthrough, ...netted].sort(
+    const realPostHedge = [...passthrough, ...netted, ...axisPassthrough].sort(
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )
 
