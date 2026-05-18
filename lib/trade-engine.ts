@@ -1473,6 +1473,14 @@ export function getGlobalTradeEngineCoordinator(): GlobalTradeEngineCoordinator 
     engineGlobalThis.__tradeEngineCoordinator = globalCoordinator
     console.log("[v0] Global trade engine coordinator auto-initialized")
   }
+  // ── Publish engine running status for Redis snapshot guards ──
+  // When ANY engine is active, set a flag so other processes in dev mode
+  // know not to reload the snapshot (which would overwrite lock tokens).
+  const anyRunning = Array.from(globalCoordinator.engineManagers.values()).some(
+    m => m.isEngineRunning
+  )
+  engineGlobalThis.__engine_manager_instance = anyRunning ? { isEngineRunning: true } : null
+  
   return globalCoordinator
 }
 
