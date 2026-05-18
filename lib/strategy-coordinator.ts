@@ -1855,6 +1855,11 @@ export class StrategyCoordinator {
     const uniqueBaseSetsProduced = new Set<string>()
     for (const s of mainSets) uniqueBaseSetsProduced.add(s.parentSetKey ?? s.setKey)
     const failed = baseSets.length - uniqueBaseSetsProduced.size
+    
+    // Count axis Sets by direction for diagnostic logging
+    const axisSetsCount = mainSets.filter(s => s.axisWindows).length
+    const axisLong = mainSets.filter(s => s.axisWindows?.direction === "long").length
+    const axisShort = mainSets.filter(s => s.axisWindows?.direction === "short").length
 
     if (baseSets.length > 0) {
       const sample = baseSets[0]
@@ -1863,7 +1868,8 @@ export class StrategyCoordinator {
         .join(",")
       console.log(
         `[v0] [StrategyFlow] ${symbol} MAIN: ${mainSets.length} sets (${uniqueBaseSetsProduced.size}/${baseSets.length} bases, reused=${reused}) ` +
-        `variants={${variantBreakdown}} ctx={cont=${ctx.continuousCount},lastW=${ctx.lastWins},lastL=${ctx.lastLosses},prevL=${ctx.prevLosses}} ` +
+        `variants={${variantBreakdown}} axis={${axisSetsCount} total, L=${axisLong}, S=${axisShort}} ` +
+        `ctx={cont=${ctx.continuousCount},lastW=${ctx.lastWins},lastL=${ctx.lastLosses},prevL=${ctx.prevLosses}} ` +
         `| sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}}`
       )
     } else {
