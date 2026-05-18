@@ -2345,29 +2345,49 @@ export async function executeLivePosition(
     }
 
     // ── Step 4: Configure leverage + margin type on exchange ───────────────
-    if (typeof exchangeConnector.setLeverage === "function") {
-      try {
-        const lev = await exchangeConnector.setLeverage(realPosition.symbol, livePosition.leverage)
-        pushStep(livePosition, "set_leverage", !!lev?.success, lev?.error || `leverage=${livePosition.leverage}`)
-      } catch (err) {
-        pushStep(livePosition, "set_leverage", false, String(err))
-      }
-    } else {
-      pushStep(livePosition, "set_leverage", true, "connector does not expose setLeverage — skipping")
-    }
-
+    // T2.3 perf: parallelize the two pre-flight venue calls. They are
+    // idempotent and independent — `setLeverage` configures the
+    // per-symbol leverage bracket, `setMarginType` configures
+    // cross/isolated. Running them concurrently shaves one full
+    // round-trip off every live entry. Both still complete BEFORE the
+    // order is placed, so the venue sees consistent margin semantics
+    // for the order. Errors are captured per-call and logged
+    // independently — a failure in one does NOT skip the other.
     const marginTypeSetting = (connSettings.margin_type as "cross" | "isolated") || "cross"
     livePosition.marginType = marginTypeSetting
-    if (typeof exchangeConnector.setMarginType === "function") {
-      try {
-        const m = await exchangeConnector.setMarginType(realPosition.symbol, marginTypeSetting)
-        pushStep(livePosition, "set_margin_type", !!m?.success, m?.error || `margin=${marginTypeSetting}`)
-      } catch (err) {
-        pushStep(livePosition, "set_margin_type", false, String(err))
-      }
-    } else {
-      pushStep(livePosition, "set_margin_type", true, "connector does not expose setMarginType — skipping")
-    }
+
+    const setLeveragePromise: Promise<{ ok: boolean; note: string }> =
+      typeof exchangeConnector.setLeverage === "function"
+        ? exchangeConnector
+            .setLeverage(realPosition.symbol, livePosition.leverage)
+            .then((lev: any) => ({
+              ok: !!lev?.success,
+              note: lev?.error || `leverage=${livePosition.leverage}`,
+            }))
+            .catch((err: unknown) => ({ ok: false, note: String(err) }))
+        : Promise.resolve({
+            ok: true,
+            note: "connector does not expose setLeverage — skipping",
+          })
+
+    const setMarginTypePromise: Promise<{ ok: boolean; note: string }> =
+      typeof exchangeConnector.setMarginType === "function"
+        ? exchangeConnector
+            .setMarginType(realPosition.symbol, marginTypeSetting)
+            .then((m: any) => ({
+              ok: !!m?.success,
+              note: m?.error || `margin=${marginTypeSetting}`,
+            }))
+            .catch((err: unknown) => ({ ok: false, note: String(err) }))
+        : Promise.resolve({
+            ok: true,
+            note: "connector does not expose setMarginType — skipping",
+          })
+
+    const [levResult, marginResult] = await Promise.all([setLeveragePromise, setMarginTypePromise])
+    pushStep(livePosition, "set_leverage", levResult.ok, levResult.note)
+    pushStep(livePosition, "set_margin_type", marginResult.ok, marginResult.note)
+
 
     // ── Step 5: Place entry order with retry ─────────────────────����─────────
     const exchangeSide: "buy" | "sell" = realPosition.direction === "long" ? "buy" : "sell"
@@ -2817,7 +2837,7 @@ export async function executeLivePosition(
         extra: { orderId: livePosition.orderId, attempts: placeAttempt },
       })
     } else {
-      // D) Final guard: fill unconfirmed but order was accepted — treat as filled
+      // D) Final guard: fill unconfirmed but order was accepted �� treat as filled
       // with computedVolume so SL/TP can be placed. The position is "open" on the
       // exchange (order went to market); protection orders are reduce-only so no
       // new risk is added. Reconcile will correct executedQty on next tick.
