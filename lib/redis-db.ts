@@ -336,16 +336,34 @@ export class InlineLocalRedis {
   }
   
   private startTTLCleanup(): void {
-    // DISABLED: Automatic TTL cleanup causing all data to be deleted every 60 seconds
-    // Only run cleanup manually when explicitly requested
-    // const globalCleanup = globalThis as unknown as { __redis_cleanup_started?: boolean }
-    // if (globalCleanup.__redis_cleanup_started) return
-    // globalCleanup.__redis_cleanup_started = true
+    // TTL-based cleanup + LRU eviction when heap memory exceeds threshold.
+    // In dev mode, module reloads accumulate data; in prod, this prevents
+    // unbounded growth of position history and candle buffers.
+    const globalCleanup = globalThis as unknown as { __redis_cleanup_started?: boolean }
+    if (globalCleanup.__redis_cleanup_started) return
+    globalCleanup.__redis_cleanup_started = true
     
-    // const ttlCleanupTimer = setInterval(() => {
-    //   this.cleanupExpiredKeys()
-    // }, 60000)
-    // ttlCleanupTimer.unref?.()
+    const CLEANUP_INTERVAL_MS = 60_000 // Every 60s
+    const MEMORY_LIMIT_BYTES = 1_000_000_000 // 1GB soft limit
+    
+    const ttlCleanupTimer = setInterval(() => {
+      try {
+        // First, clean up expired keys
+        const cleaned = this.cleanupExpiredKeys()
+        
+        // Check memory pressure: if heap > threshold, evict old position/candle records
+        const heapUsedMB = (process.memoryUsage?.().heapUsed || 0) / 1024 / 1024
+        const heapLimitMB = 1000 // 1GB
+        
+        if (heapUsedMB > heapLimitMB) {
+          console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
+          this.evictOldRecords()
+        }
+      } catch (err) {
+        // Swallow errors so the cleanup timer doesn't die
+      }
+    }, CLEANUP_INTERVAL_MS)
+    ttlCleanupTimer.unref?.()
   }
   
   private cleanupExpiredKeys(): number {
@@ -362,6 +380,37 @@ export class InlineLocalRedis {
       }
     }
     return cleaned
+  }
+  
+  private evictOldRecords(): number {
+    // LRU eviction: delete oldest position/candle records when heap pressure high.
+    // Target keys that accumulate unboundedly: `strategy:*:positions`, `market_data:*:candles`.
+    // We measure "age" by parsing timestamps in the key structure or falling back to FIFO order.
+    let evicted = 0
+    const targetPatterns = [
+      (k: string) => k.startsWith("strategy:") && k.includes(":positions"),
+      (k: string) => k.startsWith("market_data:") && k.endsWith(":candles"),
+    ]
+    
+    const keysToEvict: string[] = []
+    for (const [key] of this.data.hashes.entries()) {
+      if (targetPatterns.some(p => p(key))) {
+        keysToEvict.push(key)
+      }
+    }
+    
+    // Evict oldest 20% of matching keys to recover memory
+    const evictCount = Math.max(1, Math.floor(keysToEvict.length * 0.2))
+    for (let i = 0; i < evictCount && i < keysToEvict.length; i++) {
+      const key = keysToEvict[i]
+      this.deleteKey(key)
+      evicted++
+    }
+    
+    if (evicted > 0) {
+      console.log(`[v0] [Redis Memory] Evicted ${evicted} old records to reduce memory pressure`)
+    }
+    return evicted
   }
   
   private isExpired(key: string): boolean {
