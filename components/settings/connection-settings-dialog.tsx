@@ -226,6 +226,24 @@ export function ConnectionSettingsDialog({
               typeof coord.blockMaxStack === "number"
                 ? coord.blockMaxStack
                 : DEFAULT_COORDINATION_SETTINGS.blockMaxStack,
+            // ── Prev-PI threshold hydrate ───────────────────────────
+            // Two persistence paths: the new nested `coord.prevPiMinCount`
+            // (saved alongside other coordination knobs) and the flat
+            // top-level `settings.prevPiMinCount` (read by the engine
+            // and `getStrategyTracking`). Hydrate from either, prefer
+            // the flat value because that's what the engine actually
+            // reads at Base creation.
+            prevPiMinCount: (() => {
+              const flat = Number((settings as Record<string, unknown>).prevPiMinCount)
+              if (Number.isFinite(flat) && flat >= 1) {
+                return Math.min(50, Math.floor(flat))
+              }
+              const nested = Number((coord as Record<string, unknown>).prevPiMinCount)
+              if (Number.isFinite(nested) && nested >= 1) {
+                return Math.min(50, Math.floor(nested))
+              }
+              return DEFAULT_COORDINATION_SETTINGS.prevPiMinCount
+            })(),
           })
         }
       }
@@ -311,8 +329,12 @@ export function ConnectionSettingsDialog({
           preset: stratPreset,
         },
         // Strategy coordination (axes + variants toggles)
-        coordination_settings: coordination,
-        coordinationSettings:  coordination, // legacy alias
+          coordination_settings: coordination,
+          coordinationSettings:  coordination, // legacy alias
+          // Flat top-level mirror so the engine + `getStrategyTracking`
+          // can read it as a plain `connection_settings` HASH field
+          // without parsing the nested coordination JSON every cycle.
+          prevPiMinCount: coordination.prevPiMinCount,
       }
 
       const [settingsRes, indRes] = await Promise.all([
