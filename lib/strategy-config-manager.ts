@@ -295,6 +295,32 @@ export class StrategyConfigManager {
     return idx >= 0 ? raw.slice(idx + 1) : raw
   }
 
+  /**
+   * Best-effort indication-type extraction from a composite configSetKey.
+   * The keys produced upstream embed the indication type as one of the
+   * leading segments (e.g. `direction:long:cfg_…` or
+   * `connId:active_advanced:short:cfg_…`). We scan for the first segment
+   * that matches our known type vocabulary and return it lower-cased;
+   * returns "" when no recognised token appears (callers fall back to
+   * "unknown" rather than dropping the position from PI history).
+   */
+  static extractIndicationType(configSetKey: string | undefined | null): string {
+    if (!configSetKey) return ""
+    const KNOWN = new Set([
+      "direction",
+      "move",
+      "active",
+      "active_advanced",
+      "optimal",
+      "auto",
+    ])
+    for (const seg of String(configSetKey).split(":")) {
+      const s = seg.trim().toLowerCase()
+      if (KNOWN.has(s)) return s
+    }
+    return ""
+  }
+
   async getPositionCount(configId: string): Promise<number> {
     await initRedis()
     const client = getRedisClient()

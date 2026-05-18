@@ -64,6 +64,20 @@ export interface CoordinationSettings {
   // (gate closes at n ≥ blockMaxStack) so the stacking is bounded.
   blockVolumeRatio: number // 0.25..3.0 per spec band (UI clamps; engine re-clamps)
   blockMaxStack:    number // 2..8 (gate uses `n < blockMaxStack`)
+
+  /**
+   * ── Prev-PI threshold (operator spec) ──────────────────────────────
+   *
+   * Activation threshold for the historic-PI blend at Base stage and
+   * the per-variant Real-stage tuner. Below this many CLOSED positions
+   * in the (symbol × indicationType × direction) bucket, the engine
+   * runs in BOOTSTRAP mode (= raw indication PF, no historic blend) so
+   * fresh boots can produce trades immediately. At/above the threshold
+   * the engine engages historic PF min-blend and Real-stage size/leverage
+   * tuning. Default 5 = smallest statistically meaningful denominator.
+   * Backed by `connection_settings:{conn}.prevPiMinCount`.
+   */
+  prevPiMinCount: number // 1..50, default 5
 }
 
 /** Spec-aligned defaults — match the constants in strategy-coordinator.ts. */

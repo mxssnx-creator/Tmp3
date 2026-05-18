@@ -159,6 +159,39 @@ export interface StrategyStageTracking {
     avgProfitFactor: number
     cap: number                       // maxLiveSets, default 500
   }
+  /**
+   * ── Valid Positions Counts (operator spec) ─────────────────────────
+   * "add to statistics and overviews.. Valid Positions Counts ..
+   *  Overall, Combined (Accumulated)."
+   *
+   * Maintained by `lib/pi-history.ts::bumpValidPositions`, fired from
+   * `evaluateRealSets` once per Real Set produced.
+   *   - overall:  lifetime count of valid Real Sets ever produced
+   *   - combined: Sets whose parent Base is currently running (alive)
+   *   - bySymbol/byDirection/byType: dimensional breakdowns
+   */
+  validPositions: {
+    overall: number
+    combined: number
+    bySymbol: Record<string, number>
+    byDirection: Record<string, number>
+    byType: Record<string, number>
+  }
+  /**
+   * Connection-level prev-PI summary so settings panels and dashboard
+   * tiles can render "what's the engine learning right now" without
+   * reading raw redis hashes.
+   */
+  prevPi: {
+    count: number
+    successRate: number
+    profitFactor: number
+    avgDDT: number
+    /** Operator-tunable activation threshold (default 5). */
+    minCount: number
+    /** True when current count clears `minCount` and PF blending is active. */
+    active: boolean
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -277,6 +310,25 @@ export async function getStrategyTracking(
   // Axis accumulation at Real stage
   const axisAccumulation = await readAxisAccumulation(client, connectionId)
 
+  // ── Valid Positions + Prev-PI rollup ──
+  // Both are connection-scoped HASHes maintained by `lib/pi-history.ts`.
+  // We resolve them in parallel with the rest of the tracking reads so
+  // dashboard refreshes stay one round-trip in the steady state.
+  const { getValidPositions, getPiHistoryOverall } = await import(
+    "@/lib/pi-history",
+  )
+  const prevPiMinCountSetting = Number(
+    (settings as Record<string, string>).prevPiMinCount || "5",
+  )
+  const prevPiMinCount =
+    Number.isFinite(prevPiMinCountSetting) && prevPiMinCountSetting > 0
+      ? Math.min(50, Math.floor(prevPiMinCountSetting))
+      : 5
+  const [validPositions, prevPi] = await Promise.all([
+    getValidPositions(connectionId),
+    getPiHistoryOverall(connectionId, prevPiMinCount),
+  ])
+
   // Active sets currently processing (counted across symbols)
   let baseActivelyProcessing = 0
   let liveActive = 0
@@ -364,6 +416,15 @@ export async function getStrategyTracking(
       setsTotal: Number(prog.strategies_live_total || "0"),
       avgProfitFactor: Number(prog.live_avg_profit_factor || "0"),
       cap: Number(settings.maxLiveSets || "500"),
+    },
+    validPositions,
+    prevPi: {
+      count: prevPi.count,
+      successRate: prevPi.successRate,
+      profitFactor: prevPi.profitFactor,
+      avgDDT: prevPi.avgDDT,
+      minCount: prevPiMinCount,
+      active: prevPi.hasSignal,
     },
   }
 }

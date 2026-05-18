@@ -628,6 +628,49 @@ export class PseudoPositionManager {
       // frozen at prehistoric-time. Entry serialisation goes through
       // the canonical static on StrategyConfigManager so writer and
       // reader never drift.
+      // ── PI history accumulator (atomic, in-pipeline) ────────────────
+      // Lifetime per (symbol × indicationType × direction) HASH that the
+      // strategy coordinator reads at Base creation to blend prev-PI PF
+      // into avgProfitFactor and at Real to tune size/leverage. Uses
+      // hincrby so concurrent closes never lose a count, and composes
+      // into the existing close pipeline so the whole transaction stays
+      // one round-trip.
+      try {
+        const { recordPiClosed } = await import("@/lib/pi-history")
+        const indicationType = String(
+          position.indication_type ||
+          position.signal_source     ||
+          StrategyConfigManager.extractIndicationType(configSetKey) ||
+          "unknown",
+        )
+        const directionRaw = side === "long" || side === "short" ? side : "long"
+        const drawdownPctOrPx = parseFloat(position.max_drawdown || "0")
+        const openedMs = new Date(
+          String(position.opened_at || position.entry_time || position.created_at || closedAtIso),
+        ).getTime()
+        const closedMs = new Date(closedAtIso).getTime()
+        const positionDurationMin =
+          Number.isFinite(openedMs) && Number.isFinite(closedMs) && closedMs > openedMs
+            ? (closedMs - openedMs) / 60000
+            : 0
+        // We don't track adverse-excursion duration separately — proxy
+        // with full position duration when there was a drawdown sample,
+        // 0 otherwise. Fine for cumulative averages.
+        const drawdownMinutes = drawdownPctOrPx > 0 ? positionDurationMin : 0
+        recordPiClosed({
+          connectionId: this.connectionId,
+          symbol: String(position.symbol || ""),
+          indicationType,
+          direction: directionRaw,
+          pnl,
+          drawdownMinutes,
+          pipeline,
+        })
+      } catch (piErr) {
+        // Non-critical; PI history is observability only.
+        console.warn(`[v0] [closePosition] recordPiClosed failed:`, piErr)
+      }
+
       if (configId) {
         const notional = entryPrice * quantity
         const resultPct = notional > 0 ? (pnl / notional) * 100 : 0
