@@ -328,6 +328,8 @@ export class PseudoPositionManager {
 
       // Store position in Redis
       const id = nanoid()
+      // Generate unique tracking ID to identify system-created positions
+      const systemTrackingId = `sys-${this.connectionId}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
       const client = getRedisClient()
 
       const positionData: Record<string, string> = {
@@ -342,6 +344,8 @@ export class PseudoPositionManager {
         // list so historic-backfilled Sets stay continuously current.
         // When absent, `closePosition` falls back to parsing `config_set_key`.
         strategy_config_id: params.strategyConfigId || "",
+        // System tracking ID — marks this as a system-created position
+        system_tracking_id: systemTrackingId,
         entry_price: String(params.entryPrice),
         current_price: String(params.entryPrice),
         quantity: String(volumeCalc.finalVolume),
