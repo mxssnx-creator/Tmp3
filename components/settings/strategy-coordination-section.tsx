@@ -693,7 +693,7 @@ export function StrategyCoordinationSection({
               </CardDescription>
             </div>
             <Badge variant="outline" className="text-[10px] tabular-nums">
-              5–50 step 5
+              8–80 step 2
             </Badge>
           </div>
         </CardHeader>
@@ -719,9 +719,9 @@ export function StrategyCoordinationSection({
             <div className="flex items-center gap-3 pt-1">
               <Slider
                 value={[value.mainEvalPosCount]}
-                min={5}
-                max={50}
-                step={5}
+                min={8}
+                max={80}
+                step={2}
                 onValueChange={(v) =>
                   onChange({ ...value, mainEvalPosCount: v[0] })
                 }
@@ -753,9 +753,9 @@ export function StrategyCoordinationSection({
             <div className="flex items-center gap-3 pt-1">
               <Slider
                 value={[value.realEvalPosCount]}
-                min={5}
-                max={50}
-                step={5}
+                min={8}
+                max={80}
+                step={2}
                 onValueChange={(v) =>
                   onChange({ ...value, realEvalPosCount: v[0] })
                 }
