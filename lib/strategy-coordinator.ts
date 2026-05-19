@@ -1661,7 +1661,7 @@ export class StrategyCoordinator {
           entries_total:     String(mainEntriesTotal),
           entries_count:     String(mainEntriesTotal),
           axis_sets:         String(axisSetsAdded),
-          evaluated:         String(baseSets.length),
+          evaluated:         String(mainSets.length),
           passed_sets:       String(mainSets.length),
           pass_rate:         String(passRatioMain.toFixed(4)),
           count_pos_eval:    String(mainSets.length),
@@ -1684,7 +1684,7 @@ export class StrategyCoordinator {
             mainSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
           [`s:${symbol}:passed`]:     String(mainSets.length),
-          [`s:${symbol}:evaluated`]:  String(baseSets.length),
+          [`s:${symbol}:evaluated`]:  String(mainSets.length),
           [`s:${symbol}:apf`]:        String(mainAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(mainAvgDDT)),
           [`s:${symbol}:apps`]:       String(mainAvgPosPerSet.toFixed(2)),
@@ -1703,7 +1703,7 @@ export class StrategyCoordinator {
         }).catch(() => {}),
         client.set(`strategies:${this.connectionId}:main:count`, String(mainSets.length)),
         client.set(`strategies:${this.connectionId}:main:evaluated`, String(mainSets.length)),
-        client.set(`strategies:${this.connectionId}:base:passed`, String(mainSets.length)),
+        client.set(`strategies:${this.connectionId}:base:passed`, String(baseSets.length)),
         client.expire(`strategies:${this.connectionId}:main:count`, 86400),
         client.expire(`strategies:${this.connectionId}:main:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:base:passed`, 86400),
@@ -2499,7 +2499,7 @@ export class StrategyCoordinator {
         // Overwriting them with Real's realSets.length would corrupt MAIN's
         // pass statistics and make passed_sets > evaluated impossible to read.
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
-        client.set(`strategies:${this.connectionId}:real:evaluated`, String(realSets.length)),
+        client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainSets.length)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
         // ── CRITICAL: Persist Real Sets for Live evaluation ────────────────────
         // Bug fix: Real Sets were computed but never written, causing Live to load
