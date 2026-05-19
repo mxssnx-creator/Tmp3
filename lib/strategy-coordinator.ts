@@ -2179,7 +2179,9 @@ export class StrategyCoordinator {
           externalPipeline: accPipeline,
         })
       }
-      ;(accPipeline as any).exec().catch(() => {})
+      ;(accPipeline as any).exec().catch((err: any) => {
+        console.error(`[v0] [StrategyFlow] ${symbol} accumulation pipeline failed:`, err?.message || err)
+      })
     } catch (tunerErr) {
       console.warn(`[v0] [StrategyFlow] ${symbol} Real tuner failed:`, tunerErr)
     }

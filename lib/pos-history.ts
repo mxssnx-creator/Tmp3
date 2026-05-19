@@ -464,13 +464,54 @@ export interface ValidPositionsSnapshot {
 export async function getValidPositions(
   connectionId: string,
 ): Promise<ValidPositionsSnapshot> {
-  const empty: ValidPositionsSnapshot = {
-    overall: 0,
-    combined: 0,
-    bySymbol: {},
-    byDirection: {},
-    byType: {},
+  if (!connectionId) {
+    return {
+      overall: 0,
+      combined: 0,
+      bySymbol: {},
+      byDirection: { long: 0, short: 0 },
+      byType: {},
+    }
   }
+  try {
+    const client = getRedisClient()
+    const k = VALID_POS_KEY(connectionId)
+    const hash = await client.hgetall(k)
+    
+    // Debug: log what we got from Redis
+    if (Object.keys(hash).length === 0) {
+      console.log(`[v0] [PosHistory] getValidPositions(${connectionId}): empty hash from Redis key "${k}"`)
+    }
+
+    return {
+      overall: Number(hash.overall || 0),
+      combined: Number(hash.combined || 0),
+      bySymbol: Object.fromEntries(
+        Object.entries(hash)
+          .filter(([key]) => key.startsWith("by_symbol:"))
+          .map(([key, val]) => [key.substring("by_symbol:".length), Number(val)]),
+      ),
+      byDirection: {
+        long: Number(hash["by_dir:long"] || 0),
+        short: Number(hash["by_dir:short"] || 0),
+      },
+      byType: Object.fromEntries(
+        Object.entries(hash)
+          .filter(([key]) => key.startsWith("by_type:"))
+          .map(([key, val]) => [key.substring("by_type:".length), Number(val)]),
+      ),
+    }
+  } catch (err) {
+    console.error(`[v0] [PosHistory] getValidPositions error:`, err)
+    return {
+      overall: 0,
+      combined: 0,
+      bySymbol: {},
+      byDirection: { long: 0, short: 0 },
+      byType: {},
+    }
+  }
+}
   if (!connectionId) return empty
   try {
     const client = getRedisClient()
