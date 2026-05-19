@@ -55,6 +55,21 @@ async function handleStartAll() {
 
     for (const connection of activeConnections) {
       try {
+        // Reset evaluated counters for fresh start
+        const redis = await initRedis()
+        const evalKeys = [
+          `strategies:${connection.id}:base:evaluated`,
+          `strategies:${connection.id}:main:evaluated`,
+          `strategies:${connection.id}:real:evaluated`,
+        ]
+        for (const key of evalKeys) {
+          try {
+            await redis.del(key)
+          } catch (delErr) {
+            console.warn(`[START-ALL] Failed to delete ${key}:`, delErr)
+          }
+        }
+
         await coordinator.startEngine(connection.id, {
           connectionId: connection.id,
           indicationInterval,

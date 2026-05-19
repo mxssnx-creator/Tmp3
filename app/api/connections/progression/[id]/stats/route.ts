@@ -1133,7 +1133,7 @@ export async function GET(
         const passRatio      = passRatioRaw > 0
           ? Math.round(passRatioRaw * 1000) / 10   // convert 0-1 fraction → percent
           : stageEvaluated > 0
-            ? Math.round((stagePassed / stageEvaluated) * 1000) / 10
+            ? Math.round((stagePassed / Math.max(stageEvaluated, 1)) * 1000) / 10
             : 0
 
         // ── Actively-running counts (operator spec) ──
@@ -1503,9 +1503,43 @@ export async function GET(
           real: stratCounts.real || 0,
           live: stratCounts.live || 0,
           total: stratTotal,
-          baseEvaluated: stratEvaluated.base || 0,
-          mainEvaluated: stratEvaluated.main || 0,
-          realEvaluated: stratEvaluated.real || 0,
+          baseEvaluated: (() => {
+            // Validate constraint: eval <= sets
+            const base = stratCounts.base || 0
+            const eval_val = stratEvaluated.base || 0
+            if (eval_val > base && base > 0) {
+              console.warn(
+                `[STATS-VALIDATION] ${connectionId}: baseEvaluated (${eval_val}) > base (${base}). ` +
+                `Clamping to base.`,
+              )
+              return base
+            }
+            return eval_val
+          })(),
+          mainEvaluated: (() => {
+            const main = stratCounts.main || 0
+            const eval_val = stratEvaluated.main || 0
+            if (eval_val > main && main > 0) {
+              console.warn(
+                `[STATS-VALIDATION] ${connectionId}: mainEvaluated (${eval_val}) > main (${main}). ` +
+                `Clamping to main.`,
+              )
+              return main
+            }
+            return eval_val
+          })(),
+          realEvaluated: (() => {
+            const real = stratCounts.real || 0
+            const eval_val = stratEvaluated.real || 0
+            if (eval_val > real && real > 0) {
+              console.warn(
+                `[STATS-VALIDATION] ${connectionId}: realEvaluated (${eval_val}) > real (${real}). ` +
+                `Clamping to real.`,
+              )
+              return real
+            }
+            return eval_val
+          })(),
         },
       },
 
