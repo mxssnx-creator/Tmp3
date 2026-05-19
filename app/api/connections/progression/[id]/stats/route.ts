@@ -839,7 +839,7 @@ export async function GET(
       direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
     }
     const activeStratByStage: Record<string, number> = {
-      base: 0, main: 0, real: 0,
+      base: 0, main: 0, real: 0, live: 0,
     }
     // ── DISTINCT-SETS-PROGRESSING tally (per type / per stage) ────────
     // The cumulative `indCounts.*` and `stratCounts.*` count the total
@@ -857,7 +857,7 @@ export async function GET(
       direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
     }
     const activeSetsStratByStage: Record<string, number> = {
-      base: 0, main: 0, real: 0,
+      base: 0, main: 0, real: 0, live: 0,
     }
     try {
       const [indActiveHash, stratActiveHash] = await Promise.all([
@@ -917,8 +917,9 @@ export async function GET(
     await Promise.all(
       stratTypes.map(async (type) => {
         // Prefer the cross-symbol sum from strategies_active hash (already computed above).
-        // For "live" there is no strategies_active entry, so fall back to the standalone key.
-        const fromActive = (type !== "live") ? (activeStratByStage[type] || 0) : 0
+        // `createLiveSets` now writes `{symbol}:live` to strategies_active each cycle, so
+        // `activeStratByStage.live` is valid and should be preferred like the other stages.
+        const fromActive = activeStratByStage[type] || 0
         // Issue both standalone-key reads in parallel — they're
         // independent and previously chained as sequential awaits,
         // doubling the per-stage wall time for no benefit.
