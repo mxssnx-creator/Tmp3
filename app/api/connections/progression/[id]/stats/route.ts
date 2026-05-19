@@ -1125,18 +1125,25 @@ export async function GET(
           ? weightedDDT / weightSum
           : parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
 
-        // Eval percentage: main = evaluated/base, real = evaluated/main.
-        // MAIN is an expansion (one base set fans out to many variant sets),
-        // so the raw ratio can exceed 100%. Cap at 100 so the dashboard
-        // never shows absurd values like 10054%.
+        // Eval percentage per stage:
+        //   base:  100% — Base self-evaluates all its sets (no filter).
+        //   main:  evaluated/base, capped at 100 (expansion: 1 base → N main).
+        //   real:  evaluated/main, capped at 100 (filter: N main → M real).
+        //   live:  evaluated/real, capped at 100 (filter: M real → K live).
         let evalPct = 0
-        if (stage === "main") {
+        if (stage === "base") {
+          evalPct = createdSets > 0 ? 100 : 0
+        } else if (stage === "main") {
           const base = stratCounts.base || 1
           const raw = base > 0 ? (stratEvaluated.main / base) * 100 : 0
           evalPct = Math.min(100, Math.round(raw * 10) / 10)
         } else if (stage === "real") {
           const main = stratCounts.main || 1
           const raw = main > 0 ? (stratEvaluated.real / main) * 100 : 0
+          evalPct = Math.min(100, Math.round(raw * 10) / 10)
+        } else if (stage === "live") {
+          const real = stratCounts.real || 1
+          const raw = real > 0 ? (stratEvaluated.real / real) * 100 : 0
           evalPct = Math.min(100, Math.round(raw * 10) / 10)
         }
 
@@ -1165,14 +1172,26 @@ export async function GET(
           ? stagePassedRaw
           : stratCounts[stage] || 0
 
-        // passRatio: prefer stored pass_rate (0-1 fraction from coordinator).
-        // Fall back to stagePassed/stageEvaluated. Never exceed 100.
+        // passRatio: prefer stored pass_rate (0-1 fraction from coordinator),
+        // but cross-validate it against the actual counted values.
+        // If pass_rate * stageEvaluated diverges from stagePassed by more
+        // than 10%, the hash is stale from a prior cycle — recompute.
         const passRatioRaw = parseFloat(dh.pass_rate || "0")
-        const passRatio = passRatioRaw > 0
+        const passRatioFromRate = passRatioRaw > 0
           ? Math.min(100, Math.round(passRatioRaw * 1000) / 10)
-          : stageEvaluated > 0
-            ? Math.min(100, Math.round((stagePassed / Math.max(stageEvaluated, 1)) * 1000) / 10)
-            : stagePassed > 0 ? 100 : 0
+          : 0
+        // Recompute from counted values — always available when stageEvaluated > 0.
+        const passRatioFromCounts = stageEvaluated > 0
+          ? Math.min(100, Math.round((stagePassed / Math.max(stageEvaluated, 1)) * 1000) / 10)
+          : stagePassed > 0 ? 100 : 0
+        // Validate: if pass_rate implies a passed count that differs by >10%
+        // from the actual stagePassed, the stored value is stale.
+        const impliedPassed = passRatioRaw * stageEvaluated
+        const stalePassRate = stageEvaluated > 0 && stagePassed > 0
+          && Math.abs(impliedPassed - stagePassed) / Math.max(stagePassed, 1) > 0.1
+        const passRatio = (passRatioFromRate > 0 && !stalePassRate)
+          ? passRatioFromRate
+          : passRatioFromCounts
 
         // ── Actively-running counts (operator spec) ──
         // `sets_running_now` is written by strategy-coordinator using
@@ -1694,13 +1713,20 @@ export async function GET(
           // positions semantics per stage:
           //   base/main: how many sets have open pseudo-positions (evaluation stage).
           //              pseudoRunningSets = scard(active_config_keys) = ground truth.
-          //              Fall back to pseudoOpen (individual position objects count)
-          //              when the Set-level count is not yet populated.
-          //   real:      promoted sets awaiting mirror — realOpen from real:position:* keys.
-          //              Fall back to stratCounts.real (last-cycle output count).
+          //              Fall back to pseudoOpen (individual position objects count).
+          //   real:      promoted sets currently active — realOpen from real:position:*
+          //              keys is ground truth. Do NOT fall back to stratCounts.real
+          //              (that is 1920 = total-ever-created, not open positions).
+          //              Fall back to setsRunningNow (active coordination count)
+          //              which is a tight upper bound on truly-open real positions.
           //   live:      actual exchange positions (created − closed + unfilled orders).
           const baseMainPos = pseudoRunningSets || pseudoOpen
-          const realPos     = realOpen || stratCounts.real || 0
+          // Use setsRunningNow from the Real stage detail (already collected
+          // in the stage loop above) as the fallback — it is the count of
+          // Real Sets that are actively coordinating, which is the correct
+          // semantic for "open real positions" when realOpen=0.
+          const realDetailRunning = n(stratDetail.real?.setsRunningNow)
+          const realPos = realOpen || realDetailRunning || 0
           return {
             base: { sets: baseRun,    trackings: stratCounts.base || 0, positions: baseMainPos },
             main: { sets: cappedMain, trackings: stratCounts.main || 0, positions: baseMainPos },
