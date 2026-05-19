@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic"
 /**
  * POST /api/admin/clear-progressions
  *
- * Targeted "Reset DB" surface for the QuickStart panel.
+ * Targeted "Soft Reset DB" surface for the QuickStart panel.
  *
  * The existing `/api/admin/reset-and-init` flushes the entire Redis
  * keyspace and re-runs migrations — that is too destructive for the
@@ -25,8 +25,13 @@ export const dynamic = "force-dynamic"
  *     engine state/metrics, cycle counters, variant fingerprint cache,
  *     and per-connection trade history.
  *   • PRESERVES: connection records (`connection:*`), settings
- *     (`settings:*`, `app_settings:*`), migration markers, and
- *     predefinitions.
+ *     (`settings:*`, `app_settings:*`), migration markers, strategy
+ *     coordination framework (axis_pos_acc, real_pi_acc, progression
+ *     metadata, strategy_count), and position history structure.
+ *
+ * The coordination framework is preserved so new strategy progression
+ * runs can start fresh without rebuilding the infrastructure. All
+ * runtime strategy data and positions are cleared.
  *
  * Returns a per-pattern breakdown of how many keys were removed so the
  * UI can show a useful confirmation toast.
@@ -70,6 +75,11 @@ const PROTECTED_PREFIXES = [
   "auth:",                // Auth sessions & tokens
   "session:",             // User session data
   "api_key:",             // Stored API keys
+  "axis_pos_acc:",        // Axis position accumulation ledger (coordination framework)
+  "real_pi_acc:",         // Real PI accumulation (coordination framework)
+  "progression:",         // Progression metadata (coordination framework)
+  "strategy_count:",      // Strategy count tracking (coordination framework)
+  "pi_history:",          // Position history structure (coordination framework - base structure only, data will be cleared separately)
 ] as const
 
 // FORCE-CLEAR: prefixes that LOOK like they're protected but are pure

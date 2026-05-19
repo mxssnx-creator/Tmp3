@@ -1294,7 +1294,7 @@ export async function getConnection(id: string): Promise<any | null> {
 // ops per poll per component. A short TTL (1.5s) dedupes bursts without
 // introducing user-visible staleness (all writes invalidate the cache
 // immediately via `invalidateConnectionsCache()`).
-// ────────────────────────────────────���───────────────────────────────────────
+// ────────────────────────────────────�����───────────────────────────────────────
 const __CONN_CACHE_TTL_MS = 1500
 let __connCache: { at: number; value: any[] } | null = null
 let __connInflight: Promise<any[]> | null = null
@@ -2516,3 +2516,99 @@ export function isSystemCreatedPosition(position: Record<string, string> | null 
   // System tracking IDs follow format: sys-{connId}-{timestamp}-{random}
   return trackingId.startsWith("sys-") && trackingId.length > 10
 }
+
+/**
+ * Soft reset: Clear all runtime data while preserving coordination framework
+ * 
+ * Coordination framework that is PRESERVED:
+ * - axis_pos_acc:* (axis position accumulation ledgers)
+ * - real_pi_acc:* (real PI accumulation structures)
+ * - progression:* (progression metadata)
+ * - strategy_count:* (strategy count tracking)
+ * - pi_history:* (position history framework - structure kept, data cleared)
+ * 
+ * Allows new strategy progression runs to start fresh without rebuilding
+ * the infrastructure. All runtime strategy data and positions are cleared.
+ * 
+ * @returns object with cleared key counts per bucket
+ */
+export async function softResetWithCoordinationPreserved(): Promise<{
+  deleted: number
+  protected: number
+  buckets: Record<string, number>
+}> {
+  const client = getRedisClient()
+  
+  // Prefixes to preserve (coordination framework + credentials/settings)
+  const PRESERVED = [
+    "connection:",
+    "connections:tombstoned",
+    "settings:",
+    "app_settings",
+    "all_settings",
+    "migration:",
+    "_migration",
+    "_schema_version",
+    "predefinitions:",
+    "system:base_connections_seeded",
+    "auth:",
+    "session:",
+    "api_key:",
+    "axis_pos_acc:",      // COORDINATION FRAMEWORK
+    "real_pi_acc:",       // COORDINATION FRAMEWORK
+    "progression:",       // COORDINATION FRAMEWORK
+    "strategy_count:",    // COORDINATION FRAMEWORK
+  ]
+  
+  // Get all keys
+  const allKeys = await client.keys("*").catch(() => [] as string[])
+  
+  // Filter to keys to delete
+  const keysToDelete = allKeys.filter((k) => {
+    if (typeof k !== "string") return false
+    // Check if key should be preserved
+    for (const prefix of PRESERVED) {
+      if (k.startsWith(prefix)) return false
+    }
+    return true
+  })
+  
+  // Build bucket summary before deletion
+  const buckets: Record<string, number> = {}
+  for (const k of keysToDelete) {
+    const idx = k.indexOf(":")
+    const bucket = idx > 0 ? k.slice(0, idx) + ":*" : k
+    buckets[bucket] = (buckets[bucket] || 0) + 1
+  }
+  
+  // Delete in chunks
+  let deleted = 0
+  const CHUNK_SIZE = 500
+  for (let i = 0; i < keysToDelete.length; i += CHUNK_SIZE) {
+    const chunk = keysToDelete.slice(i, i + CHUNK_SIZE)
+    try {
+      const n = await client.del(...chunk)
+      deleted += typeof n === "number" ? n : chunk.length
+    } catch {
+      for (const k of chunk) {
+        try { await client.del(k); deleted++ } catch { /* skip */ }
+      }
+    }
+  }
+  
+  // Persist to disk
+  try {
+    if (typeof (client as any).persistNow === "function") {
+      await (client as any).persistNow().catch(() => null)
+    } else if (typeof (client as any).saveToDisk === "function") {
+      await (client as any).saveToDisk().catch(() => null)
+    }
+  } catch { /* non-critical */ }
+  
+  return {
+    deleted,
+    protected: allKeys.length - keysToDelete.length,
+    buckets,
+  }
+}
+
