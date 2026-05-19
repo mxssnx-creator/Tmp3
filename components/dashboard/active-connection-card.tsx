@@ -1974,7 +1974,7 @@ export function ActiveConnectionCard({
               {/* Order Settings Panel */}
               <OrderSettingsPanel
                 orderType={orderType}
-                marketSettings={{ slippageTolerance: 3, autoExecution: true }}
+                marketSettings={{ slippageTolerance: 0.06, autoExecution: true }}
                 limitSettings={{ priceOffset: 0.5, timeoutSeconds: 300 }}
               />
 

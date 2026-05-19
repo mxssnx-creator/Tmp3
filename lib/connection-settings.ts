@@ -62,7 +62,7 @@ const DEFAULT_SETTINGS: Omit<ConnectionSettings, "connectionId"> = {
     autoStopAfterLoss: true,
   },
   advanced: {
-    slippageTolerance: 0.5,
+    slippageTolerance: 0.0006,
     executionSpeed: "normal",
     useTrailingStop: true,
     enableAutoExit: false,
