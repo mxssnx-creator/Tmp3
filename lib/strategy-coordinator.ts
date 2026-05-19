@@ -1945,19 +1945,22 @@ export class StrategyCoordinator {
       // For each REAL set, create one pseudo position to represent it on dashboard
       for (const set of realSets) {
         try {
-          const setKey = set.key || `${symbol}:${set.direction || "long"}`
-          
+          const setKey = set.setKey || `${symbol}:${set.direction || "long"}`
+
           // Check if we already have an active pseudo position for this set
           const existingKey = `pseudo_position_set_mapping:${this.connectionId}:${setKey}`
           const existing = await getSettings(existingKey).catch(() => null)
           if (existing) continue
-          
-          // Get entry details for sizing
-          const entry = (set.entries && set.entries[0]) || {}
-          const entryPrice = Number(entry.entry_price || 100)
-          const quantity = Number(entry.quantity || 1)
+
+          // Derive a representative entry price from the set's quality metrics.
+          // StrategySetEntry has no entry_price/quantity fields — use avgProfitFactor
+          // as a proxy weighting for sizing context (placeholder until real prices
+          // are injected upstream).
+          const avgPF = set.avgProfitFactor || 1
+          const entryPrice = Math.max(1, avgPF * 100)   // unitless proxy
+          const quantity   = set.entryCount || 1
           const positionCost = entryPrice * quantity
-          
+
           // Create pseudo position representing this REAL set
           const pseudoPos = {
             id: `pseudo-${this.connectionId}-${setKey}-${Date.now()}`,
@@ -1970,24 +1973,24 @@ export class StrategyCoordinator {
             status: "open",
             position_level: "real",
             config_set_key: setKey,
-            source_set_key: set.key,
+            source_set_key: setKey,
             created_at: new Date().toISOString(),
             profit_factor: set.avgProfitFactor || 0,
             confidence: set.avgConfidence || 0,
           }
-          
+
           // Store the pseudo position
           await setSettings(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, pseudoPos)
-          
+
           // Add to connection's pseudo positions set
           await client.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id)
-          
+
           // Store mapping for deduplication
           await setSettings(existingKey, { posId: pseudoPos.id, createdAt: Date.now() })
-          
+
           createdCount++
         } catch (err) {
-          console.warn(`[v0] Failed to create pseudo position for set ${set.key}:`, err)
+          console.warn(`[StrategyFlow] Failed to create pseudo position for set ${(set as StrategySet).setKey}:`, err)
         }
       }
       
@@ -2140,8 +2143,6 @@ export class StrategyCoordinator {
       axisPassthrough.push(s)
       axisSetsCounted++
     }
-    console.log(`[v0] [RealStage] ${symbol}: realSorted=${realSorted.length} axisSetsCounted=${axisSetsCounted} profileVariants=${passthrough.length}`)
-
     const netted: StrategySet[] = []
     const netTargetWrites: Record<string, string> = {}
     let netCancelled = 0
@@ -2174,8 +2175,6 @@ export class StrategyCoordinator {
       netCancelled += Math.min(L, S) * 2 + Math.max(0, winnerPool.length - remainder)
       netTargetWrites[bucketKey] = `${winnerDir}:${remainder}`
     }
-
-    console.log(`[v0] [RealStage] ${symbol}: profileNetting: hedgeBuckets=${hedgeBuckets.size} netted=${netted.length} cancelled=${netCancelled} axisPass=${axisPassthrough.length}`)
 
     const realPostHedge = [...passthrough, ...netted, ...axisPassthrough].sort(
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
@@ -3193,7 +3192,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // �����── HELPERS ────────────────────────���──────────────────���─────────────────────
+  // �����── HELPERS ────────────────────────���──────────��───────���─────────────────────
 
   // Per-cycle position-context cache. The pseudo-position list is shared
   // across all Main invocations within the same cycle to amortise Redis
@@ -3359,7 +3358,7 @@ export class StrategyCoordinator {
    *   - prevPosCount, prevLosses, lastPosCount, lastWins, lastLosses
    *     → closed pseudo positions within a 24h lookback window.
    * Intentional exceptions (fields based on OPEN state by design, per
-   * spec) — gates on these fields are NOT closed-only:
+   * spec) ��� gates on these fields are NOT closed-only:
    *   - continuousCount  → # currently-open pseudo positions
    *                        (spec: "Continuous Positions" are active)
    *   - perSymbolOpen    → per-symbol open count (feeds `block` gate

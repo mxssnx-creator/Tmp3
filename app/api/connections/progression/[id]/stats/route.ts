@@ -1628,62 +1628,45 @@ export async function GET(
         },
         strategies: (() => {
           // ── Actively-running per stage (operator spec) ─────────────
-          // Source of truth: `strategy_detail:{conn}:{stage}` ->
-          // `sets_running_now`, written by strategy-coordinator using
-          // membership in `pseudo_positions:{conn}:active_config_keys`.
-          // This is what the dashboard MUST show — already-progressed
-          // Sets that have since closed are intentionally excluded.
-          //
-          // Fallback: when the detail hash hasn't been written yet
-          // (fresh cycle, first symbol still processing), we use the
-          // (symbol, stage) presence count as a best-effort estimate.
-          // 
-          // For REAL and LIVE stages: if setsRunningNow is 0 but we have
-          // tracked sets, use the stage set count as they are actively being processed.
-          const baseRun  = n(stratDetail.base?.setsRunningNow)  || activeSetsStratByStage.base || 0
-          const mainRun  = n(stratDetail.main?.setsRunningNow)  || activeSetsStratByStage.main || 0
-          const realRun  = n(stratDetail.real?.setsRunningNow)  || activeSetsStratByStage.real || stratCounts.real || 0
-          const liveRun  = n(stratDetail.live?.setsRunningNow)  || pseudoRunningSets || stratCounts.live || 0
-          // Pipeline-aware total: same logical Set exists at multiple
-          // stages (mirroring principle). The "deepest-active" count
-          // is the canonical aggregate — Live ⊂ Real ⊂ Main ⊂ Base.
-          // Surface the maximum of the four to avoid double-counting.
-          const totalRun = Math.max(baseRun, mainRun, realRun, liveRun)
-          
-          // Position counts now reflect CASCADE FILTERING:
-          // - BASE: count = baseRun (number of base sets)
-          // - MAIN: count = mainRun (expanded variants from base)
-          // - REAL: count = realRun (filtered worthy sets)
-          // - LIVE: count = calculated from progHash (actual orders/closed)
-          //
-          // This shows how sets flow through stages and get filtered.
-          // Each stage shows the actual count of sets at that stage,
-          // which represents position count for that stage of evaluation.
+          // Source of truth: `strategy_detail:{conn}:{stage}.sets_running_now`,
+          // written by strategy-coordinator each cycle using parent-base
+          // active_config_keys membership. Fallback only to the per-symbol
+          // presence count — never fall back to total-ever-created (stratCounts)
+          // which would inflate the figure to thousands when nothing is running.
+          const baseRun = n(stratDetail.base?.setsRunningNow) || activeSetsStratByStage.base || 0
+          const mainRun = n(stratDetail.main?.setsRunningNow) || activeSetsStratByStage.main || 0
+          const realRun = n(stratDetail.real?.setsRunningNow) || activeSetsStratByStage.real || 0
+          const liveRun = n(stratDetail.live?.setsRunningNow) || pseudoRunningSets || 0
+
+          // Cascade: each downstream stage is a subset — cap child ≤ parent.
+          const cappedMain = Math.min(mainRun, stratCounts.main || mainRun)
+          const cappedReal = Math.min(realRun, cappedMain)
+          const cappedLive = Math.min(liveRun, cappedReal)
+
+          const livePositions = Math.max(
+            0,
+            n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
+            Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count)),
+          )
+
+          // Pipeline-aware total — the deepest active stage is canonical.
+          const totalRun = Math.max(baseRun, cappedMain, cappedReal, cappedLive)
+
           return {
-            base: { sets: baseRun, trackings: stratCounts.base || 0, positions: baseRun },
-            main: { sets: mainRun, trackings: stratCounts.main || 0, positions: mainRun },
-            real: { sets: realRun, trackings: stratCounts.real || 0, positions: realRun },
+            base: { sets: baseRun,    trackings: stratCounts.base || 0, positions: pseudoOpen },
+            main: { sets: cappedMain, trackings: stratCounts.main || 0, positions: pseudoOpen },
+            // Real positions = promoted Set count tracked in real:position:* keys,
+            // not the running-now set count (which is a coordination metric).
+            real: { sets: cappedReal, trackings: stratCounts.real || 0, positions: realOpen },
             live: {
-              // Live's "running" = distinct Sets currently feeding
-              // exchange orders (== pseudoRunningSets when detail hash
-              // is empty).
-              sets:      liveRun,
+              sets:      cappedLive,
               trackings: stratCounts.live || 0,
-              positions: Math.max(
-                0,
-                n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
-                Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count)),
-              ),
+              positions: livePositions,
             },
             total: {
               sets:      totalRun,
               trackings: stratTotal,
-              // Open positions are NOT summed across stages (mirroring
-              // principle — same logical position exists at multiple
-              // stages). Use the deepest-active stage as the canonical
-              // "currently-progressing" total.
-              positions: Math.max(realRun, n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
-                Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count))),
+              positions: Math.max(realOpen, livePositions),
             },
           }
         })(),
@@ -1795,7 +1778,7 @@ export async function GET(
       // pipeline (see lib/trade-engine/stages/live-stage.ts). Every stage of
       // the pipeline increments one of these so the UI can show a real-time
       // picture of exchange-level activity.
-      // ── OPEN POSITIONS & ACCUMULATED VOLUME ─────────────────────────────
+      // ── OPEN POSITIONS & ACCUMULATED VOLUME ───────��─────────────────────
       // Snapshot of every "currently holding exposure" layer of the
       // mirroring pipeline. CRITICAL semantics — pseudo/real/live are
       // NOT independent pools: they represent the SAME trading signal
