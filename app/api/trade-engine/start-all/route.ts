@@ -3,7 +3,7 @@ import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { initRedis, getAllConnections, getSettings } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 
-export async function GET() {
+async function handleStartAll() {
   try {
     const coordinator = getGlobalTradeEngineCoordinator()
     
@@ -102,4 +102,12 @@ export async function GET() {
       { status: 500 }
     )
   }
+}
+
+export async function GET() {
+  return handleStartAll()
+}
+
+export async function POST() {
+  return handleStartAll()
 }
