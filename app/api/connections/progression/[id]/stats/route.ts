@@ -1649,7 +1649,7 @@ export async function GET(
           return {
             base: { sets: baseRun, trackings: stratCounts.base || 0, positions: pseudoOpen },
             main: { sets: mainRun, trackings: stratCounts.main || 0, positions: pseudoOpen },
-            real: { sets: realRun, trackings: stratCounts.real || 0, positions: realOpen },
+            real: { sets: realRun, trackings: stratCounts.real || 0, positions: pseudoOpen },
             live: {
               // Live's "running" = distinct Sets currently feeding
               // exchange orders (== pseudoRunningSets when detail hash
