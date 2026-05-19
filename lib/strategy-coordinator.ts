@@ -1945,6 +1945,12 @@ export class StrategyCoordinator {
     // MARKED as invalid with status flag — they're not validated against PF/DDT
     // and not promoted to Real, but kept in map for re-evaluation on subsequent
     // cycles once entryCount accumulates. Default 10.
+    //
+    // CRITICAL FIX: For NEW systems with no history (baseEC=0, liveCont=0),
+    // don't reject sets purely on entryCount. If a set has at least 1 synthetic
+    // entry (axis Sets always have entries for synthetic tracking), it should
+    // pass the gate and be evaluated on PF/DDT merit. This allows fresh
+    // connections to start generating positions on cycle 1.
     const realMinPos = this._coordinationSettings.realEvalPosCount
     const beforePosGate = mainSets.length
     const mainSetsEligible = mainSets.map((s) => {
@@ -1952,7 +1958,11 @@ export class StrategyCoordinator {
       const hist = s.prevPos?.count ?? 0
       const posCount = Math.max(live, hist)
       
-      if (posCount < realMinPos) {
+      // ALLOW axis Sets with synthetic entries even if posCount < realMinPos
+      // (new systems need a way to start generating positions)
+      const hasEntries = (s.entries?.length ?? 0) > 0
+      const isAxisSet = s.axisWindows && s.axisWindows.direction
+      if (posCount < realMinPos && !(isAxisSet && hasEntries)) {
         // Mark as invalid but keep for later evaluation
         s.status = "invalid"
         s.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
