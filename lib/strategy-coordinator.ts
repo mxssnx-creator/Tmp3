@@ -1350,7 +1350,7 @@ export class StrategyCoordinator {
     // cache-miss paths populate this map so reuses still trigger fan-out.
     const defaultByBaseKey = new Map<string, StrategySet>()
 
-    // ── 2. Base/variant async processing ────────────────────────────────────
+    // ── 2. Base/variant async processing ────────────────────────��───────────
     // Process all baseSet × variant combinations in parallel for faster throughput.
     // Each combination calls the async buildVariantSet, which previously ran
     // sequentially. Now they all start together and resolve concurrently.
@@ -1644,7 +1644,7 @@ export class StrategyCoordinator {
           [`s:${symbol}:passed`]: String(mainSets.length),
         }).catch(() => {}),
         client.set(`strategies:${this.connectionId}:main:count`, String(mainSets.length)),
-        client.set(`strategies:${this.connectionId}:main:evaluated`, String(baseSets.length)),
+        client.set(`strategies:${this.connectionId}:main:evaluated`, String(mainSets.length)),
         client.set(`strategies:${this.connectionId}:base:passed`, String(mainSets.length)),
         client.expire(`strategies:${this.connectionId}:main:count`, 86400),
         client.expire(`strategies:${this.connectionId}:main:evaluated`, 86400),
@@ -2342,7 +2342,7 @@ export class StrategyCoordinator {
           [`s:${symbol}:passed`]: String(realSets.length),
         }).catch(() => {}),
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
-        client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainSets.length)),
+        client.set(`strategies:${this.connectionId}:real:evaluated`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
         // ── CRITICAL: Persist Real Sets for Live evaluation ────────────────────
         // Bug fix: Real Sets were computed but never written, causing Live to load
