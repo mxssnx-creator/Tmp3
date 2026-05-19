@@ -1979,9 +1979,6 @@ export class StrategyCoordinator {
           // Add to connection's pseudo positions set
           await client.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id)
           
-          // Add to active_config_keys for tracking
-          await client.sadd(`pseudo_positions:${this.connectionId}:active_config_keys`, setKey)
-          
           // Store mapping for deduplication
           await setSettings(existingKey, { posId: pseudoPos.id, createdAt: Date.now() })
           
@@ -2384,23 +2381,11 @@ export class StrategyCoordinator {
 
       // ── Running-now resolution for Real (axis-cloned Sets) ──
       // Real CLONES Main's already-cloned variant Sets and adjusts
-      // them along the position-count axis. Each Real Set still
-      // ultimately traces back to a Base parentSetKey — that's our
-      // canonical "alive" check. Reuse the per-cycle activeKeys cache
-      // populated by createBaseSets; if stale, refetch.
-      const realCache = this._activeKeysCache
-      const realCacheFresh = realCache && Date.now() - realCache.cycleAt < 30_000
-      const realActiveKeys = realCacheFresh
-        ? realCache!.keys
-        : new Set<string>(
-            (await client
-              .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
-              .catch(() => [])) as string[],
-          )
-      const realRunningNow = realSets.filter((s) => {
-        const parent = s.parentSetKey || s.setKey.split("#")[0]
-        return realActiveKeys.has(parent)
-      }).length
+      // them along the position-count axis. Unlike Main (which keys off
+      // parent Base status), Real stage filters by profitability, so its
+      // "running" count reflects only those Real Sets that are currently
+      // being tracked as viable (entry count > 0). This shows cascade filtering.
+      const realRunningNow = realSets.filter((s) => (s.entryCount || 0) > 0).length
 
       // ── Real 4-perspective stats (Overall / Accumulated / General / Combined) ──
       // Per operator spec: "in Strategies Real ensure correct stats..
