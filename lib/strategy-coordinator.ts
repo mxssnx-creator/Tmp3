@@ -1614,13 +1614,10 @@ export class StrategyCoordinator {
       const mainDetailKey = `strategy_detail:${this.connectionId}:main`
       const mainAvgPF  = mainSets.length > 0 ? mainSets.reduce((s, st) => s + st.avgProfitFactor, 0) / mainSets.length : 0
       const mainAvgDDT = mainSets.length > 0 ? mainSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / mainSets.length : 0
-      // BASE->MAIN is an *expansion* (one base set fans out to many variants),
-      // so the raw ratio can exceed 1 (e.g. 2405/5 = 481). Clamp to [0,1]
-      // so pass_rate stored in Redis is always a valid 0-1 fraction that the
-      // stats route renders as a 0-100% percentage without overflow.
-      const passRatioMain = baseSets.length > 0
-        ? Math.min(1, mainSets.length / baseSets.length)
-        : 0
+      // passRatioMain is computed after uniqueBaseSetsProduced is built (see below).
+      // Placeholder here so the declaration order is clear — the actual value
+      // is assigned further down once uniqueBaseSetsProduced is populated.
+      // (TypeScript let allows re-assignment; computation moved after the loop.)
       // Avg positions per Set at Main = avg of expanded entryCount values.
       // Each entry represents one (size × leverage × positionState) config
       // ready for downstream coordination, so this figure is the canonical
@@ -1890,16 +1887,33 @@ export class StrategyCoordinator {
     } catch { /* non-critical */ }
 
     // ── Position count metrics for main stage ──────────────────────
-    // Track entries created at Main stage so dashboard pipeline shows progress
+    // Track entries created at Main stage so dashboard pipeline shows progress.
+    // IMPORTANT: only count profile-variant Sets (those WITHOUT axisWindows.direction).
+    // Axis Sets carry a synthetic entryCount = baseEC + min(cont, liveCont) which
+    // is NOT a new "position created" — it is a projection of positions that
+    // already exist. Including axis Sets inflates this counter by up to
+    // 320× (full Cartesian fan-out) per cycle per Base Set.
     const uniqueBaseSetsProduced = new Set<string>()
     for (const s of mainSets) uniqueBaseSetsProduced.add(s.parentSetKey ?? s.setKey)
-    
-    const mainEntriesTotal = mainSets.reduce((sum, s) => sum + (s.entryCount ?? 0), 0)
+
+    // BASE->MAIN pass rate = fraction of Base Sets that produced at least
+    // one surviving Main variant. Using mainSets.length / baseSets.length
+    // inflates the ratio because mainSets includes the axis fan-out (320+ Sets
+    // per Base Set). uniqueBaseSetsProduced.size is the correct numerator.
+    // Computed HERE (after the loop) because uniqueBaseSetsProduced is only
+    // available after iteration over mainSets completes.
+    const passRatioMain = baseSets.length > 0
+      ? Math.min(1, uniqueBaseSetsProduced.size / baseSets.length)
+      : 0
+
+    const mainProfileEntriesTotal = mainSets
+      .filter((s) => !s.axisWindows?.direction)
+      .reduce((sum, s) => sum + (s.entryCount ?? 0), 0)
     try {
       const client = getRedisClient()
       const progKey = `progression:${this.connectionId}`
-      if (mainEntriesTotal > 0) {
-        await client.hincrby(progKey, "main_positions_created_count", mainEntriesTotal)
+      if (mainProfileEntriesTotal > 0) {
+        await client.hincrby(progKey, "main_positions_created_count", mainProfileEntriesTotal)
       }
     } catch { /* non-critical */ }
 
@@ -1927,7 +1941,11 @@ export class StrategyCoordinator {
         timestamp: new Date(),
         totalCreated: baseSets.length,
         passedEvaluation: mainSets.length,
-        failedEvaluation: baseSets.length - uniqueBaseSetsProduced.size,
+        // failedEvaluation = Base Sets that were explicitly rejected (status=invalid),
+        // not baseSets.length - uniqueBaseSetsProduced.size (which undercounts when
+        // all Base Set parents appear via axis fan-out but some were still rejected
+        // at PF/DDT gate). Counting status=invalid directly is authoritative.
+        failedEvaluation: baseSets.filter((s) => s.status === "invalid").length,
         avgProfitFactor: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgProfitFactor, 0) / mainSets.length : 0,
         avgDrawdownTime: mainSets.length > 0 ? mainSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / mainSets.length : 0,
       },
@@ -2182,7 +2200,16 @@ export class StrategyCoordinator {
       const remainder                   = Math.abs(L - S)
       // PF-desc preserved by `realSorted` upstream → winnerPool is best-first.
       netted.push(...winnerPool.slice(0, remainder))
-      netCancelled += Math.min(L, S) * 2 + Math.max(0, winnerPool.length - remainder)
+      // Cancelled = total inputs minus survivors.
+      //   total   = L + S
+      //   survivors = remainder = |L − S|
+      //   cancelled = (L + S) − |L − S| = 2 × min(L, S)
+      //
+      // Previous formula `min(L,S)*2 + max(0, winnerPool.length − remainder)`
+      // overcounted: winnerPool.length = max(L,S), so the extra term adds
+      // max(L,S) − |L−S| = min(L,S) — doubling the min(L,S) cancellation.
+      // E.g. L=5, S=3 → previous gave 6+3=9 but correct is (5+3)−2=6.
+      netCancelled += L + S - remainder
       netTargetWrites[bucketKey] = `${winnerDir}:${remainder}`
     }
 
@@ -2405,6 +2432,13 @@ export class StrategyCoordinator {
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
     await setSettings(realKey, { sets: realSets, count: realSets.length, created: new Date() })
 
+    // Hoisted outside the try-block so the return statement (also outside) can see it.
+    // Count of Main Sets that actually entered PF/DDT evaluation (excludes pos-count
+    // pre-gated sets). Used for correct passRatioReal and evaluated counters.
+    const mainPFEligible = mainSetsEligible.filter(
+      (s) => !(s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")),
+    ).length
+
     // Write Real counts to progression hash — CUMULATIVE via hincrby so the dashboard
     // doesn't oscillate with per-cycle snapshots (see matching fix in createBaseSets/createMainSets).
     // Per-cycle snapshot is kept in `strategies_real_current` for components that want it.
@@ -2417,14 +2451,23 @@ export class StrategyCoordinator {
       // Position evaluation real: average confidence of REAL sets
       // (how well did the Real stage filter perform)
       const realAvgConf = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgConfidence || 0), 0) / realSets.length : 0
-      const passRatioReal = mainSets.length > 0 ? realSets.length / mainSets.length : 0
+      // passRatioReal = fraction of ELIGIBLE Main Sets (those that reached the
+      // PF/DDT gate — not the ones gated out before it by insufficient_pos_count)
+      // that passed into Real. Using mainSets.length as the denominator deflates
+      // the ratio because mainSets includes the large axis fan-out (~320 Sets per
+      // Base Set) while realSets are comparatively few after the PF gate.
+      // The correct denominator is the count of Sets that were actually evaluated
+      // against PF/DDT criteria (not pre-rejected by the pos-count gate).
+      const mainPFEligible = mainSetsEligible.filter(
+        (s) => !(s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")),
+      ).length
+      const passRatioReal = mainPFEligible > 0 ? realSets.length / mainPFEligible : 0
       const realEntriesTotal  = realSets.reduce((s, st) => s + (st.entryCount || 0), 0)
       const realAvgPosPerSet  = realSets.length > 0 ? realEntriesTotal / realSets.length : 0
-      // Calculate average position count that was evaluated per Real set
-      // This represents how many positions were considered on average
-      const realAvgPosEval = realSets.length > 0 
-        ? realSets.reduce((s, st) => s + Math.max(1, st.entryCount || 1), 0) / realSets.length 
-        : 0
+      // Average entryCount per Real Set — identical to realAvgPosPerSet.
+      // The previous formula used Math.max(1, entryCount||1) which biased
+      // Sets with entryCount=0 upward. Reuse the already-correct value.
+      const realAvgPosEval = realAvgPosPerSet
 
       // ── Running-now resolution for Real ──────────────────────────
       // A Real Set is "running now" only when its originating Base Set is
@@ -2489,7 +2532,9 @@ export class StrategyCoordinator {
           avg_drawdown_time:  String(Math.round(realAvgDDT)),
           avg_pos_eval_real:  String(realAvgPosEval.toFixed(4)),
           avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
-          evaluated:          String(mainSets.length),
+          // evaluated = Sets that entered the PF/DDT gate (not pre-gated by pos-count).
+          // Using mainSets.length inflates this by the full axis fan-out.
+          evaluated:          String(mainPFEligible),
           passed_sets:        String(realSets.length),
           pass_rate:          String(passRatioReal.toFixed(4)),
           count_pos_eval:     String(realSets.length),
@@ -2521,7 +2566,7 @@ export class StrategyCoordinator {
             realSets.filter((s) => (s.entryCount || 0) > 0).length,
           ),
           [`s:${symbol}:passed`]:     String(realSets.length),
-          [`s:${symbol}:evaluated`]:  String(mainSets.length),
+          [`s:${symbol}:evaluated`]:  String(mainPFEligible),
           [`s:${symbol}:apf`]:        String(realAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(realAvgDDT)),
           [`s:${symbol}:apps`]:       String(realAvgPosPerSet.toFixed(2)),
@@ -2535,7 +2580,7 @@ export class StrategyCoordinator {
         // Overwriting them with Real's realSets.length would corrupt MAIN's
         // pass statistics and make passed_sets > evaluated impossible to read.
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
-        client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainSets.length)),
+        client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainPFEligible)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
         // ── CRITICAL: Persist Real Sets for Live evaluation ────────────────────
         // Bug fix: Real Sets were computed but never written, causing Live to load
@@ -2558,7 +2603,7 @@ export class StrategyCoordinator {
       // strategies_real_total = cumulative Sets PROMOTED by REAL (output count).
       // strategies_real_evaluated = Main Sets that entered REAL (input count).
       if (realSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_total", realSets.length))
-      if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", mainSets.length))
+      if (mainPFEligible > 0) writes.push(client.hincrby(redisKey, "strategies_real_evaluated", mainPFEligible))
 
       // ── ACTIVE-NOW snapshot for Real stage ──────────────────────────
       // Mirrors the Base/Main pattern. The dashboard reads this hash and
@@ -2737,9 +2782,10 @@ export class StrategyCoordinator {
         type: "real",
         symbol,
         timestamp: new Date(),
-        totalCreated: mainSets.length,
+        // totalCreated = Sets that entered PF evaluation (axis fan-out excluded from denominator).
+        totalCreated: mainPFEligible,
         passedEvaluation: realSets.length,
-        failedEvaluation: mainSets.length - realSets.length,
+        failedEvaluation: mainPFEligible - realSets.length,
         avgProfitFactor: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgProfitFactor, 0) / realSets.length : 0,
         avgDrawdownTime: realSets.length > 0 ? realSets.reduce((s, set) => s + set.avgDrawdownTime, 0) / realSets.length : 0,
       },
@@ -2847,6 +2893,27 @@ export class StrategyCoordinator {
         }
       }
 
+      // ── bumpValidPositions — Live-promoted Set counter ─────────────────
+      // The `valid_positions:{conn}` hash (written by bumpValidPositions in
+      // pos-history.ts) tracks the connection-wide count of Sets that have
+      // reached Live stage, split by symbol and direction. The dashboard
+      // "Valid positions" tile reads this hash. Without this call the counter
+      // never increments regardless of how many Sets qualify each cycle.
+      try {
+        const { bumpValidPositions } = await import("@/lib/pos-history")
+        const vpPipeline = getRedisClient().multi()
+        for (const set of qualifying) {
+          bumpValidPositions({
+            connectionId: this.connectionId,
+            symbol,
+            direction: set.direction,
+            indicationType: set.indicationType,
+            externalPipeline: vpPipeline,
+          })
+        }
+        ;(vpPipeline as any).exec().catch(() => {})
+      } catch { /* non-critical — valid_positions counter is observability only */ }
+
       const liveVariantWrites: Promise<any>[] = []
       for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
         const agg = liveVariantAgg[variant]
@@ -2867,8 +2934,15 @@ export class StrategyCoordinator {
         )
       }
 
+      // strategies_live_total must be CUMULATIVE (hincrby), not a per-cycle
+      // snapshot (hset). All other stage _total fields use hincrby; using hset
+      // here made Live's lifetime total reset to the current-cycle count every
+      // cycle, so the dashboard always showed a tiny snapshot instead of the
+      // true accumulated lifetime count.
       await Promise.all([
-        client.hset(redisKey, "strategies_live_total", String(qualifying.length)),
+        qualifying.length > 0
+          ? client.hincrby(redisKey, "strategies_live_total", qualifying.length)
+          : Promise.resolve(),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(liveDetailKey, {
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
