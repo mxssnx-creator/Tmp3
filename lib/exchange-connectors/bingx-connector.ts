@@ -39,10 +39,25 @@ import { safeParseResponse } from "@/lib/safe-response-parser"
 export class BingXConnector extends BaseExchangeConnector {
   private timeOffset: number = 0 // milliseconds to adjust local time
   private lastTimeSync: number = 0
-  private timeSyncIntervalMs: number = 300000 // re-sync every 5 minutes
+  // Re-sync every 60 s (down from 300 s). In serverless environments each
+  // request may be a fresh module instance so lastTimeSync resets to 0 and
+  // the first sync always fires — the interval only matters within a single
+  // long-lived instance (e.g. development server).
+  private timeSyncIntervalMs: number = 60_000
+  // Serialise the initial sync: if multiple signed requests fire concurrently
+  // before the first syncServerTime() resolves, they all await the SAME
+  // promise instead of each reading timeOffset=0 (stale) and all failing
+  // with "timestamp is invalid". Without this, up to N concurrent calls can
+  // all use offset=0 and all fail before any of their individual syncs
+  // complete — producing one 109400 error per call per cold start.
+  private syncPromise: Promise<void> | null = null
 
   constructor(credentials: ExchangeCredentials, exchange: string = "bingx") {
     super(credentials, exchange)
+    // Kick off the first time-sync immediately in the background so that
+    // the offset is ready by the time the first signed request fires.
+    // Errors are swallowed — the sync will be retried in syncServerTime().
+    this.syncPromise = this.syncServerTime().catch(() => { this.syncPromise = null })
   }
 
   private getBaseUrl(): string {
@@ -61,9 +76,20 @@ export class BingXConnector extends BaseExchangeConnector {
   private async syncServerTime(): Promise<void> {
     const now = Date.now()
     if (now - this.lastTimeSync < this.timeSyncIntervalMs) {
-      return // recently synced
+      return // recently synced within the throttle window
+    }
+    // If a sync is already in-flight (from the constructor kick-off or a
+    // concurrent call), wait for that one rather than issuing a second
+    // fetch in parallel. This ensures all concurrent signed requests share
+    // a single round-trip cost on the first call per instance.
+    if (this.syncPromise) {
+      await this.syncPromise
+      return
     }
 
+    // Own the in-flight slot; clear it when done so future callers can
+    // trigger a fresh sync once the TTL expires.
+    this.syncPromise = (async () => {
     try {
       // NTP-style midpoint sync: capture local time around the request
       // and assume symmetric latency. The previous implementation used
@@ -102,7 +128,16 @@ export class BingXConnector extends BaseExchangeConnector {
       // Fall back to local time; worst case we'll hit timestamp errors
       // and retry with a fresh sync.
       this.log(`[v0] Failed to sync server time: ${String(err).slice(0, 80)}`)
+    } finally {
+      // Clear the in-flight slot once this sync completes (success or fail).
+      // Future callers will either pass the throttle check (if we just
+      // succeeded) or trigger a fresh sync (if we failed or enough time has
+      // elapsed). Without this, a failed sync would block future syncs forever.
+      this.syncPromise = null
     }
+    })()
+
+    await this.syncPromise
   }
 
   /**
@@ -132,7 +167,11 @@ export class BingXConnector extends BaseExchangeConnector {
     const code = String(data?.code ?? "")
     const msg  = String(data?.msg ?? "").toLowerCase()
     if (code === "109400" && msg.includes("timestamp")) {
-      this.lastTimeSync = 0 // force a resync on next call
+      // Force a fresh sync: clear both the throttle gate AND any in-flight
+      // shared promise so syncServerTime() issues a new HTTP call instead of
+      // coalescing onto the stale-offset promise that was already resolved.
+      this.lastTimeSync = 0
+      this.syncPromise = null
       await this.syncServerTime()
       return true
     }
@@ -380,11 +419,47 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`Response status: ${response.status}`)
       this.log(`Response code: ${data.code}`)
 
-      // Check for error responses — BingX can return `code` as a number or string
+      // Check for error responses — BingX can return `code` as a number or string.
+      // On a timestamp error (code 100421 = "Null timestamp or timestamp mismatch")
+      // force-resync the server-time offset and retry once, matching the behaviour
+      // of placeOrder/cancelOrder which also call resyncOnTimestampError.
+      // Without this retry getBalance always fails on a cold-start or after a
+      // clock-drift event, producing the "Created pseudo position" fallback loop
+      // visible in the server logs.
       if (!response.ok || !this.isBingXSuccess(data.code)) {
-        const errorMsg = data.msg || data.error || `HTTP ${response.status}: ${response.statusText}`
-        this.logError(`API Error (code ${data.code}): ${errorMsg}`)
-        throw new Error(errorMsg)
+        // Timestamp error → resync and retry once
+        if (String(data.code) === "100421" || (await this.resyncOnTimestampError(data))) {
+          // Force a clean resync in case it was 100421 (not 109400)
+          this.lastTimeSync = 0
+          await this.syncServerTime()
+          // Rebuild params with a fresh timestamp and re-sign
+          const retryTimestamp = this.getTimestamp()
+          const retryParams: Record<string, string> = { timestamp: String(retryTimestamp) }
+          const retrySortedKeys = Object.keys(retryParams).sort()
+          const retryQueryString = retrySortedKeys.map(k => `${k}=${retryParams[k]}`).join("&")
+          const retrySignature = crypto
+            .createHmac("sha256", this.credentials.apiSecret)
+            .update(retryQueryString)
+            .digest("hex")
+          const retryUrl = `${baseUrl}${endpoint}?${retryQueryString}&signature=${retrySignature}`
+          const retryResponse = await this.rateLimitedFetch(retryUrl, {
+            method: "GET",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey, "Content-Type": "application/json" },
+          })
+          const retryData = await safeParseResponse(retryResponse)
+          if (!retryResponse.ok || !this.isBingXSuccess(retryData.code)) {
+            const retryErrMsg = retryData.msg || retryData.error || `HTTP ${retryResponse.status}`
+            this.logError(`API Error after resync (code ${retryData.code}): ${retryErrMsg}`)
+            throw new Error(retryErrMsg)
+          }
+          // Swap the original data reference so the rest of the method parses
+          // the successful retry response
+          Object.assign(data, retryData)
+        } else {
+          const errorMsg = data.msg || data.error || `HTTP ${response.status}: ${response.statusText}`
+          this.logError(`API Error (code ${data.code}): ${errorMsg}`)
+          throw new Error(errorMsg)
+        }
       }
 
       this.log("Successfully retrieved account data")
@@ -1656,7 +1731,7 @@ export class BingXConnector extends BaseExchangeConnector {
    * ─────────────────────────────────────────────────────────────────
    * BINGX API SKILLS - Official implementation
    * Source: https://github.com/BingX-API/api-ai-skills
-   * ─────────────────────────────────────────────────────────────────
+   * ──���──────────────────────────────────────────────────────────────
    */
 
   /**

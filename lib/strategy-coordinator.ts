@@ -1265,7 +1265,9 @@ export class StrategyCoordinator {
       // hgetalls this hash and aggregates by stage.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
-          [`${symbol}:base`]: String(baseSets.length),
+          [`${symbol}:base`]:          String(baseSets.length),
+          // base:evaluated = same as base (every Base Set IS evaluated at Base stage)
+          [`${symbol}:base:evaluated`]: String(baseSets.length),
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
@@ -1604,33 +1606,41 @@ export class StrategyCoordinator {
       }
     } catch { /* non-critical */ }
 
-    // Write Main counts to progression hash — CUMULATIVE via hincrby so the dashboard
-    // does not oscillate with per-cycle snapshots (see matching fix in createBaseSets).
-    // Per-cycle snapshot is kept in `strategies_main_current` for components that want it.
+    // ── Main-stage aggregate metrics (all at method-body scope) ─────────────
+    const mainEntriesTotal     = mainSets.reduce((s, st) => s + (st.entryCount || 0), 0)
+    const mainAvgPosPerSet     = mainSets.length > 0 ? mainEntriesTotal / mainSets.length : 0
+    const mainAvgPF            = mainSets.length > 0 ? mainSets.reduce((s, st) => s + st.avgProfitFactor, 0) / mainSets.length : 0
+    const mainAvgDDT           = mainSets.length > 0 ? mainSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / mainSets.length : 0
+    const mainDetailKey        = `strategy_detail:${this.connectionId}:main`
+
+    // Count only profile-variant Sets (no axis fan-out) for main_positions_created_count.
+    // Used in the Redis write block below; declared here so it's in scope for the write.
+    const mainProfileEntriesTotal = mainSets
+      .filter((s) => !s.axisWindows?.direction)
+      .reduce((sum, s) => sum + (s.entryCount ?? 0), 0)
+
+    const axisSetsCount = mainSets.filter(s => s.axisWindows).length
+    const axisLong = mainSets.filter(s => s.axisWindows?.direction === "long").length
+    const axisShort = mainSets.filter(s => s.axisWindows?.direction === "short").length
+
+    // ── Build uniqueBaseSetsProduced and passRatioMain ────────────────────
+    const uniqueBaseSetsProduced = new Set<string>()
+    for (const s of mainSets) uniqueBaseSetsProduced.add(s.parentSetKey ?? s.setKey)
+    // BASE->MAIN pass rate = fraction of Base Sets that produced ≥1 variant.
+    // Using mainSets.length/baseSets.length inflates the ratio by 320×
+    // (full axis fan-out); uniqueBaseSetsProduced.size is the correct numerator.
+    const passRatioMain = baseSets.length > 0
+      ? Math.min(1, uniqueBaseSetsProduced.size / baseSets.length)
+      : 0
+
+    // ── Write Main counts to Redis ────────────────────────────────────────
+    // CUMULATIVE via hincrby so the dashboard does not oscillate with
+    // per-cycle snapshots (see matching fix in createBaseSets).
     try {
-      // Reuse the same client instance bound at the top of this function —
-      // avoids an extra getRedisClient() call per cycle.
+      const client = getRedisClient()
       const redisKey = `progression:${this.connectionId}`
-      const mainDetailKey = `strategy_detail:${this.connectionId}:main`
-      const mainAvgPF  = mainSets.length > 0 ? mainSets.reduce((s, st) => s + st.avgProfitFactor, 0) / mainSets.length : 0
-      const mainAvgDDT = mainSets.length > 0 ? mainSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / mainSets.length : 0
-      // passRatioMain is computed after uniqueBaseSetsProduced is built (see below).
-      // Placeholder here so the declaration order is clear — the actual value
-      // is assigned further down once uniqueBaseSetsProduced is populated.
-      // (TypeScript let allows re-assignment; computation moved after the loop.)
-      // Avg positions per Set at Main = avg of expanded entryCount values.
-      // Each entry represents one (size × leverage × positionState) config
-      // ready for downstream coordination, so this figure is the canonical
-      // "how many positions does each validated Main Set hold?" metric.
-      const mainEntriesTotal = mainSets.reduce((s, st) => s + (st.entryCount || 0), 0)
-      const mainAvgPosPerSet = mainSets.length > 0 ? mainEntriesTotal / mainSets.length : 0
 
       // ── Running-now resolution for Main (cloned/filtered Sets) ──
-      // Each Main variant Set carries `parentSetKey` pointing at the
-      // Base Set whose positions it clones and strategically adjusts.
-      // A Main Set is "running" iff its parent's setKey is in the
-      // active_config_keys snapshot — Main itself does NOT open new
-      // positions, so we don't need a separate active set for it.
       const cache = this._activeKeysCache
       const cacheFresh = cache && Date.now() - cache.cycleAt < 30_000
       const activeKeys = cacheFresh
@@ -1649,8 +1659,6 @@ export class StrategyCoordinator {
         client.hset(redisKey, "strategies_main_current", String(mainSets.length)),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(mainDetailKey, {
-          // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
-          // for backwards compat; /stats prefers per-symbol sums below.
           created_sets:      String(mainSets.length),
           avg_profit_factor: String(mainAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(mainAvgDDT)),
@@ -1662,24 +1670,14 @@ export class StrategyCoordinator {
           passed_sets:       String(mainSets.length),
           pass_rate:         String(passRatioMain.toFixed(4)),
           count_pos_eval:    String(mainSets.length),
-          // ── ACTIVELY-RUNNING metrics (operator spec) ──────────────
-          //   Main CLONES + FILTERS Base's positions — no new exchange
-          //   positions opened. A Main Set is "running" iff its
-          //   parentSetKey is in active_config_keys (parent Base Set
-          //   actively coordinating ≥1 open pseudo-position).
           sets_running_now:         String(mainRunningNow),
           sets_with_open_positions: String(mainRunningNow),
-          sets_progressing:         String(
-            mainSets.filter((s) => (s.entryCount || 0) > 0).length,
-          ),
+          sets_progressing:         String(mainSets.filter((s) => (s.entryCount || 0) > 0).length),
           updated_at:        String(Date.now()),
-          // Per-symbol fields — see createBaseSets for rationale.
           [`s:${symbol}:created`]:    String(mainSets.length),
           [`s:${symbol}:entries`]:    String(mainEntriesTotal),
           [`s:${symbol}:running`]:    String(mainRunningNow),
-          [`s:${symbol}:progressing`]: String(
-            mainSets.filter((s) => (s.entryCount || 0) > 0).length,
-          ),
+          [`s:${symbol}:progressing`]: String(mainSets.filter((s) => (s.entryCount || 0) > 0).length),
           [`s:${symbol}:passed`]:     String(mainSets.length),
           [`s:${symbol}:evaluated`]:  String(mainSets.length),
           [`s:${symbol}:apf`]:        String(mainAvgPF.toFixed(4)),
@@ -1688,11 +1686,6 @@ export class StrategyCoordinator {
           [`s:${symbol}:ts`]:         String(Date.now()),
         }),
         client.expire(mainDetailKey, 86400),
-        // Patch Base's pass_rate from this Main cycle. Use baseSets.length
-        // for passed_sets — the Base stage passes ALL its sets to Main
-        // (expansion, not filtering), so passed == evaluated == baseSets.length.
-        // Writing mainSets.length (2400) would make passed > evaluated (5),
-        // which is an impossible state and breaks the passRatio percentage.
         client.hset(`strategy_detail:${this.connectionId}:base`, {
           passed_sets: String(baseSets.length),
           pass_rate:   String(passRatioMain.toFixed(4)),
@@ -1705,221 +1698,37 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:main:evaluated`, 86400),
         client.expire(`strategies:${this.connectionId}:base:passed`, 86400),
       ]
-      // strategies_main_total = cumulative Sets PRODUCED by MAIN (output count).
-      // strategies_main_evaluated = Base Sets that entered MAIN (input count).
       if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", mainSets.length))
       if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", baseSets.length))
 
-      // ── Main-stage COORDINATION metrics (per-cycle snapshot + cumulative) ─
-      // These let the stats API answer the user's question "is the Main stage
-      // coordinating correctly?" at a glance — how many related variant Sets
-      // were generated vs. reused from the fingerprint cache, which variants
-      // were gated active by the current position context, and the live
-      // position-context snapshot (continuous / last-N wins / prev losses).
       const relatedCreated = mainSets.length - reused
       const activeVariantNames = activeVariants.map((p) => p.name)
-
       writes.push(
-        // Cumulative counters (lifetime)
         client.hincrby(redisKey, "strategies_main_related_created", relatedCreated),
         client.hincrby(redisKey, "strategies_main_related_reused",  reused),
         client.hincrby(redisKey, "strategies_main_cycles",          1),
-        // Per-cycle snapshot fields (overwrite every cycle — "what happened now")
         client.hset(redisKey, {
-          strategies_main_active_variants:   activeVariantNames.join(","),
+          strategies_main_active_variants:      activeVariantNames.join(","),
           strategies_main_active_variant_count: String(activeVariantNames.length),
-          strategies_main_last_reused:       String(reused),
-          strategies_main_last_created:      String(relatedCreated),
-          strategies_main_ctx_continuous:    String(ctx.continuousCount),
-          strategies_main_ctx_last_wins:     String(ctx.lastWins),
-          strategies_main_ctx_last_losses:   String(ctx.lastLosses),
-          strategies_main_ctx_prev_losses:   String(ctx.prevLosses),
-          strategies_main_ctx_prev_total:    String(ctx.prevPosCount),
-          strategies_main_ctx_updated_at:    String(Date.now()),
+          strategies_main_last_reused:          String(reused),
+          strategies_main_last_created:         String(relatedCreated),
+          strategies_main_ctx_continuous:       String(ctx.continuousCount),
+          strategies_main_ctx_last_wins:        String(ctx.lastWins),
+          strategies_main_ctx_last_losses:      String(ctx.lastLosses),
+          strategies_main_ctx_prev_losses:      String(ctx.prevLosses),
+          strategies_main_ctx_prev_total:       String(ctx.prevPosCount),
+          strategies_main_ctx_updated_at:       String(Date.now()),
         }),
       )
 
-      // ─�� Per-axis Position-Count window counters (cumulative) ──────────
-      //
-      // Spec: *"step 1 previous 1-12; Last (of previous) 1-4; continuous
-      // 1-8 and Pause 1-8"*. Every Main Set materialised this cycle was
-      // gated on a position context whose four axes fall into one of
-      // these step-1 buckets. We hincrby a per-axis-N counter so the
-      // dashboard can show "how many Main Sets were created under each
-      // axis window" without re-deriving from raw events.
-      //
-      // Axis windows are encoded on each Set via `axisWindows` — see
-      // `buildVariantSet`. A Set with `axisWindows.prev = 5` increments
-      // `strategies_main_axis_prev_5_sets` (and similarly for last/cont/
-      // pause). 0 buckets are still emitted (the operator may want to
-      // see how often a given axis was inactive). Block + DCA Sets share
-      // the same axis snapshot as the cycle's ctx, so they roll up to
-      // the same per-axis tile cleanly without special-casing.
-      //
-      // Storage cost is bounded: at most (12+5+9+9) = 35 sub-keys per
-      // axis lifetime, all on the same `axis_windows:{id}` hash so a
-      // single hgetall covers the whole panel. Counter writes are
-      // pipelined with the rest of the Main writes for free.
-      const axisHashKey = `axis_windows:${this.connectionId}`
-      const axisIncrements: Record<string, number> = {}
-      for (const set of mainSets) {
-        const aw = set.axisWindows
-        if (!aw) continue
-        // Resolve the direction for this axis Set. expandAxisSets stores
-        // it in `axisWindows.direction`; profile-variant and Base Sets
-        // use the top-level `set.direction` field.
-        const dir = aw.direction ?? set.direction   // "long" | "short"
-        const dirSuffix = dir ? `_${dir}` : ""
-        // Per-axis-N bucket — count of Sets per window (combined + direction-split)
-        axisIncrements[`prev_${aw.prev}_sets`]  = (axisIncrements[`prev_${aw.prev}_sets`]  || 0) + 1
-        axisIncrements[`last_${aw.last}_sets`]  = (axisIncrements[`last_${aw.last}_sets`]  || 0) + 1
-        axisIncrements[`cont_${aw.cont}_sets`]  = (axisIncrements[`cont_${aw.cont}_sets`]  || 0) + 1
-        axisIncrements[`pause_${aw.pause}_sets`] = (axisIncrements[`pause_${aw.pause}_sets`] || 0) + 1
-        if (dirSuffix) {
-          axisIncrements[`prev_${aw.prev}_sets${dirSuffix}`]  = (axisIncrements[`prev_${aw.prev}_sets${dirSuffix}`]  || 0) + 1
-          axisIncrements[`last_${aw.last}_sets${dirSuffix}`]  = (axisIncrements[`last_${aw.last}_sets${dirSuffix}`]  || 0) + 1
-          axisIncrements[`cont_${aw.cont}_sets${dirSuffix}`]  = (axisIncrements[`cont_${aw.cont}_sets${dirSuffix}`]  || 0) + 1
-          axisIncrements[`pause_${aw.pause}_sets${dirSuffix}`] = (axisIncrements[`pause_${aw.pause}_sets${dirSuffix}`] || 0) + 1
-        }
-        // Per-axis-N entries — "Pos counts" for each axis window, both
-        // combined and direction-split (so the dashboard can show long vs
-        // short pos-count contribution per window). entryCount is used
-        // because it reflects the live-capped continuous count
-        // (= baseEC + min(cont, liveCont)) from expandAxisSets — more
-        // accurate than entries.length since axis Sets carry one synthetic
-        // representative entry regardless of the bucket's cont window size.
-        const ec = set.entryCount || 0
-        if (ec > 0) {
-          axisIncrements[`prev_${aw.prev}_pos`]   = (axisIncrements[`prev_${aw.prev}_pos`]   || 0) + ec
-          axisIncrements[`last_${aw.last}_pos`]   = (axisIncrements[`last_${aw.last}_pos`]   || 0) + ec
-          axisIncrements[`cont_${aw.cont}_pos`]   = (axisIncrements[`cont_${aw.cont}_pos`]   || 0) + ec
-          axisIncrements[`pause_${aw.pause}_pos`] = (axisIncrements[`pause_${aw.pause}_pos`] || 0) + ec
-          if (dirSuffix) {
-            axisIncrements[`prev_${aw.prev}_pos${dirSuffix}`]   = (axisIncrements[`prev_${aw.prev}_pos${dirSuffix}`]   || 0) + ec
-            axisIncrements[`last_${aw.last}_pos${dirSuffix}`]   = (axisIncrements[`last_${aw.last}_pos${dirSuffix}`]   || 0) + ec
-            axisIncrements[`cont_${aw.cont}_pos${dirSuffix}`]   = (axisIncrements[`cont_${aw.cont}_pos${dirSuffix}`]   || 0) + ec
-            axisIncrements[`pause_${aw.pause}_pos${dirSuffix}`] = (axisIncrements[`pause_${aw.pause}_pos${dirSuffix}`] || 0) + ec
-          }
-        }
-      }
-      for (const [field, n] of Object.entries(axisIncrements)) {
-        if (n > 0) writes.push(client.hincrby(axisHashKey, field, n))
-      }
-      writes.push(client.hset(axisHashKey, { updated_at: String(Date.now()) }))
-      writes.push(client.expire(axisHashKey, 7 * 24 * 60 * 60))
-
-      // ── Variant persistence (cumulative over the lifetime of the run) ──
-      // For each variant we accumulate:
-      //   entries_count   — total entries classified under this variant (incr)
-      //   created_sets    — total Sets containing ≥1 entry of variant (incr)
-      //   passed_sets     — same as created_sets at Main stage (all passed)
-      //   sum_pf          — running sum of profitFactor for weighted avg
-      //   sum_ddt         — running sum of drawdownTime for weighted avg
-      //   avg_profit_factor / avg_drawdown_time / avg_pos_per_set — derived
-      //
-      // Using hincrby for the counters keeps them append-only and crash-safe.
-      // The derived averages are rewritten as hset after each accumulation so
-      // the stats API can read them directly without recomputing on the fly.
-      for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
-        const agg = variantAgg[variant]
-        if (agg.entries === 0) continue
-
-        const vKey = `strategy_variant:${this.connectionId}:${variant}`
-        writes.push(
-          client.hincrby(vKey, "entries_count",  agg.entries),
-          client.hincrby(vKey, "created_sets",   agg.setsContaining),
-          client.hincrby(vKey, "passed_sets",    agg.passedSets),
-          // Scaled integer sums (×1000 for PF, ×10 for DDT minutes) so we can
-          // use hincrby atomically. We reconstruct the floats on read.
-          client.hincrby(vKey, "sum_pf_x1000",   Math.round(agg.sumPF * 1000)),
-          client.hincrby(vKey, "sum_ddt_x10",    Math.round(agg.sumDDT * 10)),
-          client.hset(vKey, { updated_at: new Date().toISOString() }),
-          client.expire(vKey, 7 * 24 * 60 * 60),
-        )
-      }
-      await Promise.all(writes)
-
-      // After the atomic counter writes finalise, rewrite the derived averages
-      // in a follow-up pass (one more round-trip per variant worst-case). Read
-      // the freshly-incremented counters so the averages always reflect the
-      // full lifetime of the run rather than just the current cycle.
-      try {
-        const recompute: Promise<any>[] = []
-        for (const variant of ["default", "trailing", "block", "dca", "pause"] as const) {
-          const agg = variantAgg[variant]
-          if (agg.entries === 0) continue
-          const vKey = `strategy_variant:${this.connectionId}:${variant}`
-          recompute.push(
-            (async () => {
-              const h = ((await client.hgetall(vKey).catch(() => null)) || {}) as Record<string, string>
-              const entriesCount = Number(h.entries_count  || "0")
-              const createdSets  = Number(h.created_sets   || "0")
-              const sumPfX1000   = Number(h.sum_pf_x1000   || "0")
-              const sumDdtX10    = Number(h.sum_ddt_x10    || "0")
-              const avgPF  = entriesCount > 0 ? (sumPfX1000  / 1000) / entriesCount : 0
-              const avgDDT = entriesCount > 0 ? (sumDdtX10   / 10)   / entriesCount : 0
-              const avgPosPerSet = createdSets > 0 ? entriesCount / createdSets : 0
-              const passRate = createdSets > 0 ? (Number(h.passed_sets || "0") / createdSets) : 0
-              await client.hset(vKey, {
-                avg_profit_factor: avgPF.toFixed(4),
-                avg_drawdown_time: avgDDT.toFixed(2),
-                avg_pos_per_set:   avgPosPerSet.toFixed(2),
-                pass_rate:         passRate.toFixed(4),
-              })
-            })(),
-          )
-        }
-        await Promise.all(recompute)
-      } catch { /* non-critical */ }
-    } catch { /* non-critical */ }
-
-    // ── ACTIVE-NOW snapshot for Main stage ────────────────────────────
-    // Same pattern as createBaseSets — single field per (symbol, stage)
-    // overwritten per cycle. Done here BEFORE the early-return path
-    // below so a Main run that produces 0 Sets correctly clears the
-    // previous cycle's value.
-    try {
-      const _client = getRedisClient()
-      await _client.hset(`strategies_active:${this.connectionId}`, {
-        [`${symbol}:main`]: String(mainSets.length),
-      })
-      await _client.expire(`strategies_active:${this.connectionId}`, 600)
-    } catch { /* non-critical */ }
-
-    // ── Position count metrics for main stage ──────────────────────
-    // Track entries created at Main stage so dashboard pipeline shows progress.
-    // IMPORTANT: only count profile-variant Sets (those WITHOUT axisWindows.direction).
-    // Axis Sets carry a synthetic entryCount = baseEC + min(cont, liveCont) which
-    // is NOT a new "position created" — it is a projection of positions that
-    // already exist. Including axis Sets inflates this counter by up to
-    // 320× (full Cartesian fan-out) per cycle per Base Set.
-    const uniqueBaseSetsProduced = new Set<string>()
-    for (const s of mainSets) uniqueBaseSetsProduced.add(s.parentSetKey ?? s.setKey)
-
-    // BASE->MAIN pass rate = fraction of Base Sets that produced at least
-    // one surviving Main variant. Using mainSets.length / baseSets.length
-    // inflates the ratio because mainSets includes the axis fan-out (320+ Sets
-    // per Base Set). uniqueBaseSetsProduced.size is the correct numerator.
-    // Computed HERE (after the loop) because uniqueBaseSetsProduced is only
-    // available after iteration over mainSets completes.
-    const passRatioMain = baseSets.length > 0
-      ? Math.min(1, uniqueBaseSetsProduced.size / baseSets.length)
-      : 0
-
-    const mainProfileEntriesTotal = mainSets
-      .filter((s) => !s.axisWindows?.direction)
-      .reduce((sum, s) => sum + (s.entryCount ?? 0), 0)
-    try {
-      const client = getRedisClient()
-      const progKey = `progression:${this.connectionId}`
+      // ── Position count metrics for main stage ──
+      // Only count profile-variant Sets (no axis fan-out) for this counter.
       if (mainProfileEntriesTotal > 0) {
-        await client.hincrby(progKey, "main_positions_created_count", mainProfileEntriesTotal)
+        writes.push(client.hincrby(redisKey, "main_positions_created_count", mainProfileEntriesTotal))
       }
-    } catch { /* non-critical */ }
 
-    const axisSetsCount = mainSets.filter(s => s.axisWindows).length
-    const axisLong = mainSets.filter(s => s.axisWindows?.direction === "long").length
-    const axisShort = mainSets.filter(s => s.axisWindows?.direction === "short").length
+      await Promise.all(writes)
+    } catch { /* non-critical — Redis write failure should not kill strategy flow */ }
 
     if (baseSets.length > 0) {
       const sample = baseSets[0]
@@ -2612,7 +2421,11 @@ export class StrategyCoordinator {
       // forward to Live evaluation — not the raw post-filter count.
       writes.push(
         client.hset(`strategies_active:${this.connectionId}`, {
-          [`${symbol}:real`]: String(realSets.length),
+          [`${symbol}:real`]:           String(realSets.length),
+          // real:evaluated = Main Sets that entered PF evaluation (excludes
+          // pos-count pre-gated Sets). Cross-symbol sum in stats route will
+          // match stratCounts.real denominator exactly.
+          [`${symbol}:real:evaluated`]: String(mainPFEligible),
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
@@ -2908,6 +2721,10 @@ export class StrategyCoordinator {
             symbol,
             direction: set.direction,
             indicationType: set.indicationType,
+            // Live sets are by definition currently running (they have
+            // open or in-formation positions). isRunningNow drives the
+            // `combined` (= active accumulation) counter in valid_positions.
+            isRunningNow: true,
             externalPipeline: vpPipeline,
           })
         }

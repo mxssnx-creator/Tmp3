@@ -719,9 +719,15 @@ export class ProgressionStateManager {
         strategies_base_total: "0",
         strategies_main_total: "0",
         strategies_real_total: "0",
-        strategy_evaluated_base: "0",
-        strategy_evaluated_main: "0",
-        strategy_evaluated_real: "0",
+        // IMPORTANT: must match the field names read by getProgressionState
+        // (which reads `strategies_base_evaluated` etc.). The old keys
+        // `strategy_evaluated_base` / `strategy_evaluated_main` /
+        // `strategy_evaluated_real` were never read — they silently diverged
+        // from the reader, causing strategy-evaluated counters to always
+        // show 0 on the dashboard after a fresh progression start.
+        strategies_base_evaluated: "0",
+        strategies_main_evaluated: "0",
+        strategies_real_evaluated: "0",
       })
 
       console.log(
