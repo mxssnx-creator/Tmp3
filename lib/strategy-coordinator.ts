@@ -1350,7 +1350,7 @@ export class StrategyCoordinator {
     // cache-miss paths populate this map so reuses still trigger fan-out.
     const defaultByBaseKey = new Map<string, StrategySet>()
 
-    // ── 2. Base/variant async processing ────────────────────────��───────────
+    // ── 2. Base/variant async processing ────────────────────────���───────────
     // Process all baseSet × variant combinations in parallel for faster throughput.
     // Each combination calls the async buildVariantSet, which previously ran
     // sequentially. Now they all start together and resolve concurrently.
@@ -1364,20 +1364,25 @@ export class StrategyCoordinator {
 
     for (const baseSet of baseSets) {
       // ── Min-positions gate (operator spec, systemwide fix) ──────
-      // During historic replay / first-pass prehistoric, we're still building
-      // position history. Skip the min-pos gate if the Set has any historic
-      // position data (prevPos.count > 0), OR if it's brand new (has at least
-      // 1 live indication entry). Once realtime begins and there's neither
-      // historic nor live data, the gate engages normally.
+      // Evaluation requires minimum historical data to have statistical
+      // confidence in profitFactor averages. Uses "last X positions" (default 15)
+      // from prevPos.count (historical closed positions).
+      //
+      // Gate logic:
+      // - If historic data exists: require histCount >= mainMinPos
+      // - If no historic but live data: allow (bootstrap new strategy)
+      // - If neither: skip (no data to validate)
       const liveCount    = baseSet.entryCount ?? baseSet.entries?.length ?? 0
       const histCount    = baseSet.prevPos?.count ?? 0
       const setPosCount  = Math.max(liveCount, histCount)
       
-      // Gate applies only when:
-      // 1. No historic data (not in backtest), AND
-      // 2. Not enough live entries to have meaningful validation
-      const inHistoricOrBacktest = histCount > 0 || liveCount > 0
-      if (!inHistoricOrBacktest && setPosCount < mainMinPos) {
+      // CRITICAL: During PREHISTORIC and REALTIME, require minimum historical positions
+      // If we have historic data (prevPos), the evaluation must be based on at least
+      // mainMinPos (default 15) closed positions to have meaningful profitFactor average.
+      // Exception: allow bootstrap (gate skip) only when there's NO historic data yet.
+      const hasHistoricData = histCount > 0
+      if (hasHistoricData && histCount < mainMinPos) {
+        // Insufficient historic positions — skip evaluation this cycle
         skippedLowPos++
         continue
       }
