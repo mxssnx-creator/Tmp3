@@ -1634,10 +1634,13 @@ export async function GET(
           // Fallback: when the detail hash hasn't been written yet
           // (fresh cycle, first symbol still processing), we use the
           // (symbol, stage) presence count as a best-effort estimate.
+          // 
+          // For REAL and LIVE stages: if setsRunningNow is 0 but we have
+          // tracked sets, use the stage set count as they are actively being processed.
           const baseRun  = n(stratDetail.base?.setsRunningNow)  || activeSetsStratByStage.base || 0
           const mainRun  = n(stratDetail.main?.setsRunningNow)  || activeSetsStratByStage.main || 0
-          const realRun  = n(stratDetail.real?.setsRunningNow)  || activeSetsStratByStage.real || 0
-          const liveRun  = n(stratDetail.live?.setsRunningNow)  || pseudoRunningSets || 0
+          const realRun  = n(stratDetail.real?.setsRunningNow)  || activeSetsStratByStage.real || stratCounts.real || 0
+          const liveRun  = n(stratDetail.live?.setsRunningNow)  || pseudoRunningSets || stratCounts.live || 0
           // Pipeline-aware total: same logical Set exists at multiple
           // stages (mirroring principle). The "deepest-active" count
           // is the canonical aggregate — Live ⊂ Real ⊂ Main ⊂ Base.
