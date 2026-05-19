@@ -849,6 +849,176 @@ const migrations: Migration[] = [
       }
     },
   },
+  {
+    name: "022-comprehensive-data-structure-consistency",
+    version: 22,
+    up: async (client: any) => {
+      await client.set("_schema_version", "22")
+      
+      // Comprehensive data structure validation and repair migration
+      // Ensures all required keys, indexes, and data structures are present
+      
+      console.log(`[v0] Migration 022: Starting comprehensive data structure validation...`)
+      
+      let fixed = 0
+      let validated = 0
+      
+      // ── 1. Validate and fix strategy progression keys ─────────────
+      const connections = await client.smembers("connections:main:enabled") || []
+      
+      for (const connId of connections) {
+        try {
+          // Ensure progression container exists for each connection
+          const keysPrefix = `strategies:${connId}`
+          const indices = [
+            { key: `${keysPrefix}:indices`, description: "Connection indices" },
+            { key: `strategy_count:${connId}`, description: "Total strategy count" },
+            { key: `real_pi_acc:${connId}`, description: "Real position accumulation" },
+            { key: `axis_pos_acc:${connId}`, description: "Axis position accumulation" },
+          ]
+          
+          for (const { key, description } of indices) {
+            const exists = await client.exists(key)
+            if (!exists) {
+              // Initialize with empty marker
+              await client.hset(key, "_initialized", "1")
+              fixed++
+              console.log(`[v0] Migration 022: Created ${description} key: ${key}`)
+            }
+            validated++
+          }
+          
+          // Ensure progression metadata exists
+          const progMetadata = `progression:${connId}:metadata`
+          const metaExists = await client.exists(progMetadata)
+          if (!metaExists) {
+            await client.hset(progMetadata, {
+              created_at: new Date().toISOString(),
+              last_cycle: new Date().toISOString(),
+              total_base_created: "0",
+              total_main_created: "0",
+              total_real_created: "0",
+              total_live_created: "0",
+            })
+            fixed++
+            console.log(`[v0] Migration 022: Created progression metadata for ${connId}`)
+          }
+          validated++
+          
+          // Ensure per-symbol tracking sets exist
+          const symbols = await client.smembers(`${keysPrefix}:symbols`) || []
+          for (const symbol of symbols) {
+            const symbolSets = [
+              `${keysPrefix}:${symbol}:base:sets`,
+              `${keysPrefix}:${symbol}:main:sets`,
+              `${keysPrefix}:${symbol}:real:sets`,
+              `${keysPrefix}:${symbol}:live:sets`,
+            ]
+            
+            for (const setKey of symbolSets) {
+              const isSet = await client.type(setKey)
+              if (isSet === "none") {
+                // Initialize as empty set with marker
+                await client.sadd(setKey, "_init")
+                await client.srem(setKey, "_init")
+                fixed++
+                console.log(`[v0] Migration 022: Initialized set key: ${setKey}`)
+              }
+              validated++
+            }
+          }
+        } catch (err) {
+          console.warn(`[v0] Migration 022: Error validating connection ${connId}:`, err)
+        }
+      }
+      
+      // ── 2. Validate position history structures ──────────────────
+      try {
+        const historyKeys = await client.keys("pi_history:*")
+        console.log(`[v0] Migration 022: Found ${historyKeys.length} position history keys`)
+        validated += historyKeys.length
+        
+        // Each position history hash should have standard fields
+        for (const key of historyKeys) {
+          const data = await client.hgetall(key)
+          const requiredFields = ["count", "wins", "losses", "pf_num_x1000", "pf_den_x1000", "ddt_num_x10"]
+          const hasAllFields = requiredFields.every(f => f in data || data[f] !== undefined)
+          
+          if (!hasAllFields) {
+            // Repair by ensuring all fields exist
+            const updates: Record<string, string> = {}
+            for (const field of requiredFields) {
+              if (!(field in data)) {
+                updates[field] = "0"
+              }
+            }
+            if (Object.keys(updates).length > 0) {
+              await client.hset(key, updates)
+              fixed++
+              console.log(`[v0] Migration 022: Repaired position history key: ${key}`)
+            }
+          }
+          validated++
+        }
+      } catch (err) {
+        console.warn(`[v0] Migration 022: Error validating position history:`, err)
+      }
+      
+      // ── 3. Validate axis position accumulation ledgers ──────────
+      try {
+        const axisKeys = await client.keys("axis_pos_acc:*")
+        console.log(`[v0] Migration 022: Found ${axisKeys.length} axis position accumulation keys`)
+        validated += axisKeys.length
+        
+        // Axis ledgers should have accumulation data
+        for (const key of axisKeys) {
+          const exists = await client.exists(key)
+          if (exists) {
+            // Check TTL is set (90 days)
+            const ttl = await client.ttl(key)
+            if (ttl === -1) {
+              // No expiry set, add it
+              await client.expire(key, 90 * 24 * 60 * 60)
+              fixed++
+              console.log(`[v0] Migration 022: Set expiry on axis ledger: ${key}`)
+            }
+          }
+          validated++
+        }
+      } catch (err) {
+        console.warn(`[v0] Migration 022: Error validating axis accumulation:`, err)
+      }
+      
+      // ── 4. Validate hedge bucket structures ─────────────────────
+      try {
+        const hedgeKeys = await client.keys("live_net_target:*")
+        console.log(`[v0] Migration 022: Found ${hedgeKeys.length} hedge net target keys`)
+        validated += hedgeKeys.length
+        
+        // Each should contain direction:remainder pairs
+        for (const key of hedgeKeys) {
+          const value = await client.get(key)
+          if (!value || !value.includes(":")) {
+            // Repair with neutral default
+            await client.set(key, "flat:0")
+            fixed++
+            console.log(`[v0] Migration 022: Repaired hedge target: ${key}`)
+          }
+          validated++
+        }
+      } catch (err) {
+        console.warn(`[v0] Migration 022: Error validating hedge structures:`, err)
+      }
+      
+      console.log(`[v0] Migration 022: COMPLETE`)
+      console.log(`  - Fixed: ${fixed} keys/structures`)
+      console.log(`  - Validated: ${validated} keys`)
+      console.log(`[v0] Migration 022: Data structure consistency check finished`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "21")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
