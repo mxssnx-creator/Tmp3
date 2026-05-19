@@ -1925,6 +1925,81 @@ export class StrategyCoordinator {
   // ─── STAGE 3: REAL ────────────────────────────────────────────────────────��──
 
   /**
+   * Create pseudo positions from REAL sets for dashboard visualization.
+   * Each REAL set should have at least one pseudo position so it shows on the
+   * dashboard as "open" in the strategies view. This is for evaluation/display only.
+   */
+  private async createPseudoPositionsFromRealSets(
+    symbol: string,
+    realSets: StrategySet[],
+  ): Promise<void> {
+    try {
+      if (!realSets || realSets.length === 0) return
+      
+      const client = getRedisClient()
+      let createdCount = 0
+      
+      // For each REAL set, create one pseudo position to represent it on dashboard
+      for (const set of realSets) {
+        try {
+          const setKey = set.key || `${symbol}:${set.direction || "long"}`
+          
+          // Check if we already have an active pseudo position for this set
+          const existingKey = `pseudo_position_set_mapping:${this.connectionId}:${setKey}`
+          const existing = await getSettings(existingKey).catch(() => null)
+          if (existing) continue
+          
+          // Get entry details for sizing
+          const entry = (set.entries && set.entries[0]) || {}
+          const entryPrice = Number(entry.entry_price || 100)
+          const quantity = Number(entry.quantity || 1)
+          const positionCost = entryPrice * quantity
+          
+          // Create pseudo position representing this REAL set
+          const pseudoPos = {
+            id: `pseudo-${this.connectionId}-${setKey}-${Date.now()}`,
+            connectionId: this.connectionId,
+            symbol,
+            direction: set.direction || "long",
+            entry_price: entryPrice,
+            quantity,
+            position_cost: positionCost,
+            status: "open",
+            position_level: "real",
+            config_set_key: setKey,
+            source_set_key: set.key,
+            created_at: new Date().toISOString(),
+            profit_factor: set.avgProfitFactor || 0,
+            confidence: set.avgConfidence || 0,
+          }
+          
+          // Store the pseudo position
+          await setSettings(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, pseudoPos)
+          
+          // Add to connection's pseudo positions set
+          await client.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id)
+          
+          // Add to active_config_keys for tracking
+          await client.sadd(`pseudo_positions:${this.connectionId}:active_config_keys`, setKey)
+          
+          // Store mapping for deduplication
+          await setSettings(existingKey, { posId: pseudoPos.id, createdAt: Date.now() })
+          
+          createdCount++
+        } catch (err) {
+          console.warn(`[v0] Failed to create pseudo position for set ${set.key}:`, err)
+        }
+      }
+      
+      if (createdCount > 0) {
+        console.log(`[v0] [StrategyFlow] Created ${createdCount} pseudo positions from ${realSets.length} REAL sets for ${symbol}`)
+      }
+    } catch (error) {
+      console.warn(`[v0] Error creating pseudo positions from REAL sets for ${symbol}:`, error)
+    }
+  }
+
+  /**
    * Promote MAIN Sets with avgProfitFactor >= 1.4 to REAL.
    */
   private async evaluateRealSets(
@@ -2678,6 +2753,9 @@ export class StrategyCoordinator {
       created: new Date(),
       executable: true,
     })
+
+    // Create pseudo positions from REAL/LIVE sets so they appear on dashboard
+    await this.createPseudoPositionsFromRealSets(symbol, realSets)
 
     // Write live set count into progression hash — use hset so count reflects current cycle snapshot.
     // NOTE: strategies_real_total and strategy_evaluated_real are already written by evaluateRealSets.
