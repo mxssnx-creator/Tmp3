@@ -181,11 +181,11 @@ export function QuickstartOptionsBar() {
   // sliders don't flash defaults over saved values.
   const [hydrated, setHydrated] = useState(false)
   const [loading, setLoading] = useState(false)
-  const [controlOrders, setControlOrders] = useState(false)
+  const [controlOrders, setControlOrders] = useState(true)
   const [pfMin, setPfMin] = useState<ProfitFactorMin>(DEFAULT_PF_MIN)
-  const [volumeFactor, setVolumeFactor] = useState<number>(1)
+  const [volumeFactor, setVolumeFactor] = useState<number>(0.1)
   const [blockEnabled, setBlockEnabled] = useState(true)
-  const [dcaEnabled, setDcaEnabled] = useState(true)
+  const [dcaEnabled, setDcaEnabled] = useState(false)
   // Trailing-stop master variant gate. Engine-side default is also true
   // (`coord.variants.trailing !== false` in strategy-coordinator), so an
   // operator who never touches this control still gets trailing.
@@ -270,7 +270,7 @@ export function QuickstartOptionsBar() {
           settings.coordinationSettings ||
           {}
         const variants = coord.variants || {}
-        // Defaults: trailing ON, block ON, dca ON — matches the engine-side
+        // Defaults: trailing ON, block ON, dca OFF — matches the engine-side
         // defaults in `lib/strategy-coordinator.ts`. Use `!== false` so absent
         // keys default to true (don't surprise operators who never touched
         // coordination — the previous run was already trailing).

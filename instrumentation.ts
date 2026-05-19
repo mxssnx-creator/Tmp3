@@ -36,14 +36,19 @@ export async function register() {
   // ──────────────────────────────────────────────────────────────────────
   // Boot-time core init.
   //
-  // 1. completeStartup(): initialises Redis (which runs migrations AND
+  // 1. Initialize the trade-engine coordinator singleton FIRST.
+  //    This publishes __engine_manager_instance.isEngineRunning to
+  //    globalThis, which the Redis snapshot loader checks to prevent
+  //    reloading stale lock state while an engine is running.
+  //
+  // 2. completeStartup(): initialises Redis (which runs migrations AND
   //    restores the on-disk snapshot via loadFromDisk) and prepares the
   //    trade-engine coordinator singleton — without auto-starting any
   //    engine. Without this hook the coordinator and snapshot only come
   //    online when someone hits a route, which can be many minutes after
   //    a redeploy.
   //
-  // 2. initializeTradeEngineAutoStart(): starts the auto-start MONITOR
+  // 3. initializeTradeEngineAutoStart(): starts the auto-start MONITOR
   //    only — it does NOT start engines on its own. The monitor scans for
   //    connections with `is_enabled_dashboard=1` and (re-)starts ONLY
   //    those, so disabled connections stay disabled across restarts.
@@ -52,6 +57,14 @@ export async function register() {
   // runtime even if Redis hydration or the coordinator fail. Subsequent
   // route hits will retry.
   // ──────────────────────────────────────────────────────────────────────
+  try {
+    const { getGlobalTradeEngineCoordinator } = await import("@/lib/trade-engine")
+    getGlobalTradeEngineCoordinator()
+    console.log("[v0] [Instrumentation] Trade engine coordinator initialized")
+  } catch (error) {
+    console.error("[Instrumentation] coordinator init failed:", error)
+  }
+
   try {
     const { completeStartup } = await import("@/lib/startup-coordinator")
     await completeStartup()

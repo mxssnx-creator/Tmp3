@@ -464,32 +464,195 @@ export interface ValidPositionsSnapshot {
 export async function getValidPositions(
   connectionId: string,
 ): Promise<ValidPositionsSnapshot> {
-  const empty: ValidPositionsSnapshot = {
-    overall: 0,
-    combined: 0,
-    bySymbol: {},
-    byDirection: {},
-    byType: {},
+  if (!connectionId) {
+    return {
+      overall: 0,
+      combined: 0,
+      bySymbol: {},
+      byDirection: { long: 0, short: 0 },
+      byType: {},
+    }
   }
-  if (!connectionId) return empty
   try {
     const client = getRedisClient()
-    const hash = (await client.hgetall(VALID_POS_KEY(connectionId))) as Record<
-      string,
-      string
-    >
-    if (!hash) return empty
-    const out: ValidPositionsSnapshot = { ...empty }
-    for (const [k, v] of Object.entries(hash)) {
-      const n = Number(v) || 0
-      if (k === "overall") out.overall = n
-      else if (k === "combined") out.combined = n
-      else if (k.startsWith("by_symbol:")) out.bySymbol[k.slice(10)] = n
-      else if (k.startsWith("by_dir:"))    out.byDirection[k.slice(7)] = n
-      else if (k.startsWith("by_type:"))   out.byType[k.slice(8)] = n
+    const k = VALID_POS_KEY(connectionId)
+    const hash = await client.hgetall(k)
+    
+    // Debug: log what we got from Redis
+    if (!hash || Object.keys(hash).length === 0) {
+      console.log(`[v0] [PosHistory] getValidPositions(${connectionId}): empty hash from Redis key "${k}"`)
     }
+
+    const h = hash || {}
+    return {
+      overall: Number(h.overall || 0),
+      combined: Number(h.combined || 0),
+      bySymbol: Object.fromEntries(
+        Object.entries(h)
+          .filter(([key]) => key.startsWith("by_symbol:"))
+          .map(([key, val]) => [key.substring("by_symbol:".length), Number(val)]),
+      ),
+      byDirection: {
+        long: Number(h["by_dir:long"] || 0),
+        short: Number(h["by_dir:short"] || 0),
+      },
+      byType: Object.fromEntries(
+        Object.entries(h)
+          .filter(([key]) => key.startsWith("by_type:"))
+          .map(([key, val]) => [key.substring("by_type:".length), Number(val)]),
+      ),
+    }
+  } catch (err) {
+    console.error(`[v0] [PosHistory] getValidPositions error:`, err)
+    return {
+      overall: 0,
+      combined: 0,
+      bySymbol: {},
+      byDirection: { long: 0, short: 0 },
+      byType: {},
+    }
+  }
+}
+
+// ── Per-Base hedge position-count accumulation (Real stage) ───────────
+//
+// Operator spec: "Do the accumulations for pos counts Sets at stage Real
+// (hedging long, short for related same base Set)."
+//
+// For each Base Set, Real emits multiple derived Sets in both long and
+// short directions (axis Cartesian + profile variants). This ledger
+// accumulates the ENTRY COUNT (position-slots) per direction per Base
+// Set so the engine can track the net hedge posture:
+//
+//   net = long_entries − short_entries
+//   net > 0 → net-long bias   (more long positions than short)
+//   net < 0 → net-short bias  (more short positions than long)
+//   net = 0 → fully hedged    (equal long/short exposure)
+//
+// Key schema: `hedge_pos_acc:{conn}`  (one HASH per connection)
+// Fields per base Set (parentSetKey):
+//   `{parentSetKey}:long`   — cumulative entryCount from long Real Sets
+//   `{parentSetKey}:short`  — cumulative entryCount from short Real Sets
+//   `{parentSetKey}:sets_long`   — cumulative count of long Real Sets
+//   `{parentSetKey}:sets_short`  — cumulative count of short Real Sets
+//   `{parentSetKey}:ts`    — last-updated epoch ms (hset, not hincrby)
+//
+// All numeric fields use hincrby (atomic, no read-modify-write races).
+// Composes into the caller's shared accPipeline so Real-stage overhead
+// is zero added round-trips.
+
+const HEDGE_ACC_KEY = (connectionId: string) => `hedge_pos_acc:${connectionId}`
+
+export interface HedgePosAccumulationInput {
+  connectionId: string
+  /** parentSetKey = the Base Set this Real Set derives from. */
+  parentSetKey: string
+  direction: "long" | "short"
+  /** Number of position-slots (entries) in this Real Set. */
+  entryCount: number
+  externalPipeline?: ReturnType<ReturnType<typeof getRedisClient>["multi"]>
+}
+
+/**
+ * Accumulate position counts for a single Real Set into the per-Base
+ * hedge ledger. Call once per Real Set in the tuner loop.
+ *
+ * - `entryCount` increments the directional entry total.
+ * - Sets count increments separately so callers can derive average
+ *   entries-per-set per direction.
+ * - `ts` is refreshed with every call so readers know when the ledger
+ *   was last written without a separate key.
+ */
+export function bumpHedgePosAccumulation(input: HedgePosAccumulationInput): void {
+  const { connectionId, parentSetKey, direction, entryCount, externalPipeline } = input
+  if (!connectionId || !parentSetKey || entryCount <= 0) return
+
+  const key    = HEDGE_ACC_KEY(connectionId)
+  const client = externalPipeline ?? getRedisClient().multi()
+  const dir    = direction === "short" ? "short" : "long"
+
+  client.hincrby(key, `${parentSetKey}:${dir}`,       entryCount)
+  client.hincrby(key, `${parentSetKey}:sets_${dir}`,  1)
+  client.hset(key,    `${parentSetKey}:ts`,           String(Date.now()))
+  client.expire(key, TTL_SECONDS)
+
+  if (!externalPipeline) {
+    ;(client as any).exec().catch(() => {})
+  }
+}
+
+export interface HedgePosSnapshot {
+  parentSetKey: string
+  longEntries:  number
+  shortEntries: number
+  longSets:     number
+  shortSets:    number
+  /** longEntries − shortEntries. Positive = net-long, negative = net-short. */
+  net:          number
+  /** Absolute net exposure as a fraction of total entries. 0 = fully hedged, 1 = all one side. */
+  hedgeRatio:   number
+  lastUpdated:  number
+}
+
+/**
+ * Read the full hedge accumulation map for a connection.
+ * Returns one snapshot per parentSetKey that has accumulated data.
+ */
+export async function getHedgePosAccumulation(
+  connectionId: string,
+): Promise<HedgePosSnapshot[]> {
+  if (!connectionId) return []
+  try {
+    const client = getRedisClient()
+    const hash = (await client.hgetall(HEDGE_ACC_KEY(connectionId))) as Record<string, string> | null
+    if (!hash) return []
+
+    // Group flat hash fields back into per-parentSetKey snapshots.
+    // Fields: `{key}:long`, `{key}:short`, `{key}:sets_long`, `{key}:sets_short`, `{key}:ts`
+    const byBase = new Map<string, {
+      long: number; short: number
+      setsLong: number; setsShort: number
+      ts: number
+    }>()
+
+    for (const [field, rawVal] of Object.entries(hash)) {
+      const val = Number(rawVal) || 0
+      // Split on last `:` suffix to extract the base key and field suffix
+      const colonIdx = field.lastIndexOf(":")
+      if (colonIdx === -1) continue
+      const baseKey = field.slice(0, colonIdx)
+      const suffix  = field.slice(colonIdx + 1)
+
+      let entry = byBase.get(baseKey)
+      if (!entry) {
+        entry = { long: 0, short: 0, setsLong: 0, setsShort: 0, ts: 0 }
+        byBase.set(baseKey, entry)
+      }
+      if      (suffix === "long")       entry.long      = val
+      else if (suffix === "short")      entry.short     = val
+      else if (suffix === "sets_long")  entry.setsLong  = val
+      else if (suffix === "sets_short") entry.setsShort = val
+      else if (suffix === "ts")         entry.ts        = val
+    }
+
+    const out: HedgePosSnapshot[] = []
+    for (const [parentSetKey, e] of byBase) {
+      const total = e.long + e.short
+      out.push({
+        parentSetKey,
+        longEntries:  e.long,
+        shortEntries: e.short,
+        longSets:     e.setsLong,
+        shortSets:    e.setsShort,
+        net:          e.long - e.short,
+        hedgeRatio:   total > 0 ? Math.abs(e.long - e.short) / total : 0,
+        lastUpdated:  e.ts,
+      })
+    }
+    // Sort: most-imbalanced (largest |net|) first so dashboards surface the biggest exposures
+    out.sort((a, b) => Math.abs(b.net) - Math.abs(a.net))
     return out
   } catch {
-    return empty
+    return []
   }
 }

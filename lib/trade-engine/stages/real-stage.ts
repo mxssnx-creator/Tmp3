@@ -283,7 +283,7 @@ export async function getRealPositions(connectionId: string): Promise<RealPositi
   const client = getRedisClient()
 
   try {
-    const keys = await client.keys(`real:position:real:${connectionId}:*`)
+    const keys = await client.keys(`real:position:*`)
     if (keys.length === 0) return []
 
     // Batch all GETs into a single fan-out. The prior sequential loop
@@ -296,7 +296,13 @@ export async function getRealPositions(connectionId: string): Promise<RealPositi
     const positions: RealPosition[] = []
     for (const data of rawValues) {
       if (!data) continue
-      try { positions.push(JSON.parse(data as string)) } catch { /* ignore */ }
+      try {
+        const pos = JSON.parse(data as string)
+        // Filter by connectionId to only return positions for this connection
+        if (pos.connectionId === connectionId) {
+          positions.push(pos)
+        }
+      } catch { /* ignore */ }
     }
     return positions
   } catch (err) {

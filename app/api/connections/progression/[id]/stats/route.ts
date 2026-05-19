@@ -96,6 +96,7 @@ export async function GET(
       prehistoricSymbolCount,
       axisWindowsHashRaw,
       ordersBySymbolRaw,
+      hedgePosAccHashRaw,
     ] = await Promise.all([
       client.hgetall(`progression:${connectionId}`).catch(() => null),
       client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
@@ -115,6 +116,10 @@ export async function GET(
       // chip strip. Stays in lock-step with the global
       // `live_orders_placed_count` / `live_orders_filled_count` totals.
       client.hgetall(`live_orders_by_symbol:${connectionId}`).catch(() => null),
+      // Per-Base hedge pos-count accumulation written by bumpHedgePosAccumulation
+      // in the Real stage tuner loop. Fields: `{parentSetKey}:{long|short|sets_long|sets_short|ts}`
+      // Consumed to surface long/short hedge breakdown per base Set in strategyDetail.real.
+      client.hgetall(`hedge_pos_acc:${connectionId}`).catch(() => null),
     ])
 
     const progHash: Record<string, string>       = progHashRaw       || {}
@@ -122,6 +127,7 @@ export async function GET(
     const realtimeHash: Record<string, string>   = realtimeHashRaw   || {}
     const axisWindowsHash: Record<string, string> = axisWindowsHashRaw || {}
     const ordersBySymbolHash: Record<string, string> = ordersBySymbolRaw || {}
+    const hedgePosAccHash: Record<string, string> = (hedgePosAccHashRaw as Record<string, string>) || {}
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
@@ -366,9 +372,10 @@ export async function GET(
       ) || 0
     } catch { /* non-critical */ }
 
-    // Back-compat: the historic `positionsOpen` field always referred
-    // to the pseudo total, so keep that contract.
-    const positionsOpen = pseudoOpen
+    // Back-compat: the historic `positionsOpen` field counts total open positions
+    // across all pipeline stages: pseudo (evaluation) + real (promotion) + live (execution).
+    // This gives operators visibility into "how many strategies currently have positions".
+    let positionsOpen = pseudoOpen
 
     // Top-5 per-Set rollup sorted by POSITION COUNT — pseudo positions
     // are evaluation-stage exposure, not real money, so sorting by count
@@ -400,7 +407,7 @@ export async function GET(
       Array<{ realPositionId: string }>
     >()
     try {
-      const realKeys = await client.keys(`real:position:real:${connectionId}:*`)
+      const realKeys = await client.keys(`real:position:*`)
       if (realKeys.length > 0) {
         const caps = realKeys.slice(0, 500)
         const raws = await Promise.all(
@@ -410,6 +417,8 @@ export async function GET(
           if (!raw) continue
           try {
             const pos = JSON.parse(raw as string)
+            // Filter by this connection only (pos object contains connectionId field)
+            if (pos.connectionId !== connectionId) continue
             if (pos.status === "closed") continue
             realOpen++
             // Index for live position join (fallback path)
@@ -688,6 +697,9 @@ export async function GET(
     // by a few seconds. These scan-derived values are the authoritative
     // "right now" view for the coordination UI.
     const liveOpenScanned = livePositionSetRelations.length
+    
+    // Update total positions count to include all stages: pseudo + real + live
+    positionsOpen = pseudoOpen + realOpen + liveOpenScanned
     const liveResolvedViaPseudo = livePositionSetRelations.filter(
       (p) => p.resolution === "pseudo",
     ).length
@@ -833,7 +845,7 @@ export async function GET(
       direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
     }
     const activeStratByStage: Record<string, number> = {
-      base: 0, main: 0, real: 0,
+      base: 0, main: 0, real: 0, live: 0,
     }
     // ── DISTINCT-SETS-PROGRESSING tally (per type / per stage) ────────
     // The cumulative `indCounts.*` and `stratCounts.*` count the total
@@ -851,7 +863,7 @@ export async function GET(
       direction: 0, move: 0, active: 0, active_advanced: 0, optimal: 0, auto: 0,
     }
     const activeSetsStratByStage: Record<string, number> = {
-      base: 0, main: 0, real: 0,
+      base: 0, main: 0, real: 0, live: 0,
     }
     try {
       const [indActiveHash, stratActiveHash] = await Promise.all([
@@ -889,9 +901,12 @@ export async function GET(
       }
     } catch { /* non-critical: dashboard falls back to cumulative */ }
     const activeIndTotal = Object.values(activeIndByType).reduce((s, v) => s + v, 0)
-    const activeStratTotal = activeStratByStage.base + activeStratByStage.main + activeStratByStage.real
+    // Pipeline-aware total: only count REAL stage (final filtered output), not sum of BASE+MAIN+REAL
+    // Each strategy survives through the cascade filter, not added at each stage.
+    const activeStratTotal = activeStratByStage.real || strategiesTotal
     const activeSetsIndTotal   = Object.values(activeSetsIndByType).reduce((s, v) => s + v, 0)
-    const activeSetsStratTotal = activeSetsStratByStage.base + activeSetsStratByStage.main + activeSetsStratByStage.real
+    // Only count distinct REAL-stage sets progressing, not sum across stages
+    const activeSetsStratTotal = activeSetsStratByStage.real || 0
 
     // Strategy per-stage counts
     // NOTE on source priority:
@@ -908,8 +923,9 @@ export async function GET(
     await Promise.all(
       stratTypes.map(async (type) => {
         // Prefer the cross-symbol sum from strategies_active hash (already computed above).
-        // For "live" there is no strategies_active entry, so fall back to the standalone key.
-        const fromActive = (type !== "live") ? (activeStratByStage[type] || 0) : 0
+        // `createLiveSets` now writes `{symbol}:live` to strategies_active each cycle, so
+        // `activeStratByStage.live` is valid and should be preferred like the other stages.
+        const fromActive = activeStratByStage[type] || 0
         // Issue both standalone-key reads in parallel — they're
         // independent and previously chained as sequential awaits,
         // doubling the per-stage wall time for no benefit.
@@ -1027,7 +1043,9 @@ export async function GET(
     // Shared shape for base/main/real/live. `Record<string, any>` keeps the
     // structure flexible for tier-specific extras (win rate, total PnL, etc.
     // live only) without needing a discriminated union on every write site.
-    const stratDetail: Record<string, Record<string, number>> = {}
+    // Typed as Record<string, unknown> to allow the Real stage to include
+    // the hedgePosAcc nested object alongside the flat number fields.
+    const stratDetail: Record<string, Record<string, unknown>> = {}
 
     // Track stale-symbol fields for opportunistic pruning. Without this,
     // every symbol ever evaluated (incl. ones removed from the basket
@@ -1116,25 +1134,74 @@ export async function GET(
           ? weightedDDT / weightSum
           : parseFloat(dh.avg_drawdown_time    || progHash[`strategy_${stage}_avg_drawdown_time`]    || "0")
 
-        // Eval percentage: main = evaluated/base, real = evaluated/main
+        // Eval percentage per stage:
+        //   base:  100% — Base self-evaluates all its sets (no filter).
+        //   main:  evaluated/base, capped at 100 (expansion: 1 base → N main).
+        //   real:  evaluated/main, capped at 100 (filter: N main → M real).
+        //   live:  evaluated/real, capped at 100 (filter: M real → K live).
         let evalPct = 0
-        if (stage === "main") {
+        if (stage === "base") {
+          // createdSets may be 0 if dh.created_sets absent; use stratCounts.base fallback
+          evalPct = (createdSets > 0 || (stratCounts.base || 0) > 0) ? 100 : 0
+        } else if (stage === "main") {
           const base = stratCounts.base || 1
-          evalPct = base > 0 ? Math.round((stratEvaluated.main / base) * 1000) / 10 : 0
+          const raw = base > 0 ? (stratEvaluated.main / base) * 100 : 0
+          evalPct = Math.min(100, Math.round(raw * 10) / 10)
         } else if (stage === "real") {
           const main = stratCounts.main || 1
-          evalPct = main > 0 ? Math.round((stratEvaluated.real / main) * 1000) / 10 : 0
+          const raw = main > 0 ? (stratEvaluated.real / main) * 100 : 0
+          evalPct = Math.min(100, Math.round(raw * 10) / 10)
+        } else if (stage === "live") {
+          const real = stratCounts.real || 1
+          const raw = real > 0 ? (stratEvaluated.real / real) * 100 : 0
+          evalPct = Math.min(100, Math.round(raw * 10) / 10)
         }
 
-        // Pass ratio = passed/evaluated for this stage — prefer detail hash's pass_rate
-        const stageEvaluated = n(dh.evaluated) || stratEvaluated[stage] || 0
-        const stagePassed    = n(dh.passed_sets || progHash[`strategy_${stage}_passed`])
-        const passRatioRaw   = parseFloat(dh.pass_rate || "0")
-        const passRatio      = passRatioRaw > 0
-          ? Math.round(passRatioRaw * 1000) / 10   // convert 0-1 fraction → percent
-          : stageEvaluated > 0
-            ? Math.round((stagePassed / stageEvaluated) * 1000) / 10
-            : 0
+        // ── evaluated / passed / passRatio ────────────────────────────
+        // Source priority:
+        //   1. Per-symbol cross-sum (symEvaluated / symPassed) when fresh.
+        //   2. Legacy dh.evaluated / dh.passed_sets — only trust when > 1
+        //      (value of "1" means stale single-symbol last-write).
+        //   3. Standalone Redis keys (stratEvaluated / stratCounts) written
+        //      every coordinator cycle with the correct semantics.
+        const stageEvaluatedRaw = useCross
+          ? symEvaluated
+          : n(dh.evaluated) > 1 ? n(dh.evaluated) : 0
+        const stageEvaluated = stageEvaluatedRaw
+          || stratEvaluated[stage]
+          || stratCounts[stage]
+          || 0
+
+        // passed = sets that advanced to the next stage.
+        // Expansion stages (BASE/MAIN): all sets pass → fall back to stageEvaluated.
+        // Filter stages (REAL): output count = stratCounts.real.
+        const stagePassedRaw = useCross
+          ? symPassed
+          : n(dh.passed_sets || progHash[`strategy_${stage}_passed`])
+        const stagePassed = stagePassedRaw > 0
+          ? stagePassedRaw
+          : stratCounts[stage] || 0
+
+        // passRatio: prefer stored pass_rate (0-1 fraction from coordinator),
+        // but cross-validate it against the actual counted values.
+        // If pass_rate * stageEvaluated diverges from stagePassed by more
+        // than 10%, the hash is stale from a prior cycle — recompute.
+        const passRatioRaw = parseFloat(dh.pass_rate || "0")
+        const passRatioFromRate = passRatioRaw > 0
+          ? Math.min(100, Math.round(passRatioRaw * 1000) / 10)
+          : 0
+        // Recompute from counted values — always available when stageEvaluated > 0.
+        const passRatioFromCounts = stageEvaluated > 0
+          ? Math.min(100, Math.round((stagePassed / Math.max(stageEvaluated, 1)) * 1000) / 10)
+          : stagePassed > 0 ? 100 : 0
+        // Validate: if pass_rate implies a passed count that differs by >10%
+        // from the actual stagePassed, the stored value is stale.
+        const impliedPassed = passRatioRaw * stageEvaluated
+        const stalePassRate = stageEvaluated > 0 && stagePassed > 0
+          && Math.abs(impliedPassed - stagePassed) / Math.max(stagePassed, 1) > 0.1
+        const passRatio = (passRatioFromRate > 0 && !stalePassRate)
+          ? passRatioFromRate
+          : passRatioFromCounts
 
         // ── Actively-running counts (operator spec) ──
         // `sets_running_now` is written by strategy-coordinator using
@@ -1144,11 +1211,16 @@ export async function GET(
         // an open pseudo-position OR mid-formation this cycle. The
         // dashboard surfaces this as the canonical "Active" count.
         const setsRunningNow  = n(dh.sets_running_now || dh.sets_with_open_positions)
-        const setsProgressing = n(dh.sets_progressing) || createdSets
+        // setsProgressing: how many sets have entries/positions building up.
+        // Fall back to setsRunningNow (sets with open pseudo-positions) NOT
+        // createdSets (lifetime total) — createdSets inflates to 9000+ and is
+        // not meaningful as a "currently progressing" metric.
+        const setsProgressing = n(dh.sets_progressing) || setsRunningNow || stratCounts[stage] || 0
 
         stratDetail[stage] = {
           avgPosPerSet:        isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100      : 0,
           createdSets,
+          entriesCount:        n(dh.entries_total || dh.entries_count),
           avgProfitFactor:     isFinite(avgProfitFactor) ? Math.round(avgProfitFactor * 1000) / 1000 : 0,
           avgProcessingTimeMs: isFinite(avgProcessingMs) ? Math.round(avgProcessingMs * 10) / 10     : 0,
           avgPosEvalReal:      isFinite(avgPosEvalReal)  ? Math.round(avgPosEvalReal * 1000) / 1000  : 0,
@@ -1162,16 +1234,93 @@ export async function GET(
           setsRunningNow,
           setsProgressing,
           setsWithOpenPositions: setsRunningNow,
+          // Main stage only: count of axis "additional Pos-Count Sets" created
+          axisSets: stage === "main" ? n(dh.axis_sets || progHash.strategies_main_axis_sets) : 0,
           // Real-only 4-perspective stats (overall/accumulated/general/combined).
           // For non-Real stages the fields are 0 — the dialog only renders
           // the 4-tile panel when stage === "real".
           ...(stage === "real"
-            ? {
-                statOverall:     n(progHash.strategies_real_total),
-                statAccumulated: n(dh.stat_accumulated),
-                statGeneral:     n(dh.stat_general) || createdSets,
-                statCombined:    n(dh.stat_combined) || setsRunningNow,
-              }
+            ? (() => {
+                // Overall = total Real sets produced across all cycles.
+                // Fall back to stratCounts.real (current-cycle output count).
+                // Accumulated = axis position accumulation sum from axis_pos_acc hash.
+                // Written by bumpAxisPosAccumulation in the Real tuner loop.
+                // General = distinct Real sets this cycle (not lifetime createdSets).
+                // Combined = Real sets running now (those with active base set coordination).
+
+                // ── Hedge pos-count accumulation per base Set ─────────────────
+                // Rebuilt from flat `hedge_pos_acc:{conn}` hash fields.
+                // Fields: `{parentSetKey}:{long|short|sets_long|sets_short|ts}`
+                // We aggregate totals and per-base snapshots so the dashboard
+                // can render both a summary (total long/short entries) and the
+                // per-base breakdown (which base Set is most imbalanced).
+                const hedgeByBase = new Map<string, {
+                  long: number; short: number
+                  setsLong: number; setsShort: number
+                  ts: number
+                }>()
+                for (const [field, rawVal] of Object.entries(hedgePosAccHash)) {
+                  const val = Number(rawVal) || 0
+                  const colonIdx = field.lastIndexOf(":")
+                  if (colonIdx === -1) continue
+                  const baseKey = field.slice(0, colonIdx)
+                  const suffix  = field.slice(colonIdx + 1)
+                  let entry = hedgeByBase.get(baseKey)
+                  if (!entry) {
+                    entry = { long: 0, short: 0, setsLong: 0, setsShort: 0, ts: 0 }
+                    hedgeByBase.set(baseKey, entry)
+                  }
+                  if      (suffix === "long")       entry.long      = val
+                  else if (suffix === "short")      entry.short     = val
+                  else if (suffix === "sets_long")  entry.setsLong  = val
+                  else if (suffix === "sets_short") entry.setsShort = val
+                  else if (suffix === "ts")         entry.ts        = val
+                }
+                let hedgeTotalLong = 0, hedgeTotalShort = 0
+                let hedgeTotalSetsLong = 0, hedgeTotalSetsShort = 0
+                const hedgePerBase: Array<{
+                  parentSetKey: string
+                  longEntries: number; shortEntries: number
+                  longSets: number; shortSets: number
+                  net: number; hedgeRatio: number; lastUpdated: number
+                }> = []
+                for (const [parentSetKey, e] of hedgeByBase) {
+                  hedgeTotalLong      += e.long
+                  hedgeTotalShort     += e.short
+                  hedgeTotalSetsLong  += e.setsLong
+                  hedgeTotalSetsShort += e.setsShort
+                  const total = e.long + e.short
+                  hedgePerBase.push({
+                    parentSetKey,
+                    longEntries:  e.long,
+                    shortEntries: e.short,
+                    longSets:     e.setsLong,
+                    shortSets:    e.setsShort,
+                    net:          e.long - e.short,
+                    hedgeRatio:   total > 0 ? Math.abs(e.long - e.short) / total : 0,
+                    lastUpdated:  e.ts,
+                  })
+                }
+                // Sort most-imbalanced first
+                hedgePerBase.sort((a, b) => Math.abs(b.net) - Math.abs(a.net))
+
+                return {
+                  statOverall:     n(progHash.strategies_real_total) || stratCounts.real || 0,
+                  statAccumulated: n(dh.stat_accumulated),
+                  statGeneral:     n(dh.stat_general) || stageEvaluated || stratCounts.real || 0,
+                  statCombined:    n(dh.stat_combined) || setsRunningNow || stratCounts.real || 0,
+                  // ── Hedge pos-count accumulation (long/short per base Set) ──
+                  hedgePosAcc: {
+                    totalLongEntries:  hedgeTotalLong,
+                    totalShortEntries: hedgeTotalShort,
+                    totalLongSets:     hedgeTotalSetsLong,
+                    totalShortSets:    hedgeTotalSetsShort,
+                    netEntries:        hedgeTotalLong - hedgeTotalShort,
+                    baseCount:         hedgeByBase.size,
+                    perBase:           hedgePerBase,
+                  },
+                }
+              })()
             : {}),
         }
       })
@@ -1452,7 +1601,9 @@ export async function GET(
         // `indications_count` key was only written when per-type counts
         // were non-zero on the SAME cycle — a write-order race.
         indicationsTotal: indTotal,
-        strategiesTotal,
+        // Same principle for strategies: use stratTotal (computed from stratCounts.real
+        // and fallback to strategiesTotal) instead of stale progHash value.
+        strategiesTotal: stratTotal,
         positionsOpen,
         // Sets + Positions are the canonical "continuous live progression" anchors
         // the user relies on. These come straight from atomic hincrby writes
@@ -1503,9 +1654,43 @@ export async function GET(
           real: stratCounts.real || 0,
           live: stratCounts.live || 0,
           total: stratTotal,
-          baseEvaluated: stratEvaluated.base || 0,
-          mainEvaluated: stratEvaluated.main || 0,
-          realEvaluated: stratEvaluated.real || 0,
+          baseEvaluated: (() => {
+            // Validate constraint: eval <= sets
+            const base = stratCounts.base || 0
+            const eval_val = stratEvaluated.base || 0
+            if (eval_val > base && base > 0) {
+              console.warn(
+                `[STATS-VALIDATION] ${connectionId}: baseEvaluated (${eval_val}) > base (${base}). ` +
+                `Clamping to base.`,
+              )
+              return base
+            }
+            return eval_val
+          })(),
+          mainEvaluated: (() => {
+            const main = stratCounts.main || 0
+            const eval_val = stratEvaluated.main || 0
+            if (eval_val > main && main > 0) {
+              console.warn(
+                `[STATS-VALIDATION] ${connectionId}: mainEvaluated (${eval_val}) > main (${main}). ` +
+                `Clamping to main.`,
+              )
+              return main
+            }
+            return eval_val
+          })(),
+          realEvaluated: (() => {
+            const real = stratCounts.real || 0
+            const eval_val = stratEvaluated.real || 0
+            if (eval_val > real && real > 0) {
+              console.warn(
+                `[STATS-VALIDATION] ${connectionId}: realEvaluated (${eval_val}) > real (${real}). ` +
+                `Clamping to real.`,
+              )
+              return real
+            }
+            return eval_val
+          })(),
         },
       },
 
@@ -1580,48 +1765,60 @@ export async function GET(
         },
         strategies: (() => {
           // ── Actively-running per stage (operator spec) ─────────────
-          // Source of truth: `strategy_detail:{conn}:{stage}` ->
-          // `sets_running_now`, written by strategy-coordinator using
-          // membership in `pseudo_positions:{conn}:active_config_keys`.
-          // This is what the dashboard MUST show — already-progressed
-          // Sets that have since closed are intentionally excluded.
-          //
-          // Fallback: when the detail hash hasn't been written yet
-          // (fresh cycle, first symbol still processing), we use the
-          // (symbol, stage) presence count as a best-effort estimate.
-          const baseRun  = n(stratDetail.base?.setsRunningNow)  || activeSetsStratByStage.base || 0
-          const mainRun  = n(stratDetail.main?.setsRunningNow)  || activeSetsStratByStage.main || 0
-          const realRun  = n(stratDetail.real?.setsRunningNow)  || activeSetsStratByStage.real || 0
-          const liveRun  = n(stratDetail.live?.setsRunningNow)  || pseudoRunningSets || 0
-          // Pipeline-aware total: same logical Set exists at multiple
-          // stages (mirroring principle). The "deepest-active" count
-          // is the canonical aggregate — Live ⊂ Real ⊂ Main ⊂ Base.
-          // Surface the maximum of the four to avoid double-counting.
-          const totalRun = Math.max(baseRun, mainRun, realRun, liveRun)
+          // Source of truth: `strategy_detail:{conn}:{stage}.sets_running_now`,
+          // written by strategy-coordinator each cycle using parent-base
+          // active_config_keys membership. Fallback only to the per-symbol
+          // presence count — never fall back to total-ever-created (stratCounts)
+          // which would inflate the figure to thousands when nothing is running.
+          const baseRun = n(stratDetail.base?.setsRunningNow) || activeSetsStratByStage.base || 0
+          const mainRun = n(stratDetail.main?.setsRunningNow) || activeSetsStratByStage.main || 0
+          const realRun = n(stratDetail.real?.setsRunningNow) || activeSetsStratByStage.real || 0
+          const liveRun = n(stratDetail.live?.setsRunningNow) || pseudoRunningSets || 0
+
+          // Cascade: each downstream stage is a subset — cap child ≤ parent.
+          const cappedMain = Math.min(mainRun, stratCounts.main || mainRun)
+          const cappedReal = Math.min(realRun, cappedMain)
+          const cappedLive = Math.min(liveRun, cappedReal)
+
+          const livePositions = Math.max(
+            0,
+            n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
+            Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count)),
+          )
+
+          // Pipeline-aware total — the deepest active stage is canonical.
+          const totalRun = Math.max(baseRun, cappedMain, cappedReal, cappedLive)
+
+          // positions semantics per stage:
+          //   base/main: how many sets have open pseudo-positions (evaluation stage).
+          //              pseudoRunningSets = scard(active_config_keys) = ground truth.
+          //              Fall back to pseudoOpen (individual position objects count).
+          //   real:      promoted sets currently active — realOpen from real:position:*
+          //              keys is ground truth. Do NOT fall back to stratCounts.real
+          //              (that is 1920 = total-ever-created, not open positions).
+          //              Fall back to setsRunningNow (active coordination count)
+          //              which is a tight upper bound on truly-open real positions.
+          //   live:      actual exchange positions (created − closed + unfilled orders).
+          const baseMainPos = pseudoRunningSets || pseudoOpen
+          // Use setsRunningNow from the Real stage detail (already collected
+          // in the stage loop above) as the fallback — it is the count of
+          // Real Sets that are actively coordinating, which is the correct
+          // semantic for "open real positions" when realOpen=0.
+          const realDetailRunning = n(stratDetail.real?.setsRunningNow)
+          const realPos = realOpen || realDetailRunning || 0
           return {
-            base: { sets: baseRun, trackings: stratCounts.base || 0, positions: pseudoOpen },
-            main: { sets: mainRun, trackings: stratCounts.main || 0, positions: pseudoOpen },
-            real: { sets: realRun, trackings: stratCounts.real || 0, positions: realOpen },
+            base: { sets: baseRun,    trackings: stratCounts.base || 0, positions: baseMainPos },
+            main: { sets: cappedMain, trackings: stratCounts.main || 0, positions: baseMainPos },
+            real: { sets: cappedReal, trackings: stratCounts.real || 0, positions: realPos },
             live: {
-              // Live's "running" = distinct Sets currently feeding
-              // exchange orders (== pseudoRunningSets when detail hash
-              // is empty).
-              sets:      liveRun,
+              sets:      cappedLive,
               trackings: stratCounts.live || 0,
-              positions: Math.max(
-                0,
-                n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
-                Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count)),
-              ),
+              positions: livePositions,
             },
             total: {
               sets:      totalRun,
               trackings: stratTotal,
-              // Open positions are NOT summed across stages (mirroring
-              // principle — same logical position exists at multiple
-              // stages). Use the deepest-active stage as the canonical
-              // "currently-progressing" total.
-              positions: Math.max(pseudoOpen, realOpen),
+              positions: Math.max(baseMainPos, realPos, livePositions),
             },
           }
         })(),
@@ -1733,7 +1930,7 @@ export async function GET(
       // pipeline (see lib/trade-engine/stages/live-stage.ts). Every stage of
       // the pipeline increments one of these so the UI can show a real-time
       // picture of exchange-level activity.
-      // ── OPEN POSITIONS & ACCUMULATED VOLUME ─────────────────────────────
+      // ── OPEN POSITIONS & ACCUMULATED VOLUME ───────��─────────────────────
       // Snapshot of every "currently holding exposure" layer of the
       // mirroring pipeline. CRITICAL semantics — pseudo/real/live are
       // NOT independent pools: they represent the SAME trading signal
@@ -1763,6 +1960,9 @@ export async function GET(
       //     `live.positions[].mirroredSets` array carries those
       //     equivalent Sets so the UI can render "N Sets → 1 Order".
       openPositions: (() => {
+        const pseudoOpen = Math.max(0, n(progHash.pseudo_positions_created_count))
+        const mainOpen = Math.max(0, n(progHash.main_positions_created_count))
+        const realOpen = Math.max(0, n(progHash.real_positions_created_count))
         const liveOpen = Math.max(
           0,
           n(progHash.live_positions_created_count) -

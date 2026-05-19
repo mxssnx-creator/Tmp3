@@ -158,6 +158,28 @@ async function fetchRealMarketData(
  * Fetches REAL data from exchanges, falls back to synthetic only on failure
  */
 export async function loadMarketDataForEngine(symbols: string[] = []): Promise<number> {
+  // ── Dev-mode optimization: skip cold-boot loading if already cached ──
+  // In Next.js dev mode, module reloads and hot-reload cause repeated
+  // calls to loadMarketDataForEngine. Each call fetches 86k candles per
+  // symbol from exchange APIs, bloating heap and hammering rate limits.
+  // Check if data is already resident; reuse existing candles.
+  try {
+    await initRedis()
+    const client = getClient()
+    const isDev = process.env.NODE_ENV === "development"
+    
+    if (isDev) {
+      const checkKey = `market_data:BTCUSDT:1s`
+      const existing = await client.get(checkKey)
+      if (existing) {
+        console.log(`[v0] [MarketData] Dev-mode: data already cached, skipping reload`)
+        return 0 // Already loaded in this dev session
+      }
+    }
+  } catch (_) {
+    // Proceed normally if the check fails
+  }
+  
   try {
     await initRedis()
     const client = getClient()

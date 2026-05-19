@@ -117,7 +117,16 @@ function fmt(n: number) {
 
 function pct(a: number, b: number) {
   if (!b) return "0%"
-  return `${Math.round((a / b) * 100)}%`
+  return `${Math.min(100, Math.round((a / b) * 100))}%`
+}
+
+// For expansion stages (Base→Main) where a >> b, show a multiplier instead of
+// a percentage that would display as "48100%". Returns e.g. "481×" or "100%".
+function ratio(a: number, b: number) {
+  if (!b || !a) return undefined
+  const r = a / b
+  if (r > 1.5) return `${Math.round(r)}× Base`   // expansion: show multiplier
+  return `${Math.min(100, Math.round(r * 100))}% of Base`
 }
 
 function StatCell({ label, value, sub, accent }: { label: string; value: string; sub?: string; accent?: string }) {
@@ -149,7 +158,10 @@ function StratSection({
   //   - X = evaluated (actually: passed at this stage)
   //   - Y = evaluatedOf (the parent stage's output / this stage's input)
   //   - Z = (X / Y) × 100%
-  const evalPct = evaluatedOf > 0 ? Math.round((evaluated / evaluatedOf) * 1000) / 10 : (detail?.evalPct ?? 0)
+  // Cap at 100: Main is an expansion stage (1 base → many main variants),
+  // so evaluated/evaluatedOf can be >>1. Progress bars and percentages
+  // should never display >100% — the expansion is captured in the raw count.
+  const evalPct = Math.min(100, evaluatedOf > 0 ? Math.round((evaluated / evaluatedOf) * 1000) / 10 : (detail?.evalPct ?? 0))
 
   return (
     <div className={`rounded-md border p-2.5 space-y-2 ${bgCls}`}>
@@ -517,7 +529,7 @@ export function QuickstartOverviewDialog() {
               <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
                 <StatCell label="Base" value={fmt(bd?.strategies.base || 0)} accent="text-orange-600 dark:text-orange-400" />
                 <StatCell label="Main" value={fmt(bd?.strategies.main || 0)} accent="text-yellow-600 dark:text-yellow-400"
-                  sub={bd?.strategies.base ? `${pct(bd.strategies.main, bd.strategies.base)} of Base` : undefined}
+                  sub={bd?.strategies.base ? ratio(bd.strategies.main, bd.strategies.base) : undefined}
                 />
                 <StatCell label="Real" value={fmt(bd?.strategies.real || 0)} accent="text-green-600 dark:text-green-400"
                   sub={bd?.strategies.main ? `${pct(bd.strategies.real, bd.strategies.main)} of Main` : undefined}

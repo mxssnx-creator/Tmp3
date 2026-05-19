@@ -390,7 +390,12 @@ async function tryAcquireLock(
   connectionId: string,
   symbol: string,
   direction: "long" | "short",
-  ttlSeconds = 300,
+  // 30 s gives ample time for the full exchange pipeline (place +
+  // fill-poll + SL/TP ≈ 5-15 s p99) while self-clearing quickly on
+  // crashes so the next cycle can retry within one minute.
+  // The previous 300 s default blocked the slot for 5 minutes on a
+  // crash — unacceptable with a 50 ms cycle cadence and 10+ symbols.
+  ttlSeconds = 30,
 ): Promise<boolean> {
   try {
     const client = getRedisClient()
@@ -420,7 +425,7 @@ async function refreshLockTTL(
   connectionId: string,
   symbol: string,
   direction: "long" | "short",
-  ttlSeconds = 300,
+  ttlSeconds = 30,
 ): Promise<void> {
   try {
     const client = getRedisClient()
@@ -5371,6 +5376,14 @@ export async function syncLiveFromPseudo(
   exchangeConnector: any,
 ): Promise<void> {
   try {
+    // ── System tracking validation ──
+    // Only sync positions created by this system. Skip foreign/manual orders.
+    const trackingId = String(pseudoPos?.system_tracking_id || "").trim()
+    if (!trackingId.startsWith("sys-") || trackingId.length <= 10) {
+      // Silent skip - don't log every foreign position on every tick
+      return
+    }
+
     const symbol = String(pseudoPos?.symbol || "").toUpperCase()
     const side: "long" | "short" = pseudoPos?.side === "short" ? "short" : "long"
     if (!symbol) return

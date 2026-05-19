@@ -49,7 +49,7 @@ export function ConnectionEditDialog({ isOpen, connection, onClose, onSave }: Co
     margin_type: "cross",
     position_mode: "hedge",
     is_testnet: false,
-    volume_factor: 1.0,
+    volume_factor: 0.1,
   })
 
   const [activeTab, setActiveTab] = useState("basic")

@@ -194,7 +194,7 @@ import {
  *   • cause the per-cycle deadline to fire even though no single task
  *     was hung — the whole batch was just queued behind itself
  *
- * Capping concurrency at 16 keeps p99 cycle latency stable across watchlist
+ * Capping concurrency at 32 keeps p99 cycle latency stable across watchlist
  * sizes from 1 to a few hundred symbols. The cap is intentionally
  * larger than typical symbol counts (most operators run 1–25) so the
  * common case still runs fully in parallel; the cap only kicks in for
@@ -203,7 +203,7 @@ import {
  * If a future operator runs hundreds of symbols and the cap becomes the
  * bottleneck, expose this as a setting — but don't remove the cap.
  */
-const SYMBOL_CONCURRENCY = 16
+const SYMBOL_CONCURRENCY = 32
 
 /**
  * Per-cycle hard deadline (ms) for engine processor ticks.
@@ -1535,6 +1535,7 @@ export class TradeEngineManager {
           indication: this.indicationProcessor,
           strategy: this.strategyProcessor,
           realtime: this.realtimeProcessor,
+          liveStage: require("./stages/live-stage"),
         }
         const pipelineResults = await withCycleDeadline(
           mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, (symbol) =>

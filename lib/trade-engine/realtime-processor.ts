@@ -520,6 +520,14 @@ export class RealtimeProcessor {
    */
   private async processPosition(position: any, prehistoricReady: boolean): Promise<void> {
     try {
+      // ── System tracking validation ──
+      // Only process positions created by this system. Skip foreign/manual orders.
+      const trackingId = String(position?.system_tracking_id || "").trim()
+      if (!trackingId.startsWith("sys-") || trackingId.length <= 10) {
+        // Silent skip for foreign positions - don't pollute logs with every tick
+        return
+      }
+
       // Phase A is the critical path — always kick off the price fetch.
       // Phase B (prev-set) only fires when prehistoric is ready, and
       // runs in parallel with the price fetch to avoid sequential
@@ -979,7 +987,7 @@ export class RealtimeProcessor {
       //
       // This is the single most important fix for the operator's
       // recurring "Live Positions are Still not getting closed"
-      // complaint on paper-mode connections — every other close path
+      // complaint on paper-mode connections ��� every other close path
       // was gated on having a working exchange connector, so paper
       // simulated positions accumulated unboundedly.
       //

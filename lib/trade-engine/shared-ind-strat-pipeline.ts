@@ -80,6 +80,115 @@ export interface PipelineDeps {
   asOfMs?: number
   asOfCandle?: any
   setsProcessor?: IndicationSetsProcessor
+  /** Live stage exports — contains executeLivePosition for realtime order placement. */
+  liveStage?: any
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Internal: Convert Real Sets to live orders with independent control specs
+// ────────────────────────────────────────────────────────────────────────────
+
+async function executeReadyStrategiesAsLiveOrders(
+  connectionId: string,
+  symbol: string,
+  liveStageExports: any,
+): Promise<void> {
+  try {
+    const { getSettings, setSettings } = await import("@/lib/redis-db")
+    const { executeLivePosition } = liveStageExports
+
+    // Retrieve Real Sets that are ready for live trading
+    const realKey = `strategies:${connectionId}:${symbol}:real:sets`
+    const stored = await getSettings(realKey)
+    const realSets = stored?.sets || []
+
+    console.log(`[v0] [Phase4] ${symbol}: realSets.length=${realSets.length}`)
+
+    if (realSets.length === 0) return
+
+    // Create mock exchange connector for testing/development
+    // In production, this would be a real exchange API connector
+    const exchangeConnector = {
+      placeOrder: async (symbol: string, direction: string, quantity: number, params: any) => {
+        console.log(`[v0] [Phase4] Mock placeOrder: ${symbol} ${direction} qty=${quantity}`)
+        return { orderId: `mock:${Date.now()}`, status: "filled" }
+      },
+      setLeverage: async (symbol: string, leverage: number) => {
+        console.log(`[v0] [Phase4] Mock setLeverage: ${symbol} lev=${leverage}`)
+        return { symbol, leverage }
+      },
+      getPosition: async (symbol: string) => {
+        return { symbol, size: 0 }
+      },
+      closePosition: async (symbol: string, direction: string) => {
+        console.log(`[v0] [Phase4] Mock closePosition: ${symbol} ${direction}`)
+        return { status: "closed" }
+      },
+    }
+
+    // Track execution statistics for monitoring
+    let createdCount = 0
+    let failedCount = 0
+    let totalEntries = 0
+
+    // Convert each Real Set entry to an independent live order
+    for (const realSet of realSets) {
+      const entries = realSet.entries || []
+      totalEntries += entries.length
+      console.log(`[v0] [Phase4] ${symbol}: realSet=${realSet.setKey} entries=${entries.length}`)
+      
+      if (!entries || entries.length === 0) continue
+
+      for (const entry of entries) {
+        try {
+          const realPosition = {
+            id: `real:${connectionId}:${symbol}:${realSet.setKey}:${entry.id}:${Date.now()}`,
+            connectionId,
+            symbol,
+            direction: realSet.direction || "long",
+            quantity: Math.max(0.1, entry.sizeMultiplier || 1.0),
+            entryPrice: 0,
+            leverage: Math.max(1, Math.min(20, entry.leverage || 1)),
+            stopLoss: realSet.stopLoss,
+            takeProfit: realSet.takeProfit,
+            trailingStop: realSet.trailingStop,
+            trailingStepSize: realSet.trailingStepSize,
+            maxHoldTime: realSet.maxHoldTime,
+            setKey: realSet.setKey,
+            parentSetKey: realSet.parentSetKey,
+            variant: realSet.variant,
+            axisWindows: realSet.axisWindows,
+            entryConfidence: entry.confidence,
+            entryProfitFactor: entry.profitFactor,
+          }
+
+          const livePos = await executeLivePosition(connectionId, realPosition, exchangeConnector)
+          console.log(`[v0] [Phase4] ${symbol}: created livePos status=${livePos?.status}`)
+          
+          if (livePos?.status === "filled" || livePos?.status === "placed") {
+            createdCount++
+          } else {
+            failedCount++
+          }
+        } catch (err) {
+          failedCount++
+          console.error(`[v0] [Phase4] ${symbol}: error=${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+    }
+
+    console.log(`[v0] [Phase4] ${symbol}: total=${totalEntries} created=${createdCount} failed=${failedCount}`)
+
+    if (createdCount > 0) {
+      await setSettings(`live_execution:${connectionId}:${symbol}:latest`, {
+        timestamp: new Date().toISOString(),
+        created: createdCount,
+        failed: failedCount,
+      }).catch(() => {})
+    }
+  } catch (err) {
+    console.error(`[v0] [Phase4] error: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 /**
@@ -169,6 +278,18 @@ export async function runIndStratCycle(
         })
       result.strategiesEvaluated = stratResult.strategiesEvaluated || 0
       result.liveReady = stratResult.liveReady || 0
+
+      // ── Phase 4: Execute ready Real Sets as live orders (realtime only) ──
+      if (mode === "realtime" && result.liveReady > 0 && deps?.liveStage) {
+        try {
+          await executeReadyStrategiesAsLiveOrders(connectionId, symbol, deps.liveStage)
+        } catch (err) {
+          console.error(
+            `[v0] [SharedPipeline] Live order execution error:`,
+            err instanceof Error ? err.message : String(err),
+          )
+        }
+      }
     }
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err)

@@ -3,7 +3,7 @@ import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { initRedis, getAllConnections, getSettings } from "@/lib/redis-db"
 import { SystemLogger } from "@/lib/system-logger"
 
-export async function GET() {
+async function handleStartAll() {
   try {
     const coordinator = getGlobalTradeEngineCoordinator()
     
@@ -55,6 +55,21 @@ export async function GET() {
 
     for (const connection of activeConnections) {
       try {
+        // Reset evaluated counters for fresh start
+        const redis = await initRedis()
+        const evalKeys = [
+          `strategies:${connection.id}:base:evaluated`,
+          `strategies:${connection.id}:main:evaluated`,
+          `strategies:${connection.id}:real:evaluated`,
+        ]
+        for (const key of evalKeys) {
+          try {
+            await redis.del(key)
+          } catch (delErr) {
+            console.warn(`[START-ALL] Failed to delete ${key}:`, delErr)
+          }
+        }
+
         await coordinator.startEngine(connection.id, {
           connectionId: connection.id,
           indicationInterval,
@@ -102,4 +117,12 @@ export async function GET() {
       { status: 500 }
     )
   }
+}
+
+export async function GET() {
+  return handleStartAll()
+}
+
+export async function POST() {
+  return handleStartAll()
 }
