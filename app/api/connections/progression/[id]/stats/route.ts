@@ -366,9 +366,10 @@ export async function GET(
       ) || 0
     } catch { /* non-critical */ }
 
-    // Back-compat: the historic `positionsOpen` field always referred
-    // to the pseudo total, so keep that contract.
-    const positionsOpen = pseudoOpen
+    // Back-compat: the historic `positionsOpen` field counts total open positions
+    // across all pipeline stages: pseudo (evaluation) + real (promotion) + live (execution).
+    // This gives operators visibility into "how many strategies currently have positions".
+    let positionsOpen = pseudoOpen
 
     // Top-5 per-Set rollup sorted by POSITION COUNT — pseudo positions
     // are evaluation-stage exposure, not real money, so sorting by count
@@ -400,7 +401,7 @@ export async function GET(
       Array<{ realPositionId: string }>
     >()
     try {
-      const realKeys = await client.keys(`real:position:real:${connectionId}:*`)
+      const realKeys = await client.keys(`real:position:*`)
       if (realKeys.length > 0) {
         const caps = realKeys.slice(0, 500)
         const raws = await Promise.all(
@@ -410,6 +411,8 @@ export async function GET(
           if (!raw) continue
           try {
             const pos = JSON.parse(raw as string)
+            // Filter by this connection only (pos object contains connectionId field)
+            if (pos.connectionId !== connectionId) continue
             if (pos.status === "closed") continue
             realOpen++
             // Index for live position join (fallback path)
@@ -688,6 +691,9 @@ export async function GET(
     // by a few seconds. These scan-derived values are the authoritative
     // "right now" view for the coordination UI.
     const liveOpenScanned = livePositionSetRelations.length
+    
+    // Update total positions count to include all stages: pseudo + real + live
+    positionsOpen = pseudoOpen + realOpen + liveOpenScanned
     const liveResolvedViaPseudo = livePositionSetRelations.filter(
       (p) => p.resolution === "pseudo",
     ).length
