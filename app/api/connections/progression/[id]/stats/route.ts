@@ -865,6 +865,14 @@ export async function GET(
     const activeSetsStratByStage: Record<string, number> = {
       base: 0, main: 0, real: 0, live: 0,
     }
+    // Cross-symbol evaluated counts — summed from strategies_active hash
+    // `:evaluated` suffix fields written by the engine. Using the same
+    // hash and same summing loop as stratCounts ensures both numerator
+    // and denominator are in the same (cross-symbol) scope, preventing
+    // the STATS-VALIDATION "baseEvaluated > base" false positives that
+    // occurred when a single-symbol standalone key was compared against
+    // the cross-symbol active sum.
+    const activeStratEvaluated: Record<string, number> = { base: 0, main: 0, real: 0 }
     try {
       const [indActiveHash, stratActiveHash] = await Promise.all([
         client.hgetall(`indications_active:${connectionId}`).catch(() => null),
@@ -891,11 +899,19 @@ export async function GET(
         for (const [field, val] of Object.entries(stratActiveHash)) {
           const idx = field.lastIndexOf(":")
           if (idx <= 0) continue
-          const stage = field.slice(idx + 1)
+          const suffix = field.slice(idx + 1)   // e.g. "base", "main", "real", "base:evaluated"
           const numVal = n(val)
-          if (stage in activeStratByStage) {
-            activeStratByStage[stage] += numVal
-            if (numVal > 0) activeSetsStratByStage[stage] += 1
+          // Fields ending in ":evaluated" are written by the engine to give cross-symbol
+          // evaluated counts in the same scope as the stage counts. Aggregate them into
+          // stratEvaluated so the STATS-VALIDATION check compares apples to apples.
+          if (suffix === "base:evaluated" || suffix === "main:evaluated" || suffix === "real:evaluated") {
+            const stage = suffix.replace(":evaluated", "") as "base" | "main" | "real"
+            activeStratEvaluated[stage] = (activeStratEvaluated[stage] ?? 0) + numVal
+            continue
+          }
+          if (suffix in activeStratByStage) {
+            activeStratByStage[suffix] += numVal
+            if (numVal > 0) activeSetsStratByStage[suffix] += 1
           }
         }
       }
@@ -941,9 +957,12 @@ export async function GET(
         stratCounts[type] = fromActive > 0 ? fromActive
                           : fromKey   > 0 ? fromKey
                           : 0
-        // Standalone key is last-symbol-wins current count. Cumulative hash field
-        // (strategies_{type}_evaluated) is intentionally ignored here.
-        stratEvaluated[type] = n(evalFromKeyRaw)
+        // Prefer cross-symbol activeStratEvaluated (from strategies_active hash
+        // `:evaluated` suffix fields) so the denominator matches stratCounts[type]
+        // scope. Fall back to the last-symbol-wins standalone key only when the
+        // active hash hasn't been written yet (cold start / old engine version).
+        const fromActiveEval = activeStratEvaluated[type] ?? 0
+        stratEvaluated[type] = fromActiveEval > 0 ? fromActiveEval : n(evalFromKeyRaw)
       })
     )
     // ── Pipeline-aware "total strategies" ────────────────────────────────
@@ -1157,7 +1176,7 @@ export async function GET(
           evalPct = Math.min(100, Math.round(raw * 10) / 10)
         }
 
-        // ── evaluated / passed / passRatio ────────────────────────────
+        // ── evaluated / passed / passRatio ───���────────────────────────
         // Source priority:
         //   1. Per-symbol cross-sum (symEvaluated / symPassed) when fresh.
         //   2. Legacy dh.evaluated / dh.passed_sets — only trust when > 1
@@ -1503,7 +1522,7 @@ export async function GET(
     let redisDbEntries = 0
     try { redisDbEntries = await client.dbSize() } catch { /* non-critical */ }
 
-    // ── Build response ─────────────────────────────────────────────���─────────
+    // ── Build response ─────────────────────────────────────────────�����─────────
     return NextResponse.json({
       success: true,
       connectionId,
