@@ -1652,10 +1652,13 @@ export class StrategyCoordinator {
           avg_profit_factor: String(mainAvgPF.toFixed(4)),
           avg_drawdown_time: String(Math.round(mainAvgDDT)),
           avg_pos_per_set:   String(mainAvgPosPerSet.toFixed(2)),
+          entries_total:     String(mainEntriesTotal),
+          entries_count:     String(mainEntriesTotal),
+          axis_sets:         String(axisSetsAdded),
           evaluated:         String(baseSets.length),
           passed_sets:       String(mainSets.length),
           pass_rate:         String(passRatioMain.toFixed(4)),
-          entries_total:     String(mainEntriesTotal),
+          count_pos_eval:    String(mainSets.length),
           // ── ACTIVELY-RUNNING metrics (operator spec) ──────────────
           //   Main CLONES + FILTERS Base's positions — no new exchange
           //   positions opened. A Main Set is "running" iff its

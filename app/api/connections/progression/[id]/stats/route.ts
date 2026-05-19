@@ -1158,6 +1158,7 @@ export async function GET(
         stratDetail[stage] = {
           avgPosPerSet:        isFinite(avgPosPerSet)    ? Math.round(avgPosPerSet * 100) / 100      : 0,
           createdSets,
+          entriesCount:        n(dh.entries_total || dh.entries_count),
           avgProfitFactor:     isFinite(avgProfitFactor) ? Math.round(avgProfitFactor * 1000) / 1000 : 0,
           avgProcessingTimeMs: isFinite(avgProcessingMs) ? Math.round(avgProcessingMs * 10) / 10     : 0,
           avgPosEvalReal:      isFinite(avgPosEvalReal)  ? Math.round(avgPosEvalReal * 1000) / 1000  : 0,
@@ -1171,6 +1172,8 @@ export async function GET(
           setsRunningNow,
           setsProgressing,
           setsWithOpenPositions: setsRunningNow,
+          // Main stage only: count of axis "additional Pos-Count Sets" created
+          axisSets: stage === "main" ? n(dh.axis_sets || progHash.strategies_main_axis_sets) : 0,
           // Real-only 4-perspective stats (overall/accumulated/general/combined).
           // For non-Real stages the fields are 0 — the dialog only renders
           // the 4-tile panel when stage === "real".
