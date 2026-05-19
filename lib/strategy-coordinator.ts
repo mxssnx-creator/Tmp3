@@ -1407,12 +1407,12 @@ export class StrategyCoordinator {
       const histCount    = baseSet.prevPos?.count ?? 0
       const setPosCount  = Math.max(liveCount, histCount)
       
-      // Check if we have sufficient history (default mainEvalPosCount = 15)
+      // Check if we have sufficient history (default mainMinPos = 15)
       const hasHistoricData = histCount > 0
-      if (hasHistoricData && histCount < mainEvalPosCount) {
+      if (hasHistoricData && histCount < mainMinPos) {
         // Mark as invalid with reason, but keep in map so it can be re-evaluated later
         baseSet.status = "invalid"
-        baseSet.rejectionReason = `insufficient_history: ${histCount}/${mainEvalPosCount}`
+        baseSet.rejectionReason = `insufficient_history: ${histCount}/${mainMinPos}`
         skippedLowPos++
         continue
       }
@@ -1959,11 +1959,9 @@ export class StrategyCoordinator {
         return s
       }
       return s
-    }).filter((s) => {
-      // Only pass eligible sets to next stage (for logging purposes)
-      return (s.status !== "invalid" || (s.entryCount ?? s.entries?.length ?? 0) > 0)
     })
-    const skippedRealLowPos = beforePosGate - mainSetsEligible.length
+    // Don't filter out - keep all sets including marked-invalid ones for re-evaluation
+    const skippedRealLowPos = mainSetsEligible.filter(s => s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")).length
     if (skippedRealLowPos > 0) {
       logProgressionEvent(
         this.connectionId,
@@ -1979,6 +1977,11 @@ export class StrategyCoordinator {
     // Mark status on mainSetsEligible for efficient tracking
     const realQualifying = mainSetsEligible.filter(
       (s) => {
+        // Skip already-marked invalid (insufficient positions)
+        if (s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")) {
+          return false
+        }
+        
         const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
                       s.avgDrawdownTime <= metrics.maxDrawdownTime
         if (passes) {
