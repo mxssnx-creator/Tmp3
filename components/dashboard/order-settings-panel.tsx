@@ -24,7 +24,7 @@ interface OrderSettingsPanelProps {
 
 export function OrderSettingsPanel({
   orderType,
-  marketSettings = { slippageTolerance: 1, autoExecution: true },
+  marketSettings = { slippageTolerance: 3, autoExecution: true },
   limitSettings = { priceOffset: 0.5, timeoutSeconds: 300 },
   onMarketSettingsChange,
   onLimitSettingsChange,
@@ -51,9 +51,9 @@ export function OrderSettingsPanel({
                 onValueChange={(value) =>
                   onMarketSettingsChange?.({ ...marketSettings, slippageTolerance: value[0] })
                 }
-                min={0.1}
-                max={5}
-                step={0.1}
+                min={0.5}
+                max={10}
+                step={0.5}
                 className="w-full"
               />
               <p className="text-xs text-muted-foreground">
