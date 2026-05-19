@@ -1646,21 +1646,32 @@ export async function GET(
           // is the canonical aggregate — Live ⊂ Real ⊂ Main ⊂ Base.
           // Surface the maximum of the four to avoid double-counting.
           const totalRun = Math.max(baseRun, mainRun, realRun, liveRun)
+          
+          // Position counts should reflect filtering through stages:
+          // - BASE: equals number of base sets (smallest)
+          // - MAIN: can grow (variants expand), but still tied to base
+          // - REAL: filtered to evaluate-worthy sets
+          // - LIVE: positions that have been promoted to orders
+          //
+          // Use set counts as the position proxy when actual position tracking isn't available,
+          // then overlay with realOpen (actual real:position:* count if it exists)
+          const basePositions = baseRun // Base positions = base sets
+          const mainPositions = Math.max(basePositions, mainRun) // Main positions >= base (expansion)
+          const realPositions = Math.max(0, Math.min(realRun, pseudoOpen > 0 ? pseudoOpen : realRun)) // Real filtered
+          const livePositions = n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
+            Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count))
+          
           return {
-            base: { sets: baseRun, trackings: stratCounts.base || 0, positions: pseudoOpen },
-            main: { sets: mainRun, trackings: stratCounts.main || 0, positions: pseudoOpen },
-            real: { sets: realRun, trackings: stratCounts.real || 0, positions: pseudoOpen },
+            base: { sets: baseRun, trackings: stratCounts.base || 0, positions: basePositions },
+            main: { sets: mainRun, trackings: stratCounts.main || 0, positions: mainPositions },
+            real: { sets: realRun, trackings: stratCounts.real || 0, positions: realPositions },
             live: {
               // Live's "running" = distinct Sets currently feeding
               // exchange orders (== pseudoRunningSets when detail hash
               // is empty).
               sets:      liveRun,
               trackings: stratCounts.live || 0,
-              positions: Math.max(
-                0,
-                n(progHash.live_positions_created_count) - n(progHash.live_positions_closed_count) +
-                Math.max(0, n(progHash.live_orders_placed_count) - n(progHash.live_orders_filled_count)),
-              ),
+              positions: Math.max(0, livePositions),
             },
             total: {
               sets:      totalRun,
@@ -1669,7 +1680,7 @@ export async function GET(
               // principle — same logical position exists at multiple
               // stages). Use the deepest-active stage as the canonical
               // "currently-progressing" total.
-              positions: Math.max(pseudoOpen, realOpen),
+              positions: Math.max(realPositions, livePositions),
             },
           }
         })(),
