@@ -2938,19 +2938,44 @@ export class StrategyCoordinator {
           const { exchangeConnectorFactory } = await import("@/lib/exchange-connectors/factory")
           const connector = await exchangeConnectorFactory.getOrCreateConnector(this.connectionId)
           if (connector) {
-            // Dispatch each qualifying set as a live exchange position. The
-            // full pipeline (pre-flight → price fetch → volume calc → leverage
-            // setup → entry order → fill poll → SL/TP → exchange sync → logs
-            // → metrics) is owned by executeLivePosition. We only supply the
-            // strategic inputs (direction, SL/TP %, leverage hint) and let the
-            // pipeline decide the exact quantity and entry price from live
-            // exchange state.
+            // Dispatch live positions. Each pipeline call is heavyweight:
+            // price fetch → volume calc → leverage → order → fill poll →
+            // SL/TP → sync. With 10+ symbols × N qualifying Sets per symbol,
+            // dispatching every Set serially creates a blocking storm that
+            // saturates the cycle budget.
+            //
+            // The dedup lock (live:lock:{conn}:{sym}:{dir}) already enforces
+            // "at most 1 open position per symbol+direction". Every Set beyond
+            // the first that targets the same direction will hit "Dedup lock
+            // held" and still cost 3-5 Redis round-trips (tryAcquireLock +
+            // findOpenLivePositionByDir + savePosition + incrementMetric +
+            // logProgressionEvent) before being deferred.
+            //
+            // Fix: pre-select at most 1 Set per direction (the highest-PF one,
+            // already guaranteed by .sort() above) before calling the pipeline.
+            // Only call executeLivePosition for sets that have a real chance of
+            // acquiring the lock or merging — not for the 49 duplicates that
+            // will always be deferred on the same cycle.
+            //
+            // The qualifying array is already sorted by avgProfitFactor desc.
+            // Walk it once and keep only the first Set seen for each direction.
+            const dispatchSets: StrategySet[] = []
+            {
+              let sawLong  = false
+              let sawShort = false
+              for (const s of qualifying) {
+                if (s.direction === "long"  && !sawLong)  { dispatchSets.push(s); sawLong  = true }
+                if (s.direction === "short" && !sawShort) { dispatchSets.push(s); sawShort = true }
+                if (sawLong && sawShort) break
+              }
+            }
+
             let placed = 0
             let filled = 0
             let rejected = 0
             let errored = 0
 
-            for (const set of qualifying) {
+            for (const set of dispatchSets) {
               try {
                 // Axis Sets are pure-metadata projections (entries=[]).
                 // Hydrate from the parent Real Set when entries is empty so

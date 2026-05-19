@@ -390,7 +390,12 @@ async function tryAcquireLock(
   connectionId: string,
   symbol: string,
   direction: "long" | "short",
-  ttlSeconds = 300,
+  // 30 s gives ample time for the full exchange pipeline (place +
+  // fill-poll + SL/TP ≈ 5-15 s p99) while self-clearing quickly on
+  // crashes so the next cycle can retry within one minute.
+  // The previous 300 s default blocked the slot for 5 minutes on a
+  // crash — unacceptable with a 50 ms cycle cadence and 10+ symbols.
+  ttlSeconds = 30,
 ): Promise<boolean> {
   try {
     const client = getRedisClient()
@@ -420,7 +425,7 @@ async function refreshLockTTL(
   connectionId: string,
   symbol: string,
   direction: "long" | "short",
-  ttlSeconds = 300,
+  ttlSeconds = 30,
 ): Promise<void> {
   try {
     const client = getRedisClient()

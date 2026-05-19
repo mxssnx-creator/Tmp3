@@ -1043,7 +1043,9 @@ export async function GET(
     // Shared shape for base/main/real/live. `Record<string, any>` keeps the
     // structure flexible for tier-specific extras (win rate, total PnL, etc.
     // live only) without needing a discriminated union on every write site.
-    const stratDetail: Record<string, Record<string, number>> = {}
+    // Typed as Record<string, unknown> to allow the Real stage to include
+    // the hedgePosAcc nested object alongside the flat number fields.
+    const stratDetail: Record<string, Record<string, unknown>> = {}
 
     // Track stale-symbol fields for opportunistic pruning. Without this,
     // every symbol ever evaluated (incl. ones removed from the basket
