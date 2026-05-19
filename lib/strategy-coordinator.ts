@@ -1511,7 +1511,7 @@ export class StrategyCoordinator {
     //   prev (PF-filtered) × last (outcome-tagged) × cont × dir
     //
     // Axis Sets are pure projections of the parent default — they
-    // inherit PF / DDT / conf / trailingProfile, carry `entries: []`,
+    // inherit PF / DDT / conf / trailingProfile, carry a synthetic representative entry,
     // and tag `axisWindows.{prev,last,cont,direction,outcome,axisKey}`
     // so Real-stage hedge netting can bucket them by
     // `(symbol × ind × triple × outcome)`.
@@ -1787,9 +1787,10 @@ export class StrategyCoordinator {
         // Per-axis-N entries — "Pos counts" for each axis window, both
         // combined and direction-split (so the dashboard can show long vs
         // short pos-count contribution per window). entryCount is used
-        // because axis Sets carry `entries: []` (pure-metadata projections)
-        // while their position-count semantics are encoded in entryCount
-        // (= baseEC + cont per expandAxisSets spec).
+        // because it reflects the live-capped continuous count
+        // (= baseEC + min(cont, liveCont)) from expandAxisSets — more
+        // accurate than entries.length since axis Sets carry one synthetic
+        // representative entry regardless of the bucket's cont window size.
         const ec = set.entryCount || 0
         if (ec > 0) {
           axisIncrements[`prev_${aw.prev}_pos`]   = (axisIncrements[`prev_${aw.prev}_pos`]   || 0) + ec
@@ -2033,7 +2034,7 @@ export class StrategyCoordinator {
     // and not promoted to Real, but kept in map for re-evaluation on subsequent
     // cycles once entryCount accumulates. Default 10.
     //
-    // CRITICAL FIX: For NEW systems with no history (baseEC=0, liveCont=0),
+    // For NEW systems with no history (baseEC=0, liveCont=0),
     // don't reject sets purely on entryCount. If a set has at least 1 synthetic
     // entry (axis Sets always have entries for synthetic tracking), it should
     // pass the gate and be evaluated on PF/DDT merit. This allows fresh
@@ -2185,16 +2186,30 @@ export class StrategyCoordinator {
       netTargetWrites[bucketKey] = `${winnerDir}:${remainder}`
     }
 
-    const realPostHedge = [...passthrough, ...netted, ...axisPassthrough].sort(
+    // `netted` already contains BOTH:
+    //   (1) profile-variant Sets without axisWindows (direct pass-through at line 2160)
+    //   (2) hedge-bucket survivors (winnerPool.slice(0, remainder) at line 2183)
+    // Using `[...passthrough, ...netted, ...]` would double-count every Set that
+    // entered a hedge bucket AND survived — it appears in passthrough (input to
+    // bucketing) and again in netted (winning output). Correct form uses netted only.
+    const realPostHedge = [...netted, ...axisPassthrough].sort(
       (a, b) => b.avgProfitFactor - a.avgProfitFactor,
     )
 
     if (hedgeBuckets.size > 0) {
-      console.log(
-        `[v0] [StrategyFlow] ${symbol} REAL hedge-net: ${hedgeBuckets.size} buckets, ` +
-        `${netted.length} survivors (+ ${passthrough.length} passthrough), ` +
-        `${netCancelled} axis Sets cancelled out`,
-      )
+      logProgressionEvent(
+        this.connectionId,
+        "real_stage",
+        "debug",
+        `${symbol} REAL hedge-net: ${hedgeBuckets.size} buckets, ${netted.length} survivors, ${netCancelled} profile-variant pairs cancelled`,
+        {
+          symbol,
+          buckets:   hedgeBuckets.size,
+          survivors: netted.length,
+          cancelled: netCancelled,
+          axis:      axisPassthrough.length,
+        },
+      ).catch(() => {})
     }
 
     // Resolve the cap with this precedence:
@@ -3588,8 +3603,8 @@ export class StrategyCoordinator {
 
     // ── Inherited quality fields used for the synthetic representative entry ─
     // The Real-stage tuner walks `set.entries` to mutate sizeMultiplier /
-    // leverage per-cycle. Axis Sets used to ship empty `entries: []`,
-    // making the tuner a no-op and the variant aggregates count zero.
+    // leverage per-cycle. Axis Sets now carry one synthetic representative
+    // entry so the tuner fires and variant aggregates count correctly.
     // Per spec ("ongoing continuous count of Pis to be added, counted
     // onto the new sets") each axis Set gets ONE faithful pos-coord
     // projection inherited from the parent Base default — flagged with
