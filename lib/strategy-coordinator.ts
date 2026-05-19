@@ -833,21 +833,25 @@ export class StrategyCoordinator {
       // STAGE 1: BASE — one Set per (indication_type × direction)
       const { result: baseResult, sets: baseSets } = await this.createBaseSets(symbol, indications)
       results.push(baseResult)
+      console.log(`[v0] [evaluating data] ${symbol} BASE: ${baseSets.length} sets created from ${indications.length} indications`)
 
       // STAGE 2: MAIN — validate Base Sets AND create additional related
       // variant Sets (Default / Trailing / Block / DCA) gated by posCtx.
       const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx)
       results.push(mainResult)
+      console.log(`[v0] [evaluating data] ${symbol} MAIN: ${mainSets.length} sets (${mainResult.passedEvaluation} promoted)`)
 
       // STAGE 3: REAL — promote Sets with avgPF >= 1.4 (base-promoted AND
       // additional related variants flow uniformly through this filter)
       const { result: realResult, sets: realSets } = await this.evaluateRealSets(symbol, mainSets)
       results.push(realResult)
+      console.log(`[v0] [evaluating data] ${symbol} REAL: ${realSets.length} sets passed (PF >= 1.4), netting evaluated`)
 
       // STAGE 4: LIVE — best 500 Sets for execution (skip in prehistoric mode)
       if (!isPrehistoric) {
         const { result: liveResult } = await this.createLiveSets(symbol, realSets)
         results.push(liveResult)
+        console.log(`[v0] [evaluating data] ${symbol} LIVE: ${liveResult.passedEvaluation} orders to execute, ${realSets.length - liveResult.passedEvaluation} queued`)
       }
 
       await this.logStrategyProgression(symbol, results)
