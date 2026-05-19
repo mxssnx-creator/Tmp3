@@ -2370,10 +2370,17 @@ export class StrategyCoordinator {
       const realDetailKey = `strategy_detail:${this.connectionId}:real`
       const realAvgPF   = realSets.length > 0 ? realSets.reduce((s, st) => s + st.avgProfitFactor, 0) / realSets.length : 0
       const realAvgDDT  = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / realSets.length : 0
+      // Position evaluation real: average confidence of REAL sets
+      // (how well did the Real stage filter perform)
       const realAvgConf = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgConfidence || 0), 0) / realSets.length : 0
       const passRatioReal = mainSets.length > 0 ? realSets.length / mainSets.length : 0
       const realEntriesTotal  = realSets.reduce((s, st) => s + (st.entryCount || 0), 0)
       const realAvgPosPerSet  = realSets.length > 0 ? realEntriesTotal / realSets.length : 0
+      // Calculate average position count that was evaluated per Real set
+      // This represents how many positions were considered on average
+      const realAvgPosEval = realSets.length > 0 
+        ? realSets.reduce((s, st) => s + Math.max(1, st.entryCount || 1), 0) / realSets.length 
+        : 0
 
       // ── Running-now resolution for Real (axis-cloned Sets) ──
       // Real CLONES Main's already-cloned variant Sets and adjusts
@@ -2437,7 +2444,7 @@ export class StrategyCoordinator {
           created_sets:       String(realSets.length),
           avg_profit_factor:  String(realAvgPF.toFixed(4)),
           avg_drawdown_time:  String(Math.round(realAvgDDT)),
-          avg_pos_eval_real:  String(realAvgConf.toFixed(4)),
+          avg_pos_eval_real:  String(realAvgPosEval.toFixed(4)),
           avg_pos_per_set:    String(realAvgPosPerSet.toFixed(2)),
           evaluated:          String(mainSets.length),
           passed_sets:        String(realSets.length),
@@ -2475,7 +2482,7 @@ export class StrategyCoordinator {
           [`s:${symbol}:apf`]:        String(realAvgPF.toFixed(4)),
           [`s:${symbol}:addt`]:       String(Math.round(realAvgDDT)),
           [`s:${symbol}:apps`]:       String(realAvgPosPerSet.toFixed(2)),
-          [`s:${symbol}:aper`]:       String(realAvgConf.toFixed(4)),
+          [`s:${symbol}:aper`]:       String(realAvgPosEval.toFixed(4)),
           [`s:${symbol}:ts`]:         String(Date.now()),
         }),
         client.expire(realDetailKey, 86400),
