@@ -1132,7 +1132,8 @@ export async function GET(
         //   live:  evaluated/real, capped at 100 (filter: M real → K live).
         let evalPct = 0
         if (stage === "base") {
-          evalPct = createdSets > 0 ? 100 : 0
+          // createdSets may be 0 if dh.created_sets absent; use stratCounts.base fallback
+          evalPct = (createdSets > 0 || (stratCounts.base || 0) > 0) ? 100 : 0
         } else if (stage === "main") {
           const base = stratCounts.base || 1
           const raw = base > 0 ? (stratEvaluated.main / base) * 100 : 0
