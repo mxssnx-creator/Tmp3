@@ -2230,7 +2230,7 @@ export class StrategyCoordinator {
     // is incremented for every Real Set produced — that's the dashboard
     // accumulation column.
     try {
-      const { bumpRealPosAccumulation, bumpValidPositions, bumpAxisPosAccumulation } = await import(
+      const { bumpRealPosAccumulation, bumpValidPositions, bumpAxisPosAccumulation, bumpHedgePosAccumulation } = await import(
         "@/lib/pos-history",
       )
       const realActiveKeysForVP = await (async () => {
@@ -2247,6 +2247,27 @@ export class StrategyCoordinator {
       for (const s of realSets) {
         const parentKey = s.parentSetKey || s.setKey.split("#")[0]
         bumpRealPosAccumulation(this.connectionId, parentKey, 1, accPipeline)
+
+        // ── Hedge pos-count accumulation per base Set (operator spec) ─
+        // "Do the accumulations for pos counts Sets at stage Real
+        // (hedging long, short for related same base Set)."
+        //
+        // For every Real Set, increment the per-Base hedge ledger by the
+        // Set's entryCount in its direction (long or short). This builds
+        // up the cumulative picture of how many position-slots each Base
+        // Set is running per side across all cycles, enabling net-hedge
+        // posture reads (long − short) per Base Set without a full scan.
+        // entryCount is used (not 1) so axis Sets with larger windows
+        // contribute proportionally to the hedge totals.
+        const hedgeDir = (s.axisWindows?.direction ?? s.direction ?? "long") as "long" | "short"
+        const hedgeEC  = s.entryCount > 0 ? s.entryCount : 1
+        bumpHedgePosAccumulation({
+          connectionId: this.connectionId,
+          parentSetKey: parentKey,
+          direction:    hedgeDir,
+          entryCount:   hedgeEC,
+          externalPipeline: accPipeline,
+        })
 
         // ── Per-axis-Set continuous-count ledger (operator spec) ─────
         // For axis Sets (the prev × last × cont × outcome × dir

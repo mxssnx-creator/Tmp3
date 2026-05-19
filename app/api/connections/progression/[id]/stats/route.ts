@@ -96,6 +96,7 @@ export async function GET(
       prehistoricSymbolCount,
       axisWindowsHashRaw,
       ordersBySymbolRaw,
+      hedgePosAccHashRaw,
     ] = await Promise.all([
       client.hgetall(`progression:${connectionId}`).catch(() => null),
       client.hgetall(`prehistoric:${connectionId}`).catch(() => null),
@@ -115,6 +116,10 @@ export async function GET(
       // chip strip. Stays in lock-step with the global
       // `live_orders_placed_count` / `live_orders_filled_count` totals.
       client.hgetall(`live_orders_by_symbol:${connectionId}`).catch(() => null),
+      // Per-Base hedge pos-count accumulation written by bumpHedgePosAccumulation
+      // in the Real stage tuner loop. Fields: `{parentSetKey}:{long|short|sets_long|sets_short|ts}`
+      // Consumed to surface long/short hedge breakdown per base Set in strategyDetail.real.
+      client.hgetall(`hedge_pos_acc:${connectionId}`).catch(() => null),
     ])
 
     const progHash: Record<string, string>       = progHashRaw       || {}
@@ -122,6 +127,7 @@ export async function GET(
     const realtimeHash: Record<string, string>   = realtimeHashRaw   || {}
     const axisWindowsHash: Record<string, string> = axisWindowsHashRaw || {}
     const ordersBySymbolHash: Record<string, string> = ordersBySymbolRaw || {}
+    const hedgePosAccHash: Record<string, string> = (hedgePosAccHashRaw as Record<string, string>) || {}
 
     const es = (engineState as Record<string, any>) || {}
     const ep = (engineProgression as Record<string, any>) || {}
@@ -1232,18 +1238,87 @@ export async function GET(
           // For non-Real stages the fields are 0 — the dialog only renders
           // the 4-tile panel when stage === "real".
           ...(stage === "real"
-            ? {
+            ? (() => {
                 // Overall = total Real sets produced across all cycles.
                 // Fall back to stratCounts.real (current-cycle output count).
-                statOverall:     n(progHash.strategies_real_total) || stratCounts.real || 0,
                 // Accumulated = axis position accumulation sum from axis_pos_acc hash.
                 // Written by bumpAxisPosAccumulation in the Real tuner loop.
-                statAccumulated: n(dh.stat_accumulated),
                 // General = distinct Real sets this cycle (not lifetime createdSets).
-                statGeneral:     n(dh.stat_general) || stageEvaluated || stratCounts.real || 0,
                 // Combined = Real sets running now (those with active base set coordination).
-                statCombined:    n(dh.stat_combined) || setsRunningNow || stratCounts.real || 0,
-              }
+
+                // ── Hedge pos-count accumulation per base Set ─────────────────
+                // Rebuilt from flat `hedge_pos_acc:{conn}` hash fields.
+                // Fields: `{parentSetKey}:{long|short|sets_long|sets_short|ts}`
+                // We aggregate totals and per-base snapshots so the dashboard
+                // can render both a summary (total long/short entries) and the
+                // per-base breakdown (which base Set is most imbalanced).
+                const hedgeByBase = new Map<string, {
+                  long: number; short: number
+                  setsLong: number; setsShort: number
+                  ts: number
+                }>()
+                for (const [field, rawVal] of Object.entries(hedgePosAccHash)) {
+                  const val = Number(rawVal) || 0
+                  const colonIdx = field.lastIndexOf(":")
+                  if (colonIdx === -1) continue
+                  const baseKey = field.slice(0, colonIdx)
+                  const suffix  = field.slice(colonIdx + 1)
+                  let entry = hedgeByBase.get(baseKey)
+                  if (!entry) {
+                    entry = { long: 0, short: 0, setsLong: 0, setsShort: 0, ts: 0 }
+                    hedgeByBase.set(baseKey, entry)
+                  }
+                  if      (suffix === "long")       entry.long      = val
+                  else if (suffix === "short")      entry.short     = val
+                  else if (suffix === "sets_long")  entry.setsLong  = val
+                  else if (suffix === "sets_short") entry.setsShort = val
+                  else if (suffix === "ts")         entry.ts        = val
+                }
+                let hedgeTotalLong = 0, hedgeTotalShort = 0
+                let hedgeTotalSetsLong = 0, hedgeTotalSetsShort = 0
+                const hedgePerBase: Array<{
+                  parentSetKey: string
+                  longEntries: number; shortEntries: number
+                  longSets: number; shortSets: number
+                  net: number; hedgeRatio: number; lastUpdated: number
+                }> = []
+                for (const [parentSetKey, e] of hedgeByBase) {
+                  hedgeTotalLong      += e.long
+                  hedgeTotalShort     += e.short
+                  hedgeTotalSetsLong  += e.setsLong
+                  hedgeTotalSetsShort += e.setsShort
+                  const total = e.long + e.short
+                  hedgePerBase.push({
+                    parentSetKey,
+                    longEntries:  e.long,
+                    shortEntries: e.short,
+                    longSets:     e.setsLong,
+                    shortSets:    e.setsShort,
+                    net:          e.long - e.short,
+                    hedgeRatio:   total > 0 ? Math.abs(e.long - e.short) / total : 0,
+                    lastUpdated:  e.ts,
+                  })
+                }
+                // Sort most-imbalanced first
+                hedgePerBase.sort((a, b) => Math.abs(b.net) - Math.abs(a.net))
+
+                return {
+                  statOverall:     n(progHash.strategies_real_total) || stratCounts.real || 0,
+                  statAccumulated: n(dh.stat_accumulated),
+                  statGeneral:     n(dh.stat_general) || stageEvaluated || stratCounts.real || 0,
+                  statCombined:    n(dh.stat_combined) || setsRunningNow || stratCounts.real || 0,
+                  // ── Hedge pos-count accumulation (long/short per base Set) ──
+                  hedgePosAcc: {
+                    totalLongEntries:  hedgeTotalLong,
+                    totalShortEntries: hedgeTotalShort,
+                    totalLongSets:     hedgeTotalSetsLong,
+                    totalShortSets:    hedgeTotalSetsShort,
+                    netEntries:        hedgeTotalLong - hedgeTotalShort,
+                    baseCount:         hedgeByBase.size,
+                    perBase:           hedgePerBase,
+                  },
+                }
+              })()
             : {}),
         }
       })
