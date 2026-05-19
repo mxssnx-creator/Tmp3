@@ -1614,7 +1614,13 @@ export class StrategyCoordinator {
       const mainDetailKey = `strategy_detail:${this.connectionId}:main`
       const mainAvgPF  = mainSets.length > 0 ? mainSets.reduce((s, st) => s + st.avgProfitFactor, 0) / mainSets.length : 0
       const mainAvgDDT = mainSets.length > 0 ? mainSets.reduce((s, st) => s + (st.avgDrawdownTime || 0), 0) / mainSets.length : 0
-      const passRatioMain = baseSets.length > 0 ? mainSets.length / baseSets.length : 0
+      // BASE->MAIN is an *expansion* (one base set fans out to many variants),
+      // so the raw ratio can exceed 1 (e.g. 2405/5 = 481). Clamp to [0,1]
+      // so pass_rate stored in Redis is always a valid 0-1 fraction that the
+      // stats route renders as a 0-100% percentage without overflow.
+      const passRatioMain = baseSets.length > 0
+        ? Math.min(1, mainSets.length / baseSets.length)
+        : 0
       // Avg positions per Set at Main = avg of expanded entryCount values.
       // Each entry represents one (size × leverage × positionState) config
       // ready for downstream coordination, so this figure is the canonical
@@ -1685,12 +1691,15 @@ export class StrategyCoordinator {
           [`s:${symbol}:ts`]:         String(Date.now()),
         }),
         client.expire(mainDetailKey, 86400),
-        // Patch Base's per-symbol passed count so its `pass_rate` reflects
-        // Main's filter outcome for THIS symbol on the next /stats poll.
+        // Patch Base's pass_rate from this Main cycle. Use baseSets.length
+        // for passed_sets — the Base stage passes ALL its sets to Main
+        // (expansion, not filtering), so passed == evaluated == baseSets.length.
+        // Writing mainSets.length (2400) would make passed > evaluated (5),
+        // which is an impossible state and breaks the passRatio percentage.
         client.hset(`strategy_detail:${this.connectionId}:base`, {
-          passed_sets: String(mainSets.length),
+          passed_sets: String(baseSets.length),
           pass_rate:   String(passRatioMain.toFixed(4)),
-          [`s:${symbol}:passed`]: String(mainSets.length),
+          [`s:${symbol}:passed`]: String(baseSets.length),
         }).catch(() => {}),
         client.set(`strategies:${this.connectionId}:main:count`, String(mainSets.length)),
         client.set(`strategies:${this.connectionId}:main:evaluated`, String(mainSets.length)),
@@ -2381,13 +2390,25 @@ export class StrategyCoordinator {
         ? realSets.reduce((s, st) => s + Math.max(1, st.entryCount || 1), 0) / realSets.length 
         : 0
 
-      // ── Running-now resolution for Real (axis-cloned Sets) ──
-      // Real CLONES Main's already-cloned variant Sets and adjusts
-      // them along the position-count axis. Unlike Main (which keys off
-      // parent Base status), Real stage filters by profitability, so its
-      // "running" count reflects only those Real Sets that are currently
-      // being tracked as viable (entry count > 0). This shows cascade filtering.
-      const realRunningNow = realSets.filter((s) => (s.entryCount || 0) > 0).length
+      // ── Running-now resolution for Real ──────────────────────────
+      // A Real Set is "running now" only when its originating Base Set is
+      // actively coordinating (present in active_config_keys). This mirrors
+      // the Main-stage logic and guarantees REAL running <= MAIN running,
+      // making the cascade filter visible in the dashboard.
+      // Reuse _activeKeysCache populated by createBaseSets this cycle.
+      const realActiveCache = this._activeKeysCache
+      const realCacheFresh = realActiveCache && Date.now() - realActiveCache.cycleAt < 30_000
+      const realActiveBaseKeys = realCacheFresh
+        ? realActiveCache!.keys
+        : new Set<string>(
+            (await client
+              .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
+              .catch(() => [])) as string[],
+          )
+      const realRunningNow = realSets.filter((s) => {
+        const base = (s.parentSetKey ?? s.setKey).split("#")[0]
+        return realActiveBaseKeys.has(base)
+      }).length
 
       // ── Real 4-perspective stats (Overall / Accumulated / General / Combined) ──
       // Per operator spec: "in Strategies Real ensure correct stats..
@@ -2403,22 +2424,21 @@ export class StrategyCoordinator {
       //                  (`strategies_real_current`).
       //   - Combined:    actively-running right now (= realRunningNow).
       //
-      // We pre-compute the axis sum HERE so the stats route never has to
-      // do four extra HGETALLs on every dashboard refresh.
+      // Pre-compute the axis POSITION accumulation sum so the stats route
+      // never needs extra round-trips on every dashboard refresh.
+      // Source: axis_pos_acc:{conn} — the hash bumpAxisPosAccumulation writes
+      // to in the Real tuner loop above. Each field is parentSetKey|axisKey and
+      // the value is the cumulative entryCount (= baseEC + min(cont,liveCont))
+      // across all cycles — exactly the "Accumulated" perspective the operator
+      // described as "ongoing continuous count of Pis added onto the new sets".
       let realAccumulatedSum = 0
       try {
-        const axisHashes = await Promise.all(
-          (["prev", "last", "cont", "pause"] as const).map((axis) =>
-            client
-              .hgetall(`strategy_axis_real:${this.connectionId}:${axis}`)
-              .catch(() => ({} as Record<string, string>)),
-          ),
-        )
-        for (const h of axisHashes) {
-          for (const v of Object.values(h || {})) {
-            const n = Number(v)
-            if (Number.isFinite(n)) realAccumulatedSum += n
-          }
+        const axisAccHash = (await client
+          .hgetall(`axis_pos_acc:${this.connectionId}`)
+          .catch(() => ({} as Record<string, string>))) as Record<string, string>
+        for (const v of Object.values(axisAccHash || {})) {
+          const num = Number(v)
+          if (Number.isFinite(num)) realAccumulatedSum += num
         }
       } catch { /* fallback: 0 */ }
 
@@ -2473,11 +2493,11 @@ export class StrategyCoordinator {
           [`s:${symbol}:ts`]:         String(Date.now()),
         }),
         client.expire(realDetailKey, 86400),
-        client.hset(`strategy_detail:${this.connectionId}:main`, {
-          passed_sets: String(realSets.length),
-          pass_rate:   String(passRatioReal.toFixed(4)),
-          [`s:${symbol}:passed`]: String(realSets.length),
-        }).catch(() => {}),
+        // NOTE: do NOT patch strategy_detail:{conn}:main here. The Main detail
+        // already writes its own passed_sets = mainSets.length and
+        // pass_rate = passRatioMain (clamped to [0,1]) each Main cycle.
+        // Overwriting them with Real's realSets.length would corrupt MAIN's
+        // pass statistics and make passed_sets > evaluated impossible to read.
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:real:evaluated`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
