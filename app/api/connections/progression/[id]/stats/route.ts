@@ -889,9 +889,12 @@ export async function GET(
       }
     } catch { /* non-critical: dashboard falls back to cumulative */ }
     const activeIndTotal = Object.values(activeIndByType).reduce((s, v) => s + v, 0)
-    const activeStratTotal = activeStratByStage.base + activeStratByStage.main + activeStratByStage.real
+    // Pipeline-aware total: only count REAL stage (final filtered output), not sum of BASE+MAIN+REAL
+    // Each strategy survives through the cascade filter, not added at each stage.
+    const activeStratTotal = activeStratByStage.real || strategiesTotal
     const activeSetsIndTotal   = Object.values(activeSetsIndByType).reduce((s, v) => s + v, 0)
-    const activeSetsStratTotal = activeSetsStratByStage.base + activeSetsStratByStage.main + activeSetsStratByStage.real
+    // Only count distinct REAL-stage sets progressing, not sum across stages
+    const activeSetsStratTotal = activeSetsStratByStage.real || 0
 
     // Strategy per-stage counts
     // NOTE on source priority:
@@ -1452,7 +1455,9 @@ export async function GET(
         // `indications_count` key was only written when per-type counts
         // were non-zero on the SAME cycle — a write-order race.
         indicationsTotal: indTotal,
-        strategiesTotal,
+        // Same principle for strategies: use stratTotal (computed from stratCounts.real
+        // and fallback to strategiesTotal) instead of stale progHash value.
+        strategiesTotal: stratTotal,
         positionsOpen,
         // Sets + Positions are the canonical "continuous live progression" anchors
         // the user relies on. These come straight from atomic hincrby writes
