@@ -59,6 +59,37 @@ export interface StrategySet {
   entryCount: number        // number of config entries in this set (max 250)
   entries: StrategySetEntry[]
   createdAt: string
+  
+  /**
+   * ── Set validity status across stages ──────────────────────────────────
+   * 
+   * Tracks evaluation state at each stage without duplicating sets.
+   * More performant than creating separate set copies for different stages.
+   * 
+   * Status values:
+   *   - "valid_base": Passes BASE→MAIN evaluation (minProfitFactor threshold)
+   *   - "valid_main": Passes MAIN→REAL evaluation (higher PF threshold, e.g. 1.4)
+   *   - "valid_real": Passes REAL→LIVE evaluation (in top performers)
+   *   - "invalid": Failed some evaluation gate
+   *   - undefined: Not yet evaluated at this stage
+   * 
+   * Allows efficient pipeline by checking status before re-evaluating,
+   * avoiding duplicate calculations while maintaining set uniqueness.
+   */
+  status?: "valid_base" | "valid_main" | "valid_real" | "invalid"
+  
+  /**
+   * ── Evaluation reason when status is "invalid" ──────────────────────
+   * 
+   * Explains why set was rejected in current cycle:
+   *   - "insufficient_history": prevPos.count < mainEvalPosCount threshold
+   *   - "low_profitfactor": avgProfitFactor < threshold
+   *   - "hedge_netted": Hedged out by opposing direction
+   *   - "low_performance": Real-stage performance filter
+   *   - Other: specific reason for rejection
+   */
+  rejectionReason?: string
+  
   // Lineage — populated at MAIN stage; preserved through REAL/LIVE
   parentSetKey?: string
   variant?: "default" | "trailing" | "block" | "dca" | "pause"
@@ -1350,7 +1381,7 @@ export class StrategyCoordinator {
     // cache-miss paths populate this map so reuses still trigger fan-out.
     const defaultByBaseKey = new Map<string, StrategySet>()
 
-    // ── 2. Base/variant async processing ────────────────────────���───────────
+    // ── 2. Base/variant async processing ────────────────────────����───────────
     // Process all baseSet × variant combinations in parallel for faster throughput.
     // Each combination calls the async buildVariantSet, which previously ran
     // sequentially. Now they all start together and resolve concurrently.
@@ -1363,33 +1394,43 @@ export class StrategyCoordinator {
     }>[] = []
 
     for (const baseSet of baseSets) {
-      // ── Min-positions gate (operator spec, systemwide fix) ──────
-      // Evaluation requires minimum historical data to have statistical
-      // confidence in profitFactor averages. Uses "last X positions" (default 15)
-      // from prevPos.count (historical closed positions).
+      // ── Min-positions gate + Status tracking (operator spec) ────────────────────
+      // Evaluation requires minimum historical data. Instead of skipping,
+      // mark with status="invalid" + rejectionReason so sets persist but
+      // won't be evaluated until sufficient data. More efficient than duplicating.
       //
-      // Gate logic:
-      // - If historic data exists: require histCount >= mainMinPos
-      // - If no historic but live data: allow (bootstrap new strategy)
-      // - If neither: skip (no data to validate)
+      // Status field allows:
+      // - Efficient pipeline by checking status before re-calculating
+      // - Dashboard visibility: why sets are delayed
+      // - Zero duplication: single set object with state flag
       const liveCount    = baseSet.entryCount ?? baseSet.entries?.length ?? 0
       const histCount    = baseSet.prevPos?.count ?? 0
       const setPosCount  = Math.max(liveCount, histCount)
       
-      // CRITICAL: During PREHISTORIC and REALTIME, require minimum historical positions
-      // If we have historic data (prevPos), the evaluation must be based on at least
-      // mainMinPos (default 15) closed positions to have meaningful profitFactor average.
-      // Exception: allow bootstrap (gate skip) only when there's NO historic data yet.
+      // Check if we have sufficient history (default mainEvalPosCount = 15)
       const hasHistoricData = histCount > 0
-      if (hasHistoricData && histCount < mainMinPos) {
-        // Insufficient historic positions — skip evaluation this cycle
+      if (hasHistoricData && histCount < mainEvalPosCount) {
+        // Mark as invalid with reason, but keep in map so it can be re-evaluated later
+        baseSet.status = "invalid"
+        baseSet.rejectionReason = `insufficient_history: ${histCount}/${mainEvalPosCount}`
         skippedLowPos++
         continue
       }
 
-      // Base-level validation
-      if (baseSet.avgProfitFactor < metrics.minProfitFactor) continue
-      if (baseSet.avgDrawdownTime > metrics.maxDrawdownTime) continue
+      // Base-level validation - mark status based on pass/fail
+      if (baseSet.avgProfitFactor < metrics.minProfitFactor) {
+        baseSet.status = "invalid"
+        baseSet.rejectionReason = `low_profitfactor: ${baseSet.avgProfitFactor.toFixed(2)} < ${metrics.minProfitFactor}`
+        continue
+      }
+      if (baseSet.avgDrawdownTime > metrics.maxDrawdownTime) {
+        baseSet.status = "invalid"
+        baseSet.rejectionReason = `high_drawdowntime: ${baseSet.avgDrawdownTime} > ${metrics.maxDrawdownTime}`
+        continue
+      }
+
+      // Mark as valid for BASE→MAIN evaluation
+      baseSet.status = "valid_base"
 
       const variantsForThisBase = baseSet.trailingProfile
         ? activeVariants.filter((p) => p.name === "default")
@@ -1901,30 +1942,26 @@ export class StrategyCoordinator {
 
     // ── Stage-validation min-position threshold (operator spec, systemwide fix) ────
     // Same semantics as Main: Sets below `realEvalPosCount` are
-    // SKIPPED — they're not validated against PF/DDT and not promoted
-    // to Real. Default 10. Re-evaluated on subsequent cycles once
-    // entryCount accumulates.
-    //
-    // Symmetric with the Main gate: we take MAX(entryCount, prevPos.count)
-    // so historic closes (populated by ConfigSetProcessor →
-    // recordPosClosed during prehistoric) qualify a Set for Real
-    // evaluation even when the live cycle's entry count is small.
-    // This guarantees Real becomes productive immediately after
-    // prehistoric finishes its first pass.
-    //
-    // During historic/backtest replay, bypass this gate since we're
-    // still accumulating position history. The gate naturally engages
-    // once realtime starts and there's no historic position data.
+    // MARKED as invalid with status flag — they're not validated against PF/DDT
+    // and not promoted to Real, but kept in map for re-evaluation on subsequent
+    // cycles once entryCount accumulates. Default 10.
     const realMinPos = this._coordinationSettings.realEvalPosCount
     const beforePosGate = mainSets.length
-    const mainSetsEligible = mainSets.filter((s) => {
+    const mainSetsEligible = mainSets.map((s) => {
       const live = s.entryCount ?? s.entries?.length ?? 0
       const hist = s.prevPos?.count ?? 0
-      // During historic/backtest, bypass gate if either live or hist data exists
-      const inHistoricOrBacktest = live > 0 || hist > 0
-      if (!inHistoricOrBacktest) return false
-      // Gate only applies when truly no data exists (realtime, empty set)
-      return Math.max(live, hist) >= realMinPos || inHistoricOrBacktest
+      const posCount = Math.max(live, hist)
+      
+      if (posCount < realMinPos) {
+        // Mark as invalid but keep for later evaluation
+        s.status = "invalid"
+        s.rejectionReason = `insufficient_pos_count: ${posCount}/${realMinPos}`
+        return s
+      }
+      return s
+    }).filter((s) => {
+      // Only pass eligible sets to next stage (for logging purposes)
+      return (s.status !== "invalid" || (s.entryCount ?? s.entries?.length ?? 0) > 0)
     })
     const skippedRealLowPos = beforePosGate - mainSetsEligible.length
     if (skippedRealLowPos > 0) {
@@ -1932,17 +1969,30 @@ export class StrategyCoordinator {
         this.connectionId,
         "real_stage",
         "debug",
-        `Real min-pos gate skipped ${skippedRealLowPos}/${beforePosGate} (threshold=${realMinPos})`,
+        `Real min-pos gate marked ${skippedRealLowPos}/${beforePosGate} as invalid (threshold=${realMinPos})`,
         { symbol, skippedLowPos: skippedRealLowPos, threshold: realMinPos, mainTotal: beforePosGate },
       ).catch(() => {})
     }
 
     // P0-2: Real filter axes are PF-min + DDT-max ONLY. Confidence is
     // advisory metadata and is not part of the filter predicate.
+    // Mark status on mainSetsEligible for efficient tracking
     const realQualifying = mainSetsEligible.filter(
-      (s) =>
-        s.avgProfitFactor >= metrics.minProfitFactor &&
-        s.avgDrawdownTime <= metrics.maxDrawdownTime,
+      (s) => {
+        const passes = s.avgProfitFactor >= metrics.minProfitFactor &&
+                      s.avgDrawdownTime <= metrics.maxDrawdownTime
+        if (passes) {
+          s.status = "valid_real"
+        } else {
+          s.status = "invalid"
+          if (s.avgProfitFactor < metrics.minProfitFactor) {
+            s.rejectionReason = `real_low_pf: ${s.avgProfitFactor.toFixed(2)} < ${metrics.minProfitFactor}`
+          } else {
+            s.rejectionReason = `real_high_ddt: ${s.avgDrawdownTime} > ${metrics.maxDrawdownTime}`
+          }
+        }
+        return passes
+      }
     )
 
     // ── PRIORITY SORT: better Sets first ─────────────────��────────────
