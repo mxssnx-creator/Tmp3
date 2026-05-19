@@ -479,24 +479,25 @@ export async function getValidPositions(
     const hash = await client.hgetall(k)
     
     // Debug: log what we got from Redis
-    if (Object.keys(hash).length === 0) {
+    if (!hash || Object.keys(hash).length === 0) {
       console.log(`[v0] [PosHistory] getValidPositions(${connectionId}): empty hash from Redis key "${k}"`)
     }
 
+    const h = hash || {}
     return {
-      overall: Number(hash.overall || 0),
-      combined: Number(hash.combined || 0),
+      overall: Number(h.overall || 0),
+      combined: Number(h.combined || 0),
       bySymbol: Object.fromEntries(
-        Object.entries(hash)
+        Object.entries(h)
           .filter(([key]) => key.startsWith("by_symbol:"))
           .map(([key, val]) => [key.substring("by_symbol:".length), Number(val)]),
       ),
       byDirection: {
-        long: Number(hash["by_dir:long"] || 0),
-        short: Number(hash["by_dir:short"] || 0),
+        long: Number(h["by_dir:long"] || 0),
+        short: Number(h["by_dir:short"] || 0),
       },
       byType: Object.fromEntries(
-        Object.entries(hash)
+        Object.entries(h)
           .filter(([key]) => key.startsWith("by_type:"))
           .map(([key, val]) => [key.substring("by_type:".length), Number(val)]),
       ),
@@ -510,27 +511,5 @@ export async function getValidPositions(
       byDirection: { long: 0, short: 0 },
       byType: {},
     }
-  }
-}
-  if (!connectionId) return empty
-  try {
-    const client = getRedisClient()
-    const hash = (await client.hgetall(VALID_POS_KEY(connectionId))) as Record<
-      string,
-      string
-    >
-    if (!hash) return empty
-    const out: ValidPositionsSnapshot = { ...empty }
-    for (const [k, v] of Object.entries(hash)) {
-      const n = Number(v) || 0
-      if (k === "overall") out.overall = n
-      else if (k === "combined") out.combined = n
-      else if (k.startsWith("by_symbol:")) out.bySymbol[k.slice(10)] = n
-      else if (k.startsWith("by_dir:"))    out.byDirection[k.slice(7)] = n
-      else if (k.startsWith("by_type:"))   out.byType[k.slice(8)] = n
-    }
-    return out
-  } catch {
-    return empty
   }
 }
