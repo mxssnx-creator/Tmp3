@@ -1640,6 +1640,7 @@ export class TradeEngineManager {
           // client services these in constant time; Promise.all minimises the
           // awaited round-trips per cycle compared to sequential awaits.
           const nowMs = Date.now()
+          const nowIso = new Date(nowMs).toISOString()
           const writes: Promise<any>[] = [
             client.hincrby(redisKey, "indication_cycle_count", 1),
             // ── Realtime Progression cycle counter (three-progression refactor) ──
@@ -1671,10 +1672,15 @@ export class TradeEngineManager {
             client.hset(`settings:trade_engine_state:${this.connectionId}`, {
               status: "running",
               last_processor_heartbeat: String(nowMs),
-              last_indication_run: new Date(nowMs).toISOString(),
+              last_indication_run: nowIso,
             }),
-            client.expire(redisKey, 7 * 24 * 60 * 60),
           ]
+          // Gate expire to every 500 cycles — TTL is 7 days so resetting
+          // it every tick wastes one Redis round-trip per cycle (~20/s).
+          // At 500 cycles (20 Hz ≈ every 25 s) the key stays alive indefinitely.
+          if (cycleCount % 500 === 1) {
+            writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
+          }
           if (Object.keys(indicationTypeCounts).length > 0) {
             writes.push(client.hincrby(redisKey, "indication_live_cycle_count", 1))
             for (const [type, count] of Object.entries(indicationTypeCounts)) {
@@ -2028,6 +2034,7 @@ export class TradeEngineManager {
           // sequential awaits saves multiple RTTs per cycle and lets us
           // include the per-symbol error fields in the same batch.
           const nowMs = Date.now()
+          const nowIso = new Date(nowMs).toISOString()
           const writes: Promise<any>[] = [
             client.hincrby(redisKey, "strategy_cycle_count", 1),
             client.hincrby(redisKey, "frames_processed", 1),
@@ -2056,10 +2063,13 @@ export class TradeEngineManager {
             client.hset(`settings:trade_engine_state:${this.connectionId}`, {
               status: "running",
               last_processor_heartbeat: String(nowMs),
-              last_strategy_run: new Date(nowMs).toISOString(),
+              last_strategy_run: nowIso,
             }),
-            client.expire(redisKey, 7 * 24 * 60 * 60),
           ]
+          // Gate expire — same rationale as indication tick above.
+          if (cycleCount % 500 === 1) {
+            writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
+          }
           if (evaluatedThisCycle > 0) {
             writes.push(client.hincrby(redisKey, "strategy_live_cycle_count", 1))
             writes.push(client.hincrby(redisKey, "strategies_count", evaluatedThisCycle))

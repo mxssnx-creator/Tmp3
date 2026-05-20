@@ -481,6 +481,13 @@ export class StrategyCoordinator {
   private _activeKeysCache: { keys: Set<string>; cycleAt: number } | null = null
 
   /**
+   * Monotonic counter incremented on every executeStrategyFlow call.
+   * Used to gate TTL resets (expire) on the progression hash so they
+   * fire once every 500 cycles instead of on every cycle.
+   */
+  private _stratCycleCount = 0
+
+  /**
    * ── Plan-perf Tier 1: parsed-fingerprint LRU ───────────────────────
    *
    * The fpCache stored in Redis is keyed by `fingerprint → JSON.stringify(set)`.
@@ -827,6 +834,7 @@ export class StrategyCoordinator {
     sharedContext?: PositionContext,
   ): Promise<StrategyEvaluation[]> {
     const results: StrategyEvaluation[] = []
+    this._stratCycleCount++
 
     try {
       // ── Hydrate PF thresholds + Coordination settings from operator settings ─
@@ -1188,7 +1196,6 @@ export class StrategyCoordinator {
       // them concurrently cuts that to a single bounded round-trip window.
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_base_current", String(baseSets.length)),
-        client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(detailKey, {
           // ── Legacy per-cycle aggregate fields ─────────────────────────
           // These hold THIS-symbol's values and are overwritten on every
@@ -1267,6 +1274,10 @@ export class StrategyCoordinator {
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
+      // Gate progression hash TTL reset — 7-day key, refresh every 500 cycles
+      if (this._stratCycleCount % 500 === 1) {
+        writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
+      }
       await Promise.all(writes)
     } catch { /* non-critical */ }
 
@@ -1651,7 +1662,6 @@ export class StrategyCoordinator {
 
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_main_current", String(mainSets.length)),
-        client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(mainDetailKey, {
           created_sets:      String(mainSets.length),
           avg_profit_factor: String(mainAvgPF.toFixed(4)),
@@ -1719,6 +1729,10 @@ export class StrategyCoordinator {
       // Only count profile-variant Sets (no axis fan-out) for this counter.
       if (mainProfileEntriesTotal > 0) {
         writes.push(client.hincrby(redisKey, "main_positions_created_count", mainProfileEntriesTotal))
+      }
+      // Gate progression hash TTL reset — same rationale as createBaseSets.
+      if (this._stratCycleCount % 500 === 2) {
+        writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
       }
 
       await Promise.all(writes)
@@ -2307,7 +2321,6 @@ export class StrategyCoordinator {
 
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),
-        client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(realDetailKey, {
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
           // for backwards compat; /stats prefers per-symbol sums below.
@@ -2515,6 +2528,10 @@ export class StrategyCoordinator {
         if (touched)      writes.push(client.expire(aKey,      7 * 24 * 60 * 60))
         if (touchedLong)  writes.push(client.expire(aKeyLong,  7 * 24 * 60 * 60))
         if (touchedShort) writes.push(client.expire(aKeyShort, 7 * 24 * 60 * 60))
+      }
+      // Gate progression hash TTL reset — same rationale as createBaseSets.
+      if (this._stratCycleCount % 500 === 3) {
+        writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
       }
 
       await Promise.all(writes)

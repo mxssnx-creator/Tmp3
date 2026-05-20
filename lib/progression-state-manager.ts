@@ -316,28 +316,28 @@ export class ProgressionStateManager {
       let newSuccessful = 0
       let newFailed = 0
       try {
-        // Fire the counter increment + the read of the non-incremented counter
-        // concurrently. The two operations are independent (hincrby on one
-        // field, hget on another) so there is no ordering constraint, and we
-        // save one Redis round-trip per cycle.
+        // Only fire the two hincrby calls we actually need — no hget.
+        // The third counter value (successful vs failed) is derived from
+        // the local in-process mirror which is updated below. This cuts
+        // the Redis fan-out from 3 ops to 2 ops per incrementCycle call,
+        // eliminating one round-trip per productive cycle tick.
+        const prev = this.cycleCounters.get(connectionId) ?? { completed: 0, successful: 0, failed: 0 }
         if (successful) {
-          const [completed, successCount, failedStr] = await Promise.all([
+          const [completed, successCount] = await Promise.all([
             client.hincrby(redisKey, "cycles_completed", 1),
             client.hincrby(redisKey, "successful_cycles", 1),
-            client.hget(redisKey, "failed_cycles"),
           ])
-          newCompleted = Number(completed) || 0
+          newCompleted  = Number(completed) || 0
           newSuccessful = Number(successCount) || 0
-          newFailed = parseInt((failedStr as any) || "0", 10)
+          newFailed     = prev.failed
         } else {
-          const [completed, failCount, successStr] = await Promise.all([
+          const [completed, failCount] = await Promise.all([
             client.hincrby(redisKey, "cycles_completed", 1),
             client.hincrby(redisKey, "failed_cycles", 1),
-            client.hget(redisKey, "successful_cycles"),
           ])
-          newCompleted = Number(completed) || 0
-          newFailed = Number(failCount) || 0
-          newSuccessful = parseInt((successStr as any) || "0", 10)
+          newCompleted  = Number(completed) || 0
+          newFailed     = Number(failCount) || 0
+          newSuccessful = prev.successful
         }
       } catch (e) {
         console.warn(`[v0] Failed to increment progression counters for ${connectionId}:`, e)
@@ -356,15 +356,22 @@ export class ProgressionStateManager {
       // Write metadata (non-counter fields) + expire in parallel.
       try {
         const nowIso = new Date().toISOString()
-        await Promise.all([
+        const metaWrites: Promise<any>[] = [
           client.hset(redisKey, {
             cycle_success_rate: String(successRate.toFixed(2)),
             last_cycle_time: nowIso,
             last_update: nowIso,
             connection_id: connectionId,
           }),
-          client.expire(redisKey, 7 * 24 * 60 * 60),
-        ])
+        ]
+        // Gate expire to every 500 completed cycles — the hash TTL is 7
+        // days; resetting it on every cycle burns one extra round-trip per
+        // cycle across all three concurrent processors. At 500 cycles the
+        // key is refreshed roughly every 25 s, well within the 7-day window.
+        if (newCompleted % 500 === 1) {
+          metaWrites.push(client.expire(redisKey, 7 * 24 * 60 * 60))
+        }
+        await Promise.all(metaWrites)
       } catch (writeError) {
         console.warn(`[v0] Failed to write progression metadata for ${connectionId}:`, writeError)
         return
