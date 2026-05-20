@@ -39,10 +39,25 @@ import { safeParseResponse } from "@/lib/safe-response-parser"
 export class BingXConnector extends BaseExchangeConnector {
   private timeOffset: number = 0 // milliseconds to adjust local time
   private lastTimeSync: number = 0
-  private timeSyncIntervalMs: number = 300000 // re-sync every 5 minutes
+  // Re-sync every 60 s (down from 300 s). In serverless environments each
+  // request may be a fresh module instance so lastTimeSync resets to 0 and
+  // the first sync always fires — the interval only matters within a single
+  // long-lived instance (e.g. development server).
+  private timeSyncIntervalMs: number = 60_000
+  // Serialise the initial sync: if multiple signed requests fire concurrently
+  // before the first syncServerTime() resolves, they all await the SAME
+  // promise instead of each reading timeOffset=0 (stale) and all failing
+  // with "timestamp is invalid". Without this, up to N concurrent calls can
+  // all use offset=0 and all fail before any of their individual syncs
+  // complete — producing one 109400 error per call per cold start.
+  private syncPromise: Promise<void> | null = null
 
   constructor(credentials: ExchangeCredentials, exchange: string = "bingx") {
     super(credentials, exchange)
+    // Kick off the first time-sync immediately in the background so that
+    // the offset is ready by the time the first signed request fires.
+    // Errors are swallowed — the sync will be retried in syncServerTime().
+    this.syncPromise = this.syncServerTime().catch(() => { this.syncPromise = null })
   }
 
   private getBaseUrl(): string {
@@ -59,11 +74,23 @@ export class BingXConnector extends BaseExchangeConnector {
    * Re-syncs every 5 minutes to handle gradual clock drift.
    */
   private async syncServerTime(): Promise<void> {
-    const now = Date.now()
-    if (now - this.lastTimeSync < this.timeSyncIntervalMs) {
-      return // recently synced
+    if (Date.now() - this.lastTimeSync < this.timeSyncIntervalMs) {
+      return // recently synced within the throttle window
+    }
+    // If a sync is already in-flight (from the constructor kick-off or a
+    // concurrent call), wait for that one rather than issuing a second
+    // fetch in parallel. Importantly, once the in-flight promise resolves,
+    // lastTimeSync will be updated to the actual completion time, so any
+    // subsequent callers that sneak past the throttle check (before the
+    // in-flight sync updates lastTimeSync) are correctly serialised here.
+    if (this.syncPromise) {
+      await this.syncPromise
+      return
     }
 
+    // Own the in-flight slot; clear it when done so future callers can
+    // trigger a fresh sync once the TTL expires.
+    this.syncPromise = (async () => {
     try {
       // NTP-style midpoint sync: capture local time around the request
       // and assume symmetric latency. The previous implementation used
@@ -89,7 +116,11 @@ export class BingXConnector extends BaseExchangeConnector {
           // Best estimate: midpoint of the request window.
           const localMidpoint = t0 + (t1 - t0) / 2
           this.timeOffset = serverTime - localMidpoint
-          this.lastTimeSync = now
+          // Set lastTimeSync to the ACTUAL completion time (t1), not the
+          // time captured at the start of syncServerTime. Using an early
+          // timestamp shortened the effective throttle window by one RTT
+          // (typically 200-600 ms), causing spurious re-syncs.
+          this.lastTimeSync = t1
           if (Math.abs(this.timeOffset) > 100) {
             this.log(
               `[v0] Server time sync: offset=${this.timeOffset.toFixed(0)}ms ` +
@@ -102,7 +133,16 @@ export class BingXConnector extends BaseExchangeConnector {
       // Fall back to local time; worst case we'll hit timestamp errors
       // and retry with a fresh sync.
       this.log(`[v0] Failed to sync server time: ${String(err).slice(0, 80)}`)
+    } finally {
+      // Clear the in-flight slot once this sync completes (success or fail).
+      // Future callers will either pass the throttle check (if we just
+      // succeeded) or trigger a fresh sync (if we failed or enough time has
+      // elapsed). Without this, a failed sync would block future syncs forever.
+      this.syncPromise = null
     }
+    })()
+
+    await this.syncPromise
   }
 
   /**
@@ -132,7 +172,11 @@ export class BingXConnector extends BaseExchangeConnector {
     const code = String(data?.code ?? "")
     const msg  = String(data?.msg ?? "").toLowerCase()
     if (code === "109400" && msg.includes("timestamp")) {
-      this.lastTimeSync = 0 // force a resync on next call
+      // Force a fresh sync: clear both the throttle gate AND any in-flight
+      // shared promise so syncServerTime() issues a new HTTP call instead of
+      // coalescing onto the stale-offset promise that was already resolved.
+      this.lastTimeSync = 0
+      this.syncPromise = null
       await this.syncServerTime()
       return true
     }
@@ -380,11 +424,48 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`Response status: ${response.status}`)
       this.log(`Response code: ${data.code}`)
 
-      // Check for error responses — BingX can return `code` as a number or string
+      // Check for error responses — BingX returns `code` as a number or string.
+      // On a timestamp error (code 109400 + "timestamp" in msg, or 100421)
+      // force-resync the server-time offset and retry once. resyncOnTimestampError
+      // already calls syncServerTime() internally; we must NOT call it again here
+      // or we waste a round-trip and risk the throttle preventing the second sync.
       if (!response.ok || !this.isBingXSuccess(data.code)) {
-        const errorMsg = data.msg || data.error || `HTTP ${response.status}: ${response.statusText}`
-        this.logError(`API Error (code ${data.code}): ${errorMsg}`)
-        throw new Error(errorMsg)
+        const isTimestampErr =
+          (String(data.code) === "100421") ||
+          (String(data.code) === "109400" &&
+            String(data.msg ?? "").toLowerCase().includes("timestamp"))
+
+        if (isTimestampErr) {
+          // Clear throttle + in-flight promise and perform a fresh sync.
+          // resyncOnTimestampError() is intentionally not used here because
+          // getBalance is not always called with a 109400 that has the
+          // "timestamp" substring — code 100421 is a separate "null timestamp"
+          // error. Handling both explicitly avoids the msg-matching gap.
+          this.lastTimeSync = 0
+          this.syncPromise = null
+          await this.syncServerTime()
+
+          // Rebuild signed request with corrected timestamp.
+          const { signature: retrySig, queryString: retryQs } =
+            this.signParams({ timestamp: this.getTimestamp() })
+          const retryUrlCorrect = `${baseUrl}${endpoint}?${retryQs}&signature=${retrySig}`
+          const retryResponse = await this.rateLimitedFetch(retryUrlCorrect, {
+            method: "GET",
+            headers: { "X-BX-APIKEY": this.credentials.apiKey, "Content-Type": "application/json" },
+          })
+          const retryData = await this.safeJson(retryResponse)
+          if (!retryResponse.ok || !this.isBingXSuccess(retryData.code)) {
+            const retryErrMsg = retryData.msg || retryData.error || `HTTP ${retryResponse.status}`
+            this.logError(`API Error after resync (code ${retryData.code}): ${retryErrMsg}`)
+            throw new Error(retryErrMsg)
+          }
+          // Merge retry response into data so the balance-parse below works.
+          Object.assign(data, retryData)
+        } else {
+          const errorMsg = data.msg || data.error || `HTTP ${response.status}: ${response.statusText}`
+          this.logError(`API Error (code ${data.code}): ${errorMsg}`)
+          throw new Error(errorMsg)
+        }
       }
 
       this.log("Successfully retrieved account data")
@@ -665,7 +746,7 @@ export class BingXConnector extends BaseExchangeConnector {
         if (sideMismatch && !isSpot && hedgeMode) {
           this.log("Retrying order without positionSide (detected one-way account)")
           delete params.positionSide
-          params.timestamp = Date.now()
+          params.timestamp = this.getTimestamp()
           const { signature: retrySig, queryString: retryQs } = this.signParams(params)
           const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}&signature=${retrySig}`
           const retryResp = await this.rateLimitedFetch(retryUrl, {
@@ -832,7 +913,7 @@ export class BingXConnector extends BaseExchangeConnector {
           delete params.reduceOnly
           // Hedge mode requires positionSide; ensure it's present.
           if (!params.positionSide) params.positionSide = positionSide
-          params.timestamp = Date.now()
+          params.timestamp = this.getTimestamp()
           const { signature: retrySig2, queryString: retryQs2 } = this.signParams(params)
           const retryUrl2 = `${this.getBaseUrl()}${endpoint}?${retryQs2}&signature=${retrySig2}`
           const retryResp2 = await this.rateLimitedFetch(retryUrl2, {
@@ -856,7 +937,7 @@ export class BingXConnector extends BaseExchangeConnector {
         if (sideMismatch && hedgeMode) {
           this.log("Retrying stop order without positionSide (one-way account)")
           delete params.positionSide
-          params.timestamp = Date.now()
+          params.timestamp = this.getTimestamp()
           const { signature: retrySig, queryString: retryQs } = this.signParams(params)
           const retryUrl = `${this.getBaseUrl()}${endpoint}?${retryQs}&signature=${retrySig}`
           const retryResp = await this.rateLimitedFetch(retryUrl, {
@@ -946,7 +1027,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const params = {
         symbol: bingxSymbol,
         orderId,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -1006,7 +1087,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const endpoint = this.credentials.apiType === "spot" ? "/openApi/spot/v1/trade/openOrders" : "/openApi/swap/v2/trade/openOrders"
 
       const params: Record<string, any> = {
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       if (symbol) {
@@ -1045,7 +1126,7 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const params: Record<string, any> = {
         limit,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       if (symbol) {
@@ -1093,7 +1174,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`Fetching positions${symbol ? ` for ${symbol}` : ""} (${effectiveContractType})`)
 
       const params: Record<string, any> = {
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       if (symbol) {
@@ -1144,7 +1225,7 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const params: Record<string, any> = {
         symbol: this.toBingXSymbol(symbol),
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
 
       if (leverage) {
@@ -1237,7 +1318,7 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const params: Record<string, string> = {
         coin,
-        timestamp: String(Date.now()),
+        timestamp: String(this.getTimestamp()),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -1272,7 +1353,7 @@ export class BingXConnector extends BaseExchangeConnector {
         coin,
         address,
         amount: String(amount),
-        timestamp: String(Date.now()),
+        timestamp: String(this.getTimestamp()),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -1306,7 +1387,7 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const params: Record<string, string> = {
         limit: String(limit),
-        timestamp: String(Date.now()),
+        timestamp: String(this.getTimestamp()),
       }
 
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -1610,7 +1691,7 @@ export class BingXConnector extends BaseExchangeConnector {
   }
 
   /**
-   * ── 1-second OHLCV (spec §7) ──────────────────────────────────────
+   * ── 1-second OHLCV (spec §7) ─────���────────────────────────────────
    *
    * Aggregates from BingX trade history. Spot uses
    * `/openApi/spot/v1/market/trades`, swap uses
@@ -1656,7 +1737,7 @@ export class BingXConnector extends BaseExchangeConnector {
    * ─────────────────────────────────────────────────────────────────
    * BINGX API SKILLS - Official implementation
    * Source: https://github.com/BingX-API/api-ai-skills
-   * ─────────────────────────────────────────────────────────────────
+   * ──���──────────────────────────────────────────────────────────────
    */
 
   /**
@@ -1710,7 +1791,7 @@ export class BingXConnector extends BaseExchangeConnector {
         priceChangePercent: Number.parseFloat(ticker?.priceChangePercent || "0"),
         fundingRate: Number.parseFloat(ticker?.fundingRate || "0"),
         openInterest: Number.parseFloat(ticker?.openInterest || "0"),
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
@@ -1859,7 +1940,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`[API] Closing all positions${symbol ? ` for ${symbol}` : ""}`)
       
       const params: Record<string, any> = {
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       if (symbol) {
@@ -1913,7 +1994,7 @@ export class BingXConnector extends BaseExchangeConnector {
       
       const params: Record<string, any> = {
         positionId,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -2005,7 +2086,7 @@ export class BingXConnector extends BaseExchangeConnector {
       
       const params: Record<string, any> = {
         batchOrders: JSON.stringify(batchOrders),
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -2067,7 +2148,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const params: Record<string, any> = {
         symbol: bingxSymbol,
         orderIdList: JSON.stringify(orderIds.map(id => Number(id))),
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -2118,7 +2199,7 @@ export class BingXConnector extends BaseExchangeConnector {
       this.log(`[API] Cancelling all open orders${symbol ? ` for ${symbol}` : ""}${type ? ` (type: ${type})` : ""}`)
       
       const params: Record<string, any> = {
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       if (symbol) {
@@ -2184,7 +2265,7 @@ export class BingXConnector extends BaseExchangeConnector {
       
       const params: Record<string, any> = {
         type,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       if (timeOut) {
@@ -2259,7 +2340,7 @@ export class BingXConnector extends BaseExchangeConnector {
         symbol: this.toBingXSymbol(symbol),
         amount,
         type,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       if (positionSide) {
@@ -2316,7 +2397,7 @@ export class BingXConnector extends BaseExchangeConnector {
       
       const params: Record<string, any> = {
         symbol: this.toBingXSymbol(symbol),
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       const { signature, queryString: signedQs } = this.signParams(params)
@@ -2363,7 +2444,7 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       const params: Record<string, any> = {
         symbol: this.toBingXSymbol(symbol),
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       if (orderId) params.orderId = orderId
@@ -2411,7 +2492,7 @@ export class BingXConnector extends BaseExchangeConnector {
     try {
       const params: Record<string, any> = {
         symbol: this.toBingXSymbol(symbol),
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       if (orderId) params.orderId = orderId
@@ -2461,7 +2542,7 @@ export class BingXConnector extends BaseExchangeConnector {
   ): Promise<{ success: boolean; orders?: any[]; error?: string }> {
     try {
       const params: Record<string, any> = {
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       if (symbol) params.symbol = this.toBingXSymbol(symbol)
@@ -2517,7 +2598,7 @@ export class BingXConnector extends BaseExchangeConnector {
         tradingUnit,
         startTs,
         endTs,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       if (orderId) params.orderId = orderId
@@ -2571,7 +2652,7 @@ export class BingXConnector extends BaseExchangeConnector {
       const result: any = {
         success: true,
         dataType,
-        timestamp: Date.now(),
+        timestamp: this.getTimestamp(),
       }
       
       if (dataType === "balance" || dataType === "all") {

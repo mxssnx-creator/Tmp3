@@ -106,24 +106,33 @@ async function executeReadyStrategiesAsLiveOrders(
 
     if (realSets.length === 0) return
 
-    // Create mock exchange connector for testing/development
-    // In production, this would be a real exchange API connector
-    const exchangeConnector = {
-      placeOrder: async (symbol: string, direction: string, quantity: number, params: any) => {
-        console.log(`[v0] [Phase4] Mock placeOrder: ${symbol} ${direction} qty=${quantity}`)
-        return { orderId: `mock:${Date.now()}`, status: "filled" }
-      },
-      setLeverage: async (symbol: string, leverage: number) => {
-        console.log(`[v0] [Phase4] Mock setLeverage: ${symbol} lev=${leverage}`)
-        return { symbol, leverage }
-      },
-      getPosition: async (symbol: string) => {
-        return { symbol, size: 0 }
-      },
-      closePosition: async (symbol: string, direction: string) => {
-        console.log(`[v0] [Phase4] Mock closePosition: ${symbol} ${direction}`)
-        return { status: "closed" }
-      },
+    // Build a real exchange connector from the connection's stored credentials.
+    // Previously this used a hardcoded mock that returned `mock:${Date.now()}`
+    // order IDs — no live orders were ever placed. We now create the same
+    // connector that syncWithExchange / startRealtimeProcessor use.
+    const { getConnection } = await import("@/lib/redis-db")
+    const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+    const connection = await getConnection(connectionId).catch(() => null)
+    if (!connection) {
+      console.warn(`[v0] [Phase4] ${symbol}: connection ${connectionId} not found — skipping live orders`)
+      return
+    }
+    const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
+    const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
+    if (!apiKey || !apiSecret) {
+      console.warn(`[v0] [Phase4] ${symbol}: no credentials on connection ${connectionId} — skipping live orders`)
+      return
+    }
+    const exchangeConnector = await createExchangeConnector(connection.exchange, {
+      apiKey,
+      apiSecret,
+      apiType: connection.api_type,
+      contractType: connection.contract_type,
+      isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
+    }).catch(() => null)
+    if (!exchangeConnector) {
+      console.warn(`[v0] [Phase4] ${symbol}: failed to create exchange connector for ${connection.exchange} — skipping`)
+      return
     }
 
     // Track execution statistics for monitoring

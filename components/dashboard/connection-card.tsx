@@ -1079,7 +1079,7 @@ export function ConnectionCard({
 
                         <div className="space-y-2">
                           <label className="text-sm font-medium">Slippage Tolerance (%)</label>
-                          <Input type="number" step="0.1" placeholder="e.g., 0.5" className="h-9" />
+                          <Input type="number" step="0.02" min="0.02" max="0.3" placeholder="e.g., 0.06" className="h-9" />
                           <p className="text-xs text-muted-foreground">Maximum acceptable price slippage</p>
                         </div>
 

@@ -24,7 +24,7 @@ interface OrderSettingsPanelProps {
 
 export function OrderSettingsPanel({
   orderType,
-  marketSettings = { slippageTolerance: 1, autoExecution: true },
+  marketSettings = { slippageTolerance: 0.06, autoExecution: true },
   limitSettings = { priceOffset: 0.5, timeoutSeconds: 300 },
   onMarketSettingsChange,
   onLimitSettingsChange,
@@ -43,7 +43,7 @@ export function OrderSettingsPanel({
               <div className="flex items-center justify-between">
                 <Label className="text-sm font-medium">Slippage Tolerance</Label>
                 <Badge variant="secondary" className="text-xs">
-                  {marketSettings.slippageTolerance}%
+                  {marketSettings.slippageTolerance.toFixed(2)}%
                 </Badge>
               </div>
               <Slider
@@ -51,9 +51,9 @@ export function OrderSettingsPanel({
                 onValueChange={(value) =>
                   onMarketSettingsChange?.({ ...marketSettings, slippageTolerance: value[0] })
                 }
-                min={0.1}
-                max={5}
-                step={0.1}
+                min={0.02}
+                max={0.3}
+                step={0.02}
                 className="w-full"
               />
               <p className="text-xs text-muted-foreground">

@@ -3232,7 +3232,30 @@ export async function closeLivePosition(
     // had completed via an SL/TP fill seconds earlier.
     let exchangeCloseSuccess = false
     let exchangeCloseReason: "ok" | "already_closed" | "failed" | "skipped" = "skipped"
-    if (exchangeConnector && typeof exchangeConnector.closePosition === "function") {
+
+    // ── Ownership guard ────────────────────────────────────────────────
+    // Only issue a closePosition call when the system has a verified
+    // orderId for this position — proof that WE placed the entry order.
+    // Without an orderId the position was either simulated (no exchange
+    // call made), the entry order failed silently, or the slot was
+    // allocated but never confirmed. In those cases we must NOT call
+    // closePosition because the exchange may have an external/manual
+    // position at the same symbol+direction that we would inadvertently
+    // close. The Redis record is cleaned up by the local close path
+    // below regardless.
+    const hasSystemOrderId = !!position.orderId
+    if (!hasSystemOrderId && exchangeConnector) {
+      exchangeCloseReason = "skipped"
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "info",
+        `closeLivePosition: skipping exchange close for ${position.symbol} ${position.direction} — no system orderId (external position protection)`,
+        { positionId: position.id, symbol: position.symbol, direction: position.direction },
+      ).catch(() => {})
+    }
+
+    if (hasSystemOrderId && exchangeConnector && typeof exchangeConnector.closePosition === "function") {
       const maxRetries = 2
       // Tighter backoff: 200 → 400 ms. Transient API blips (rate-limit
       // bump, brief network reload) clear in well under 500 ms; the old
@@ -4138,6 +4161,21 @@ export async function reconcileLivePositions(
             delta.updated++
             return delta
           }
+
+          // ── Ownership guard ──────────────────────────────────────────
+          // Only arm SL/TP and issue force-closes on positions that carry
+          // a system orderId — proof WE placed the entry order.
+          // If orderId is absent, the exchange position at this
+          // symbol+direction may have been opened manually by the operator
+          // or by another system. We must not arm reduce-only orders or
+          // close it. We still save the refreshed markPrice/PnL so the
+          // dashboard reflects current unrealised PnL accurately.
+          if (!pos.orderId) {
+            await savePosition(pos)
+            delta.updated++
+            return delta
+          }
+
           try {
             const protectionResult = await updateProtectionOrders(
               exchangeConnector,
@@ -4235,18 +4273,16 @@ export async function reconcileLivePositions(
             pos.takeProfitOrderId = undefined
           }
 
-          if (pos.executedQuantity > 0 && pos.status !== "placed") {
-            try {
-              const closeP = exchangeConnector.closePosition(pos.symbol, pos.direction)
-              const timeoutP = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error("reconcile-close timeout after 2s")), 2000),
-              )
-              await Promise.race([closeP, timeoutP])
-            } catch {
-              /* already gone, timed out, or transient — reconcile is best-effort */
-            }
-          }
-
+          // ── Do NOT call closePosition on the exchange here ────────────
+          // This branch runs when the Redis-tracked position is absent
+          // from the exchange's open-positions list. That means the
+          // exchange has ALREADY closed it (SL/TP filled, liquidated,
+          // or the operator closed it manually). Calling closePosition
+          // here would therefore target any OTHER open position at the
+          // same symbol+direction — including ones the operator placed
+          // manually that the system did not create. We must not touch
+          // those. The Redis record is closed locally by the code below;
+          // no exchange action is required or safe.
           pos.status = "closed"
           pos.closedAt = Date.now()
           pos.realizedPnL = Math.round(realizedPnl * 100) / 100
