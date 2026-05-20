@@ -1725,16 +1725,6 @@ export class StrategyCoordinator {
     } catch { /* non-critical — Redis write failure should not kill strategy flow */ }
 
     if (baseSets.length > 0) {
-      const sample = baseSets[0]
-      const variantBreakdown = ["default", "trailing", "block", "dca", "pause"]
-        .map((v) => `${v[0]}=${mainSets.filter((s) => s.variant === v).length}`)
-        .join(",")
-      console.log(
-        `[v0] [StrategyFlow] ${symbol} MAIN: ${mainSets.length} sets (${uniqueBaseSetsProduced.size}/${baseSets.length} bases, reused=${reused}) ` +
-        `variants={${variantBreakdown}} axis={${axisSetsCount} total, L=${axisLong}, S=${axisShort}} ` +
-        `ctx={cont=${ctx.continuousCount},lastW=${ctx.lastWins},lastL=${ctx.lastLosses},prevL=${ctx.prevLosses}} ` +
-        `| sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}}`
-      )
     }
 
     return {
@@ -2222,12 +2212,6 @@ export class StrategyCoordinator {
       } catch { /* non-critical */ }
     }
 
-    // Debug: show why sets failed REAL filter
-    if (mainSets.length > 0 && realSets.length === 0) {
-      const sample = mainSets[0]
-      console.log(`[v0] [StrategyFlow] ${symbol} REAL filter rejected all: sample={pf=${sample.avgProfitFactor.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}, conf=${sample.avgConfidence.toFixed(2)} (advisory)} threshold={minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime}}`)
-    }
-
     // Persist REAL sets
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
     await setSettings(realKey, { sets: realSets, count: realSets.length, created: new Date() })
@@ -2566,10 +2550,6 @@ export class StrategyCoordinator {
       } catch { /* non-critical */ }
     } catch { /* non-critical */ }
 
-    console.log(
-      `[v0] [StrategyFlow] ${symbol} REAL: ${realSets.length}/${mainSets.length} Sets promoted (minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime})`
-    )
-
     // ── Position count metrics for real stage ──────────────────────
     // Track entries passing Real filter so dashboard shows promotion success
     const realEntriesTotal = realSets.reduce((sum, s) => sum + (s.entryCount ?? 0), 0)
@@ -2639,11 +2619,7 @@ export class StrategyCoordinator {
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
 
-    console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime}min)`)
-    if (realSets.length > 0 && qualifying.length === 0) {
-      const sample = realSets[0]
-      console.log(`[v0] [StrategyFlow] ${symbol} LIVE filter rejected all real sets: sample={pf=${sample.avgProfitFactor.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}, conf=${sample.avgConfidence.toFixed(2)} (advisory)}`)
-    }
+
 
     // Persist LIVE sets
     const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
@@ -3120,14 +3096,6 @@ export class StrategyCoordinator {
               }
             }),
           )
-          const positionsCreated = creations.filter((r) => r === "created").length
-          const positionsGated   = creations.filter((r) => r === "gated").length
-          const positionErrors   = creations.filter((r) => r === "error").length
-          console.log(
-            `[v0] [StrategyFlow] ${symbol} LIVE: ${positionsCreated} new pseudo positions` +
-            ` (${positionsGated} gated/already-active, ${positionErrors} errors)` +
-            ` for ${qualifying.length} Sets`
-          )
         } else {
           console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: No entry price, skipping position creation`)
         }
@@ -3135,10 +3103,6 @@ export class StrategyCoordinator {
         console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: Position creation error:`, posErr instanceof Error ? posErr.message : String(posErr))
       }
     }
-
-    console.log(
-      `[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime}min)`
-    )
 
     return {
       result: {
