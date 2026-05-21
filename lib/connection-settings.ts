@@ -201,6 +201,9 @@ export async function updateConnectionSettings(
     }
     
     return updated
+    } finally {
+      await client.del(lockKey).catch(() => {})
+    }
   } catch (error) {
     console.error(`Failed to update connection settings for ${connectionId}:`, error)
     throw error
