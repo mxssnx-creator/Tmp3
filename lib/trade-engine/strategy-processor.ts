@@ -8,12 +8,7 @@
 
 // Force module rebuild timestamp: 1712341200000
 const _STRATEGY_BUILD_VERSION = "2.1.0"
-
-// `getSettings`, `getAppSettings`, `createPosition` no longer imported —
-// they were only consumed by the now-removed per-variant evaluators
-// and direct pseudo-position creator. Live flow imports come exclusively
-// from `StrategyCoordinator` + `PseudoPositionManager`.
-import { initRedis, getIndications } from "@/lib/redis-db"
+import { getSettings, setSettings, getRedisClient, initRedis, getIndications } from "@/lib/redis-db"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { StrategyCoordinator } from "@/lib/strategy-coordinator"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
@@ -97,7 +92,6 @@ export class StrategyProcessor {
       // On the next processor tick, we detect it and reload the configuration
       // so engine immediately reflects the new settings.
       try {
-        const { getRedisClient } = await import("@/lib/redis-db")
         const client = getRedisClient()
         const dirtyKey = `settings:dirty:${this.connectionId}`
         const isDirty = await client.get(dirtyKey)

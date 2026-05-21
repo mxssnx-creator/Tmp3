@@ -1618,11 +1618,15 @@ export class TradeEngineManager {
         // writes its own error counters to Redis inline (see below).
         // This guarantees correct counts even when withCycleDeadline
         // fires before all tasks settle — no silent data loss.
+        // Phase 4 live order execution reference — loaded once at module
+        // level (see lazy-init helpers at top of file). Previously this
+        // was `require("./stages/live-stage")` which pulled the entire
+        // 5500-line module into every pipelineDeps object on every cycle.
         const pipelineDeps = {
           indication: this.indicationProcessor,
           strategy: this.strategyProcessor,
           realtime: this.realtimeProcessor,
-          liveStage: require("./stages/live-stage"),
+          liveStage: __liveStage || (__liveStage = await import("./stages/live-stage")),
         }
         const pipelineResults = await withCycleDeadline(
           mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, (symbol) =>
@@ -1801,7 +1805,7 @@ export class TradeEngineManager {
           await Promise.all(writes)
         } catch { /* non-critical */ }
 
-        const processedThisCycle = indicationResults.reduce((sum: number, arr: any[]) => sum + (arr?.length || 0), 0)
+          const processedThisCycle = totalIndications
 
         this.componentHealth.indications.lastCycleDuration = duration
         this.componentHealth.indications.cycleCount = cycleCount

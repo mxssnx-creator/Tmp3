@@ -34,6 +34,27 @@ import { getMarketDataCached, prefetchMarketDataBatch } from "./market-data-cach
 // cold start.
 import { getEngineTimings } from "@/lib/engine-timings"
 
+// ── Module-level import memoization for live-sync hot paths ──────────
+// `fireSyncLiveFromPseudo` and `maybeRunLiveSync` were previously doing
+// 3 `await import()` calls per invocation (every trailing stop update
+// and every 5s sync), costing 3–5ms each. Memoize at module level so
+// each dynamic import resolves exactly once per process.
+let __connModule: any = null
+let __exchangeModule: any = null
+let __liveStageModule: any = null
+async function __ensureConnModule() {
+  if (!__connModule) __connModule = await import("@/lib/redis-db")
+  return __connModule.getConnection
+}
+async function __ensureExchangeModule() {
+  if (!__exchangeModule) __exchangeModule = await import("@/lib/exchange-connectors")
+  return __exchangeModule.createExchangeConnector
+}
+async function __ensureLiveStageModule() {
+  if (!__liveStageModule) __liveStageModule = await import("@/lib/trade-engine/stages/live-stage")
+  return __liveStageModule
+}
+
 export class RealtimeProcessor {
   private connectionId: string
   private positionManager: PseudoPositionManager
@@ -924,16 +945,14 @@ export class RealtimeProcessor {
    */
   private async fireSyncLiveFromPseudo(position: any): Promise<void> {
     try {
-      const { getConnection } = await import("@/lib/redis-db")
+      const getConnection = await __ensureConnModule()
       const connection = await getConnection(this.connectionId)
       if (!connection) return
       const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
       const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
-      // Paper-only if either key is empty. Do NOT check length — valid
-      // credentials vary by exchange (some are short, some long).
       if (!apiKey || !apiSecret) return
 
-      const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+      const createExchangeConnector = await __ensureExchangeModule()
       const connector = await createExchangeConnector(connection.exchange, {
         apiKey,
         apiSecret,
@@ -942,10 +961,9 @@ export class RealtimeProcessor {
         isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
       })
 
-      const { syncLiveFromPseudo } = await import("@/lib/trade-engine/stages/live-stage")
+      const { syncLiveFromPseudo } = await __ensureLiveStageModule()
       await syncLiveFromPseudo(this.connectionId, position, connector)
     } catch (err) {
-      // Best-effort — never propagate.
       console.warn(`[v0] fireSyncLiveFromPseudo error for ${position?.id}:`, err instanceof Error ? err.message : String(err))
     }
   }
@@ -1072,7 +1090,7 @@ export class RealtimeProcessor {
       // zero tracked positions is one `getLivePositions` (cheap LRANGE)
       // plus, every 5 s, one `getPositions()` exchange call inside the
       // orphan-adoption sweep. Fine.
-      const { getConnection } = await import("@/lib/redis-db")
+      const getConnection = await __ensureConnModule()
       const connection = await getConnection(this.connectionId)
       if (!connection) {
         console.warn(`[v0] [Realtime] live sync skipped: no connection record for ${this.connectionId}`)
@@ -1089,7 +1107,7 @@ export class RealtimeProcessor {
         return
       }
 
-      const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+      const createExchangeConnector = await __ensureExchangeModule()
       const connector = await createExchangeConnector(connection.exchange, {
         apiKey,
         apiSecret,
@@ -1102,7 +1120,7 @@ export class RealtimeProcessor {
         return
       }
 
-      const { syncWithExchange } = await import("@/lib/trade-engine/stages/live-stage")
+      const { syncWithExchange } = await __ensureLiveStageModule()
       await syncWithExchange(this.connectionId, connector)
     } catch (err) {
       console.warn(

@@ -225,8 +225,22 @@ export class IndicationProcessor {
    * 1. market_data:{symbol}:candles  → JSON array of 250 candles (from loadMarketDataForEngine)
    * 2. market_data:{symbol}:1m       → JSON object with .candles array
    * 3. market_data:{symbol}          → single hash entry (fallback, 1 data point)
+   *
+   * Parsed candles are cached per-symbol with 200ms TTL (matching the
+   * market-data-cache TTL) so repeated processIndication calls in the same
+   * cycle fan-out don't re-parse the same 250-candle JSON array.
    */
+  private _parsedCandlesCache = new Map<string, { candles: any[]; ts: number }>()
+  private static readonly _PARSED_CANDLES_TTL_MS = 200
+
   private async getHistoricalCandles(symbol: string): Promise<any[]> {
+    // Check the per-symbol parsed-candle cache first.
+    {
+      const cached = this._parsedCandlesCache.get(symbol)
+      if (cached && Date.now() - cached.ts < IndicationProcessor._PARSED_CANDLES_TTL_MS) {
+        return cached.candles
+      }
+    }
     try {
       await initRedis()
       const client = getRedisClient()
@@ -236,14 +250,7 @@ export class IndicationProcessor {
       if (candlesRaw) {
         const candles = JSON.parse(typeof candlesRaw === "string" ? candlesRaw : JSON.stringify(candlesRaw))
         if (Array.isArray(candles) && candles.length > 0) {
-          // ── Log throttling (event-loop hygiene) ──
-          // This fires on EVERY prehistoric tick at the realtime cadence
-          // (~20 calls/sec under typical settings), and the previous
-          // unconditional `console.log` was producing ~80 stdout writes/sec
-          // PER SYMBOL across the four log lines in the cycle, starving the
-          // event loop and making the dashboard appear to hang. The candle
-          // count is effectively constant between fetches, so we only log
-          // when the count actually changes for this symbol.
+          this._parsedCandlesCache.set(symbol, { candles, ts: Date.now() })
           this.logCandleCountIfChanged(symbol, "candles-array", candles.length)
           return candles
         }

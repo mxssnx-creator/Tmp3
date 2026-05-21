@@ -5460,50 +5460,48 @@ export async function syncLiveFromPseudo(
     })
     if (matches.length === 0) return
 
-    for (const livePos of matches) {
-      try {
-        // Translate trailing_stop_price → percent relative to THIS
-        // live position's confirmed fill. Each live position can have
-        // its own fill price (cost-averaging, partial fills) so we
-        // can't pre-compute once — the percent must be derived
-        // per-position. If trailing is active and the price is sane,
-        // use it; otherwise fall back to the static SL ratio.
-        let effectiveSlPct = slPct
-        if (trailingActive && trailingStopPrice > 0) {
-          const fill = Number(livePos.averageExecutionPrice || livePos.entryPrice || 0)
-          if (fill > 0) {
-            const liveSide: "long" | "short" =
-              livePos.direction === "short" ? "short" : "long"
-            // SL distance (percent of fill). For long: fill > stop → positive.
-            // For short: stop > fill → positive. Both branches yield a
-            // non-negative percent that fits the existing slPct contract
-            // (positive number = "stop X% adverse from entry").
-            const distPct =
-              liveSide === "long"
-                ? ((fill - trailingStopPrice) / fill) * 100
-                : ((trailingStopPrice - fill) / fill) * 100
-            // Guard against degenerate cases — a stored stop that's
-            // already on the wrong side of the fill (shouldn't happen,
-            // but a precision-loss snapshot could trigger it) would
-            // arm an unprotected position. In that case fall back to
-            // the static ratio so we don't widen the stop.
-            if (Number.isFinite(distPct) && distPct > 0) {
-              effectiveSlPct = distPct
+    // Parallelize across matching live positions — each position's
+    // SL/TP recalculation is independent. The previous serial for-loop
+    // caused 200–1200ms blocking per trailing stop update (200ms +
+    // exchange RTTs per position). Cap at 4 concurrent so we don't
+    // hammer the exchange API in a single tick.
+    const MAX_CONCURRENT_SLTP = 4
+    let nextIdx = 0
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const i = nextIdx++
+        if (i >= matches.length) return
+        const livePos = matches[i]
+        try {
+          let effectiveSlPct = slPct
+          if (trailingActive && trailingStopPrice > 0) {
+            const fill = Number(livePos.averageExecutionPrice || livePos.entryPrice || 0)
+            if (fill > 0) {
+              const liveSide: "long" | "short" =
+                livePos.direction === "short" ? "short" : "long"
+              const distPct =
+                liveSide === "long"
+                  ? ((fill - trailingStopPrice) / fill) * 100
+                  : ((trailingStopPrice - fill) / fill) * 100
+              if (Number.isFinite(distPct) && distPct > 0) {
+                effectiveSlPct = distPct
+              }
             }
           }
+          await recalculateAndApplySLTP(connectionId, livePos.id, exchangeConnector, {
+            stopLossPct: effectiveSlPct,
+            takeProfitPct: tpPct,
+          })
+        } catch (err) {
+          console.warn(
+            `${LOG_PREFIX} syncLiveFromPseudo: failed for ${livePos.id} (${symbol}/${side}):`,
+            err instanceof Error ? err.message : String(err),
+          )
         }
-
-        await recalculateAndApplySLTP(connectionId, livePos.id, exchangeConnector, {
-          stopLossPct: effectiveSlPct,
-          takeProfitPct: tpPct,
-        })
-      } catch (err) {
-        console.warn(
-          `${LOG_PREFIX} syncLiveFromPseudo: failed for ${livePos.id} (${symbol}/${side}):`,
-          err instanceof Error ? err.message : String(err),
-        )
       }
     }
+    const poolSize = Math.min(MAX_CONCURRENT_SLTP, matches.length)
+    await Promise.all(Array.from({ length: poolSize }, () => worker()))
   } catch (err) {
     console.warn(`${LOG_PREFIX} syncLiveFromPseudo top-level error:`, err instanceof Error ? err.message : String(err))
   }
