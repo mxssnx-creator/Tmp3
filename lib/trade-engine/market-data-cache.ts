@@ -97,9 +97,15 @@ export async function prefetchMarketDataBatch(symbols: string[]): Promise<void> 
         }
       }
     }
-  } catch {
-    // Non-critical — individual fetches will fall back to per-symbol reads
-  }
+    } catch (e) {
+      // Log the failure so operators can see when prefetch is broken —
+      // individual getMarketDataCached calls downstream each pay a full
+      // Redis round-trip when prefetch silently fails.
+      console.warn(
+        `[v0] [MarketDataCache] Prefetch batch failed for ${symbols.length} symbols:`,
+        e instanceof Error ? e.message : String(e),
+      )
+    }
 }
 
 // Settings cache - 5s TTL (settings change rarely)

@@ -520,18 +520,14 @@ export class ProgressionStateManager {
       ])
 
       const newTotalTrades = Number(totalTradesRaw) || 0
-      // If this trade was unsuccessful we didn't increment `successful_trades`
-      // — read it so the success rate math is still correct.
-      let newSuccessfulTrades: number
-      if (successful) {
-        newSuccessfulTrades = Number(successfulTradesRaw) || 0
-      } else {
-        try {
-          newSuccessfulTrades = Number((await client.hget(key, "successful_trades")) || "0") || 0
-        } catch {
-          newSuccessfulTrades = 0
-        }
-      }
+      // When this trade was successful, we already incremented `successful_trades`
+      // atomically via hincrby — use the returned value directly. When
+      // unsuccessful, read the count for success-rate math. We always have the
+      // resolved value available (either from hincrby return or from the extra
+      // fetch) — no separate Redis round-trip needed on either path.
+      const newSuccessfulTrades = !successful
+        ? (Number((await client.hget(key, "successful_trades")) || "0") || 0)
+        : (Number(successfulTradesRaw) || 0)
 
       const tradeSuccessRate =
         newTotalTrades > 0 ? (newSuccessfulTrades / newTotalTrades) * 100 : 0

@@ -1614,7 +1614,10 @@ export class TradeEngineManager {
         // symbol — guaranteeing the spec's "same intervalled progress
         // for ind and strat" contract and the "pseudo handling between
         // indications and strategies" ordering.
-        const failedSymbols: { symbol: string; error: string }[] = []
+        // ── Per-symbol error tracking: each task's .catch() handler
+        // writes its own error counters to Redis inline (see below).
+        // This guarantees correct counts even when withCycleDeadline
+        // fires before all tasks settle — no silent data loss.
         const pipelineDeps = {
           indication: this.indicationProcessor,
           strategy: this.strategyProcessor,
@@ -1623,10 +1626,28 @@ export class TradeEngineManager {
         }
         const pipelineResults = await withCycleDeadline(
           mapWithConcurrency(symbols, SYMBOL_CONCURRENCY, (symbol) =>
-            runIndStratCycle(this.connectionId, symbol, "realtime", pipelineDeps).catch((err) => {
+            runIndStratCycle(this.connectionId, symbol, "realtime", pipelineDeps).catch(async (err) => {
               const msg = err instanceof Error ? err.message : String(err)
-              failedSymbols.push({ symbol, error: msg })
               console.error(`[v0] [RealtimeProgression] Error for ${symbol}:`, msg)
+              // ── Inline error tracking ────────────────────────────────
+              // Per-symbol error counters are written to Redis from inside
+              // each task's catch handler, NOT deferred to the outer
+              // `failedSymbols` array. If `withCycleDeadline` fires before
+              // all tasks complete, the tasks that DID complete still write
+              // their errors — no silent data loss.
+              try {
+                const client = getRedisClient()
+                const progKey = `progression:${this.connectionId}`
+                const safeMsg = msg.slice(0, 240)
+                await Promise.all([
+                  client.hincrby(progKey, "indication_symbol_errors_count", 1),
+                  client.hset(progKey, {
+                    indication_symbol_errors_last_at: new Date().toISOString(),
+                    [`indication_symbol_last_error:${symbol}`]: safeMsg,
+                  }),
+                  client.hincrby(progKey, `indication_symbol_errors:${symbol}`, 1),
+                ])
+              } catch { /* best-effort */ }
               return {
                 symbol,
                 mode: "realtime" as const,
@@ -1671,7 +1692,8 @@ export class TradeEngineManager {
         void pipelineStrategiesEvaluated; void pipelineLiveReady; void pipelinePseudoUpdates
 
         const totalIndications = indicationResults.reduce((sum: number, arr: any[]) => sum + (arr?.length || 0), 0)
-        producedIndications = totalIndications > 0
+        // producedIndications = totalIndications > 0
+        const producedIndications = totalIndications > 0
 
         // Increment cycle count BEFORE writing to Redis so the stored value is accurate
         cycleCount++
@@ -1772,39 +1794,10 @@ export class TradeEngineManager {
             }
             writes.push(client.hincrby(redisKey, "indications_count", totalIndications))
           }
-          // ── Per-symbol error visibility ───────────────────�����────────────
-          // Without this, a chronically-failing symbol (bad ticker,
-          // delisted pair, persistent connector error) would have its
-          // errors swallowed by the per-task `.catch` and the dashboard
-          // would report green. We track:
-          //   * indication_symbol_errors_count           — cumulative
-          //   * indication_symbol_errors_last_cycle      — this tick
-          //   * indication_symbol_errors:<SYMBOL>        — per-symbol counter
-          //   * indication_symbol_last_error:<SYMBOL>    — most recent message
-          // The dashboard's "partial coverage" badge can read these to
-          // surface a list of failing symbols immediately.
-          if (failedSymbols.length > 0) {
-            writes.push(
-              client.hincrby(redisKey, "indication_symbol_errors_count", failedSymbols.length),
-            )
-            writes.push(
-              client.hset(redisKey, {
-                indication_symbol_errors_last_cycle: String(failedSymbols.length),
-                indication_symbol_errors_last_at: new Date().toISOString(),
-              }),
-            )
-            for (const { symbol, error } of failedSymbols) {
-              writes.push(client.hincrby(redisKey, `indication_symbol_errors:${symbol}`, 1))
-              // Truncate error message to a sane length so a noisy stack
-              // trace can't bloat the progression hash.
-              const safeMsg = error.slice(0, 240)
-              writes.push(
-                client.hset(redisKey, {
-                  [`indication_symbol_last_error:${symbol}`]: safeMsg,
-                }),
-              )
-            }
-          }
+          // ── Per-symbol error counters are now written inline inside each
+          // task's .catch() handler (see withCycleDeadline call above).
+          // No deferred array loop needed — counters are always correct
+          // even when the deadline fires before all tasks complete.
           await Promise.all(writes)
         } catch { /* non-critical */ }
 
@@ -1856,12 +1849,14 @@ export class TradeEngineManager {
           } catch { /* silently fail */ }
         }
 
-        // Track intervals processed in Redis for dashboard display (every cycle)
+        // Track intervals processed in Redis for dashboard display.
+        // Gate expire to every 500 cycles — same pattern as progression hash.
         try {
           const client = getRedisClient()
           const indication_key = `indication_cycles:${this.connectionId}`
-          await client.incr(indication_key)
-          await client.expire(indication_key, 86400)
+          const p: Promise<any>[] = [client.incr(indication_key)]
+          if (cycleCount % 500 === 1) p.push(client.expire(indication_key, 86400))
+          await Promise.all(p)
         } catch { /* ignore errors */ }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error)
@@ -2875,7 +2870,14 @@ export class TradeEngineManager {
             if (lastReplayedTs > resumeFrom) {
               await client
                 .set(ckptKey, String(lastReplayedTs), { EX: 7 * 24 * 60 * 60 })
-                .catch(() => { /* non-critical */ })
+                .catch((e) => {
+                  // Log checkpoint failures — silent loss causes duplicate
+                  // replay on the next cycle without operator visibility.
+                  console.warn(
+                    `[v0] [Prehistoric] checkpoint write failed for ${connId}/${symbol}:`,
+                    e instanceof Error ? e.message : String(e),
+                  )
+                })
             }
 
             return {
@@ -3287,12 +3289,20 @@ export class TradeEngineManager {
         // Silent fail - heartbeat is non-critical
       }
 
-      // Refresh market data every 30s (every 3rd heartbeat) to keep live prices current
+      // Refresh market data every 30s (every 3rd heartbeat) to keep live prices current.
+      // Skip reload if data is already fresh — the 1s envelope TTL is 24h but the
+      // loader itself writes a `market_data:BTCUSDT:1s` stamp; checking this prevents
+      // redundant exchange API calls from the heartbeat and prehistoric progression
+      // firing simultaneously.
       if (heartbeatCount % 3 === 0) {
         try {
           const symbols = await this.getSymbols()
-          await loadMarketDataForEngine(symbols)
-          console.log(`[v0] [Heartbeat] Market data refreshed for ${symbols.length} symbols`)
+          const client = getRedisClient()
+          const marketLoaded = await client.get("market_data:BTCUSDT:1s")
+          if (!marketLoaded) {
+            await loadMarketDataForEngine(symbols)
+            console.log(`[v0] [Heartbeat] Market data refreshed for ${symbols.length} symbols`)
+          }
         } catch (refreshErr) {
           console.warn(`[v0] [Heartbeat] Market data refresh failed:`, refreshErr instanceof Error ? refreshErr.message : String(refreshErr))
         }

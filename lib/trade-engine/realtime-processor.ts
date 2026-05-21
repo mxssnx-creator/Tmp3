@@ -329,23 +329,23 @@ export class RealtimeProcessor {
       // When user updates connection settings via UI, a dirty flag is set.
       // On the next realtime tick, we detect it and clear the flag so
       // position management picks up new settings on next open/close.
+      // Throttled to 1 Hz — at 5 Hz cadence the unconditional GET would
+      // fire ~5 Redis ops/s per engine just to poll a typically-false flag.
       try {
-        const client = getRedisClient()
-        const dirtyKey = `settings:dirty:${this.connectionId}`
-        const isDirty = await client.get(dirtyKey)
-        if (isDirty) {
-          // Clear the dirty flag
-          await client.del(dirtyKey)
-          
-          // Clear prev-set cache to force fresh context on next position update
-          this.prevSetCache.clear()
-          
-          console.log(
-            `[v0] [RealtimeProcessor] Settings reloaded for ${this.connectionId} - caches cleared`
-          )
+        if (Date.now() - this._lastDirtyCheckMs >= 1000) {
+          this._lastDirtyCheckMs = Date.now()
+          const client = getRedisClient()
+          const dirtyKey = `settings:dirty:${this.connectionId}`
+          const isDirty = await client.get(dirtyKey)
+          if (isDirty) {
+            await client.del(dirtyKey)
+            this.prevSetCache.clear()
+            console.log(
+              `[v0] [RealtimeProcessor] Settings reloaded for ${this.connectionId} - caches cleared`
+            )
+          }
         }
       } catch (settingsErr) {
-        // Non-critical - continue processing even if dirty check fails
         console.warn(
           `[v0] [RealtimeProcessor] Settings dirty check failed:`,
           settingsErr instanceof Error ? settingsErr.message : String(settingsErr)
