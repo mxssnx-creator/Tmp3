@@ -1177,7 +1177,29 @@ export class GlobalTradeEngineCoordinator {
               Number(state.last_processor_heartbeat) ||
               (state.last_processor_heartbeat ? new Date(state.last_processor_heartbeat).getTime() : 0) ||
               (state.last_indication_run ? new Date(state.last_indication_run).getTime() : 0)
-            if (lastHb === 0) continue // engine started but no heartbeat yet
+            if (lastHb === 0) {
+              // lastHb=0 can mean "engine just started, no heartbeat yet"
+              // OR "engine was running but Redis was down so heartbeats
+              // couldn't be written."  If the engine state shows it was
+              // running and we're past the stall threshold since
+              // `last_state_update`, treat as a stall.
+              const stateUpdatedAt = Number(state.last_state_update) || 0
+              if (stateUpdatedAt > 0 && now - stateUpdatedAt > STALL_THRESHOLD_MS) {
+                // Fall through to stall handling below — the engine was
+                // running but Red is back and heartbeats are zero.
+                console.warn(
+                  `[v0] [Watchdog] Engine ${connectionId} has zero heartbeats but shows running for ${Math.round((now - stateUpdatedAt) / 1000)}s — treating as stalled (Redis outage recovery)`,
+                )
+                // Synthesize a lastHb so the age check below fires
+                this.stallEscalation.set(connectionId, (this.stallEscalation.get(connectionId) ?? 0) + 1)
+                const manager = this.engineManagers.get(connectionId)
+                if (manager?.rearmIfStalled) {
+                  try { await manager.rearmIfStalled() } catch {}
+                }
+                continue
+              }
+              continue // engine started but no heartbeat yet
+            }
             const age = now - lastHb
             if (age > STALL_THRESHOLD_MS) {
               const consecutiveStalls = (this.stallEscalation.get(connectionId) ?? 0) + 1
