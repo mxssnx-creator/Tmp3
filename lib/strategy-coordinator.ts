@@ -1773,32 +1773,44 @@ export class StrategyCoordinator {
   ): Promise<void> {
     try {
       if (!realSets || realSets.length === 0) return
-      
+
       const client = getRedisClient()
+      // PERFORMANCE: previous implementation looped serially with one GET
+      // per set followed by 3 sequential writes per surviving set — at N
+      // Real Sets per symbol per cycle that was 4N round-trips on the
+      // hot path. Now: (1) fan out all dedup GETs into a single Promise.all,
+      // (2) batch the 3 writes per surviving set into one Promise.all,
+      // collapsing per-set latency to one RTT window each.
+
+      // Pre-compute every set's deterministic identifiers once.
+      const setMeta = realSets.map((set) => {
+        const setKey     = set.setKey || `${symbol}:${set.direction || "long"}`
+        const existingKey = `pseudo_position_set_mapping:${this.connectionId}:${setKey}`
+        return { set, setKey, existingKey }
+      })
+
+      // Phase 1 — parallel dedup check (N GETs in one batch).
+      const existing = await Promise.all(
+        setMeta.map((m) => getSettings(m.existingKey).catch(() => null))
+      )
+
+      // Phase 2 — for sets that need creation, fan out the 3 writes per set.
+      const createdAtIso = new Date().toISOString()
+      const nowMs = Date.now()
+      const writeBatches: Promise<any>[] = []
       let createdCount = 0
-      
-      // For each REAL set, create one pseudo position to represent it on dashboard
-      for (const set of realSets) {
+
+      for (let i = 0; i < setMeta.length; i++) {
+        if (existing[i]) continue
+        const { set, setKey, existingKey } = setMeta[i]
         try {
-          const setKey = set.setKey || `${symbol}:${set.direction || "long"}`
-
-          // Check if we already have an active pseudo position for this set
-          const existingKey = `pseudo_position_set_mapping:${this.connectionId}:${setKey}`
-          const existing = await getSettings(existingKey).catch(() => null)
-          if (existing) continue
-
-          // Derive a representative entry price from the set's quality metrics.
-          // StrategySetEntry has no entry_price/quantity fields — use avgProfitFactor
-          // as a proxy weighting for sizing context (placeholder until real prices
-          // are injected upstream).
-          const avgPF = set.avgProfitFactor || 1
-          const entryPrice = Math.max(1, avgPF * 100)   // unitless proxy
-          const quantity   = set.entryCount || 1
+          const avgPF       = set.avgProfitFactor || 1
+          const entryPrice  = Math.max(1, avgPF * 100)   // unitless proxy
+          const quantity    = set.entryCount || 1
           const positionCost = entryPrice * quantity
 
-          // Create pseudo position representing this REAL set
           const pseudoPos = {
-            id: `pseudo-${this.connectionId}-${setKey}-${Date.now()}`,
+            id: `pseudo-${this.connectionId}-${setKey}-${nowMs}`,
             connectionId: this.connectionId,
             symbol,
             direction: set.direction || "long",
@@ -1809,26 +1821,32 @@ export class StrategyCoordinator {
             position_level: "real",
             config_set_key: setKey,
             source_set_key: setKey,
-            created_at: new Date().toISOString(),
+            created_at: createdAtIso,
             profit_factor: set.avgProfitFactor || 0,
             confidence: set.avgConfidence || 0,
           }
 
-          // Store the pseudo position
-          await setSettings(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, pseudoPos)
-
-          // Add to connection's pseudo positions set
-          await client.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id)
-
-          // Store mapping for deduplication
-          await setSettings(existingKey, { posId: pseudoPos.id, createdAt: Date.now() })
-
+          // 3 writes per set, executed concurrently (one RTT window).
+          writeBatches.push(
+            Promise.all([
+              setSettings(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, pseudoPos),
+              client.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id),
+              setSettings(existingKey, { posId: pseudoPos.id, createdAt: nowMs }),
+            ]).catch((err) => {
+              console.warn(`[StrategyFlow] Failed to create pseudo position for set ${setKey}:`, err)
+            })
+          )
           createdCount++
         } catch (err) {
-          console.warn(`[StrategyFlow] Failed to create pseudo position for set ${(set as StrategySet).setKey}:`, err)
+          console.warn(`[StrategyFlow] Failed to prep pseudo position for set ${setKey}:`, err)
         }
       }
-      
+
+      // Final fan-in — all surviving sets' writes execute together.
+      if (writeBatches.length > 0) {
+        await Promise.all(writeBatches)
+      }
+
     } catch (error) {
       console.warn(`[v0] Error creating pseudo positions from REAL sets for ${symbol}:`, error)
     }
