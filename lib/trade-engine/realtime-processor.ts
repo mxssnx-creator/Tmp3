@@ -64,6 +64,11 @@ export class RealtimeProcessor {
   private prehistoricCheckedAt = 0
   private static readonly PREHISTORIC_RECHECK_MS = 3000
 
+  // Throttle for the settings-dirty Redis read in processRealtimeUpdates.
+  // The flag is set rarely (UI-driven) but the GET fires every tick — at
+  // ~5 Hz that's 5+ unnecessary reads/sec per connection.
+  private _lastDirtyCheckMs = 0
+
   // Heartbeat throttling: the realtime loop ticks multiple times per second.
   // Previously every tick performed a getSettings + setSettings round-trip on
   // trade_engine_state just to refresh `last_realtime_run` / the position
