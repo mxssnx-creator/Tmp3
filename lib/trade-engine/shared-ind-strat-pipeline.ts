@@ -84,9 +84,29 @@ export interface PipelineDeps {
   liveStage?: any
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Internal: Convert Real Sets to live orders with independent control specs
-// ────────────────────────────────────────────────────────────────────────────
+// ── Lazy-import cache for Phase 4 live-order path ───────────────────
+// `executeReadyStrategiesAsLiveOrders` is the heavy Phase 4 that only
+// fires when liveReady > 0 (typically < 10% of cycles). We still want
+// dynamic imports so the 90% of ticks that don't enter Phase 4 pay
+// nothing, but we memoize at module level so the 10% that DO enter
+// resolve each import exactly once per process.
+let __liveExecExports: {
+  getConnection: any
+  createExchangeConnector: any
+} | null = null
+async function __ensureLiveExecExports() {
+  if (!__liveExecExports) {
+    const [redisDb, connMod] = await Promise.all([
+      import("@/lib/redis-db"),
+      import("@/lib/exchange-connectors"),
+    ])
+    __liveExecExports = {
+      getConnection: redisDb.getConnection,
+      createExchangeConnector: connMod.createExchangeConnector,
+    }
+  }
+  return __liveExecExports
+}
 
 async function executeReadyStrategiesAsLiveOrders(
   connectionId: string,
@@ -97,19 +117,13 @@ async function executeReadyStrategiesAsLiveOrders(
     const { getSettings, setSettings } = await import("@/lib/redis-db")
     const { executeLivePosition } = liveStageExports
 
-    // Retrieve Real Sets that are ready for live trading
     const realKey = `strategies:${connectionId}:${symbol}:real:sets`
     const stored = await getSettings(realKey)
     const realSets = stored?.sets || []
 
     if (realSets.length === 0) return
 
-    // Build a real exchange connector from the connection's stored credentials.
-    // Previously this used a hardcoded mock that returned `mock:${Date.now()}`
-    // order IDs — no live orders were ever placed. We now create the same
-    // connector that syncWithExchange / startRealtimeProcessor use.
-    const { getConnection } = await import("@/lib/redis-db")
-    const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+    const { getConnection, createExchangeConnector } = await __ensureLiveExecExports()
     const connection = await getConnection(connectionId).catch(() => null)
     if (!connection) {
       console.warn(`[v0] [Phase4] ${symbol}: connection ${connectionId} not found — skipping live orders`)

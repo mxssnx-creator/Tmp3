@@ -153,11 +153,23 @@ async function fetchRealMarketData(
   }
 }
 
+// ── In-flight deduplication ─────────────────────────────────────────
+// `loadMarketDataForEngine` is called from four independent paths:
+// engine boot, heartbeat (30s), prehistoric cycle (adaptive), and the
+// fallback error handler. When two callers fire concurrently, they
+// would each fetch+parse+write the same symbol list independently,
+// doubling exchange API calls and Redis writes.
+let __loadFlight: Promise<number> | null = null
+
 /**
  * Load market data for all symbols into Redis
  * Fetches REAL data from exchanges, falls back to synthetic only on failure
  */
 export async function loadMarketDataForEngine(symbols: string[] = []): Promise<number> {
+  // Coalesce concurrent calls — the second caller joins the first
+  // promise and receives the same result, avoiding duplicate work.
+  if (__loadFlight) return __loadFlight
+  __loadFlight = (async () => {
   // ── Dev-mode optimization: skip cold-boot loading if already cached ──
   // In Next.js dev mode, module reloads and hot-reload cause repeated
   // calls to loadMarketDataForEngine. Each call fetches 86k candles per
@@ -329,6 +341,9 @@ export async function loadMarketDataForEngine(symbols: string[] = []): Promise<n
     console.error("[v0] [MarketData] Failed to load market data:", error)
     return 0
   }
+  })()
+  __loadFlight.finally(() => { __loadFlight = null })
+  return __loadFlight
 }
 
 /**

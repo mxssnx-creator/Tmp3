@@ -44,7 +44,6 @@ async function isGloballyPausedCached(): Promise<boolean> {
     return _globalPauseCache.paused
   }
   try {
-    const { getRedisClient } = await import("@/lib/redis-db")
     const client = getRedisClient()
     const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
     const paused = globalState?.status === "paused"
@@ -229,6 +228,41 @@ import {
  * bottleneck, expose this as a setting — but don't remove the cap.
  */
 const SYMBOL_CONCURRENCY = 32
+
+// ── Lazy-import helpers for LivePositions hot path ───────────────────
+// `await import()` at 200 ms cadence costs ~1 ms each (module resolution
+// in V8). We memoize the dynamic imports at module level so they resolve
+// exactly once per process — the 200 ms tick avoids the per-call
+// overhead entirely.
+let __liveStage: any = null
+async function _processSimulatedPositionsLazy(connId: string) {
+  if (!__liveStage) {
+    __liveStage = await import("./stages/live-stage")
+  }
+  return __liveStage.processSimulatedPositions(connId)
+}
+async function _syncWithExchangeLazy() {
+  if (!__liveStage) {
+    __liveStage = await import("./stages/live-stage")
+  }
+  return __liveStage.syncWithExchange
+}
+let __getConnectionFn: any = null
+async function _getConnectionLazy(connId: string) {
+  if (!__getConnectionFn) {
+    const mod = await import("@/lib/redis-db")
+    __getConnectionFn = mod.getConnection
+  }
+  return __getConnectionFn(connId)
+}
+let __createExchangeConnectorFn: any = null
+async function _createExchangeConnectorLazy() {
+  if (!__createExchangeConnectorFn) {
+    const mod = await import("@/lib/exchange-connectors")
+    __createExchangeConnectorFn = mod.createExchangeConnector
+  }
+  return __createExchangeConnectorFn
+}
 
 /**
  * Per-cycle hard deadline (ms) for engine processor ticks.
@@ -1513,7 +1547,6 @@ export class TradeEngineManager {
         try {
           if (startTime - this._lastDirtyCheckMs >= 1000) {
             this._lastDirtyCheckMs = startTime
-            const { getRedisClient } = await import("@/lib/redis-db")
             const client = getRedisClient()
             const dirtyKey = `settings:dirty:${this.connectionId}`
             const isDirty = await client.get(dirtyKey)
@@ -2303,8 +2336,7 @@ export class TradeEngineManager {
       try {
         // Always run simulated-position sweep first (covers paper-only).
         try {
-          const { processSimulatedPositions } = await import("./stages/live-stage")
-          await processSimulatedPositions(this.connectionId)
+          await _processSimulatedPositionsLazy(this.connectionId)
         } catch (simErr) {
           console.warn(
             `[v0] [LivePositions] processSimulatedPositions error:`,
@@ -2313,17 +2345,13 @@ export class TradeEngineManager {
         }
 
         if (!globallyPaused) {
-          // Build a connector and call syncWithExchange. Mirrors the
-          // logic previously inside `maybeRunLiveSync` but in a
-          // standalone loop instead of piggybacked on the realtime tick.
           try {
-            const { getConnection } = await import("@/lib/redis-db")
-            const connection = await getConnection(this.connectionId)
+            const connection = await _getConnectionLazy(this.connectionId)
             if (connection) {
               const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
               const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
               if (apiKey && apiSecret) {
-                const { createExchangeConnector } = await import("@/lib/exchange-connectors")
+                const createExchangeConnector = await _createExchangeConnectorLazy()
                 const connector = await createExchangeConnector(connection.exchange, {
                   apiKey,
                   apiSecret,
@@ -2332,8 +2360,12 @@ export class TradeEngineManager {
                   isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
                 })
                 if (connector) {
-                  const { syncWithExchange } = await import("./stages/live-stage")
-                  await syncWithExchange(this.connectionId, connector)
+                  const syncWithExchange = await _syncWithExchangeLazy()
+                  await withCycleDeadline(
+                    syncWithExchange(this.connectionId, connector),
+                    `LivePositions ${this.connectionId} syncWithExchange`,
+                    CYCLE_DEADLINE_MS,
+                  )
                 }
               }
             }
@@ -2725,23 +2757,23 @@ export class TradeEngineManager {
         const windowEndMs = Date.now()
         const windowStartMs = windowEndMs - rangeHours * 60 * 60 * 1000
 
-        // ── Step A: Bulk-load market data ONCE per cycle ─────────────────
-        // The loader writes the canonical `market_data:{symbol}:candles`
-        // JSON array (1 s bars over the look-back window) plus the `:1s`
-        // envelope. We call it once for the full symbol list, then iterate
-        // the loaded candles in Step B — exactly as the spec demands:
-        // "load marketdata at once for specific range then process by its
-        // timeframe interval."
+        // ── Step A: Bulk-load market data ONCE per cycle (DEADLINE-WRAPPED) ──
+        // `loadMarketDataForEngine` can take seconds on first boot with many
+        // symbols. Without a deadline, a hung network call blocks the entire
+        // prehistoric tick forever. 30s deadline lets scheduleNext re-arm the
+        // loop if the load hangs.
         try {
           const { loadMarketDataForEngine } = await import("@/lib/market-data-loader")
-          await loadMarketDataForEngine(symbols)
+          await withCycleDeadline(
+            loadMarketDataForEngine(symbols),
+            `Prehistoric ${connId} loadMarketData`,
+            CYCLE_DEADLINE_MS,
+          )
         } catch (loadErr) {
           console.warn(
             `[v0] [PrehistoricProgression] Market-data load warning:`,
             loadErr instanceof Error ? loadErr.message : String(loadErr),
           )
-          // Non-fatal — the per-symbol replay below will log NO DATA and
-          // skip any symbol whose candle key is still empty.
         }
 
         // ── Step B: Per-symbol step-by-step replay ───────────────────────
@@ -3117,9 +3149,10 @@ export class TradeEngineManager {
         // null. Use the mirror-aware scalar reader (statically imported
         // at the top of the module; avoids a `await import()` on this
         // cycle-hot path).
-        const useMainSymbols = await getAppSetting<boolean>("useMainSymbols", false)
+        const appSettings = await getAppSettings()
+        const useMainSymbols = appSettings?.useMainSymbols === true || appSettings?.useMainSymbols === "true" || appSettings?.useMainSymbols === "1"
         if (useMainSymbols === true) {
-          const mainSymbols = await getAppSetting<string[]>("mainSymbols", [])
+          const mainSymbols = appSettings?.mainSymbols
           if (Array.isArray(mainSymbols) && mainSymbols.length > 0) return mainSymbols
         }
 
