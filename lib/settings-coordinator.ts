@@ -71,6 +71,13 @@ export async function notifySettingsChanged(
 
   // Write the change event so running engines can detect it
   await setSettings(`settings_change:${connectionId}`, event)
+  // Also write settings:dirty flag so processor-level caches (strategy,
+  // realtime, indication) invalidate on next tick. Previously the
+  // disjoint propagation system meant only one path was triggered per
+  // save path — this ensures BOTH happen on every settings change.
+  try {
+    await setSettings(`settings:dirty:${connectionId}`, "1")
+  } catch { /* non-critical */ }
   
   // Increment a global change counter for this connection
   const counter = await getSettings(`settings_change_counter:${connectionId}`)
