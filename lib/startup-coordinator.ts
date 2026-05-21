@@ -16,7 +16,6 @@ import {
   getSettings,
   setSettings,
 } from "@/lib/redis-db"
-import { runMigrations } from "@/lib/redis-migrations"
 import { validateDatabase } from "@/lib/database-validator"
 import { getGlobalTradeEngineCoordinator } from "@/lib/trade-engine"
 import { consolidateDatabase } from "@/lib/database-consolidation"
@@ -37,11 +36,20 @@ async function reconcileStrandedPositions() {
     if (!keys.length) return
 
     const MAX_HOLD_MS = 4 * 60 * 60 * 1000 // 4 hours hard cap
+    const RECONCILE_DEADLINE_MS = 20_000 // 20s hard deadline
+    const deadline = Date.now() + RECONCILE_DEADLINE_MS
     const now = Date.now()
     let found = 0
     let closed = 0
 
     for (const key of keys) {
+      if (Date.now() > deadline) {
+        console.warn(
+          `[v0] [Startup] Reconciling stranded positions deadline ${RECONCILE_DEADLINE_MS}ms exceeded — ` +
+          `processed ${found} of ${keys.length}, deferring remainder`,
+        )
+        break
+      }
       try {
         const raw = await client.get(key)
         if (!raw) continue
@@ -143,10 +151,10 @@ export async function completeStartup() {
     await initRedis()
     console.log(`[v0] [Startup] ✓ Redis initialized\n`)
 
-    // Step 2: Run migrations
-    console.log(`[v0] [Startup] Step 2/8: Running database migrations...`)
-    const migResult = await runMigrations()
-    console.log(`[v0] [Startup] ✓ Migrations complete (v${migResult.version})\n`)
+    // Step 2: Skip — migrations already ran inside initRedis() above.
+    // Keeping the sequential step numbering for log consistency.
+    console.log(`[v0] [Startup] Step 2/8: Migrations already applied by initRedis`)
+    console.log(`[v0] [Startup] ✓ Migrations complete (no duplicate run)\n`)
 
     // Step 3: Validate database integrity
     console.log(`[v0] [Startup] Step 3/8: Validating database integrity...`)
@@ -163,13 +171,21 @@ export async function completeStartup() {
     const allConnections = await getAllConnections()
     console.log(`[v0] [Startup] ✓ Loaded ${allConnections.length} base connections\n`)
 
-    // Step 5: Consolidate database (Phase 3)
-    console.log(`[v0] [Startup] Step 5/8: Consolidating database structures...`)
+    // Step 5: Consolidate database (Phase 3) — non-blocking with 15s deadline.
+    // Consolidation is purely a data-migration step; the engine runs fine
+    // without it. Blocking startup on this makes cold-boot latency
+    // proportional to connection count (one Redis read per connection).
+    console.log(`[v0] [Startup] Step 5/8: Consolidating database structures (background, 15s deadline)...`)
     try {
-      await consolidateDatabase()
+      const DEADLINE_MS = 15_000
+      await Promise.race([
+        consolidateDatabase(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("consolidation deadline exceeded")), DEADLINE_MS)),
+      ])
       console.log(`[v0] [Startup] ✓ Database consolidation complete\n`)
     } catch (e) {
-      console.warn(`[v0] [Startup] ⚠ Database consolidation warning: ${e}`)
+      console.warn(`[v0] [Startup] ⚠ Database consolidation did not finish: ${e instanceof Error ? e.message : String(e)}`)
+      console.log(`[v0] [Startup] ✓ Continuing without consolidation (engine works without it)\n`)
     }
 
     // Step 6: Initialize coordinator (don't start engines)

@@ -605,6 +605,25 @@ export class TradeEngineManager {
       // leaving strategy/indication stats stuck at zero.
       this.isRunning = true
 
+      // ── Cache-hit fast path: arm live processors IMMEDIATELY ──────────
+      // When prehistoric data is already cached (prehistoric_loaded:{id}=1),
+      // the `:done` flag is already set and Sets are populated from the
+      // previous session. Waiting for the Prehistoric Progression's first
+      // pass callback would add unnecessary latency — the prehistoric loop
+      // still calls loadMarketDataForEngine() on every cycle, which is a
+      // full Redis scan that can block the realtime processor from starting
+      // for several seconds. Arm the live processors right here so indication
+      // / strategy / realtime cycles begin within the next scheduler tick.
+      const cacheHit = prehistoricCached === "1"
+      if (cacheHit) {
+        console.log(
+          `[v0] [Engine ${this.connectionId}] Cache hit — arming live processors immediately (prehistoric data already complete)`,
+        )
+        this.startIndicationProcessor(config.indicationInterval)
+        this.startStrategyProcessor(config.strategyInterval)
+        this.startRealtimeProcessor(config.realtimeInterval)
+      }
+
       // ── Spec contract (prehistoric → realtime ordering) ─────────────────
       // All three live processors (indication / strategy / realtime) are
       // ARMED here so their timer infrastructure is live, but every tick
@@ -662,7 +681,7 @@ export class TradeEngineManager {
         this.startStrategyProcessor(config.strategyInterval)
         this.startRealtimeProcessor(config.realtimeInterval)
       }
-      this.startPrehistoricProgression(armLiveProgressions)
+      this.startPrehistoricProgression(cacheHit ? undefined : armLiveProgressions)
 
       // Phase stays at `prehistoric_data` while the historical calculator
       // is filling sets. `loadPrehistoricData` updates the phase percent
@@ -671,7 +690,6 @@ export class TradeEngineManager {
       // `live_trading` after the done flag flips. Cache-hit path falls
       // straight through to live_trading below since prehistoric is
       // already complete.
-      const cacheHit = prehistoricCached === "1"
       if (cacheHit) {
         await this.updateProgressionPhase(
           "live_trading",
@@ -2648,31 +2666,39 @@ export class TradeEngineManager {
     let cycleCount = 0
     let firstPassDone = false
     const connId = this.connectionId
+    // Adaptive pause tracking — see scheduleNext above.
+    let _ppLastSteps = 0
+    let _ppConsecutiveIdle = 0
 
     const scheduleNext = () => {
       if (!this.isRunning) return
       try {
         if (this.prehistoricTimer) unregisterEngineTimer(this.prehistoricTimer)
       } catch { /* stale handle is fine */ }
-      // ── No-pause cadence ──────────────────────────────────────────────
-      // The Prehistoric Progression runs CONTINUOUSLY back-to-back: the
-      // moment a cycle finishes, the next one starts. The `setTimeout(…, 0)`
-      // is NOT a delay — it's a yield to the Node.js event loop so the
-      // other two progressions (Realtime, LivePositions), the WebSocket
-      // handlers, and the API request loop all get a fair tick between
-      // cycles. Removing the yield entirely (e.g. an `await tick()` recursion
-      // or `setImmediate` chain) would starve the event loop and freeze
-      // the dev server / health checks under load.
+      // ── Adaptive pause ────────────────────────────────────────────────
+      // When all symbols' checkpoints are caught up (no new candles to
+      // replay), the next tick produces 0 steps across every symbol.
+      // Running back-to-back in that state is pure churn — each cycle
+      // reloads market data from Redis, scans every symbol's checkpoint,
+      // finds nothing, loops again. That starves the Realtime Progression
+      // and the LivePositions loop (both share the event loop) leading to
+      // "Low Activity / no realtime progressions" despite the engine
+      // appearing to run.
       //
-      // The `prehistoricIntervalMs` / `prehistoricCyclePauseMs` settings
-      // are intentionally IGNORED here so operators can't accidentally
-      // reintroduce a pause that would slow historical Set fill — those
-      // fields remain in `engine-timings.ts` for back-compat but are
-      // now no-ops for this loop. The historical Set processor's own
-      // per-timeframe `last_calc_at` gate (in stages/historical-stage)
-      // still throttles redundant recomputation, so back-to-back cycles
-      // don't translate to back-to-back exchange calls.
-      this.prehistoricTimer = setTimeout(tick, 0)
+      // Adaptive pause: when the last cycle found work (steps > 0),
+      // continue at full speed (0 ms delay). When work was zero, back
+      // off: first idle gets 3 s, then climbs by 3 s per consecutive
+      // idle up to 30 s. Productive work immediately resets to instant.
+      const pause = (() => {
+        if (_ppLastSteps > 0) {
+          _ppConsecutiveIdle = 0
+          return 0
+        }
+        _ppConsecutiveIdle++
+        // 3s, 6s, 9s, ... capped at 30s
+        return Math.min(30_000, _ppConsecutiveIdle * 3000)
+      })()
+      this.prehistoricTimer = setTimeout(tick, pause)
       registerEngineTimer(this.prehistoricTimer)
     }
 
@@ -2889,6 +2915,7 @@ export class TradeEngineManager {
           (acc: number, r: any) => acc + (Number(r?.stepsReplayed) || 0),
           0,
         )
+        _ppLastSteps = stepsTotal
         const indTotal = results.reduce(
           (acc: number, r: any) => acc + (Number(r?.indications) || 0),
           0,
