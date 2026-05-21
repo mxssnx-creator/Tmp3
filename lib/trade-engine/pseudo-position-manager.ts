@@ -401,8 +401,6 @@ export class PseudoPositionManager {
       createPipeline.sadd(this.activeByDirectionKey(params.side), id)
       await createPipeline.exec()
 
-      console.log(`[v0] Created pseudo position ${id} for ${params.symbol} side=${params.side} vol=${volumeCalc.finalVolume}`)
-
       this.invalidateCache()
       await this.updateActivePositionsCount()
 
@@ -723,8 +721,6 @@ export class PseudoPositionManager {
 
       // Clear the per-tick price memo so a reused id can't be elided.
       this.lastWrittenPrice.delete(positionId)
-
-      console.log(`[v0] Closed position ${positionId}: ${reason} (PnL: ${pnl.toFixed(4)})`)
 
       this.invalidateCache()
       await this.updateActivePositionsCount()

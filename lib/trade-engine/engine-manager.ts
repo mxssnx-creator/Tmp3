@@ -30,6 +30,31 @@ interface EngineGlobalState {
 
 const engineGlobal = (typeof globalThis !== "undefined" ? globalThis : {}) as EngineGlobalState
 
+// ─────────────────────────────────────────────────────────────────────────
+// Hot-path: shared global-pause cache (1 s TTL)
+// ─────────────────────────────────────────────────────────────────────────
+// Both indication and strategy ticks (and the realtime live-sync) check
+// `trade_engine:global.status === "paused"` on every tick. That is an
+// hgetall round-trip per tick per processor — for one connection at
+// ~20 Hz that is 60+ Redis calls/s purely to gate cycle execution.
+let _globalPauseCache: { paused: boolean; checkedAtMs: number } | null = null
+async function isGloballyPausedCached(): Promise<boolean> {
+  const now = Date.now()
+  if (_globalPauseCache && now - _globalPauseCache.checkedAtMs < 1000) {
+    return _globalPauseCache.paused
+  }
+  try {
+    const { getRedisClient } = await import("@/lib/redis-db")
+    const client = getRedisClient()
+    const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
+    const paused = globalState?.status === "paused"
+    _globalPauseCache = { paused, checkedAtMs: now }
+    return paused
+  } catch {
+    return _globalPauseCache?.paused ?? false
+  }
+}
+
 // STABILITY: NEVER clear live engine timers on module reload.
 //
 // Previously this block ran on every module reload (HMR / serverless
@@ -326,6 +351,11 @@ export class TradeEngineManager {
   private realtimeTimer?: NodeJS.Timeout
   private healthCheckTimer?: NodeJS.Timeout
   private heartbeatTimer?: NodeJS.Timeout
+
+  // Throttle for the settings-dirty Redis read in the indication tick.
+  // The flag is set by the UI (rare) but read on every tick — at 20 Hz
+  // that is ~20 GETs/sec per connection. 1 s reload latency is fine.
+  private _lastDirtyCheckMs = 0
 
   /**
    * Wall-clock timestamp at which this manager instance was constructed.
@@ -1417,11 +1447,9 @@ export class TradeEngineManager {
     const tick = async () => {
       if (!this.isRunning) return
       
-      // Check pause state before executing cycle
+      // Check pause state before executing cycle (cached, 1 s TTL)
       try {
-        const client = getRedisClient()
-        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
-        if (globalState && globalState.status === "paused") {
+        if (await isGloballyPausedCached()) {
           // Engine paused - reschedule but skip processing
           scheduleNext(false)
           return
@@ -1462,17 +1490,22 @@ export class TradeEngineManager {
         // ── CHECK: Settings dirty flag and reload if needed ──────────────���─────────
         // When user updates connection settings via UI, a dirty flag is set.
         // On the next indication tick, we detect it and clear the flag.
+        // Throttle to 1×/sec — at 20 Hz the GET would fire ~20 times/sec
+        // per connection just to poll a typically-false flag.
         try {
-          const { getRedisClient } = await import("@/lib/redis-db")
-          const client = getRedisClient()
-          const dirtyKey = `settings:dirty:${this.connectionId}`
-          const isDirty = await client.get(dirtyKey)
-          if (isDirty) {
-            // Clear the dirty flag
-            await client.del(dirtyKey)
-            console.log(
-              `[v0] [IndicationProcessor] Settings reloaded for ${this.connectionId}`
-            )
+          if (startTime - this._lastDirtyCheckMs >= 1000) {
+            this._lastDirtyCheckMs = startTime
+            const { getRedisClient } = await import("@/lib/redis-db")
+            const client = getRedisClient()
+            const dirtyKey = `settings:dirty:${this.connectionId}`
+            const isDirty = await client.get(dirtyKey)
+            if (isDirty) {
+              // Clear the dirty flag
+              await client.del(dirtyKey)
+              console.log(
+                `[v0] [IndicationProcessor] Settings reloaded for ${this.connectionId}`
+              )
+            }
           }
         } catch (settingsErr) {
           // Non-critical - continue processing even if dirty check fails
@@ -1640,6 +1673,7 @@ export class TradeEngineManager {
           // client services these in constant time; Promise.all minimises the
           // awaited round-trips per cycle compared to sequential awaits.
           const nowMs = Date.now()
+          const nowIso = new Date(nowMs).toISOString()
           const writes: Promise<any>[] = [
             client.hincrby(redisKey, "indication_cycle_count", 1),
             // ── Realtime Progression cycle counter (three-progression refactor) ──
@@ -1671,10 +1705,15 @@ export class TradeEngineManager {
             client.hset(`settings:trade_engine_state:${this.connectionId}`, {
               status: "running",
               last_processor_heartbeat: String(nowMs),
-              last_indication_run: new Date(nowMs).toISOString(),
+              last_indication_run: nowIso,
             }),
-            client.expire(redisKey, 7 * 24 * 60 * 60),
           ]
+          // Gate expire to every 500 cycles — TTL is 7 days so resetting
+          // it every tick wastes one Redis round-trip per cycle (~20/s).
+          // At 500 cycles (20 Hz ≈ every 25 s) the key stays alive indefinitely.
+          if (cycleCount % 500 === 1) {
+            writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
+          }
           if (Object.keys(indicationTypeCounts).length > 0) {
             writes.push(client.hincrby(redisKey, "indication_live_cycle_count", 1))
             for (const [type, count] of Object.entries(indicationTypeCounts)) {
@@ -1909,11 +1948,9 @@ export class TradeEngineManager {
     const tick = async () => {
       if (!this.isRunning) return
       
-      // Check pause state before executing cycle
+      // Check pause state before executing cycle (cached, 1 s TTL)
       try {
-        const client = getRedisClient()
-        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
-        if (globalState && globalState.status === "paused") {
+        if (await isGloballyPausedCached()) {
           // Engine paused - reschedule but skip processing
           scheduleNext(false)
           return
@@ -2028,6 +2065,7 @@ export class TradeEngineManager {
           // sequential awaits saves multiple RTTs per cycle and lets us
           // include the per-symbol error fields in the same batch.
           const nowMs = Date.now()
+          const nowIso = new Date(nowMs).toISOString()
           const writes: Promise<any>[] = [
             client.hincrby(redisKey, "strategy_cycle_count", 1),
             client.hincrby(redisKey, "frames_processed", 1),
@@ -2056,10 +2094,13 @@ export class TradeEngineManager {
             client.hset(`settings:trade_engine_state:${this.connectionId}`, {
               status: "running",
               last_processor_heartbeat: String(nowMs),
-              last_strategy_run: new Date(nowMs).toISOString(),
+              last_strategy_run: nowIso,
             }),
-            client.expire(redisKey, 7 * 24 * 60 * 60),
           ]
+          // Gate expire — same rationale as indication tick above.
+          if (cycleCount % 500 === 1) {
+            writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
+          }
           if (evaluatedThisCycle > 0) {
             writes.push(client.hincrby(redisKey, "strategy_live_cycle_count", 1))
             writes.push(client.hincrby(redisKey, "strategies_count", evaluatedThisCycle))
@@ -2237,9 +2278,7 @@ export class TradeEngineManager {
       // trades still close locally.
       let globallyPaused = false
       try {
-        const client = getRedisClient()
-        const globalState = (await client.hgetall("trade_engine:global").catch(() => ({}))) as Record<string, string>
-        globallyPaused = globalState?.status === "paused"
+        globallyPaused = await isGloballyPausedCached()
       } catch { /* ignore */ }
 
       liveSyncInFlight = true

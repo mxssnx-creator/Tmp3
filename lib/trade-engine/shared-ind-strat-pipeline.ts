@@ -102,8 +102,6 @@ async function executeReadyStrategiesAsLiveOrders(
     const stored = await getSettings(realKey)
     const realSets = stored?.sets || []
 
-    console.log(`[v0] [Phase4] ${symbol}: realSets.length=${realSets.length}`)
-
     if (realSets.length === 0) return
 
     // Build a real exchange connector from the connection's stored credentials.
@@ -144,8 +142,6 @@ async function executeReadyStrategiesAsLiveOrders(
     for (const realSet of realSets) {
       const entries = realSet.entries || []
       totalEntries += entries.length
-      console.log(`[v0] [Phase4] ${symbol}: realSet=${realSet.setKey} entries=${entries.length}`)
-      
       if (!entries || entries.length === 0) continue
 
       for (const entry of entries) {
@@ -172,8 +168,6 @@ async function executeReadyStrategiesAsLiveOrders(
           }
 
           const livePos = await executeLivePosition(connectionId, realPosition, exchangeConnector)
-          console.log(`[v0] [Phase4] ${symbol}: created livePos status=${livePos?.status}`)
-          
           if (livePos?.status === "filled" || livePos?.status === "placed") {
             createdCount++
           } else {
@@ -185,8 +179,6 @@ async function executeReadyStrategiesAsLiveOrders(
         }
       }
     }
-
-    console.log(`[v0] [Phase4] ${symbol}: total=${totalEntries} created=${createdCount} failed=${failedCount}`)
 
     if (createdCount > 0) {
       await setSettings(`live_execution:${connectionId}:${symbol}:latest`, {

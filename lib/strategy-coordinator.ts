@@ -481,6 +481,13 @@ export class StrategyCoordinator {
   private _activeKeysCache: { keys: Set<string>; cycleAt: number } | null = null
 
   /**
+   * Monotonic counter incremented on every executeStrategyFlow call.
+   * Used to gate TTL resets (expire) on the progression hash so they
+   * fire once every 500 cycles instead of on every cycle.
+   */
+  private _stratCycleCount = 0
+
+  /**
    * ── Plan-perf Tier 1: parsed-fingerprint LRU ───────────────────────
    *
    * The fpCache stored in Redis is keyed by `fingerprint → JSON.stringify(set)`.
@@ -827,6 +834,7 @@ export class StrategyCoordinator {
     sharedContext?: PositionContext,
   ): Promise<StrategyEvaluation[]> {
     const results: StrategyEvaluation[] = []
+    this._stratCycleCount++
 
     try {
       // ── Hydrate PF thresholds + Coordination settings from operator settings ─
@@ -864,25 +872,21 @@ export class StrategyCoordinator {
       // STAGE 1: BASE — one Set per (indication_type × direction)
       const { result: baseResult, sets: baseSets } = await this.createBaseSets(symbol, indications)
       results.push(baseResult)
-      console.log(`[v0] [evaluating data] ${symbol} BASE: ${baseSets.length} sets created from ${indications.length} indications`)
 
       // STAGE 2: MAIN — validate Base Sets AND create additional related
       // variant Sets (Default / Trailing / Block / DCA) gated by posCtx.
       const { result: mainResult, sets: mainSets } = await this.createMainSets(symbol, baseSets, posCtx)
       results.push(mainResult)
-      console.log(`[v0] [evaluating data] ${symbol} MAIN: ${mainSets.length} sets (${mainResult.passedEvaluation} promoted)`)
 
       // STAGE 3: REAL — promote Sets with avgPF >= 1.4 (base-promoted AND
       // additional related variants flow uniformly through this filter)
       const { result: realResult, sets: realSets } = await this.evaluateRealSets(symbol, mainSets)
       results.push(realResult)
-      console.log(`[v0] [evaluating data] ${symbol} REAL: ${realSets.length} sets passed (PF >= 1.4), netting evaluated`)
 
       // STAGE 4: LIVE — best 500 Sets for execution (skip in prehistoric mode)
       if (!isPrehistoric) {
         const { result: liveResult } = await this.createLiveSets(symbol, realSets)
         results.push(liveResult)
-        console.log(`[v0] [evaluating data] ${symbol} LIVE: ${liveResult.passedEvaluation} orders to execute, ${realSets.length - liveResult.passedEvaluation} queued`)
       }
 
       await this.logStrategyProgression(symbol, results)
@@ -1192,7 +1196,6 @@ export class StrategyCoordinator {
       // them concurrently cuts that to a single bounded round-trip window.
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_base_current", String(baseSets.length)),
-        client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(detailKey, {
           // ── Legacy per-cycle aggregate fields ─────────────────────────
           // These hold THIS-symbol's values and are overwritten on every
@@ -1271,10 +1274,12 @@ export class StrategyCoordinator {
         }),
         client.expire(`strategies_active:${this.connectionId}`, 600),
       )
+      // Gate progression hash TTL reset — 7-day key, refresh every 500 cycles
+      if (this._stratCycleCount % 500 === 1) {
+        writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
+      }
       await Promise.all(writes)
     } catch { /* non-critical */ }
-
-    console.log(`[v0] [StrategyFlow] ${symbol} BASE: ${baseSets.length} Sets created (${baseSets.reduce((s, set) => s + set.entryCount, 0)} total entries)`)
 
     return {
       result: {
@@ -1633,7 +1638,7 @@ export class StrategyCoordinator {
       ? Math.min(1, uniqueBaseSetsProduced.size / baseSets.length)
       : 0
 
-    // ── Write Main counts to Redis ────────────────────────────────────────
+    // ── Write Main counts to Redis ──���─────────────────────────────────────
     // CUMULATIVE via hincrby so the dashboard does not oscillate with
     // per-cycle snapshots (see matching fix in createBaseSets).
     try {
@@ -1657,7 +1662,6 @@ export class StrategyCoordinator {
 
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_main_current", String(mainSets.length)),
-        client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(mainDetailKey, {
           created_sets:      String(mainSets.length),
           avg_profit_factor: String(mainAvgPF.toFixed(4)),
@@ -1726,21 +1730,15 @@ export class StrategyCoordinator {
       if (mainProfileEntriesTotal > 0) {
         writes.push(client.hincrby(redisKey, "main_positions_created_count", mainProfileEntriesTotal))
       }
+      // Gate progression hash TTL reset — same rationale as createBaseSets.
+      if (this._stratCycleCount % 500 === 2) {
+        writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
+      }
 
       await Promise.all(writes)
     } catch { /* non-critical — Redis write failure should not kill strategy flow */ }
 
     if (baseSets.length > 0) {
-      const sample = baseSets[0]
-      const variantBreakdown = ["default", "trailing", "block", "dca", "pause"]
-        .map((v) => `${v[0]}=${mainSets.filter((s) => s.variant === v).length}`)
-        .join(",")
-      console.log(
-        `[v0] [StrategyFlow] ${symbol} MAIN: ${mainSets.length} sets (${uniqueBaseSetsProduced.size}/${baseSets.length} bases, reused=${reused}) ` +
-        `variants={${variantBreakdown}} axis={${axisSetsCount} total, L=${axisLong}, S=${axisShort}} ` +
-        `ctx={cont=${ctx.continuousCount},lastW=${ctx.lastWins},lastL=${ctx.lastLosses},prevL=${ctx.prevLosses}} ` +
-        `| sample={pf=${sample.avgProfitFactor.toFixed(2)}, conf=${sample.avgConfidence.toFixed(2)}}`
-      )
     }
 
     return {
@@ -1775,32 +1773,44 @@ export class StrategyCoordinator {
   ): Promise<void> {
     try {
       if (!realSets || realSets.length === 0) return
-      
+
       const client = getRedisClient()
+      // PERFORMANCE: previous implementation looped serially with one GET
+      // per set followed by 3 sequential writes per surviving set — at N
+      // Real Sets per symbol per cycle that was 4N round-trips on the
+      // hot path. Now: (1) fan out all dedup GETs into a single Promise.all,
+      // (2) batch the 3 writes per surviving set into one Promise.all,
+      // collapsing per-set latency to one RTT window each.
+
+      // Pre-compute every set's deterministic identifiers once.
+      const setMeta = realSets.map((set) => {
+        const setKey     = set.setKey || `${symbol}:${set.direction || "long"}`
+        const existingKey = `pseudo_position_set_mapping:${this.connectionId}:${setKey}`
+        return { set, setKey, existingKey }
+      })
+
+      // Phase 1 — parallel dedup check (N GETs in one batch).
+      const existing = await Promise.all(
+        setMeta.map((m) => getSettings(m.existingKey).catch(() => null))
+      )
+
+      // Phase 2 — for sets that need creation, fan out the 3 writes per set.
+      const createdAtIso = new Date().toISOString()
+      const nowMs = Date.now()
+      const writeBatches: Promise<any>[] = []
       let createdCount = 0
-      
-      // For each REAL set, create one pseudo position to represent it on dashboard
-      for (const set of realSets) {
+
+      for (let i = 0; i < setMeta.length; i++) {
+        if (existing[i]) continue
+        const { set, setKey, existingKey } = setMeta[i]
         try {
-          const setKey = set.setKey || `${symbol}:${set.direction || "long"}`
-
-          // Check if we already have an active pseudo position for this set
-          const existingKey = `pseudo_position_set_mapping:${this.connectionId}:${setKey}`
-          const existing = await getSettings(existingKey).catch(() => null)
-          if (existing) continue
-
-          // Derive a representative entry price from the set's quality metrics.
-          // StrategySetEntry has no entry_price/quantity fields — use avgProfitFactor
-          // as a proxy weighting for sizing context (placeholder until real prices
-          // are injected upstream).
-          const avgPF = set.avgProfitFactor || 1
-          const entryPrice = Math.max(1, avgPF * 100)   // unitless proxy
-          const quantity   = set.entryCount || 1
+          const avgPF       = set.avgProfitFactor || 1
+          const entryPrice  = Math.max(1, avgPF * 100)   // unitless proxy
+          const quantity    = set.entryCount || 1
           const positionCost = entryPrice * quantity
 
-          // Create pseudo position representing this REAL set
           const pseudoPos = {
-            id: `pseudo-${this.connectionId}-${setKey}-${Date.now()}`,
+            id: `pseudo-${this.connectionId}-${setKey}-${nowMs}`,
             connectionId: this.connectionId,
             symbol,
             direction: set.direction || "long",
@@ -1811,29 +1821,32 @@ export class StrategyCoordinator {
             position_level: "real",
             config_set_key: setKey,
             source_set_key: setKey,
-            created_at: new Date().toISOString(),
+            created_at: createdAtIso,
             profit_factor: set.avgProfitFactor || 0,
             confidence: set.avgConfidence || 0,
           }
 
-          // Store the pseudo position
-          await setSettings(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, pseudoPos)
-
-          // Add to connection's pseudo positions set
-          await client.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id)
-
-          // Store mapping for deduplication
-          await setSettings(existingKey, { posId: pseudoPos.id, createdAt: Date.now() })
-
+          // 3 writes per set, executed concurrently (one RTT window).
+          writeBatches.push(
+            Promise.all([
+              setSettings(`pseudo_position:${this.connectionId}:${pseudoPos.id}`, pseudoPos),
+              client.sadd(`pseudo_positions:${this.connectionId}`, pseudoPos.id),
+              setSettings(existingKey, { posId: pseudoPos.id, createdAt: nowMs }),
+            ]).catch((err) => {
+              console.warn(`[StrategyFlow] Failed to create pseudo position for set ${setKey}:`, err)
+            })
+          )
           createdCount++
         } catch (err) {
-          console.warn(`[StrategyFlow] Failed to create pseudo position for set ${(set as StrategySet).setKey}:`, err)
+          console.warn(`[StrategyFlow] Failed to prep pseudo position for set ${setKey}:`, err)
         }
       }
-      
-      if (createdCount > 0) {
-        console.log(`[v0] [StrategyFlow] Created ${createdCount} pseudo positions from ${realSets.length} REAL sets for ${symbol}`)
+
+      // Final fan-in — all surviving sets' writes execute together.
+      if (writeBatches.length > 0) {
+        await Promise.all(writeBatches)
       }
+
     } catch (error) {
       console.warn(`[v0] Error creating pseudo positions from REAL sets for ${symbol}:`, error)
     }
@@ -2231,12 +2244,6 @@ export class StrategyCoordinator {
       } catch { /* non-critical */ }
     }
 
-    // Debug: show why sets failed REAL filter
-    if (mainSets.length > 0 && realSets.length === 0) {
-      const sample = mainSets[0]
-      console.log(`[v0] [StrategyFlow] ${symbol} REAL filter rejected all: sample={pf=${sample.avgProfitFactor.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}, conf=${sample.avgConfidence.toFixed(2)} (advisory)} threshold={minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime}}`)
-    }
-
     // Persist REAL sets
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
     await setSettings(realKey, { sets: realSets, count: realSets.length, created: new Date() })
@@ -2332,7 +2339,6 @@ export class StrategyCoordinator {
 
       const writes: Promise<any>[] = [
         client.hset(redisKey, "strategies_real_current", String(realSets.length)),
-        client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(realDetailKey, {
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
           // for backwards compat; /stats prefers per-symbol sums below.
@@ -2541,6 +2547,10 @@ export class StrategyCoordinator {
         if (touchedLong)  writes.push(client.expire(aKeyLong,  7 * 24 * 60 * 60))
         if (touchedShort) writes.push(client.expire(aKeyShort, 7 * 24 * 60 * 60))
       }
+      // Gate progression hash TTL reset — same rationale as createBaseSets.
+      if (this._stratCycleCount % 500 === 3) {
+        writes.push(client.expire(redisKey, 7 * 24 * 60 * 60))
+      }
 
       await Promise.all(writes)
 
@@ -2574,10 +2584,6 @@ export class StrategyCoordinator {
         await Promise.all(recompute)
       } catch { /* non-critical */ }
     } catch { /* non-critical */ }
-
-    console.log(
-      `[v0] [StrategyFlow] ${symbol} REAL: ${realSets.length}/${mainSets.length} Sets promoted (minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime})`
-    )
 
     // ── Position count metrics for real stage ──────────────────────
     // Track entries passing Real filter so dashboard shows promotion success
@@ -2648,11 +2654,7 @@ export class StrategyCoordinator {
       .sort((a, b) => b.avgProfitFactor - a.avgProfitFactor)
       .slice(0, maxLive)
 
-    console.log(`[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime}min)`)
-    if (realSets.length > 0 && qualifying.length === 0) {
-      const sample = realSets[0]
-      console.log(`[v0] [StrategyFlow] ${symbol} LIVE filter rejected all real sets: sample={pf=${sample.avgProfitFactor.toFixed(2)}, ddt=${sample.avgDrawdownTime.toFixed(0)}, conf=${sample.avgConfidence.toFixed(2)} (advisory)}`)
-    }
+
 
     // Persist LIVE sets
     const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
@@ -3129,14 +3131,6 @@ export class StrategyCoordinator {
               }
             }),
           )
-          const positionsCreated = creations.filter((r) => r === "created").length
-          const positionsGated   = creations.filter((r) => r === "gated").length
-          const positionErrors   = creations.filter((r) => r === "error").length
-          console.log(
-            `[v0] [StrategyFlow] ${symbol} LIVE: ${positionsCreated} new pseudo positions` +
-            ` (${positionsGated} gated/already-active, ${positionErrors} errors)` +
-            ` for ${qualifying.length} Sets`
-          )
         } else {
           console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: No entry price, skipping position creation`)
         }
@@ -3144,10 +3138,6 @@ export class StrategyCoordinator {
         console.warn(`[v0] [StrategyFlow] ${symbol} LIVE: Position creation error:`, posErr instanceof Error ? posErr.message : String(posErr))
       }
     }
-
-    console.log(
-      `[v0] [StrategyFlow] ${symbol} LIVE: ${qualifying.length}/${realSets.length} Sets selected (top ${maxLive} by PF, minPF=${metrics.minProfitFactor}, maxDDT=${metrics.maxDrawdownTime}min)`
-    )
 
     return {
       result: {
