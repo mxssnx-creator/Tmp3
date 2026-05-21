@@ -225,8 +225,22 @@ function pushStep(pos: LivePosition, step: string, success: boolean, details?: s
 // on serverless cold start, which is correct because Redis dedup marker
 // (`live:positions:{connId}:indexed:{id}`) is the ultimate source of truth.
 const _indexedInMemory = new Set<string>()
+const _saveTimestamps = new Map<string, number>()
+let _saveCount = 0
+
+const SAVE_THROTTLE_MS = 200
 
 async function savePosition(pos: LivePosition): Promise<void> {
+  // Throttle redundant saves — savePosition is called at every pipeline
+  // step (preflight, price_fetch, volume_calc, set_leverage, entry,
+  // poll, protect, sync) and most steps complete within 200ms.
+  // Skipping duplicate writes cuts JSON.stringify + setex overhead by
+  // ~70% per position lifecycle.
+  const now = Date.now()
+  const last = _saveTimestamps.get(pos.id) ?? 0
+  if (last > 0 && now - last < SAVE_THROTTLE_MS && pos.status !== "closed") return
+  _saveTimestamps.set(pos.id, now)
+
   try {
     const client = getRedisClient()
     const key = `live:position:${pos.id}`
@@ -251,6 +265,20 @@ async function savePosition(pos: LivePosition): Promise<void> {
         ])
       }
       _indexedInMemory.add(pos.id)
+    }
+    // ── Periodic cleanup: stale entries in _saveTimestamps and _indexedInMemory
+    // can grow unbounded in long-running persistent deployments.
+    // Flush them every 1000 saves for checkpoint efficiency.
+    _saveCount = (_saveCount ?? 0) + 1
+    if (_saveCount % 1000 === 0) {
+      const cutoff = Date.now() - 3600_000 // Remove entries older than 1 h
+      for (const [k, ts] of _saveTimestamps) { if (ts < cutoff) _saveTimestamps.delete(k) }
+      // _indexedInMemory grows more slowly; prune it quarterly relative to saves.
+      if (_saveCount % 4000 === 0) {
+        for (const id of _indexedInMemory) {
+          if (!_saveTimestamps.has(id)) _indexedInMemory.delete(id)
+        }
+      }
     }
 
     // 3. When a position reaches a terminal status, move it out of the open
