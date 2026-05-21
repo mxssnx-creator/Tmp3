@@ -52,9 +52,10 @@ export async function GET() {
       }
     }
 
+    const status = report.status || (redisHealthy ? "healthy" : "degraded")
     const response = {
       ...report,
-      status: "healthy",
+      status,
       timestamp: new Date().toISOString(),
       redis: {
         healthy: true,
