@@ -78,6 +78,8 @@ export class RealtimeProcessor {
   // actually changed.
   private lastHeartbeatAt = 0
   private lastPositionsCount = -1
+  /** Per-position in-flight gate to prevent concurrent processPosition calls on same ID. */
+  private _inflightProcessPosition = new Set<string>()
   private static readonly HEARTBEAT_INTERVAL_MS = 1000
 
   // ── Live-position exchange sync throttle ───────────────────────────────
@@ -360,6 +362,21 @@ export class RealtimeProcessor {
       const count = activePositions.length
       const now = Date.now()
 
+      // ── Per-position in-flight gate ────────────────────────────────────
+      // `processRealtimeUpdates` and `updateOpenPseudoPositionsForSymbol`
+      // (called from the shared pipeline) can both process the same position
+      // concurrently — one via the all-positions fan-out, the other via the
+      // per-symbol filter. Without a gate, two concurrent `processPosition`
+      // calls on the same ID can double-increment trades, emit duplicate
+      // broadcasts, and race on close. A simple in-memory Set prevents the
+      // hot-path overlap (single Node process, single-threaded).
+      const inflight = this._inflightProcessPosition
+      for (let i = activePositions.length - 1; i >= 0; i--) {
+        if (inflight.has(activePositions[i].id)) {
+          activePositions.splice(i, 1)
+        }
+      }
+
       // Write the lightweight heartbeat at most once per second, and skip the
       // preceding getSettings() unless the position count changed (which is
       // when we need to merge with the persisted state hash).
@@ -447,9 +464,13 @@ export class RealtimeProcessor {
       // (prev-set enrichment) can be conditionally skipped without
       // blocking Phase A (mark-to-market + TP/SL).
       await Promise.all(
-        activePositions.map((position) =>
-          this.processPosition(position, prehistoricReady),
-        ),
+        activePositions.map((position) => {
+          if (!position?.id) return Promise.resolve()
+          this._inflightProcessPosition.add(position.id)
+          return this.processPosition(position, prehistoricReady).finally(() => {
+            this._inflightProcessPosition.delete(position.id)
+          })
+        }),
       )
 
       // ── Cross-tick visibility for the "open positions are being

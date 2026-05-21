@@ -202,15 +202,27 @@ export class ExchangePositionManager {
       let trailHighPrice = position.trail_high_price
 
       if (position.trailing_enabled && !trailActivated) {
-        const profitPercent = ((updates.currentPrice - position.entry_price) / position.entry_price) * 100
+        // For shorts, price DROP is profitable — invert the direction
+        // so trail_start correctly gates at a positive percentage.
+        const priceDelta = position.direction === "short"
+          ? (position.entry_price - updates.currentPrice)
+          : (updates.currentPrice - position.entry_price)
+        const profitPercent = (priceDelta / position.entry_price) * 100
         if (profitPercent >= (position.trail_start || 0)) {
           trailActivated = true
           trailHighPrice = updates.currentPrice
         }
       }
 
-      if (trailActivated && updates.currentPrice > (trailHighPrice || 0)) {
-        trailHighPrice = updates.currentPrice
+      if (trailActivated) {
+        // Trail-high: tracks the most-favourable price since activation.
+        // For longs, that's the HIGHEST price; for shorts, the LOWEST.
+        const isFavourable = position.direction === "short"
+          ? updates.currentPrice < (trailHighPrice || Infinity)
+          : updates.currentPrice > (trailHighPrice || -Infinity)
+        if (isFavourable) {
+          trailHighPrice = updates.currentPrice
+        }
       }
 
       await setSettings(`exchange_position:${lookup.id}`, {

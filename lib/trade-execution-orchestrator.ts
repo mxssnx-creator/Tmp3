@@ -208,8 +208,9 @@ export class TradeExecutionOrchestrator {
 
       this.log(`  Closing position: ${position.size} @ ${position.entryPrice}`)
 
-      // Step 3: Close position with retry
-      const closeResult = await this.closePositionWithRetry(connector, symbol, position.size)
+      // Step 3: Close position with retry — use inverted direction
+      const closeSide = position.direction === "short" ? "buy" : "sell"
+      const closeResult = await this.closePositionWithRetry(connector, symbol, closeSide, position.size)
 
       if (!closeResult.success) {
         return {
@@ -302,12 +303,13 @@ export class TradeExecutionOrchestrator {
   /**
    * Close position with retry
    */
-  private async closePositionWithRetry(connector: any, symbol: string, size: number, maxAttempts: number = 3): Promise<any> {
+  private async closePositionWithRetry(connector: any, symbol: string, side: string, size: number, maxAttempts: number = 3): Promise<any> {
+    const closeSide = side || "sell"
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        this.log(`  Closing position (attempt ${attempt}/${maxAttempts})...`)
+        this.log(`  Closing position (attempt ${attempt}/${maxAttempts}, side=${closeSide})...`)
 
-        const result = await connector.placeOrder(symbol, "sell", size, undefined, "market")
+        const result = await connector.placeOrder(symbol, closeSide, size, undefined, "market")
 
         if (result.success) {
           return result

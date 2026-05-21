@@ -390,12 +390,10 @@ async function tryAcquireLock(
   connectionId: string,
   symbol: string,
   direction: "long" | "short",
-  // 30 s gives ample time for the full exchange pipeline (place +
-  // fill-poll + SL/TP ≈ 5-15 s p99) while self-clearing quickly on
-  // crashes so the next cycle can retry within one minute.
-  // The previous 300 s default blocked the slot for 5 minutes on a
-  // crash — unacceptable with a 50 ms cycle cadence and 10+ symbols.
-  ttlSeconds = 30,
+  // 90 s TTL — the full entry pipeline can take 30s+ on slow venues
+  // (15s poll + 5s SL/TP + retries). 30s was insufficient and could
+  // expire mid-pipeline, letting another tick place a duplicate.
+  ttlSeconds = 90,
 ): Promise<boolean> {
   try {
     const client = getRedisClient()
@@ -2722,15 +2720,16 @@ export async function executeLivePosition(
     // Successful placement — reset the margin error consecutive-failure counter
     // so the backoff resets to the shortest cooldown on the next failure.
     marginErrorCooldownByConnection.delete(connectionId)
-    // Lock was already acquired ATOMICALLY at the top of this function via
-    // `tryAcquireLock` (see the dedup-gate block). The legacy
-    // `await acquireLock(...)` here was redundant — it just re-stamped a
-    // lock we already owned. Keeping the order here would also paper over
-    // any future regression where the gate atomicity is removed: removing
-    // it makes the contract obvious — "fresh-entry path runs IFF we own
-    // the lock". A long-running entry's TTL is refreshed by the
-    // accumulation path (`refreshLockTTL`) and by `closeLivePosition`'s
-    // explicit `releaseLock`.
+    // ── Refresh the dedup lock TTL ──────────────────────────────────────
+    // The poll-fill phase below can take up to 15s. Without a mid-pipeline
+    // TTL refresh, a slow venue + SL/TP placement could push past the
+    // lock's 90s window, letting another tick place a duplicate position.
+    // Re-stamp the lock here so the slot stays owned through fill + protect.
+    await refreshLockTTL(
+      connectionId,
+      realPosition.symbol,
+      realPosition.direction,
+    ).catch(() => {})
     await logProgressionEvent(connectionId, "live_trading", "info", `Entry order placed for ${realPosition.symbol}`, {
       orderId: livePosition.orderId,
       side: exchangeSide,
@@ -3238,12 +3237,13 @@ export async function closeLivePosition(
     // orderId for this position — proof that WE placed the entry order.
     // Without an orderId the position was either simulated (no exchange
     // call made), the entry order failed silently, or the slot was
-    // allocated but never confirmed. In those cases we must NOT call
-    // closePosition because the exchange may have an external/manual
-    // position at the same symbol+direction that we would inadvertently
-    // close. The Redis record is cleaned up by the local close path
-    // below regardless.
-    const hasSystemOrderId = !!position.orderId
+    // allocated but never confirmed.
+    //
+    // Fallback: if `orderId` is missing but `exchangePositionId` exists
+    // (reconciled/adopted position), use it to close via exchange-side
+    // position ID. Without EITHER, skip exchange close — the position
+    // may be external/manual.
+    const hasSystemOrderId = !!(position.orderId || position.exchangePositionId)
     if (!hasSystemOrderId && exchangeConnector) {
       exchangeCloseReason = "skipped"
       await logProgressionEvent(

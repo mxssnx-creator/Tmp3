@@ -598,6 +598,10 @@ export class PseudoPositionManager {
       pipeline.srem(this.positionsSetKey(), positionId)
       if (configSetKey) {
         pipeline.srem(this.activeConfigKeysSetKey(), configSetKey)
+        // Clean up the atomic gate on close so a future position with the
+        // same config set key can be created immediately.
+        const gateKey = `pseudo:gate:${this.connectionId}:${configSetKey}`
+        pipeline.del(gateKey)
       }
       // P0-4: Free the per-direction slot so another position in the
       // same direction can open on the next cycle. Use the hash's
@@ -945,9 +949,21 @@ export class PseudoPositionManager {
   ): Promise<boolean> {
     try {
       const client = getRedisClient()
-      // Gate 1: Set-uniqueness (SISMEMBER).
+      // Gate 1: Set-uniqueness. Use SET NX as a mutex so two concurrent
+      // `createPosition` calls for the same configSetKey can't both pass.
+      // SISMEMBER + SADD was racy: both callers could see `false` before
+      // either added to the set, producing duplicate positions.
+      const gateKey = `pseudo:gate:${this.connectionId}:${configSetKey}`
+      const acquired = await client.set(gateKey, "1", { NX: true, EX: 5 })
+      if (!acquired) return false
+      // Second check: the Set may already contain the key from a prior run
+      // (the gate TTL expired but the Set entry persisted). Double-check.
       const isMember = await client.sismember(this.activeConfigKeysSetKey(), configSetKey)
-      if (isMember) return false
+      if (isMember) {
+        // Release the gate — another caller on a future cycle can retry.
+        await client.del(gateKey).catch(() => {})
+        return false
+      }
 
       // Gate 2: per-direction cap (SCARD). When `side` is not supplied
       // (legacy callers), skip the per-direction gate to preserve
