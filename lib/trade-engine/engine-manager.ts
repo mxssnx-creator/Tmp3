@@ -524,6 +524,13 @@ export class TradeEngineManager {
     // record of intended intervals.
     this.startConfig = config
 
+    // ── Symbols cache invalidation ──────────────────────────────────────
+    // Quick-start and any engine restart must resolve fresh symbols from
+    // Redis (`trade_engine_state:{id}` wins over `connection:{id}`) so a
+    // stale 5-second in-memory TTL can't rebind the new run to a previous
+    // symbol list.
+    this.invalidateSymbolsCache()
+
     // Idempotent global unhandled-rejection handler. Defined here (not at
     // module top) so it runs in the same process tick as the engine that
     // would otherwise leak the rejection. Multiple managers calling this

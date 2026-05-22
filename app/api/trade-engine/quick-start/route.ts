@@ -301,10 +301,22 @@ export async function POST(request: Request) {
     if (symbols.length === 0) {
       try {
         const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"
-        const topRes = await fetch(
-          `${baseUrl}/api/exchange/${exchangeName}/top-symbols?limit=${requestedCount}&t=${Date.now()}`,
-          { signal: AbortSignal.timeout(5000), cache: "no-store" }
-        )
+        // AbortSignal.timeout() is unreliable on Node.js < V20. Use a plain
+        // Promise.race so the timeout actually fires even when the built-in
+        // abort-controller integration is absent (Node 18 §fetch).
+        const FETCH_MS = 30000
+        const timeoutCtrl = new AbortController()
+        const FETCH_TIMEOUT = setTimeout(() => timeoutCtrl.abort(), FETCH_MS)
+        const topRes = await Promise.race([
+          fetch(
+            `${baseUrl}/api/exchange/${exchangeName}/top-symbols?limit=${requestedCount}&t=${Date.now()}`,
+            { signal: timeoutCtrl.signal, cache: "no-store" },
+          ),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`top-symbols fetch timed out after ${FETCH_MS} ms`)), FETCH_MS),
+          ),
+        ])
+        clearTimeout(FETCH_TIMEOUT)
         if (topRes.ok) {
           const topData = await topRes.json()
           // Prefer the new `symbolList` (string[]) when N>1; fall back to
