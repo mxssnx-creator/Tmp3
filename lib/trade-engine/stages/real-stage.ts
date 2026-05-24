@@ -219,17 +219,47 @@ function createRealPosition(
     evaluationScore: number
   }
 ): RealPosition {
+  // CRITICAL VALIDATION: Prevent division by zero crashes
+  if (!mainPos.entryPrice || mainPos.entryPrice <= 0) {
+    console.error("[v0] [RealStage] CRASH PREVENTION: entryPrice must be > 0", {
+      entryPrice: mainPos.entryPrice,
+      symbol: mainPos.symbol,
+      direction: mainPos.direction,
+    })
+    // Return placeholder with minimal data to prevent crashes
+    return {
+      id: `real:error:${mainPos.symbol}:${Date.now()}`,
+      connectionId,
+      symbol: mainPos.symbol,
+      direction: mainPos.direction,
+      entryPrice: 0.01, // Minimum valid price
+      quantity: 0,
+      leverage: 1,
+      riskAmount: 0,
+      rewardTarget: 0,
+      stopLoss: 0,
+      takeProfit: 0,
+      mainPositionCount: 0,
+      evaluationScore: 0,
+      ratioMet: false,
+      timestamp: Date.now(),
+      ratios: {
+        profitabilityRatio: 0,
+        accountRiskRatio: 0,
+        successRateRatio: 0,
+        consistencyRatio: 0,
+      },
+      status: "error",
+    }
+  }
+
   const riskPercentage = 0.02 // 2% risk per trade
   const riskAmount = accountBalance * riskPercentage
-  const quantity = riskAmount / mainPos.entryPrice
+  const quantity = Math.max(0, riskAmount / mainPos.entryPrice)
 
   // Stop distance: volatilityScore (0–1) scales a percentage offset from
   // entryPrice. A score of 0.5 → 5% stop, score of 1.0 → 10% stop.
-  // The previous formula used `entryPrice * (1 - vol * 0.1)` which
-  // produced a PRICE, not a distance — stopLoss was entryPrice minus a
-  // near-full entryPrice value, yielding a ~0 or negative stop price for
-  // longs when volatility was low.
-  const stopPct = Math.max(0.005, mainPos.volatilityScore * 0.1) // ≥ 0.5% stop
+  const stopPct = Math.max(0.005, (mainPos.volatilityScore || 0.5) * 0.1) // ≥ 0.5% stop
   const stopDistance = mainPos.entryPrice * stopPct
   const stopLoss =
     mainPos.direction === "long"
@@ -237,7 +267,7 @@ function createRealPosition(
       : mainPos.entryPrice + stopDistance
 
   // Take profit at profitRatio × stop distance from entry
-  const rewardDistance = stopDistance * ratios.profitRatio
+  const rewardDistance = stopDistance * (ratios.profitRatio || 1.5)
   const takeProfit =
     mainPos.direction === "long"
       ? mainPos.entryPrice + rewardDistance
@@ -245,8 +275,8 @@ function createRealPosition(
 
   // Leverage: how many units of riskAmount fit inside the stop distance
   // margin. Clamped to [1, 10].
-  const stopMargin = mainPos.entryPrice * Math.max(0.001, 1 - mainPos.riskScore)
-  const leverage = Math.min(Math.max(1, Math.round(riskAmount / stopMargin)), 10)
+  const stopMargin = mainPos.entryPrice * Math.max(0.001, 1 - (mainPos.riskScore || 0))
+  const leverage = Math.min(Math.max(1, Math.round(riskAmount / Math.max(0.001, stopMargin))), 10)
 
   return {
     id: `real:${connectionId}:${mainPos.symbol}:${mainPos.direction}:${Date.now()}`,

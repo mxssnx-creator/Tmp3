@@ -2168,8 +2168,35 @@ export async function executeLivePosition(
     // `processSimulatedPositions` sweep walking Redis market_data
     // and force-closing on SL/TP cross or max-hold-time expiry.
     if (!isLiveTradeEnabled) {
-      const simEntryPrice = livePosition.entryPrice || realPosition.entryPrice || 0
+      // CRITICAL FIX: Validate price is not zero to prevent crashes
+      let simEntryPrice = livePosition.entryPrice || realPosition.entryPrice || 0
+      if (!simEntryPrice || simEntryPrice <= 0) {
+        // Attempt to fetch current market price if entry price is invalid
+        simEntryPrice = await fetchCurrentPrice(realPosition.symbol).catch(() => null)
+        if (!simEntryPrice || simEntryPrice <= 0) {
+          livePosition.status = "error"
+          livePosition.statusReason = `Cannot simulate order — no valid entry price for ${realPosition.symbol}`
+          pushStep(livePosition, "price_validation", false, livePosition.statusReason)
+          await savePosition(livePosition)
+          await incrementMetric(connectionId, "live_orders_failed_count")
+          await logProgressionEvent(connectionId, "live_trading", "error", "Simulated order failed — invalid price", {
+            symbol: realPosition.symbol,
+            entryPrice: simEntryPrice,
+          })
+          return livePosition
+        }
+      }
+
       const simQty = realPosition.quantity || 0
+      if (!simQty || simQty <= 0) {
+        livePosition.status = "error"
+        livePosition.statusReason = `Cannot simulate order — invalid quantity for ${realPosition.symbol}`
+        pushStep(livePosition, "qty_validation", false, livePosition.statusReason)
+        await savePosition(livePosition)
+        await incrementMetric(connectionId, "live_orders_failed_count")
+        return livePosition
+      }
+
       livePosition.executedQuantity = simQty
       livePosition.remainingQuantity = 0
       livePosition.averageExecutionPrice = simEntryPrice
