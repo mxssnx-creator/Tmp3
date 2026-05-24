@@ -84,20 +84,16 @@ export async function evaluateToRealPositions(
     for (const mainPos of mainPositions) {
       // Check ratio criteria
       const profitRatio = calculateProfitabilityRatio(mainPos)
-      // accountRisk: dimensionless fraction (0–1) of account balance at risk
-      // per trade. riskAmount = maxRisk × balance; we check that the risk
-      // amount (in $ terms) does not exceed the configured ceiling. The
-      // previous implementation compared units (riskAmount/entryPrice) against
-      // dollars (maxRisk×balance), which was a category error and always true
-      // for any real-world asset price > $1.
-      const riskAmount = maxRisk * accountBalance
-      const accountRiskRatio = riskAmount / accountBalance // = maxRisk, sanity check
+      // accountRisk: dimensionless fraction (0–1) of account balance at risk per trade
+      // Compute per-position risk in dollar terms, then check it doesn't exceed ceiling
+      const riskAmount = (mainPos.quantity || 1) * mainPos.entryPrice * maxRisk
+      const accountRiskRatio = riskAmount / accountBalance // Fraction of account at risk
       const successRate = mainPos.metrics.successRate
       const consistency = mainPos.metrics.consistencyScore
 
       const ratiosMet =
         profitRatio >= minProfit &&
-        accountRiskRatio <= maxRisk &&       // dimensionless: riskFraction ≤ configured ceiling
+        accountRiskRatio <= maxRisk &&       // Ensure risk per position ≤ ceiling
         successRate >= minSuccess &&
         consistency >= minConsist
 
