@@ -10,8 +10,18 @@ export async function POST() {
     await initRedis()
     const client = getRedisClient()
 
-    // Test 1: Check progression state
-    const progressionKeys = await client.keys("progression:*")
+    // Test 1: Get all keys and group by prefix
+    const allKeys = await client.keys("*")
+    console.log(`[v0] [Diagnostic] Total keys in Redis: ${allKeys.length}`)
+
+    // Group by prefix
+    const keyGroups: Record<string, number> = {}
+    for (const key of allKeys) {
+      const prefix = key.split(":")[0]
+      keyGroups[prefix] = (keyGroups[prefix] || 0) + 1
+    }
+
+    const progressionKeys = allKeys.filter(k => k.startsWith("progression:"))
     console.log(`[v0] [Diagnostic] Found ${progressionKeys.length} progression states`)
 
     // Test 2: Check strategy sets
@@ -21,7 +31,7 @@ export async function POST() {
 
     console.log(`[v0] [Diagnostic] Base sets: ${baseSetKeys.length}, Main sets: ${mainSetKeys.length}, Real sets: ${realSetKeys.length}`)
 
-    // Test 3: Check positions
+    // Test 3: Check positions (correct key pattern)
     const basePositions = await client.keys("base:position:*")
     const mainPositions = await client.keys("main:position:*")
     const realPositions = await client.keys("real:position:*")
@@ -52,6 +62,8 @@ export async function POST() {
       timestamp: new Date().toISOString(),
       success: true,
       summary: {
+        totalKeys: allKeys.length,
+        keysByPrefix: keyGroups,
         progressionStates: progressionKeys.length,
         sets: {
           base: baseSetKeys.length,
