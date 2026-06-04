@@ -1282,7 +1282,7 @@ async function placeProtectionOrder(
       return null
     }
 
-    // ── Venue minimum-quantity floor ──────────────────────────────────
+    // ── Venue minimum-quantity floor ───────���──────────────────────────
     // Same per-base-asset floor used by the test harness — shared via
     // `lib/exchange-min-qty.ts` so they cannot drift. BingX rejects
     // sub-minimum orders with code=110422 "The minimum size per order
@@ -3456,6 +3456,63 @@ export async function closeLivePosition(
     const margin = notional > 0 ? notional / lev : 0
     const roi = margin > 0 ? (pnl / margin) * 100 : 0
 
+    // ── 3b. Genuine exchange-close failure → DO NOT terminalise ────────
+    //
+    // `exchangeCloseReason === "failed"` means we had a system orderId,
+    // a connector, AND the venue rejected the close with an error that is
+    // NOT an "already closed" variant after all retries. The previous
+    // behaviour marked the record `closed` and let `savePosition()` move
+    // it into the closed archive. That stranded a REAL position open on
+    // the venue — and because the SL/TP legs were cancelled in parallel
+    // (and/or orphan-swept) above, that stranded position is now also
+    // UNPROTECTED. Worse, once archived it leaves the open index, so
+    // `reconcileLivePositions` never sees it again to retry the close.
+    //
+    // Correct behaviour: keep the position OPEN and tracked. The next
+    // reconcile tick will (a) re-arm SL/TP via `updateProtectionOrders`,
+    // and (b) retry the close via the SL/TP-cross, max-hold, or
+    // external-close-detection paths. We also fire a best-effort SL/TP
+    // re-arm right here so the position is not left naked for even one
+    // reconcile interval. Idempotent callers (cross-check / reconcile /
+    // orphan / shutdown) all ignore the return value, and the API
+    // manual-close passes no connector (→ "skipped", never "failed"),
+    // so returning a non-"closed" position here is safe everywhere.
+    if (exchangeCloseReason === "failed") {
+      if ((position.status as string) === "closed") position.status = "open"
+      position.updatedAt = Date.now()
+      pushStep(
+        position,
+        "close",
+        false,
+        `exchange close FAILED @ ${closePrice} reason=${closeReason} — position kept OPEN for reconcile retry (protection will re-arm)`,
+      )
+      // Best-effort immediate protection re-arm so the position is not
+      // left unprotected during the gap until the next reconcile tick.
+      if (exchangeConnector) {
+        try {
+          await updateProtectionOrders(exchangeConnector, position, "close_failed_rearm")
+        } catch (rearmErr) {
+          console.warn(
+            `${LOG_PREFIX} [close-failed] SL/TP re-arm error for ${position.symbol}:`,
+            rearmErr instanceof Error ? rearmErr.message : String(rearmErr),
+          )
+        }
+      }
+      await savePosition(position) // non-terminal status → stays in open index
+      await incrementMetric(connectionId, "live_positions_close_failed_count")
+      await logProgressionEvent(
+        connectionId,
+        "live_trading",
+        "error",
+        `Exchange close FAILED for ${position.symbol} — kept open; reconcile will retry & re-arm protection`,
+        { positionId: position.id, symbol: position.symbol, direction: position.direction, closePrice, closeReason },
+      ).catch(() => {})
+      console.error(
+        `${LOG_PREFIX} [v0] Exchange close FAILED — keeping position OPEN for retry: ${position.symbol} ${position.direction}`,
+      )
+      return position
+    }
+
     // ── 4. Persist with terminal state ────────────────────────────────
     position.status = "closed"
     position.closedAt = Date.now()
@@ -3498,13 +3555,12 @@ export async function closeLivePosition(
     if (!wasAlreadyClosed) {
       await incrementMetric(connectionId, "live_positions_closed_count")
       if (pnl > 0) await incrementMetric(connectionId, "live_wins_count")
-      // Only count as exchange-close failure when the connector actually
-      // failed. `already_closed` means the exchange-side state already
-      // matches our intent (SL/TP fired first), and `skipped` means we
-      // never had a connector — neither is a real failure.
-      if (exchangeCloseReason === "failed") {
-        await incrementMetric(connectionId, "live_positions_close_failed_count")
-      }
+      // NOTE: a genuine `exchangeCloseReason === "failed"` no longer
+      // reaches this terminal block — it returns early in step 3b above,
+      // keeping the position OPEN and tracked (and bumping
+      // `live_positions_close_failed_count` there) so reconcile can retry
+      // instead of stranding an unprotected position on the venue. Only
+      // `ok` / `already_closed` / `skipped` outcomes terminalise here.
     }
 
     await logProgressionEvent(connectionId, "live_trading", "info", `Closed live position ${position.symbol}`, {
