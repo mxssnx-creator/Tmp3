@@ -686,7 +686,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default — operator-tunable
+      minProfitFactor: 1.0,   // spec default ��� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -776,6 +776,50 @@ export class StrategyCoordinator {
       this.METRICS.main.maxDrawdownTime = mainDdtMin
       this.METRICS.real.maxDrawdownTime = realDdtMin
       this.METRICS.live.maxDrawdownTime = liveDdtMin
+
+      // ── Per-connection overrides (ALWAYS win over app-level) ────────────
+      // The Connection Settings dialog persists per-stage PF / DDT(min) /
+      // max-positions into the `connection_settings:{id}` HASH (flattened by
+      // the PATCH route as connMinProfitFactor{Stage} /
+      // connMaxDrawdownTime{Stage}Min / connMaxPositions{Stage}). When a
+      // field is present we override the app-level default just loaded above,
+      // so a per-connection knob is authoritative for THIS connection while
+      // unset fields keep falling back to the app default. Read on the same
+      // 5s TTL cycle as the app settings — one extra hgetall is cheap.
+      try {
+        const client = getRedisClient()
+        const cs = ((await client.hgetall(`connection_settings:${this.connectionId}`).catch(() => null)) ||
+          {}) as Record<string, string>
+        const ovr = (raw: unknown, lo: number, hi: number): number | undefined => {
+          if (raw === undefined || raw === null || raw === "") return undefined
+          const n = Number(raw)
+          if (!Number.isFinite(n) || n < 0) return undefined
+          return Math.max(lo, Math.min(hi, n))
+        }
+        // PF per stage [0, 5]
+        const pfBase = ovr(cs.connMinProfitFactorBase, 0, 5)
+        const pfMain = ovr(cs.connMinProfitFactorMain, 0, 5)
+        const pfReal = ovr(cs.connMinProfitFactorReal, 0, 5)
+        const pfLive = ovr(cs.connMinProfitFactorLive, 0, 5)
+        if (pfBase !== undefined) { this.PF_BASE_MIN = pfBase; this.METRICS.base.minProfitFactor = pfBase }
+        if (pfMain !== undefined) { this.PF_MAIN_MIN = pfMain; this.METRICS.main.minProfitFactor = pfMain }
+        if (pfReal !== undefined) { this.PF_REAL_MIN = pfReal; this.METRICS.real.minProfitFactor = pfReal }
+        if (pfLive !== undefined) { this.PF_LIVE_MIN = pfLive; this.METRICS.live.minProfitFactor = pfLive }
+        // DDT per stage in MINUTES [1, 4320] (1min .. 72h). Base stays open.
+        const ddtMain = ovr(cs.connMaxDrawdownTimeMainMin, 1, 4320)
+        const ddtReal = ovr(cs.connMaxDrawdownTimeRealMin, 1, 4320)
+        const ddtLive = ovr(cs.connMaxDrawdownTimeLiveMin, 1, 4320)
+        if (ddtMain !== undefined) this.METRICS.main.maxDrawdownTime = ddtMain
+        if (ddtReal !== undefined) this.METRICS.real.maxDrawdownTime = ddtReal
+        if (ddtLive !== undefined) this.METRICS.live.maxDrawdownTime = ddtLive
+      } catch (csErr) {
+        // Per-connection override read is best-effort; app-level values
+        // already applied above keep the gate active on a miss.
+        console.warn(
+          `[v0] [StrategyCoordinator] ${this.connectionId} per-connection threshold override read failed; using app-level`,
+          csErr instanceof Error ? csErr.message : String(csErr),
+        )
+      }
     } catch (err) {
       // Don't fail the whole flow on a settings read miss — the
       // already-loaded values (either the defaults or the last
@@ -1186,7 +1230,7 @@ export class StrategyCoordinator {
         const rawAvgPF = entries.reduce((s, e) => s + e.profitFactor, 0) / entries.length
         const avgConf = entries.reduce((s, e) => s + e.confidence, 0) / entries.length
 
-        // ── Prev-PI min-blend on avgProfitFactor ─────────────────────────
+        // ── Prev-PI min-blend on avgProfitFactor ─────────��───────────────
         // Operator spec: "evaluating prev pos and profitfactors min from
         // historic". When the historic bucket has at least `prevPosMinCount`
         // closed positions, the Set's avgProfitFactor becomes the MIN of
@@ -2844,7 +2888,7 @@ export class StrategyCoordinator {
     }
   }
 
-  // ─── STAGE 4: LIVE ─────────����──────────��─────����──────────────────────���────────
+  // ─── STAGE 4: LIVE ─────────����──────────��─────����──────────────────────���───────��
 
   /**
    * Select the best 500 Sets from REAL for live trading.
